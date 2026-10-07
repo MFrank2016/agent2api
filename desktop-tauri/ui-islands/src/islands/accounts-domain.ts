@@ -138,10 +138,10 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // 而不是一个地区的两种拼法，国际版将来接入时另立 provider id，不把它做成账号字段。
   // `usage: true` 对应 providers::trae::usage（上游两份账：ide_user_ent_usage 的权益包/
   // 积分池 + ide_user_pay_status 的快请求与 SOLO 并发）。
-  // `checkin: false` 同样不是省事：签到那条链在参考实现里有把出口 IP 打进封禁的前科，
-  // 且它记的「签到钱包」与模型调用真正扣的积分池是两笔钱 —— 不给按钮，免得给一个
-  // 点了必然报错（或报出一个对不上官方数字的余额）的入口。
-  trae: { usage: true, checkin: false, edition: false, identifier: 'uid', expiry: 'expiresAt' },
+  // `checkin: true` —— 后端已实现（见 providers::trae::checkin，源码 providers/trae/checkin.rs）。
+  // 策略偏保守：复用账号已绑定的 device_id，**不轮换**；上游风控返回 code 9074 时直接判失败，
+  // 不做重试，避免在参考实现里那种「把出口 IP 打进封禁」的链路上反复试探。
+  trae: { usage: true, checkin: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
   // Loomy（讯飞）。三位各有出处：
   // `usage: true` 对应 providers::loomy::balance —— 余额是**双账户**（永久积分 +
   //   每日赠送积分，读 `GET /api/v2/points/records` 的摘要字段），界面上两张卡都列。
