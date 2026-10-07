@@ -22,7 +22,8 @@ services:
     container_name: agent2api
     restart: unless-stopped
     ports:
-      - "3065:3065"
+      # 只绑本机回环：公网入口统一走 Caddy（agent2api.061995.xyz），不直接暴露 3065
+      - "127.0.0.1:3065:3065"
     environment:
       # 面板管理员：可选。不设时走登录页注册（首次打开面板即提示）；
       # 无人值守 / IaC 部署才需要在这里预置（密码明文填，启动时自动
@@ -37,3 +38,10 @@ services:
     volumes:
       # 全部状态（SQLite 库、配置、日志）都在这一个卷里
       - ./data:/data
+    networks:
+      # 加入 Caddy 的外部网络，Caddy 按容器名 agent2api 反代
+      - caddy_caddy_net
+
+networks:
+  caddy_caddy_net:
+    external: true
