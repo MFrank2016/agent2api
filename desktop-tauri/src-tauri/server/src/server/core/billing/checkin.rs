@@ -84,15 +84,15 @@ pub fn supports_checkin(account: &Value) -> bool {
         .get("provider")
         .and_then(Value::as_str)
         .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
-    // CodeArts 与 Trae 两家都没有「签到」链路，必须先排除：
-    // `checkin_for` 的分派 match 把「不在范围里的家」报成「未接入」，而这两家
-    // 的按钮在界面上由能力位 `checkin: false` 收起 —— 这一层是批量路径
+    // CodeArts 没有「签到」链路，必须先排除：
+    // `checkin_for` 的分派 match 把「不在范围里的家」报成「未接入」，而它的
+    // 按钮在界面上由能力位 `checkin: false` 收起 —— 这一层是批量路径
     // （`resolve_checkin_targets` 的 filter）与 API 直调的兜底，双保险。
     // 注意 CodeArts 的每日福利**不是**签到（那是 ops 福利领取，独立的「领福利」
     // 按钮，见 `providers::codearts::welfare`），与这条链无交集。
-    if provider == crate::server::core::account_store::codearts_accounts::CODEARTS_PROVIDER_ID
-        || provider == crate::server::core::account_store::TRAE_PROVIDER_ID
-    {
+    // Trae 此前也在这份排除名单里（那时它没接签到）；现已接入
+    // `providers::trae::checkin`，因此移出名单，与其它家一样参与签到。
+    if provider == crate::server::core::account_store::codearts_accounts::CODEARTS_PROVIDER_ID {
         return false;
     }
     !crate::server::core::account_store::is_accio_family(provider)
@@ -188,13 +188,17 @@ pub fn resolve_checkin_targets(
 /// 单个账号签到。已签到（上游非 0 code）不算错误，原样返回结果 ——
 /// 前端把「今天已签到」显示成一条 warn 提示。
 ///
-/// ── 按提供商分派（四家的接口互不相通）────────────────────────
+/// ── 按提供商分派（各家的接口互不相通）────────────────────────
 ///   - **WorkBuddy**：计费服务的每日签到（`billing.claim_daily_checkin`）；
 ///   - **小浣熊**：桌面登录积分链路（`providers::raccoon::balance::claim_daily_grant`）；
 ///   - **AutoClaw**：通用任务接口的 `daily_signin` 任务
 ///     （`providers::autoclaw::checkin::claim_daily_signin`）；
 ///   - **Qoder**：活动（campaign）领取链路，只有中国版有
-///     （`providers::qoder::checkin::claim_daily_checkin`）。
+///     （`providers::qoder::checkin::claim_daily_checkin`）；
+///   - **Loomy**：每日首次登录刷新赠送积分
+///     （`providers::loomy::checkin::claim_daily_login`）；
+///   - **Trae**：ug 族的每日积分领取
+///     （`providers::trae::checkin::claim_daily_checkin`）。
 ///
 /// 拿一家的 token 去打另一家的签到接口只会稳定报错，所以这条分派是必需的而不是
 /// 优化。各分支的收尾（claim → 结果行 + 日志）完全一致，共用 [`claim_result`]；
@@ -248,6 +252,16 @@ pub async fn checkin_for(
             // 的模块头）。自动签到框架对它就是「每天替账号打一次这个接口」。
             let claim =
                 crate::server::core::providers::loomy::checkin::claim_daily_login(store, &id)
+                    .await
+                    .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
+        "trae" => {
+            // Trae 的每日积分走 ug 族独立的 claim 接口（`trae/checkin.rs`）：
+            // 一次调用只打一次 claim、不轮换 device_id、不重试（风控前科见那里
+            // 的模块头）。9074「人太多」是正常失败结果，原样交给 claim_result。
+            let claim =
+                crate::server::core::providers::trae::checkin::claim_daily_checkin(store, &id)
                     .await
                     .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
