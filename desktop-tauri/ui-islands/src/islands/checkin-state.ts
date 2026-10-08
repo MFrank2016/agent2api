@@ -5,7 +5,7 @@
  *   · 快照层 —— `GET /api/checkin-center` 的一次聚合：每日签到分组（判定在后端，
  *     与批量签到同一对判据）、自动签到设置、签到历史台账、一次性项的账号清单。
  *     页面打开 / 切入时拉一次，签到动作完成后整体重拉。
- *   · 惰性层 —— 新手任务（Loomy）的任务状态。它是上游查询，快照刻意不带
+ *   · 惰性层 —— 新手任务（Loomy / 小浣熊）的任务状态。它是上游查询，快照刻意不带
  *     （见 api::checkin_center 的模块头）；这里按账号缓存查询结果，
  *     界面用「上次查询时间」如实呈现缓存的新旧。
  *
@@ -81,9 +81,9 @@ export type CheckinCenterSnapshot = {
     todayEligible: number
   }
   extras: {
-    onboarding: Array<{ id: string; name: string }>
-    welfare: Array<{ id: string; name: string }>
-    plans: Array<{ id: string; name: string; claimAt?: number | null; claimPlans?: Record<string, number> | null }>
+    onboarding: Array<{ id: string; name: string; provider?: string }>
+    welfare: Array<{ id: string; name: string; provider?: string }>
+    plans: Array<{ id: string; name: string; provider?: string; claimAt?: number | null; claimPlans?: Record<string, number> | null }>
   }
   auto: AutoCheckinState
   /** WorkBuddy 国际版日活保活的模型链（后端快照直接给当前生效值 + 缺省值） */
@@ -91,7 +91,7 @@ export type CheckinCenterSnapshot = {
   history: CheckinHistoryEntry[]
 }
 
-/** 一个 Loomy 账号的 novice 任务缓存（status: idle = 还没查过） */
+/** 一个新手任务账号的任务缓存（Loomy / 小浣熊；status: idle = 还没查过） */
 export type OnboardingCache = {
   status: 'idle' | 'loading' | 'loaded' | 'error'
   error?: string
@@ -172,7 +172,7 @@ export type CheckinStore = {
   keepaliveDraft: string | null
   /** 单账号签到在途（行内按钮的去重闸） */
   signing: ReadonlySet<string>
-  /** Loomy 新手任务的按账号缓存 */
+  /** 新手任务的按账号缓存（Loomy / 小浣熊） */
   onboarding: ReadonlyMap<string, OnboardingCache>
 }
 
@@ -311,12 +311,12 @@ export async function runAllCheckin(): Promise<void> {
   } catch (error) {
     toast(`签到失败：${errorMessage(error)}`, 'err')
   } finally {
-    patch({ runningAll: false })
-    await loadCheckinCenter()
-    // 快照到位后自动处理 Loomy 新手任务（不 await：签到结果已经播报过，
-    // 查询与领取是后台的一次跟进，进度直接落在「待领新手任务」卡上）
-    void autoProcessOnboarding(getCheckinStore().snapshot?.extras.onboarding ?? [])
-    shared().wbApp?.refresh?.()
+      patch({ runningAll: false })
+      await loadCheckinCenter()
+      // 快照到位后自动处理新手任务（不 await：签到结果已经播报过，
+      // 查询与领取是后台的一次跟进，进度直接落在「待领新手任务」卡上）
+      void autoProcessOnboarding(getCheckinStore().snapshot?.extras.onboarding ?? [])
+      shared().wbApp?.refresh?.()
   }
 }
 
@@ -376,11 +376,11 @@ export async function signSingleAccount(id: string, mode: 'checkin' | 'full' | '
     rest.delete(busyKey)
     patch({ signing: rest })
     await loadCheckinCenter()
-    // 只处理刚签的这个账号：从快照的 Loomy 清单里过滤，不是 Loomy 账号则数组为空
-    // （新手任务目前只有 Loomy 一家有，别的家不发无意义的查询）
-    const loomyRows = (getCheckinStore().snapshot?.extras.onboarding ?? [])
+    // 只处理刚签的这个账号：从快照的新手任务清单里过滤，账号不在清单里则数组为空
+    // （清单由后端按 provider 组装：Loomy / 小浣熊，别的家不发无意义的查询）
+    const onboardingRows = (getCheckinStore().snapshot?.extras.onboarding ?? [])
       .filter(row => row.id === id)
-    void autoProcessOnboarding(loomyRows)
+    void autoProcessOnboarding(onboardingRows)
     shared().wbApp?.refresh?.()
   }
 }
@@ -473,20 +473,21 @@ export async function submitKeepaliveModels(value: string): Promise<void> {
   }
 }
 
-/* ─── Loomy 新手任务（惰性查询 + 一键领取）─── */
+/* ─── 新手任务（惰性查询 + 一键领取；Loomy / 小浣熊）─── */
 
 /**
  * 签到完成后的自动处理（原账号页「签到后自动弹窗领取」口径的延续）：
- * 对 [`rows`] 里的 Loomy 账号逐个查询任务状态（只读），有未领取的**立即自动领取**。
+ * 对 [`rows`] 里的账号逐个查询任务状态，有未领取的**立即自动领取**。
  *
  * ── 为什么自动领取是安全的 ──────────────────────────────────
- * 新手任务是一次性福利，服务端幂等（重复上报 alreadyCompleted，不重复加分），
- * 自动领取不会多拿；全部领完后查询结果 unclaimed=0，之后签到就只是签到。
- * 逐账号串行（与签到同一条防风控口径），单账号查询失败不拖累其它账号。
+ * 新手任务是一次性福利，两家的领取接口都幂等（Loomy 重复上报 alreadyCompleted、
+ * 小浣熊已发放过返回 granted=false，都不会重复加分），自动领取不会多拿；
+ * 全部领完后查询结果 unclaimed=0，之后签到就只是签到。逐账号串行
+ * （与签到同一条防风控口径），单账号查询失败不拖累其它账号。
  *
- * `rows` 传快照的 `extras.onboarding`（全部 Loomy 账号）；单账号签到时传只含
- * 该账号的数组（用户点的是谁就处理谁）。领取完成后 claimOnboarding 内部会
- * 重拉快照，「待领新手任务」总览卡随之归零。
+ * `rows` 传快照的 `extras.onboarding`（全部支持新手任务的账号）；单账号签到时
+ * 传只含该账号的数组（用户点的是谁就处理谁）。领取完成后 claimOnboarding
+ * 内部会重拉快照，「待领新手任务」总览卡随之归零。
  */
 async function autoProcessOnboarding(rows: Array<{ id: string }>): Promise<void> {
   for (const row of rows) {

@@ -21,8 +21,9 @@ import {
  * ── 这页管什么 ──────────────────────────────────────────────
  * 全部签到类动作的统一入口：每日签到（提供商清单与「能不能签」的判定都在后端，
  * 见 `core::auto_checkin::CHECKIN_PROVIDERS`）、自动签到设置（含 WorkBuddy
- * 国际版日活保活的模型链）、签到历史时间线、新手任务（Loomy，惰性查询）与
- * 活动福利（CodeArts / ZCode，沿用既有领取流程）。原型见 prototype/checkin-center.html。
+ * 国际版日活保活的模型链）、签到历史时间线、新手任务（Loomy / 小浣熊，
+ * 惰性查询）与活动福利（CodeArts / ZCode，沿用既有领取流程）。
+ * 原型见 prototype/checkin-center.html。
  *
  * ── 数据从哪来 ──────────────────────────────────────────────
  * 快照走 `GET /api/checkin-center` 一次拉全（load）；新手任务的任务状态是上游
@@ -62,6 +63,11 @@ const AUTO_CHECKIN_DESC =
   '各家签到接口都是幂等的，重复执行不会重复领取。'
 
 /* ─── 小组件 ───────────────────────────────── */
+
+/** 新手任务分组的提供商展示名（缺省回落 provider id 本身） */
+function onboardingProviderLabel(provider: string): string {
+  return provider === 'raccoon' ? '小浣熊' : provider === 'loomy' ? 'Loomy' : provider
+}
 
 function useCheckinStore(): CheckinStore {
   const [store, setStore] = React.useState(getCheckinStore())
@@ -209,7 +215,8 @@ function ProviderRow({ group, expanded }: { group: CheckinProviderGroup; expande
 }
 
 /** 新手任务一行（含惰性查询 / 一键领取 / 可展开收起的行级任务清单） */
-function OnboardingRow({ row }: { row: { id: string; name: string } }) {
+function OnboardingRow({ row }: { row: { id: string; name: string; provider?: string } }) {
+  const provider = row.provider ?? 'loomy'
   const cache = getCheckinStore().onboarding.get(row.id)
   const tasks: OnboardingTask[] = cache?.tasks ?? []
   const unclaimed = cache?.unclaimed ?? 0
@@ -230,7 +237,7 @@ function OnboardingRow({ row }: { row: { id: string; name: string } }) {
         tabIndex={hasDetail ? 0 : -1}
         aria-expanded={hasDetail ? expanded : undefined}
       >
-        <ProviderLogo id='loomy' label='Loomy' />
+        <ProviderLogo id={provider} label={onboardingProviderLabel(provider)} />
         <div className='ck-prov-info'>
           <div className='ck-prov-name'>{row.name || row.id}</div>
           <div className='ck-prov-desc'>
@@ -600,8 +607,8 @@ function CheckinPage() {
           </div>
           <div className='ck-stat-foot'>
             {onboardingRows.length
-              ? `已查 ${onboardingChecked.length} / 共 ${onboardingRows.length} 个 Loomy 账号`
-              : '没有 Loomy 账号'}
+              ? `已查 ${onboardingChecked.length} / 共 ${onboardingRows.length} 个账号`
+              : '没有支持新手任务的账号'}
           </div>
         </div>
       </div>
@@ -658,7 +665,7 @@ function CheckinPage() {
                 {onboardingRows.map(row => <OnboardingRow key={row.id} row={row} />)}
               </div>
             ) : (
-              <div className='ck-tl-empty'>没有 Loomy 账号 —— 新手任务目前只有 Loomy 一家提供。</div>
+              <div className='ck-tl-empty'>没有支持新手任务的账号 —— 目前有 Loomy、小浣熊两家。</div>
             )}
           </section>
 

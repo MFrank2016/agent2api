@@ -56,6 +56,8 @@ pub const DEFAULT_TIME: &str = "00:01";
 ///     成功不落 `checkinAt`、单独统计在 `active`；免费模型链可在签到中心自定义
 ///     （`billing::keepalive`）。
 ///   - **小浣熊**：「桌面登录积分」链路（`providers::raccoon` 的每日积分发放）；
+///     首次登录奖励（电脑端 / 手机端各一条端点）是一次性新手福利，不在这条
+///     每日链路里（见 `providers::raccoon::onboarding`，挂新手任务分组）；
 ///   - **AutoClaw 国内版 / 国际版**：通用任务接口的 `daily_signin` 任务
 ///     （`providers::autoclaw::checkin`）。两个地区**都支持** —— 任务接口在
 ///     两地是同一套路径、同一套任务 id，只是站点不同（已实测），因此两家
