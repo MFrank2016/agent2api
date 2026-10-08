@@ -127,6 +127,9 @@ pub async fn get_center(State(state): State<ServerState>) -> Response {
                 "checkedInToday": checked_in_today(
                     account.get("checkinAt").and_then(Value::as_i64),
                 ),
+                // 版本（cn / intl，缺失 null）：WorkBuddy 国际版在这张表里执行的是
+                // 「领日活」（活跃保活），按钮文案与提示要跟国内版的「签到」分开
+                "edition": account.get("edition").cloned().unwrap_or(Value::Null),
             }));
         } else {
             let label = crate::server::core::providers::label_of(&provider);
@@ -226,6 +229,8 @@ pub async fn get_center(State(state): State<ServerState>) -> Response {
             "plans": plan_rows,
         },
         "auto": state.auto_checkin().state(),
+        // WorkBuddy 国际版日活保活的模型链（签到中心可编辑；空清单回落缺省链）
+        "keepalive": crate::server::core::billing::keepalive::state(),
         "history": checkin_history::list(),
     }))
 }

@@ -28,6 +28,8 @@ export type CheckinAccountRow = {
   available: boolean
   checkinAt: number | null
   checkedInToday: boolean
+  /** cn / intl（缺失 null）：WorkBuddy 国际版在这张表里执行的是「领日活」 */
+  edition?: string | null
 }
 
 export type CheckinProviderGroup = {
@@ -45,10 +47,18 @@ export type CheckinHistoryEntry = {
   date?: string | null
   reason?: string | null
   succeeded?: number | null
+  /** 活跃保活数（WorkBuddy 国际版）：与 succeeded 分开统计，不落 checkinAt */
+  active?: number | null
   total?: number | null
   skipped?: number | null
   failed?: string[] | null
   failedCount?: number | null
+}
+
+/** WorkBuddy 国际版日活保活的模型链（config.json 的 checkinKeepalive） */
+export type KeepaliveState = {
+  models: string[]
+  defaultModels: string[]
 }
 
 /** 自动签到的状态（与 /api/auto-checkin 同形；tasks-panel 迁来同款读法） */
@@ -76,6 +86,8 @@ export type CheckinCenterSnapshot = {
     plans: Array<{ id: string; name: string; claimAt?: number | null; claimPlans?: Record<string, number> | null }>
   }
   auto: AutoCheckinState
+  /** WorkBuddy 国际版日活保活的模型链（后端快照直接给当前生效值 + 缺省值） */
+  keepalive?: KeepaliveState
   history: CheckinHistoryEntry[]
 }
 
@@ -98,9 +110,15 @@ type CheckinBridge = {
   getAutoCheckin?(): Promise<AutoCheckinState>
   saveAutoCheckin?(patch: Record<string, unknown>): Promise<AutoCheckinState>
   runAutoCheckinNow?(): Promise<(CheckinHistoryEntry & AutoCheckinState) | null | undefined>
+  /** WorkBuddy 国际版日活保活的模型链（读 / 存；与 bridge.rs、web_shim.rs 三处成对） */
+  getCheckinKeepalive?(): Promise<KeepaliveState>
+  saveCheckinKeepalive?(models: string[]): Promise<KeepaliveState>
+  /** WorkBuddy 国际版日活任务的手动粒度入口（mode: full | claim | keepalive） */
+  runCheckinActivity?(id: string, mode: string): Promise<Record<string, unknown> | null | undefined>
   checkinAllAccounts?(id?: string | null): Promise<{
     results?: Array<Record<string, unknown>>
     succeeded?: number
+    active?: number
     total?: number
   } | null | undefined>
   getOnboardingTasks?(id: string): Promise<{
@@ -148,6 +166,10 @@ export type CheckinStore = {
   autoSaving: boolean
   /** 签到时刻的编辑草稿：null = 跟随后端值 */
   autoTimeDraft: string | null
+  /** 保活模型链保存中（输入框临时禁用） */
+  keepaliveSaving: boolean
+  /** 保活模型链的编辑草稿：null = 跟随后端值（逗号分隔的一行文本） */
+  keepaliveDraft: string | null
   /** 单账号签到在途（行内按钮的去重闸） */
   signing: ReadonlySet<string>
   /** Loomy 新手任务的按账号缓存 */
@@ -163,6 +185,8 @@ let store: CheckinStore = {
   runningAll: false,
   autoSaving: false,
   autoTimeDraft: null,
+  keepaliveSaving: false,
+  keepaliveDraft: null,
   signing: new Set<string>(),
   onboarding: new Map<string, OnboardingCache>(),
 }
@@ -228,6 +252,7 @@ export async function loadCheckinCenter(): Promise<void> {
       loadError: '',
       // 时刻草稿跟着后端值走（首次加载 / 异地修改后都以服务端为准）
       autoTimeDraft: null,
+      keepaliveDraft: null,
     })
   } catch (error) {
     patch({ loaded: true, loadError: errorMessage(error) })
@@ -270,12 +295,14 @@ export async function runAllCheckin(): Promise<void> {
     const result = await bridge().runAutoCheckinNow?.()
     if (result) {
       const succeeded = numberOf(result.succeeded)
+      const active = numberOf(result.active)
       const total = numberOf(result.total)
       const failed = numberOf(result.failedCount)
+      const activeText = active > 0 ? `，日活保活 ${active} 个` : ''
       if (failed > 0) {
-        toast(`签到完成：${succeeded}/${total} 成功，${failed} 个失败`, 'err')
+        toast(`签到完成：${succeeded}/${total} 成功${activeText}，${failed} 个失败`, 'err')
       } else {
-        toast(`✅ 签到完成：${succeeded}/${total} 个账号成功领取`)
+        toast(`✅ 签到完成：${succeeded}/${total} 个账号成功领取${activeText}`)
       }
       // 余额读数是账号页自己缓存里的，不查它还是签到前的旧值（不 await：
       // 那是账号页的动作层，静默刷新，结果落在余额列上）
@@ -294,30 +321,59 @@ export async function runAllCheckin(): Promise<void> {
 }
 
 /**
- * 单账号签到（签到中心明细行上的「签到 / 重签」；端点与原账号页行内按钮相同）。
+ * 单账号签到 / 日活任务（签到中心明细行上的按钮）。
+ *
+ * ── 四种模式 ────────────────────────────────────────────────
+ *   - `checkin`（缺省）：普通单账号签到，走既有端点（除 WorkBuddy 国际版外
+ *     的所有账号都是它）；
+ *   - `full` / `claim` / `keepalive`：WorkBuddy 国际版日活任务的三档手动粒度
+ *     （保活+领取 / 只领取 / 只保活），走独立端点 —— 与批量签到那条「恒走
+ *     完整组合」的入口分开，粒度细分只属于手动按钮。
+ *
+ * 在途键是 `${id}:${mode}`：三颗按钮各自的转圈互不牵连，点「保活」不禁用
+ * 「领取」。结果行的 toast 按模式分流 —— 国际版的结果必须分清「保活」与
+ * 「领取」两件事，混在一句话里正是当初造成困惑的根源。
  */
-export async function signSingleAccount(id: string): Promise<void> {
-  if (store.signing.has(id)) return
+export async function signSingleAccount(id: string, mode: 'checkin' | 'full' | 'claim' | 'keepalive' = 'checkin'): Promise<void> {
+  const busyKey = `${id}:${mode}`
+  if (store.signing.has(busyKey)) return
   const next = new Set(store.signing)
-  next.add(id)
+  next.add(busyKey)
   patch({ signing: next })
   try {
-    const result = await bridge().checkinAllAccounts?.(id)
-    const row = result?.results?.[0]
-    const claim = row?.claim as { success?: boolean; msg?: string } | undefined
+    let row: Record<string, unknown> | undefined
+    if (mode === 'checkin') {
+      const result = await bridge().checkinAllAccounts?.(id)
+      row = result?.results?.[0]
+    } else {
+      row = (await bridge().runCheckinActivity?.(id, mode)) ?? undefined
+    }
+    const claim = row?.claim as
+      | { success?: boolean; msg?: string; alreadyCompleted?: boolean }
+      | undefined
+    const activity = row?.activity as { pokeSucceeded?: boolean | null } | null | undefined
     if (row?.error) {
       toast(`签到失败：${row.error}`, 'err')
+    } else if (mode === 'keepalive') {
+      // 只保活：结果就一句话（保活成功 / 失败），不存在领取语义
+      if (activity?.pokeSucceeded === true) toast(`✅ ${claim?.msg || '活跃保活完成'}`)
+      else toast(claim?.msg || '活跃保活失败', 'err')
     } else if (claim?.success === true) {
       toast(`✅ ${claim.msg || '签到成功'}`)
-    } else {
+    } else if (claim?.alreadyCompleted === true) {
       toast(claim?.msg || '今日已领取', 'err')
+    } else if (activity?.pokeSucceeded === true) {
+      // 完整模式：保活成功但没领到 —— 后端 msg 把「活动未开启」一并交代
+      toast(`✅ ${claim?.msg || '活跃保活完成，但活动未开启'}`)
+    } else {
+      toast(claim?.msg || '未领取', 'err')
     }
     accountsView().wbAccountsView?.refreshUsageAfterCheckin?.(id)
   } catch (error) {
     toast(`签到失败：${errorMessage(error)}`, 'err')
   } finally {
     const rest = new Set(getCheckinStore().signing)
-    rest.delete(id)
+    rest.delete(busyKey)
     patch({ signing: rest })
     await loadCheckinCenter()
     // 只处理刚签的这个账号：从快照的 Loomy 清单里过滤，不是 Loomy 账号则数组为空
@@ -383,6 +439,38 @@ function mergeAuto(next: AutoCheckinState): CheckinCenterSnapshot | null {
   const current = getCheckinStore().snapshot
   if (!current) return current
   return { ...current, auto: next }
+}
+
+/* ─── WorkBuddy 国际版日活保活的模型链 ─── */
+
+/** 保活模型链的编辑草稿（输入过程；提交在 blur / 回车时走 submitKeepaliveModels） */
+export function setKeepaliveDraft(value: string): void {
+  patch({ keepaliveDraft: value })
+}
+
+/**
+ * 提交保活模型链（失焦 / 回车）：按逗号 / 顿号 / 空白拆成数组交给后端
+ * （后端对字符串入参也会再拆一遍，这里先拆是为了在界面上先归一成干净的一行）。
+ * 空清单 = 恢复缺省链（语义在后端，界面只管把草稿原样交上去）。
+ */
+export async function submitKeepaliveModels(value: string): Promise<void> {
+  const draft = value.trim()
+  if (!draft) return
+  const models = draft.split(/[，、,]/).map(item => item.trim()).filter(Boolean)
+  if (getCheckinStore().keepaliveSaving) return
+  patch({ keepaliveSaving: true })
+  try {
+    const next = await bridge().saveCheckinKeepalive?.(models)
+    if (next) {
+      const current = getCheckinStore().snapshot
+      patch({ snapshot: current ? { ...current, keepalive: next } : current, keepaliveDraft: null })
+      toast('已保存：保活模型链')
+    }
+  } catch (error) {
+    toast(`保存失败：${errorMessage(error)}`, 'err')
+  } finally {
+    patch({ keepaliveSaving: false })
+  }
 }
 
 /* ─── Loomy 新手任务（惰性查询 + 一键领取）─── */
@@ -527,10 +615,12 @@ export function groupTone(group: CheckinProviderGroup): 'done' | 'part' | 'todo'
 /** 历史条目的一行摘要（时间线副标题） */
 export function historyLine(entry: CheckinHistoryEntry): string {
   const succeeded = numberOf(entry.succeeded)
+  const active = numberOf(entry.active)
   const total = numberOf(entry.total)
   const skipped = numberOf(entry.skipped)
   const failed = numberOf(entry.failedCount)
   const parts = [`成功 ${succeeded}`]
+  if (active > 0) parts.push(`保活 ${active}`)
   if (skipped > 0) parts.push(`跳过 ${skipped}`)
   if (failed > 0) parts.push(`失败 ${failed}`)
   return `${parts.join(' · ')}${total ? `（共 ${total} 个账号）` : ''}`
