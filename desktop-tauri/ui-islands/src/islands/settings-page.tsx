@@ -61,6 +61,7 @@ import {
   refreshDebug,
   refreshClineHeaders,
   refreshCors,
+  refreshRouting,
   refreshPrompt,
   refreshQueue,
   refreshRetention,
@@ -92,6 +93,8 @@ import {
   saveProviderPromptMode,
   saveQueueField,
   saveRetentionField,
+  saveRoutingDefault,
+  saveRoutingProvider,
   saveRetryField,
   saveSanitize,
   saveTimeoutField,
@@ -111,6 +114,7 @@ import {
   type PromptState,
   type ProviderPromptOption,
   type ProviderPromptState,
+  type RoutingState,
   type SettingsSnapshot,
   type StorageState,
 } from './settings-state'
@@ -1110,6 +1114,134 @@ function RetryPane({ snap }: { snap: SettingsSnapshot }) {
 
 /* ─── 网关分类 ─────────────────────────────── */
 
+/**
+ * 逐家策略的行来源：提供商目录（providers.js，与账号页 / 请求日志读的是同一份 ——
+ * `wbProviders.all()` 返回注册表全量，没账号的家 count 为 0 也照样在）里的全部家，
+ * 外加**覆盖表里有、目录里没有**的家（例如自定义提供商）：后者若只存在于覆盖表却
+ * 不出现在列表里，用户既看不到也删不掉那条覆盖。
+ */
+function routingProviderRows(routing: RoutingState): Array<{ id: string; label: string }> {
+  const rows: Array<{ id: string; label: string }> = []
+  const seen = new Set<string>()
+  for (const item of shared().wbProviders?.all?.() || []) {
+    const id = String(item?.id || '')
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    rows.push({ id, label: String(item?.label || id) })
+  }
+  for (const id of Object.keys(routing.providers)) {
+    if (seen.has(id)) continue
+    seen.add(id)
+    rows.push({ id, label: shared().wbProviders?.labelOf?.(id) || id })
+  }
+  return rows
+}
+
+/** 选路策略的状态行：默认那一档 + 有多少家单独配过 */
+function routingStateText(routing: RoutingState): string {
+  if (routing.status === 'loading') return STATES.appLoading
+  if (routing.status === 'unavailable') return STATES.routingUnavailable
+  const label = routing.strategies.find(item => item.id === routing.default)?.label || routing.default
+  const count = Object.keys(routing.providers).length
+  return count
+    ? `默认按「${label}」选路；${count} 家使用单独策略。`
+    : `默认按「${label}」选路；所有提供商都跟随默认。`
+}
+
+/**
+ * 「选路策略」面板：一个全局默认下拉 + 逐家下拉（第一项「跟随默认」= 空串，没有覆盖）。
+ * 与提示词模式那个下拉同一套用法（组件库的 Select + 显式 SelectValue）。
+ */
+function RoutingStrategyPanel({ snap }: { snap: SettingsSnapshot }) {
+  const routing = snap.routing
+  const locked = routing.status !== 'ready'
+  const busy = snap.busy === 'routing'
+  const strategyLabel = (id: string): string =>
+    routing.strategies.find(item => item.id === id)?.label || id
+  const defaultHint = routing.strategies.find(item => item.id === routing.default)?.hint || ''
+  const rows = routingProviderRows(routing)
+
+  return (
+    <section className='panel'>
+      <PanelHead
+        title='选路策略'
+        tip={TIPS.routing}
+        badge={routing.status === 'ready'
+          ? <StatusBadge tone='ok'>已生效</StatusBadge>
+          : routing.status === 'unavailable'
+            ? <StatusBadge tone='bad'>不可用</StatusBadge>
+            : <StatusBadge tone='idle'>检测中…</StatusBadge>}
+        actions={<RefreshButton id='btn-routing-refresh' onClick={() => void refreshRouting()} />}
+      />
+      <div className='panel-body'>
+        <div className='retention-list'>
+          <div className='retention-row'>
+            <label htmlFor='settings-routing-default'>默认策略</label>
+            <span className='prompt-input'>
+              {/* 同提示词模式：null = 没选（清空 / 取消），不当作一个策略名 */}
+              <Select
+                value={routing.default}
+                onValueChange={next => { if (next != null && String(next)) void saveRoutingDefault(String(next)) }}
+              >
+                <SelectTrigger
+                  id='settings-routing-default'
+                  className='w-[240px]'
+                  disabled={locked || busy}
+                  aria-label='默认选路策略'
+                >
+                  <SelectValue>{strategyLabel(routing.default)}</SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {routing.strategies.map(item => (
+                    <SelectItem key={item.id} value={item.id}>{item.label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </span>
+            <div className='hint'>{defaultHint || NOTES.routingDefault}</div>
+          </div>
+
+          <div className='prompt-group'>
+            按提供商配置<span className='note'>未单独配置的家沿用上面的默认策略</span>
+          </div>
+
+          {rows.map(row => (
+            <div className='retention-row' key={row.id}>
+              <label htmlFor={`settings-routing-${row.id}`}>{row.label}</label>
+              <span className='prompt-input'>
+                {/* 第一项「跟随默认」的值是空串 = 没有覆盖（后端据此删掉这一家的条目） */}
+                <Select
+                  value={routing.providers[row.id] ?? ''}
+                  onValueChange={next => { if (next != null) void saveRoutingProvider(row.id, String(next)) }}
+                >
+                  <SelectTrigger
+                    id={`settings-routing-${row.id}`}
+                    className='w-[240px]'
+                    disabled={locked || busy}
+                    aria-label={`${row.label} 的选路策略`}
+                  >
+                    <SelectValue>
+                      {routing.providers[row.id] ? strategyLabel(routing.providers[row.id]) : '跟随默认'}
+                    </SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value=''>跟随默认</SelectItem>
+                    {routing.strategies.map(item => (
+                      <SelectItem key={item.id} value={item.id}>{item.label}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </span>
+            </div>
+          ))}
+        </div>
+        <div className='settings-state'>{routingStateText(routing)}</div>
+        <div className='hint retention-note'>{NOTES.routing}</div>
+      </div>
+    </section>
+  )
+}
+
 function GatewayPane({ snap }: { snap: SettingsSnapshot }) {
   return (
     <>
@@ -1135,6 +1267,8 @@ function GatewayPane({ snap }: { snap: SettingsSnapshot }) {
           <div className='hint retention-note'>{NOTES.queue}</div>
         </div>
       </section>
+
+      <RoutingStrategyPanel snap={snap} />
 
       <section className='panel'>
         <PanelHead

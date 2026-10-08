@@ -54,6 +54,7 @@ import {
   type GatewayBlocks,
   type NumberField,
   type PromptPatch,
+  type RoutingStrategyOption,
 } from './settings-model'
 
 /* ─── 快照类型 ─────────────────────────────── */
@@ -78,6 +79,7 @@ export type BusyScope =
   | 'clineHeaders'
   | 'cors'
   | 'prompt'
+  | 'routing'
   | 'captcha'
   | 'export'
   | 'import'
@@ -132,6 +134,20 @@ export type ClineHeadersState = {
 
 /** 网关面（/v1/*）跨域访问开关；与 SanitizeState 同形 */
 export type CorsState = { status: LoadStatus; on: boolean }
+
+/**
+ * 选路策略（网关分类）：全局默认 + 逐家覆盖。
+ *
+ * `default` 是全局默认那一档；`providers` 只含**显式设过**的家（某一家回到
+ * 「跟随默认」就从表里消失）—— 与后端 POST 的「完整表」语义一致。
+ * `strategies` 是后端给的可选项（含 label / hint），界面不写死任何一档。
+ */
+export type RoutingState = {
+  status: LoadStatus
+  default: string
+  providers: Record<string, string>
+  strategies: RoutingStrategyOption[]
+}
 
 export type PromptState = {
   status: LoadStatus
@@ -226,6 +242,7 @@ export type SettingsSnapshot = {
   clineHeaders: ClineHeadersState
   cors: CorsState
   prompt: PromptState
+  routing: RoutingState
   storage: StorageState
   captcha: { available: boolean; enabled: boolean }
   ioFailure: IoFailure
@@ -280,6 +297,7 @@ const INITIAL: SettingsSnapshot = {
   sanitize: { status: 'loading', on: false },
   clineHeaders: { status: 'loading', defaults: {}, overrides: {}, effective: {} },
   cors: { status: 'loading', on: false },
+  routing: { status: 'loading', default: '', providers: {}, strategies: [] },
   prompt: {
     status: 'loading',
     mode: 'passthrough',
@@ -1221,6 +1239,107 @@ export async function saveCors(next: boolean): Promise<void> {
   }
 }
 
+/* ─── 选路策略（网关分类：全局默认 + 逐家覆盖）── */
+
+/** 逐家覆盖表归一化：只认「id → 非空字符串」的项，其余丢掉（宁缺勿错） */
+function routingProviders(raw: unknown): Record<string, string> {
+  if (!raw || typeof raw !== 'object') return {}
+  const out: Record<string, string> = {}
+  for (const [id, value] of Object.entries(raw as Record<string, unknown>)) {
+    const key = String(id || '').trim()
+    const strategy = typeof value === 'string' ? value.trim() : ''
+    if (key && strategy) out[key] = strategy
+  }
+  return out
+}
+
+/** 策略候选项归一化：后端给什么就是什么（id 非空才收），认不出的项丢掉 */
+function routingStrategies(raw: unknown): RoutingStrategyOption[] {
+  if (!Array.isArray(raw)) return []
+  return raw
+    .filter(item => !!item && typeof item === 'object' && String((item as Record<string, unknown>).id || ''))
+    .map(item => {
+      const entry = item as Record<string, unknown>
+      return {
+        id: String(entry.id),
+        label: String(entry.label || entry.id),
+        hint: String(entry.hint || ''),
+      }
+    })
+}
+
+export function renderRouting(data?: unknown): void {
+  if (data === undefined) return
+  if (!data || typeof data !== 'object') {
+    publish({ routing: { ...snapshot.routing, status: 'unavailable' } })
+    return
+  }
+  const record = data as Record<string, unknown>
+  publish({
+    routing: {
+      status: 'ready',
+      default: String(record.default || ''),
+      providers: routingProviders(record.providers),
+      strategies: routingStrategies(record.strategies),
+    },
+  })
+}
+
+async function loadRouting(): Promise<void> {
+  try {
+    renderRouting(await shared().workbuddyDesktop?.getRoutingStrategy())
+  } catch (error) {
+    console.warn('读取选路策略设置失败:', errorMessage(error))
+    renderRouting(null)
+  }
+}
+
+/**
+ * 提交一份选路策略（全局默认 + 逐家覆盖的**完整表**）。载荷两项俱全：后端 POST
+ * 一旦带上 `providers` 就整体替换 —— 某一家改回「跟随默认」= 从表里删掉它。
+ * 保存成功用响应重画；失败回滚到后端的真实值。
+ */
+async function commitRouting(nextDefault: string, nextProviders: Record<string, string>): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('routing')
+  publish({ routing: { ...snapshot.routing, default: nextDefault, providers: nextProviders } })
+  try {
+    const saved = await shared().workbuddyDesktop?.saveRoutingStrategy({
+      default: nextDefault,
+      providers: nextProviders,
+    })
+    renderRouting(saved)
+    toast('✅ 选路策略已保存')
+  } catch (error) {
+    toast(`保存失败：${errorMessage(error)}`, 'err')
+    await loadRouting() // 回滚到后端的真实值
+  } finally {
+    endBusy()
+  }
+}
+
+/** 改全局默认策略（逐家覆盖原样带上；非法档位直接忽略） */
+export async function saveRoutingDefault(strategy: string): Promise<void> {
+  if (!snapshot.routing.strategies.some(item => item.id === strategy)) return
+  await commitRouting(strategy, snapshot.routing.providers)
+}
+
+/** 改一家的策略：空串 = 跟随默认（从覆盖表里删掉这一家） */
+export async function saveRoutingProvider(id: string, strategy: string): Promise<void> {
+  const key = String(id || '').trim()
+  if (!key) return
+  if (strategy && !snapshot.routing.strategies.some(item => item.id === strategy)) return
+  const providers = { ...snapshot.routing.providers }
+  if (strategy) providers[key] = strategy
+  else delete providers[key]
+  await commitRouting(snapshot.routing.default, providers)
+}
+
+export async function refreshRouting(): Promise<void> {
+  await loadRouting()
+  toast('选路策略已刷新')
+}
+
 /* ─── 机器人校验（面板登录 / 注册的 ALTCHA 开关）── */
 
 async function loadCaptcha(): Promise<void> {
@@ -1749,6 +1868,7 @@ export async function load(): Promise<void> {
     loadSanitize(),
     loadClineHeaders(),
     loadCors(),
+    loadRouting(),
     loadPrompt(),
     loadStorage(),
     loadCaptcha(),

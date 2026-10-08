@@ -107,6 +107,30 @@ export type ClineHeadersData = {
   effective: Record<string, string>
 }
 
+/**
+ * 选路策略的一个候选项（后端 `GET /api/routing-strategy` 的 `strategies` 元素）。
+ *
+ * `hint` 是这一档的说明：选中的那一档显示在控件下方（与提示词模式那个下拉同款），
+ * 文案由后端给 —— 新增一档时界面不必改，直接长出来。
+ */
+export type RoutingStrategyOption = {
+  /** 策略 id（priority / least-connections / round-robin / least-recently-used /
+   *  balance-weighted / priority-weighted） */
+  id: string
+  /** 下拉里显示的短名 */
+  label: string
+  /** 这一档的说明（可空） */
+  hint: string
+}
+
+/**
+ * 选路策略的写入载荷：全局默认 + 逐家覆盖。
+ *
+ * `providers` 是**完整表**而不是增量：某一家改回「跟随默认」= 从表里删掉它 ——
+ * 后端 POST 一旦带上这张表就整体替换（见桥接层与 settings-state 的 saveRoutingStrategy）。
+ */
+export type RoutingStrategyPatch = { default: string; providers: Record<string, string> }
+
 /** 本页用到的壳 / HTTP 桥（方法名与 bridge.rs 一一对应，一个都不能改） */
 export type SettingsBridge = {
   /** 'desktop' | 'web'：面板登录那一块只在网页端有意义 */
@@ -133,6 +157,9 @@ export type SettingsBridge = {
   saveCors(enabled: boolean): Promise<unknown>
   getPrompt(): Promise<unknown>
   savePrompt(payload: PromptPatch): Promise<unknown>
+  /** 选路策略（全局默认 + 逐家覆盖）：GET 读、POST 写，响应体是生效后的全量状态 */
+  getRoutingStrategy(): Promise<unknown>
+  saveRoutingStrategy(payload: RoutingStrategyPatch): Promise<unknown>
   getStorage(): Promise<unknown>
   getCaptchaSetting(): Promise<{ captchaEnabled?: boolean } | null | undefined>
   saveCaptchaSetting(on: boolean): Promise<{ captchaEnabled?: boolean } | null | undefined>
@@ -179,6 +206,14 @@ export type SharedWindow = {
   wbUpdatePanel?: { load?: () => Promise<void> | void }
   /** 内联图标集（icons.js）：左栏分类图标由它渲染（返回 SVG 串，注入用） */
   wbIcons?: { icon?: (name: string, size?: number) => string }
+  /**
+   * 提供商目录（providers.js）：选路策略的逐家列表复用它 —— 与账号页 / 请求日志
+   * 读的是同一份目录（注册表全量 + 自定义家展示名），不在这里另写一份提供商清单。
+   */
+  wbProviders?: {
+    all?: () => Array<{ id?: string; label?: string; count?: number }>
+    labelOf?: (id: string) => string
+  }
 }
 
 export function shared(): SharedWindow {
@@ -598,6 +633,7 @@ export const TIPS = {
   io: '导出会把全部账号与自定义提供商定义写入一个 JSON 文件，可以拷到另一台机器上导入后继续使用。导入采用合并策略：同提供商下按业务身份（UID / userId / apiKey 等）去重 —— 已存在的账号只更新凭证，保留本机原有的优先级顺序；新账号追加到转发顺序末尾，不会抢占当前正在使用的账号；自定义提供商定义按 id 合并，本机缺失时自动补建。',
   retention: '三类数据各自独立计时，超出保留天数的部分会被删除：事件日志是登录、账号切换、429 切换这类系统事件；请求日志是网关每次转发到上游的逐条记录；按天聚合供报表页的热力图与按天趋势使用。把某一档改小（例如 30 天改成 7 天）保存后会立即删除超出的历史数据，此操作不可恢复；改大或保持不变不会删除任何数据。三项的可填范围均为 1–3650 天。',
   storage: '全部数据（账号、事件日志、请求记录、调试报文、设置）统一保存在配置目录下的 agent2api.db 这一个 SQLite 数据库里。备份时只需拷贝这个文件；更换保存位置请设置环境变量 AGENT2API_PROXY_HOME 后重启程序。',
+  routing: '「选路策略」决定网关在一组可用账号之间按什么规则挑一个来转发。全局默认对所有未单独配置的提供商生效，逐家的下拉可以给某一家换一种策略（选「跟随默认」即取消这一家的单独设置）。各档含义：优先级优先 = 按账号页的全局优先级从小到大取第一个可用的（默认，行为与改造前完全一致）；最少连接 = 优先挑当前在途连接数最少的账号，适合把并发摊平；轮询 = 在可用账号里依次轮流，兼顾均衡与可预期；最近最少使用 = 优先挑最久没被用过的账号；加权均衡 / 优先级加权 = 在「均衡」与「优先级」之间按权重折中。改动保存后对下一个请求立即生效，不用重启。',
 } as const
 
 /** 面板底注（`.hint.retention-note`）与各面板内的说明行 */
@@ -623,6 +659,8 @@ export const NOTES = {
   captcha: '开启后，登录页在浏览器后台自动完成验证（对真人无感），而脚本每次尝试都要先算一道题 —— 暴力破解与抢注的成本显著上升。仅影响面板的登录 / 注册，与 API 客户端的 API Key 无关。',
   panelLogin: '当前浏览器以管理员身份登录着本面板。「退出登录」会撤销这台设备的登录会话（30 天内的自动续期一并失效），需要重新输入账号密码；其他已登录的设备不受影响。',
   exportDanger: '导出文件内含 accessToken / refreshToken / apiKey 等凭证与自定义提供商定义，可直接用于登录。请妥善保管，不要外传或上传到公共位置。',
+  routing: '保存后立即生效，不用重启。只有存在多个可用账号时策略才有区别：某个模型只有一家能提供（或只配了一个账号）时，选哪一档结果都一样。',
+  routingDefault: '所有未单独配置的提供商都用这一份策略。',
 } as const
 
 /** 状态行（`.settings-state`）的派生文案：与旧实现的赋值逐字一致 */
@@ -653,4 +691,5 @@ export const STATES = {
   zoomWeb: '网页端的界面缩放由浏览器自己控制（Ctrl + / Ctrl -，或浏览器菜单里的缩放），此项不可调。',
   zoomDefault: '当前按 100% 显示（默认比例）。',
   languageOnly: '当前界面语言为简体中文（目前仅提供这一种）。',
+  routingUnavailable: '未能读取选路策略设置，请稍后重试',
 } as const

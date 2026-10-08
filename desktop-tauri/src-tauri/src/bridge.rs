@@ -548,6 +548,18 @@ const BRIDGE_JS: &str = r#"
         clearDegrade: !!(payload && payload.clearDegrade),
       }),
 
+    // ── 选路策略（设置页「网关 → 选路策略」）──
+    // 与 getPrompt / savePrompt 同形：GET 读、POST 写，响应体是生效后的全量状态
+    // （`{default, providers, strategies}`）。POST 允许部分字段（未出现的项保持原值），
+    // 但界面总是把 `{default, providers}` 两项都带上 —— `providers` 是完整表，带上即整体
+    // 替换（某一家回到「跟随默认」= 从表里删掉它），见 settings-state 的 commitRouting。
+    getRoutingStrategy: () => call('GET', '/api/routing-strategy'),
+    saveRoutingStrategy: payload =>
+      call('POST', '/api/routing-strategy', {
+        default: payload && payload.default != null ? String(payload.default) : null,
+        providers: payload && payload.providers != null ? payload.providers : null,
+      }),
+
     // ── 运行日志 ──
     getLogs: query => call('GET', '/api/logs' + toQuery(query)),
     getLogStats: () => call('GET', '/api/logs/stats'),

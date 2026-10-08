@@ -894,6 +894,19 @@ pub fn shim_js() -> &'static str {
       });
     },
 
+    // ── 选路策略（设置页「网关 → 选路策略」）──
+    // 与桌面 bridge.rs 的同名方法成对存在：GET 读、POST 写，响应体是生效后的
+    // 全量状态（`{default, providers, strategies}`）。POST 允许部分字段，但界面
+    // 总是把 `{default, providers}` 两项都带上（providers 是完整表，带上即整体替换）。
+    getRoutingStrategy: function () { return call('GET', '/api/routing-strategy'); },
+    saveRoutingStrategy: function (payload) {
+      payload = payload || {};
+      return call('POST', '/api/routing-strategy', {
+        default: payload.default != null ? String(payload.default) : null,
+        providers: payload.providers != null ? payload.providers : null,
+      });
+    },
+
     // ── 运行日志 ──
     getLogs: function (query) { return call('GET', '/api/logs' + toQuery(query)); },
     getLogStats: function () { return call('GET', '/api/logs/stats'); },
