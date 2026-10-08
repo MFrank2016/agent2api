@@ -340,3 +340,113 @@ pub(super) fn queue_from(map: &Map<String, Value>) -> QueueSettings {
 }
 
 // ─── 历史路由优先级（providerRoute，只读，供账号迁移）───────────
+
+// ─── 账号选路策略（routingStrategy：全局默认 + 逐家覆盖）────────────
+
+/// 由原始 JSON 解析选路策略设置。
+///
+/// 口径与既有配置一致（**写坏回落、不报错、不影响启动**）：
+///   - 整个键缺失 / 不是对象 → 全默认（`default = priority`、逐家表为空）；
+///   - `default` 缺失 / 非法 → `priority`；
+///   - `providers` 缺失 / 不是对象 → 空表；
+///   - 逐家项：id 空串跳过；值不是合法策略 → **回落到 `priority`**（而不是跳过 ——
+///     任务口径是「非法策略值一律回落 priority」，保留这家一个显式档位比静默
+///     跟随全局默认更符合「写坏了也要有个确定行为」）。
+///
+/// 未知 provider id **允许存在**（原样保留在表里）：它只是选路时用不上（那家
+/// 没有账号），不该在读侧被抹掉 —— 用户可能先写好配置、后加账号。
+pub(super) fn routing_strategy_from(map: &Map<String, Value>) -> RoutingStrategySettings {
+    use crate::server::core::routing::RoutingStrategy;
+
+    let Some(object) = map.get(KEY_ROUTING_STRATEGY).and_then(Value::as_object) else {
+        return RoutingStrategySettings::default();
+    };
+    let default = object
+        .get(KEY_ROUTING_STRATEGY_DEFAULT)
+        .and_then(Value::as_str)
+        .and_then(RoutingStrategy::parse)
+        .unwrap_or_default();
+    let mut providers = std::collections::BTreeMap::new();
+    if let Some(entries) = object.get(KEY_ROUTING_STRATEGY_PROVIDERS).and_then(Value::as_object) {
+        for (id, value) in entries {
+            let id = id.trim();
+            if id.is_empty() {
+                continue;
+            }
+            let strategy = value
+                .as_str()
+                .and_then(RoutingStrategy::parse)
+                .unwrap_or_default();
+            providers.insert(id.to_string(), strategy);
+        }
+    }
+    RoutingStrategySettings { default, providers }
+}
+
+#[cfg(test)]
+mod routing_strategy_tests {
+    use super::*;
+    use crate::server::core::routing::RoutingStrategy;
+    use serde_json::json;
+
+    fn object(value: Value) -> Map<String, Value> {
+        match value {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        }
+    }
+
+    #[test]
+    fn missing_key_falls_back_to_priority() {
+        let settings = routing_strategy_from(&Map::new());
+        assert_eq!(settings.default, RoutingStrategy::Priority);
+        assert!(settings.providers.is_empty());
+    }
+
+    #[test]
+    fn parses_default_and_providers() {
+        let settings = routing_strategy_from(&object(json!({
+            "routingStrategy": {
+                "default": "round-robin",
+                "providers": { "workbuddy": "least-connections" }
+            }
+        })));
+        assert_eq!(settings.default, RoutingStrategy::RoundRobin);
+        assert_eq!(settings.providers.get("workbuddy"), Some(&RoutingStrategy::LeastConnections));
+    }
+
+    #[test]
+    fn invalid_default_falls_back_to_priority() {
+        let settings = routing_strategy_from(&object(json!({
+            "routingStrategy": { "default": "bogus" }
+        })));
+        assert_eq!(settings.default, RoutingStrategy::Priority);
+    }
+
+    #[test]
+    fn invalid_provider_strategy_falls_back_to_priority() {
+        let settings = routing_strategy_from(&object(json!({
+            "routingStrategy": { "providers": { "workbuddy": "bogus" } }
+        })));
+        assert_eq!(settings.providers.get("workbuddy"), Some(&RoutingStrategy::Priority));
+    }
+
+    #[test]
+    fn unknown_provider_ids_are_kept() {
+        let settings = routing_strategy_from(&object(json!({
+            "routingStrategy": { "providers": { "future-provider": "round-robin" } }
+        })));
+        assert_eq!(settings.providers.get("future-provider"), Some(&RoutingStrategy::RoundRobin));
+    }
+
+    #[test]
+    fn wrong_shapes_fall_back_to_defaults() {
+        let settings = routing_strategy_from(&object(json!({ "routingStrategy": "priority" })));
+        assert_eq!(settings.default, RoutingStrategy::Priority);
+        assert!(settings.providers.is_empty());
+        let settings = routing_strategy_from(&object(json!({
+            "routingStrategy": { "providers": "round-robin" }
+        })));
+        assert!(settings.providers.is_empty());
+    }
+}

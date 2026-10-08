@@ -259,6 +259,15 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/queue",
             get(api::queue_api::get_queue).put(api::queue_api::put_queue),
         )
+        // 账号选路策略（全局默认 + 逐家覆盖）：GET 读、POST（允许部分字段）更新。
+        // 与 /api/retry 同一模式、同一理由独立成端点：它管「同一家内如何挑账号」
+        // （优先级 / 最少连接 / 轮询 / 加权…），保存后对下一个请求立即生效，
+        // 不重启进程。挂 protected：它影响转发会用哪个账号，与账号管理同级敏感。
+        .route(
+            "/api/routing-strategy",
+            get(api::routing_strategy::get_routing_strategy)
+                .post(api::routing_strategy::put_routing_strategy),
+        )
         // ── 调试模式（设置页「通用 → 调试模式」）──
         // GET/PUT 开关；traffic 是按 id 取原始报文的详情端点（列表接口不返回
         // 报文，见 debug_api 的模块头）。挂 protected：报文含上游 URL 与请求体。

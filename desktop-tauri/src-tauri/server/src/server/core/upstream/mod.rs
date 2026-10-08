@@ -167,6 +167,9 @@ pub struct UpstreamService {
     in_flight: Arc<Mutex<HashMap<String, Arc<InFlight>>>>,
     /// 账号级活跃连接计数（账号页「连接数」列的数据源，见 `connections.rs`）
     connections: Connections,
+    /// 账号选路策略的运行时状态（轮询游标 / LRU 时刻 / SWRR 权重，
+    /// 进程内、重启即清零，见 `routing::strategy` 的模块头）
+    routing: crate::server::core::routing::RoutingState,
 }
 
 /// 一次转发的入参
@@ -252,6 +255,7 @@ impl UpstreamService {
             auth,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             connections: Connections::new(),
+            routing: crate::server::core::routing::RoutingState::new(),
         }
     }
 
@@ -261,6 +265,14 @@ impl UpstreamService {
     /// 读到的都是同一张表。
     pub fn connections(&self) -> Connections {
         self.connections.clone()
+    }
+
+    /// 账号选路策略的运行时状态句柄（选路时读写轮询游标 / LRU 时刻 / SWRR 权重）。
+    ///
+    /// 与 `connections` 同一形态：返回克隆（内部 `Arc`），`select_target_account`
+    /// 拿它做同步挑选（不跨 `.await` 持锁）。
+    pub fn routing(&self) -> crate::server::core::routing::RoutingState {
+        self.routing.clone()
     }
 
     /// 转发一次对话请求。

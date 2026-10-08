@@ -156,6 +156,12 @@ pub struct RuntimeConfig {
     /// 于是转发热路径上一次磁盘 IO 都没有；文件读不到时这里已经是「内置默认 +
     /// 一条原因」的形态，转发层不必再处理失败路径。
     prompt: PromptSettings,
+    /// 账号选路策略（设置页「网关 → 选路策略」）。
+    ///
+    /// 与 `prompt` 同一理由：转发层**每次选路**都要取一次（改完设置下一个
+    /// 请求就生效，不重启进程），从 `Value` 里翻一次要处理类型判定与逐家表
+    /// 解析，解析一次存下来最省事。表小（≤6 家），克隆代价可忽略。
+    routing: RoutingStrategySettings,
     /// 「软件更新」的出网线路（`updateProxy`：None = 直连，默认）。
     ///
     /// 存的是归一后的配置对象（与账号代理同一形状），解析交给
@@ -222,6 +228,11 @@ impl RuntimeConfig {
     /// 系统提示词设置（界面 / 日志用；转发层要的是下面的借用视图）
     pub fn prompt_settings(&self) -> &PromptSettings {
         &self.prompt
+    }
+
+    /// 账号选路策略设置（界面 / 日志用；转发层用下面的轻量读取）
+    pub fn routing_strategy_settings(&self) -> &RoutingStrategySettings {
+        &self.routing
     }
 
     /// 转发层要的**提示词决定**：全局默认 + 各家覆盖的借用视图。
@@ -400,6 +411,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
     let retry = retry_from(&raw);
     let timeouts = timeouts_from(&raw);
     let queue = queue_from(&raw);
+    let routing = routing_strategy_from(&raw);
     RuntimeConfig {
         // 文件里有就用文件的，否则环境变量兜底（对应 `if (config.apiKey && !opts.apiKey)`）
         api_key: string_field(&raw, "apiKey").or_else(env_api_key),
@@ -413,6 +425,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         retry,
         timeouts,
         queue,
+        routing,
         log_dir: string_field(&raw, KEY_LOG_DIR),
         request_stats_dir: string_field(&raw, KEY_REQUEST_STATS_DIR),
         debug_dir: string_field(&raw, KEY_DEBUG_DIR),
@@ -1253,6 +1266,67 @@ pub fn set_queue(patch: QueuePatch) -> bool {
         }
         config.queue = next;
     })
+}
+
+// ─── 账号选路策略（routingStrategy）──────────────────────────
+
+/// 只取选路策略设置的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 `retry_settings()` 同一取舍：转发层**每次选路**都要取一次（改完设置
+/// 下一个请求就生效，不重启进程），而 `current()` 每次都会克隆整个 `raw` Map。
+/// 返回一份克隆：表很小（≤6 家），克隆只付一次 BTreeMap 的代价。未初始化时
+/// 给默认值（全 `priority`）。
+pub fn routing_strategy_settings() -> RoutingStrategySettings {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.routing.clone();
+        }
+    }
+    RoutingStrategySettings::default()
+}
+
+/// 更新选路策略（`None` = 该项不动；`providers` 出现即整体替换）。
+///
+/// 调用方（`api::routing_strategy::put_routing_strategy`）**必须先校验**：本函数
+/// 按「已合法」处理。与 `set_retry` 同一模式：内存快照与 raw 底稿一起改 ——
+/// 前者让下一个请求立刻用新策略，后者保证写盘时不吃掉 config.json 里的其它字段。
+pub fn set_routing_strategy(patch: RoutingStrategyPatch) -> bool {
+    update(|config| {
+        let mut next = config.routing.clone();
+        if let Some(default) = patch.default {
+            next.default = default;
+        }
+        if let Some(providers) = &patch.providers {
+            next.providers = providers.clone();
+        }
+        config.raw.insert(
+            KEY_ROUTING_STRATEGY.to_string(),
+            routing_strategy_value(&next),
+        );
+        config.routing = next;
+    })
+}
+
+/// 把选路策略设置编成 raw 底稿里的形态：`{ "default": "...", "providers": {...} }`。
+/// 逐家表为空时不写 `providers` 键（配置里不留没意义的空对象，与
+/// `set_prompt_provider` 对空表的处理同一取向）。
+fn routing_strategy_value(settings: &RoutingStrategySettings) -> Value {
+    let mut object = Map::new();
+    object.insert(
+        KEY_ROUTING_STRATEGY_DEFAULT.to_string(),
+        Value::String(settings.default.as_str().to_string()),
+    );
+    if !settings.providers.is_empty() {
+        let mut providers = Map::new();
+        for (id, strategy) in &settings.providers {
+            providers.insert(id.clone(), Value::String(strategy.as_str().to_string()));
+        }
+        object.insert(
+            KEY_ROUTING_STRATEGY_PROVIDERS.to_string(),
+            Value::Object(providers),
+        );
+    }
+    Value::Object(object)
 }
 
 // ─── 调试模式（debugMode）────────────────────────────────────

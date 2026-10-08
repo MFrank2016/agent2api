@@ -132,8 +132,24 @@ pub(super) async fn select_target_account(
     let counts = connection_counts(service);
     let mut excluded: Vec<String> = tried_ids.to_vec();
     let now = logging::now_ms();
+    // 选路策略设置与运行时状态：整轮选路取一次（同一次请求的多次重挑用同一套
+    // 规则与同一份状态）。余额事实表同一次取好 —— 余额加权的权重来源。
+    let settings = crate::server::config::routing_strategy_settings();
+    let state = service.routing();
+    let balances = balance_snapshot();
     loop {
-        let picked = routing::pick_account_by_priority(&candidates, keys, &counts, &excluded, now);
+        // 带策略的挑选：候选里每一家的策略都是 `priority` 时，其内部走与改造前
+        // 逐字一致的扁平路径（见 `routing::pick_account` 的兼容性守卫）。
+        let picked = routing::pick_account(
+            &candidates,
+            keys,
+            &counts,
+            &excluded,
+            now,
+            &settings,
+            &state,
+            &balances,
+        );
         let Some(picked) = picked else {
             break;
         };
@@ -443,6 +459,18 @@ fn squeeze_by_headroom(
 /// 属排障快照，传空表）。
 pub(super) fn connection_counts(service: &UpstreamService) -> HashMap<String, usize> {
     service.connections().snapshot().into_iter().collect()
+}
+
+/// 选路策略层用的余额快照：`账号 id → 已知剩余余额`（未知的账号不在表里）。
+///
+/// 数据源与 `filter_balance_blocked` 同一份（`usage_records::balance_facts` 的
+/// 内存事实表，零 IO）。只收**有已知数字**的账号 —— 未知余额的账号由策略层
+/// 用基线权重兜底（见 `routing::strategy` 的模块头），不在这里替它编一个数。
+fn balance_snapshot() -> HashMap<String, f64> {
+    crate::server::core::usage_records::balance_facts()
+        .into_iter()
+        .filter_map(|(id, fact)| fact.remaining.map(|remaining| (id, remaining)))
+        .collect()
 }
 
 /// 下一个可用账号（全局队列，限定在 `providers` 各家的账号里，跳过已尝试的）。

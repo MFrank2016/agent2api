@@ -809,3 +809,70 @@ pub struct QueuePatch {
     pub max_waits: Option<i64>,
     pub wait_seconds: Option<i64>,
 }
+
+// ─── 账号选路策略（routingStrategy：全局默认 + 逐家覆盖）──────────────
+
+/// 选路策略的配置键（config.json / kv 表）。
+///
+/// 形状：`{ "default": "<策略>", "providers": { "<providerId>": "<策略>" } }`。
+/// 取值见 [`crate::server::core::routing::RoutingStrategy`]；**默认 `priority`**
+/// （与改造前行为逐字相同）。逐家覆盖是**稀疏表**：只写想单独配置的家，
+/// 其余一律沿用 `default`（与 `promptProviders` 同一取向）。
+///
+/// ── 未知 provider id 与非法策略值 ─────────────────────────
+///   - 未知 provider id：允许存在，选路时**忽略**（那家没有账号自然轮不到它）；
+///   - 非法策略值：读侧**回落到 `priority`**（不报错、不影响启动，见模块头
+///     「写坏回落」）；走接口写入的非法值由 `api::routing_strategy` 拦成 400。
+pub const KEY_ROUTING_STRATEGY: &str = "routingStrategy";
+/// `routingStrategy` 里的全局默认子键（值 = 策略字符串）
+pub const KEY_ROUTING_STRATEGY_DEFAULT: &str = "default";
+/// `routingStrategy` 里的逐家覆盖子键（值 = `{ "<providerId>": "<策略>" }`）
+pub const KEY_ROUTING_STRATEGY_PROVIDERS: &str = "providers";
+
+/// 账号选路策略设置（设置页「网关 → 选路策略」）。
+///
+/// 与 `PromptSettings` 同一取舍：`default` + 逐家覆盖总是一起用（转发层每次
+/// 选路取一次），打包成一个值让调用方一次拿到；`BTreeMap` 而不是 `HashMap`
+/// —— 接口响应与界面都要有稳定顺序（同一份配置每次渲染的行序不同，用户会
+/// 以为设置被改动过）。
+#[derive(Clone, Debug)]
+pub struct RoutingStrategySettings {
+    /// 未单独配置的家用的那一档（缺省 = `priority`）
+    pub default: crate::server::core::routing::RoutingStrategy,
+    /// 逐家覆盖（只含被明确配置过的家）
+    pub providers: BTreeMap<String, crate::server::core::routing::RoutingStrategy>,
+}
+
+impl RoutingStrategySettings {
+    /// 某一家实际生效的策略：逐家覆盖优先，缺省用全局 `default`。
+    ///
+    /// 未知 / 未配置的家都返回 `default` —— 「未知 provider id 允许存在但
+    /// 选路时忽略」这条由此自然成立：那家没有候选账号，`resolve` 的结果
+    /// 根本用不上。
+    pub fn resolve(&self, provider_id: &str) -> crate::server::core::routing::RoutingStrategy {
+        self.providers
+            .get(provider_id)
+            .copied()
+            .unwrap_or(self.default)
+    }
+}
+
+impl Default for RoutingStrategySettings {
+    fn default() -> Self {
+        Self {
+            default: crate::server::core::routing::RoutingStrategy::default(),
+            providers: BTreeMap::new(),
+        }
+    }
+}
+
+/// 选路策略的**部分**更新入参（`None` = 该项不动）。
+///
+/// `providers` 出现即**整体替换**（不是逐键合并）：界面改一家的策略时整份回传，
+/// 「某一家改回跟随默认」= 从表里删掉它 —— 只有整体替换能表达删除（与前端
+/// `saveRoutingProvider` 的语义一致）。未带 `providers` 则这张表原样不动。
+#[derive(Clone, Debug, Default)]
+pub struct RoutingStrategyPatch {
+    pub default: Option<crate::server::core::routing::RoutingStrategy>,
+    pub providers: Option<BTreeMap<String, crate::server::core::routing::RoutingStrategy>>,
+}

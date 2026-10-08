@@ -39,6 +39,13 @@ use serde_json::{json, Value};
 use crate::server::core::account_store::priority::{by_priority_order, normalize_priority};
 use crate::server::core::account_store::store_util::js_truthy;
 
+pub mod strategy;
+
+// 选路策略层的公开出口：枚举 / 运行时状态 / 带策略的挑选。
+// 与 `pick_account_by_priority` 并存 —— 后者是策略 `priority` 的扁平实现，
+// 也是「全 priority 时逐字一致」这条兼容性承诺的落点。
+pub use strategy::{pick_account, RoutingState, RoutingStrategy};
+
 /// 「请求名 → 各家上游真名」的解析缓存：限额冷却键的解析器。
 ///
 /// ── 为什么冷却键必须是真名而不是请求名（本模块最要紧的一条）─────
@@ -81,6 +88,15 @@ pub struct CooldownKeys<'a> {
 impl<'a> CooldownKeys<'a> {
     pub fn new(requested: &'a str) -> Self {
         Self { requested, resolved: Mutex::new(HashMap::new()) }
+    }
+
+    /// 本次请求的**客户端模型名**（未解析成真名的那一个）。
+    ///
+    /// 只给选路策略层用：轮询游标的键是 `(provider, 请求名)` —— 与冷却键
+    /// 同源（同一个请求名），保证「同一模型的请求」在游标上连续。这里刻意
+    /// 不返回真名：真名是**按家**解析的，而游标要跨该家的全部账号保持一致。
+    pub fn requested(&self) -> &str {
+        self.requested
     }
 
     /// 该家实际收到的上游模型名 —— 也就是它的冷却键。
@@ -235,7 +251,34 @@ pub fn pick_account_by_priority(
     exclude_ids: &[String],
     now: i64,
 ) -> Option<Value> {
-    let mut candidates: Vec<Value> = accounts
+    let mut candidates = usable_candidates(accounts, keys, counts, exclude_ids, now);
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort_by(compare_by_priority);
+    candidates.into_iter().next()
+}
+
+/// 选路的**可用候选**：`pick_account_by_priority` 与策略层（[`strategy`]）共用
+/// 的唯一一份过滤。
+///
+/// ── 为什么要抽出来 ─────────────────────────────────────────
+/// 策略层要在同一份候选集合上做「分组 → 组内挑一个」，若它自己再写一遍过滤，
+/// 「按策略选」与「按优先级选」迟早会在边界数据（手工编辑的脏记录、并发上限的
+/// 软窗口）上分叉。抽成一处后，两条路径看到的是同一批账号 ——
+/// 「全 `priority` 时结果逐字一致」这条兼容性承诺因此是**结构性**的，而不是
+/// 靠两份代码碰巧写得一样。
+///
+/// 过滤判据（与改造前逐字相同）：有非空 id、不在 `exclude_ids` 里、可用
+/// （启用 + 该模型未限流）、未达并发上限。
+fn usable_candidates(
+    accounts: &[Value],
+    keys: &CooldownKeys<'_>,
+    counts: &HashMap<String, usize>,
+    exclude_ids: &[String],
+    now: i64,
+) -> Vec<Value> {
+    accounts
         .iter()
         .filter(|account| {
             let Some(id) = account_id(account) else {
@@ -250,12 +293,7 @@ pub fn pick_account_by_priority(
                 && !at_concurrency_limit(account, id, counts)
         })
         .cloned()
-        .collect();
-    if candidates.is_empty() {
-        return None;
-    }
-    candidates.sort_by(compare_by_priority);
-    candidates.into_iter().next()
+        .collect()
 }
 
 /// 该账号的在途请求数是否已达并发上限（`maxConcurrent == 0` = 不限，恒 false）。
@@ -408,18 +446,22 @@ pub fn accounts_of(snapshot: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// 选路排序键：`(归一后的优先级, 加入时间)`。策略层也要按同一把尺子给
+/// 账号排序 / 求「组内最优先」的那个，所以键的构造必须只有一处。
+fn priority_key(account: &Value) -> (i64, i64) {
+    (
+        normalize_priority(
+            account.get("priority"),
+            crate::server::core::account_store::priority::DEFAULT_PRIORITY,
+        ),
+        js_number(account.get("addedAt").unwrap_or(&Value::Null)).unwrap_or(0.0) as i64,
+    )
+}
+
 /// 选路排序：优先级升序，同优先级按加入时间（复用 account-store 的规则实现，
 /// 保证「界面排序」与「转发顺序」永远同一套判据）。
 fn compare_by_priority(a: &Value, b: &Value) -> std::cmp::Ordering {
-    let key = |account: &Value| {
-        (
-            normalize_priority(account.get("priority"), crate::server::core::account_store::priority::DEFAULT_PRIORITY),
-            js_number(account.get("addedAt").unwrap_or(&Value::Null)).unwrap_or(0.0),
-        )
-    };
-    let (a_priority, a_added) = key(a);
-    let (b_priority, b_added) = key(b);
-    by_priority_order((a_priority, a_added as i64), (b_priority, b_added as i64))
+    by_priority_order(priority_key(a), priority_key(b))
 }
 
 /// 公开形态里的 priority（归一后的数值）——对应 Node 在日志里打印的 `priority`。

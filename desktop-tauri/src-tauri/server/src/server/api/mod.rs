@@ -12,6 +12,7 @@
 //!   stats_api.rs  GET /api/stats/summary、/api/stats/requests、DELETE /api/stats/requests、
 //!                 GET/PUT /api/retention
 //!   retry_api.rs  GET/PUT /api/retry（请求重试设置，转发层退避的次数 / 间隔）
+//!   routing_strategy.rs GET/POST /api/routing-strategy（账号选路策略：全局默认 + 逐家覆盖）
 //!   queue_api.rs  GET/PUT /api/queue（排队等待：次数与单次时长）
 //!   accounts.rs   /api/accounts*（对照 workbuddy-account-routes.mjs）
 //!   proxies.rs    /api/proxies*（Clash 读取 + 出口测试）
@@ -82,6 +83,7 @@ pub mod protocol;
 pub mod proxies;
 pub mod queue_api;
 pub mod retry_api;
+pub mod routing_strategy;
 pub mod sanitize;
 pub mod scheduled_tasks;
 pub mod session;
