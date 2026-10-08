@@ -63,6 +63,9 @@ pub mod health;
 // 「从其他工具导入」的扫描接口（当前来源：cc-switch；存储读取见
 // `core::import_ccswitch`）
 pub mod import_sources;
+// 流式请求「首字节等待」的 SSE 保活（转发超过宽限期仍没就绪时先回保活流，
+// 见该文件模块头）—— 与 disconnect_guard 同属 handler 生命周期上的兜底件
+pub mod keepalive;
 pub mod keys_api;
 pub mod logs_api;
 pub mod model_manage;

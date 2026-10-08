@@ -52,13 +52,14 @@ use serde_json::{json, Value};
 use crate::server::config;
 use crate::server::core::upstream::cancellation;
 use crate::server::core::upstream::usage::RequestTelemetry;
-use crate::server::core::upstream::{ForwardOutcome, ForwardRequest};
+use crate::server::core::upstream::{sse, ForwardOutcome, ForwardRequest};
 use crate::server::errors::GatewayError;
 use crate::server::http::raw_json;
 use crate::server::logging;
 use crate::server::ServerState;
 
 use super::disconnect_guard::DisconnectGuard;
+use super::keepalive;
 use super::pipeline::{
     self, json_response, model_field_text, record_early_failure, record_entry, sse_response,
     write_debug_files, RecordContext, RecordingStream,
@@ -188,21 +189,65 @@ pub async fn chat_completions(
     // 下游原始请求体在此刻抄一份（request_raw 表的请求侧，见 `raw_body_text`）：
     // body 还是客户端发来的原值；送进转发层后 payload 会被就地改写（默认模型注入）
     let raw_request = pipeline::raw_body_text(&body);
-    let outcome = state
-        .upstream()
-        .forward(ForwardRequest {
-            body: payload,
-            stream,
-            dedupe_key,
-            client_headers: headers,
-            telemetry: telemetry.clone(),
-            // 提供商白名单进转发层（选路时按承载家过滤）；模型白名单已经在
-            // `resolve_model` 里判过（见那里的说明，两者分工不同）
-            allowed_providers: scope,
-            // 转发主链路不钉账号：谁承载由全局优先级队列决定
-            pinned_account: None,
-        })
-        .await;
+    // ── 转发：流式请求先与宽限期赛跑（本次新增，见 `api::keepalive` 模块头）──
+    // 流式请求（客户端要 SSE）若在宽限期内拿到转发结果，走下面原有的 match，
+    // 状态码与形态逐字不变（快分支）；超过宽限期仍未就绪则**立刻**回一条 SSE
+    // 保活流，由它继续等上游、期间周期下发 `: keep-alive` 注释帧（慢分支）——
+    // 客户端因此不会因迟迟收不到首字节而超时断开（实测的 408「客户端在响应
+    // 完成前断开连接」）。非流式请求保持原样：它本就要一次给全，保活无意义。
+    let upstream = state.upstream().clone();
+    let request = ForwardRequest {
+        body: payload,
+        stream,
+        dedupe_key,
+        client_headers: headers,
+        telemetry: telemetry.clone(),
+        // 提供商白名单进转发层（选路时按承载家过滤）；模型白名单已经在
+        // `resolve_model` 里判过（见那里的说明，两者分工不同）
+        allowed_providers: scope,
+        // 转发主链路不钉账号：谁承载由全局优先级队列决定
+        pinned_account: None,
+    };
+    let outcome = if stream {
+        match keepalive::race(
+            Box::pin(async move { upstream.forward(request).await }),
+            keepalive::GRACE,
+        )
+        .await
+        {
+            keepalive::ForwardStart::Ready(outcome) => outcome,
+            keepalive::ForwardStart::Slow(forward) => {
+                // 慢分支：响应头现在就要发（200 + SSE），收尾移交给保活流。
+                // handoff 后本守卫不再兜底；记账 / 注销取消令牌归保活流内部
+                // 的 RecordingStream（流跑完 / 被丢弃时 settle）—— 与快分支
+                // 的流式路径同一条生命周期。
+                guard.handoff();
+                let context = RecordContext {
+                    stats: state.request_stats(),
+                    telemetry: telemetry.clone(),
+                    started_at,
+                    model: requested_model.clone(),
+                    client_model: client_model.clone(),
+                    client_reasoning: client_reasoning.clone(),
+                    // 客户端此刻看到的就是 200（保活流已发出）；真实状态码 /
+                    // 结果形态由 materialize_chat 在 future 就绪时按结果改写
+                    status: 200,
+                    raw_request: raw_request.clone(),
+                    raw_response: None,
+                    is_test: false,
+                };
+                let stream = keepalive::KeepAliveStream::new(
+                    forward,
+                    keepalive::KEEP_ALIVE_INTERVAL,
+                    context,
+                    Box::new(materialize_chat),
+                );
+                return sse_response(StatusCode::OK, Box::new(stream)).into_response();
+            }
+        }
+    } else {
+        upstream.forward(request).await
+    };
     let stats = state.request_stats();
 
     match outcome {
@@ -293,6 +338,67 @@ pub async fn chat_completions(
             // 记账已完成（含手动终止的 408）：解除兜底并注销令牌
             guard.complete();
             error.payload_response()
+        }
+    }
+}
+
+/// 慢分支的结果 → 下游字节流（保活流的 [`keepalive::Materialize`] 实现）。
+///
+/// 三种结果各自的字节形态（与快分支的流式路径保持同一套收尾语义）：
+///   - `Stream`     → 上游帧原样透传；
+///   - `Completion` → 一帧 `data: <json>\n\n` + `data: [DONE]\n\n`；
+///   - `Err`        → 一帧 OpenAI 风格错误 + `data: [DONE]\n\n`。
+///
+/// 三者都经 `RecordingStream` 收尾：记账（明细一条 / token / 首响）、响应正文
+/// 采集、取消令牌注销都在流跑完 / 被丢弃时发生 —— 与快分支的流式路径同一条
+/// 生命周期（那里也是 `guard.handoff()` 后由 `RecordingStream` settle）。
+///
+/// 状态码：慢分支已经先把 200 发给客户端了，但**明细里记的**仍是上游真实
+/// 状态码（`Stream`）或错误码（`Err`）—— 与快分支的流式路径「记上游状态码」
+/// 同一口径（客户端看到的是 200，明细回答的是上游到底怎么了）。
+fn materialize_chat(
+    outcome: Result<ForwardOutcome, GatewayError>,
+    mut context: RecordContext,
+) -> Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin> {
+    match outcome {
+        Ok(ForwardOutcome::Stream { status, stream: source }) => {
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+            context.status = i64::from(status.as_u16());
+            Box::new(RecordingStream::with_terminals(
+                source,
+                context,
+                pipeline::terminal::CHAT,
+            ))
+        }
+        Ok(ForwardOutcome::Completion { body }) => {
+            context.status = 200;
+            let frames: Vec<Result<Bytes, std::io::Error>> = vec![
+                Ok(sse::sse_frame(&body)),
+                Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+            ];
+            Box::new(RecordingStream::with_terminals(
+                Box::new(futures::stream::iter(frames)),
+                context,
+                pipeline::terminal::CHAT,
+            ))
+        }
+        Err(error) => {
+            context.status = i64::from(error.http_status().as_u16());
+            let message = error.message.clone();
+            // 断流原因进请求日志的「错误」列（`note_error` 首次为准：若转发链
+            // 已经记过根因，这里不覆盖它）。与 ForwardStream 的错误帧同源。
+            context.telemetry.note_error(&message);
+            let frames: Vec<Result<Bytes, std::io::Error>> = vec![
+                Ok(sse::sse_frame(&json!({
+                    "error": { "message": message, "type": "upstream_error" }
+                }))),
+                Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+            ];
+            Box::new(RecordingStream::with_terminals(
+                Box::new(futures::stream::iter(frames)),
+                context,
+                pipeline::terminal::CHAT,
+            ))
         }
     }
 }
@@ -448,4 +554,75 @@ pub fn spawn_catalog_refresh(state: &ServerState) {
     crate::spawn_task(async move {
         crate::server::core::providers::adapter::refresh_implemented(&store).await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    //! 慢分支保活流的收尾字节形状（错误 → 错误帧 + `[DONE]`）。
+    //! 保活帧本身的字节形状与状态机在 `api::keepalive` 的用例里测（那里
+    //! 不认识任何协议）；这里测的是 chat 专属的 `materialize_chat`。
+    use super::*;
+    use crate::server::core::upstream::usage::RequestTelemetry;
+    use crate::server::request_stats::{RequestStats, Retention};
+    use futures::StreamExt;
+    use std::sync::Arc;
+
+    /// 记账降级为空操作的收尾上下文（库句柄给 None，只关心字节形状）
+    fn noop_context() -> RecordContext {
+        RecordContext {
+            stats: Arc::new(RequestStats::with_db(None, || Retention::default())),
+            telemetry: Arc::new(RequestTelemetry::new()),
+            started_at: 0,
+            model: "test-model".to_string(),
+            client_model: String::new(),
+            client_reasoning: String::new(),
+            status: 200,
+            raw_request: None,
+            raw_response: None,
+            is_test: false,
+        }
+    }
+
+    async fn drain(mut stream: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin>) -> Vec<Bytes> {
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.push(item.expect("合成帧流不应产出错误"));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn slow_branch_error_yields_error_frame_then_done() {
+        let error = GatewayError::with_status(502, "上游连接失败");
+        let frames = drain(materialize_chat(Err(error), noop_context())).await;
+        assert_eq!(frames.len(), 2);
+        let text = String::from_utf8_lossy(&frames[0]);
+        assert!(text.starts_with("data: {"), "应是 data: 帧，实得: {text}");
+        assert!(text.contains("\"type\":\"upstream_error\""));
+        assert!(text.contains("上游连接失败"));
+        assert_eq!(frames[1], Bytes::from_static(b"data: [DONE]\n\n"));
+    }
+
+    #[tokio::test]
+    async fn slow_branch_completion_yields_json_frame_then_done() {
+        let body = json!({"choices": [{"message": {"content": "hi"}}]});
+        let frames = drain(materialize_chat(Ok(ForwardOutcome::Completion { body }), noop_context())).await;
+        assert_eq!(frames.len(), 2);
+        let text = String::from_utf8_lossy(&frames[0]);
+        assert!(text.contains("hi"));
+        assert_eq!(frames[1], Bytes::from_static(b"data: [DONE]\n\n"));
+    }
+
+    #[tokio::test]
+    async fn slow_branch_stream_passes_upstream_frames_through() {
+        let source: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin> =
+            Box::new(futures::stream::iter(vec![
+                Ok(Bytes::from_static(b"data: {\"a\":1}\n\n")),
+                Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+            ]));
+        let frames = drain(materialize_chat(Ok(ForwardOutcome::Stream { status: 200, stream: source }), noop_context())).await;
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0], Bytes::from_static(b"data: {\"a\":1}\n\n"));
+        assert_eq!(frames[1], Bytes::from_static(b"data: [DONE]\n\n"));
+    }
 }
