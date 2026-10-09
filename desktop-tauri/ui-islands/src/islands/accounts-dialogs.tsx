@@ -78,9 +78,10 @@ export type ProxyPayload =
   | { source: 'pool'; proxyId: string }
   | { source: 'clash'; listenerUid: string }
   | { source: 'custom'; protocol: 'http' | 'socks5'; host: string; port: number; username: string; password: string }
+  | { source: 'pool-rotate'; group: string; strategy: 'round-robin' | 'random' | 'least-latency'; onError: 'next' | 'none' }
 
 export type ProxyDraft = {
-  mode: 'none' | 'pool' | 'clash' | 'custom'
+  mode: 'none' | 'pool' | 'clash' | 'custom' | 'pool-rotate'
   /** 池条目 id（mode === 'pool'） */
   proxyId: string
   listenerUid: string
@@ -89,6 +90,12 @@ export type ProxyDraft = {
   port: string
   username: string
   password: string
+  /** 轮询组名（mode === 'pool-rotate'） */
+  group: string
+  /** 轮询策略（mode === 'pool-rotate'；缺省 round-robin） */
+  strategy: 'round-robin' | 'random' | 'least-latency'
+  /** 失败自动换出口（mode === 'pool-rotate'；缺省 next） */
+  onError: 'next' | 'none'
 }
 
 /** 账号 proxy 字段 → 表单草稿（形态与后端 workbuddy-proxy.mjs 一致） */
@@ -96,7 +103,8 @@ export function draftOfProxy(proxy: AccountRecord['proxy']): ProxyDraft {
   const source = proxy?.config?.source || proxy?.source
   const config = proxy?.config || null
   return {
-    mode: source === 'pool' ? 'pool' : source === 'clash' ? 'clash' : source === 'custom' ? 'custom' : 'none',
+    mode: source === 'pool' ? 'pool' : source === 'clash' ? 'clash' : source === 'custom' ? 'custom'
+      : source === 'pool-rotate' ? 'pool-rotate' : 'none',
     proxyId: source === 'pool' ? String(config?.proxyId || '') : '',
     listenerUid: config?.source === 'clash' || source === 'clash' ? String(config?.listenerUid || '') : '',
     protocol: config?.protocol === 'socks5' ? 'socks5' : 'http',
@@ -104,6 +112,9 @@ export function draftOfProxy(proxy: AccountRecord['proxy']): ProxyDraft {
     port: config?.port === undefined || config?.port === null ? '' : String(config.port),
     username: config?.username || '',
     password: config?.password || '',
+    group: source === 'pool-rotate' ? String(config?.group || '') : '',
+    strategy: config?.strategy === 'random' || config?.strategy === 'least-latency' ? config.strategy : 'round-robin',
+    onError: config?.onError === 'none' ? 'none' : 'next',
   }
 }
 
@@ -117,6 +128,11 @@ export function readProxyDraft(draft: ProxyDraft): ProxyPayload {
   if (draft.mode === 'clash') {
     if (!draft.listenerUid) throw new Error('请先选择 Clash Verge 出口')
     return { source: 'clash', listenerUid: draft.listenerUid }
+  }
+  if (draft.mode === 'pool-rotate') {
+    const group = draft.group.trim()
+    if (!group) throw new Error('请填写轮询组名（或从已有分组中选择）')
+    return { source: 'pool-rotate', group, strategy: draft.strategy, onError: draft.onError }
   }
   const host = draft.host.trim()
   const port = Number(draft.port)
@@ -147,6 +163,9 @@ function clashOptionLabel(option: NonNullable<ClashSnapshot['options']>[number])
  *   · **已保存的代理** —— 引用「网络代理」页的池条目（推荐路径：出口在那里
  *     配一次、测一次，所有引用它的账号一起生效）。选项文案是
  *     「名字（协议 主机:端口）」，与账号页代理列同一格式（见 poolItemLabel）；
+ *   · **轮询组（多出口）** —— 按「分组」选中该组**全部启用**的池条目，转发时按
+ *     策略（轮询 / 随机 / 最低延迟）轮换出口；组名可直接填，也可从池里已有分组
+ *     快捷选择；「失败自动换出口」= onError:next（连不上时依次尝试组内其它出口）；
  *   · **Clash Verge** —— **只在账号当前就是直接引用 Clash 出口时出现**：
  *     那种存量记录要能改（切到别的档就消失，因为出口统一走池之后不再提供
  *     「新建一条 Clash 直引」的入口；想引用 Clash 出口请先到「网络代理」页
@@ -168,10 +187,15 @@ export function ProxyForm({
   const showClashMode = draft.mode === 'clash'
   const [testing, setTesting] = React.useState(false)
   const [testResult, setTestResult] = React.useState<React.ReactNode>(null)
-  /** 池列表：「已保存的代理」那一档的选项（模块级缓存，见 accounts-data） */
+  /** 池列表：「已保存的代理」/「轮询组」两档的选项（模块级缓存，见 accounts-data） */
   const [pool, setPool] = React.useState<PoolItem[] | null>(null)
   const [poolError, setPoolError] = React.useState('')
   const set = (patch: Partial<ProxyDraft>): void => onChange({ ...draft, ...patch })
+  /** 池里出现过的分组名（轮询组的快捷选择；按名字去重，去掉空值） */
+  const groupNames = React.useMemo(
+    () => [...new Set((pool ?? []).map(item => item.group).filter((name): name is string => Boolean(name)))],
+    [pool],
+  )
 
   // 出口列表只在 Clash 直引档出现时才需要（存量记录的下拉）—— 别的档不为它
   // 打这次请求
@@ -189,9 +213,13 @@ export function ProxyForm({
         setPoolError(errorMessage(error))
       })
   }, [])
-  // 只有选中（或初始就是）池引用时才真正去读 —— 其余三档的用户不必为一次多余的
+  // 只有选中（或初始就是）池引用 / 轮询组时才真正去读 —— 其余档的用户不必为一次多余的
   // 请求买单；读完缓存住，切到这一档不会再打网络
-  React.useEffect(() => { if (draft.mode === 'pool' && pool === null) loadPool() }, [draft.mode, pool, loadPool])
+  // 只有选中（或初始就是）池引用 / 轮询组时才真正去读 —— 其余档的用户不必为一次多余的
+  // 请求买单；读完缓存住，切到这一档不会再打网络
+  React.useEffect(() => {
+    if ((draft.mode === 'pool' || draft.mode === 'pool-rotate') && pool === null) loadPool()
+  }, [draft.mode, pool, loadPool])
 
   /** 用当前表单内容测试出口连通性 */
   async function test(): Promise<void> {
@@ -263,6 +291,9 @@ export function ProxyForm({
         <Label className='inline-flex cursor-pointer items-center gap-2 font-normal'>
           <RadioGroupItem value='pool' />已保存的代理
         </Label>
+        <Label className='inline-flex cursor-pointer items-center gap-2 font-normal'>
+          <RadioGroupItem value='pool-rotate' />轮询组（多出口）
+        </Label>
         {/* Clash 直引档只对**已经是这种配置**的账号出现（见函数说明）：
             出口统一走代理池之后不再提供新建入口 */}
         {showClashMode ? (
@@ -308,6 +339,55 @@ export function ProxyForm({
                 : pool.length
                   ? '地址与端口由「网络代理」页管理：那边改一次、测一次，所有引用它的账号一起生效'
                   : '「网络代理」页还没有出口 —— 去那里新增，或点「同步 Clash Verge」把 Clash 的出口导进来'}
+          </div>
+        </div>
+      ) : null}
+
+      {draft.mode === 'pool-rotate' ? (
+        <div className='mt-3'>
+          <div className='field-row'>
+            <label htmlFor={`${idPrefix}-rotate-group`}>分组</label>
+            <Input id={`${idPrefix}-rotate-group`} className='min-w-[180px]' placeholder='例如：kilo'
+              autoComplete='off' spellCheck={false}
+              value={draft.group} onChange={event => set({ group: event.currentTarget.value })} />
+            {groupNames.length ? (
+              <span className='inline-flex flex-wrap items-center gap-1.5'>
+                {groupNames.map(name => (
+                  <Button key={name} variant='outline' size='sm'
+                    onClick={() => set({ group: name })}>{name}</Button>
+                ))}
+              </span>
+            ) : null}
+          </div>
+          <div className='field-row mt-2.5'>
+            <label htmlFor={`${idPrefix}-rotate-strategy`}>策略</label>
+            <Select value={draft.strategy} onValueChange={value => set({ strategy: value as ProxyDraft['strategy'] })}>
+              <SelectTrigger id={`${idPrefix}-rotate-strategy`} className='min-w-[150px]'>
+                <SelectValue>{{ 'round-robin': '轮询', random: '随机', 'least-latency': '最低延迟' }[draft.strategy]}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value='round-robin'>轮询</SelectItem>
+                <SelectItem value='random'>随机</SelectItem>
+                <SelectItem value='least-latency'>最低延迟</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div className='field-row mt-2.5'>
+            <Label className='inline-flex cursor-pointer items-center gap-2.5 font-normal'>
+              <Switch checked={draft.onError === 'next'}
+                onCheckedChange={next => set({ onError: next ? 'next' : 'none' })}
+                aria-label='失败自动换出口' />
+              <span className='text-xs text-subtle'>失败自动换出口（连不上时依次尝试组内其它出口）</span>
+            </Label>
+          </div>
+          <div className='detail mt-1.5'>
+            {poolError
+              ? `读取失败：${poolError}`
+              : pool === null
+                ? '正在读取代理列表…'
+                : groupNames.length
+                  ? '本账号按策略在该组全部启用出口间轮换；出口与分组在「网络代理」页管理'
+                  : '「网络代理」页还没有带分组的出口 —— 去那里给出口填一个「分组」标签'}
           </div>
         </div>
       ) : null}

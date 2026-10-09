@@ -25,6 +25,12 @@ export type ProxyConfig = {
     listenerUid?: string
     /** `source === 'pool'` 时的池条目 id（见 PoolItem） */
     proxyId?: string
+    /** `source === 'pool-rotate'` 时的轮询组名（选中该组全部启用条目） */
+    group?: string
+    /** pool-rotate 的轮询策略；缺省 round-robin */
+    strategy?: string
+    /** pool-rotate 的失败处理：next = 自动换出口；缺省 next */
+    onError?: string
     protocol?: string
     host?: string
     port?: number
@@ -248,6 +254,8 @@ export type PoolItem = {
   /** manual | clash（表单里按它标「手动 / Clash Verge」） */
   source?: string
   enabled?: boolean
+  /** 轮询组标签（可选）：账号的 pool-rotate 出口按它选这一组条目 */
+  group?: string
   /** 解析后的出口（Clash 条目的端口在这里是实时值）；不受控字段按 unknown 收 */
   resolved?: { protocol?: string; host?: string; port?: number | null; label?: string } | null
   /** 解析失败的原因（引用了已删除的 Clash 监听器等） */

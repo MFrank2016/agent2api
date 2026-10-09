@@ -33,6 +33,8 @@ export type ProxyPoolItem = {
   port: number | null
   username: string
   password: string
+  /** 轮询组标签（可选）：账号的 pool-rotate 出口按它选这一组条目 */
+  group?: string
   listenerUid: string
   createdAt: number
   updatedAt: number
@@ -73,6 +75,8 @@ export type ProxyClashSnapshot = {
 export type ProxyPoolPayload = {
   items?: ProxyPoolItem[]
   clash?: ProxyClashSnapshot
+  /** 池里出现过的分组汇总（账号表单的轮询组下拉用它；后端 `GET /api/proxies/pool` 给） */
+  groups?: Array<{ name: string; count?: number }>
   /** 删除响应里带被删条目的名称（toast 文案用） */
   removed?: string
   /** 同步响应里的本次变更数（「同步 Clash Verge」按钮要报「更新了几项」） */
@@ -528,6 +532,7 @@ function payloadOfItem(item: ProxyPoolItem): Record<string, unknown> {
     port: item.port,
     username: item.username,
     password: item.password,
+    group: item.group,
     enabled: item.enabled,
   }
 }

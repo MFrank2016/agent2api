@@ -362,6 +362,8 @@ function ProxyModal({
   const [port, setPort] = React.useState(item?.port ? String(item.port) : '')
   const [username, setUsername] = React.useState(item?.username || '')
   const [password, setPassword] = React.useState(item?.password || '')
+  /** 轮询组标签（可选）：账号的 pool-rotate 出口按它选这一组条目 */
+  const [group, setGroup] = React.useState(item?.group || '')
   const [enabled, setEnabled] = React.useState(item ? item.enabled : true)
   const [saving, setSaving] = React.useState(false)
   const [testing, setTesting] = React.useState(false)
@@ -386,6 +388,7 @@ function ProxyModal({
         port: portNumber,
         username: username.trim(),
         password,
+        group: group.trim(),
         enabled,
       },
     }
@@ -497,6 +500,16 @@ function ProxyModal({
               <Input id='proxy-pass' placeholder='可选' autoComplete='off'
                 value={password} onChange={event => setPassword(event.currentTarget.value)} />
             </div>
+          </div>
+
+          <div className='flex flex-col gap-1.5'>
+            <Label htmlFor='proxy-group'>分组</Label>
+            <Input id='proxy-group' placeholder='可选，例如：kilo' autoComplete='off' spellCheck={false}
+              value={group} onChange={event => setGroup(event.currentTarget.value)} />
+            <p className='text-xs leading-[1.65] text-subtle'>
+              可选。给这条出口打一个分组标签，账号的<b>「轮询组（多出口）」</b>按分组选中
+              一组出口轮流使用；留空则只作为普通代理条目。
+            </p>
           </div>
 
           <div className='flex flex-row items-center gap-2.5'>
