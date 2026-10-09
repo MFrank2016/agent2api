@@ -70,6 +70,7 @@ const MAX_NAME_LENGTH: usize = 60;
 const MAX_HOST_LENGTH: usize = 255;
 const MAX_USER_LENGTH: usize = 200;
 const MAX_LABEL_LENGTH: usize = 100;
+const MAX_GROUP_LENGTH: usize = 60;
 
 /// 进程级库句柄（照 `core::task_state` 的形态：bootstrap 时 install 一次）
 static DB: OnceLock<Option<Db>> = OnceLock::new();
@@ -170,6 +171,7 @@ fn normalize_item(input: &Value, existing: Option<&Value>) -> Result<Value, Stri
     if name.is_empty() {
         return Err("请填写代理名称".to_string());
     }
+    let group = clean_string(object.get("group"), MAX_GROUP_LENGTH);
 
     let now = logging::now_ms();
     let id = existing
@@ -208,6 +210,7 @@ fn normalize_item(input: &Value, existing: Option<&Value>) -> Result<Value, Stri
     normalized.insert("id".to_string(), Value::String(id));
     normalized.insert("name".to_string(), Value::String(name));
     normalized.insert("source".to_string(), Value::String("manual".to_string()));
+    normalized.insert("group".to_string(), Value::String(group));
     normalized.insert(
         "enabled".to_string(),
         Value::Bool(!matches!(object.get("enabled"), Some(Value::Bool(false)))),
@@ -336,6 +339,7 @@ fn describe_item(item: &Value) -> Value {
     json!({
         "id": text_of(item, "id"),
         "name": text_of(item, "name"),
+        "group": text_of(item, "group"),
         "source": source,
         "enabled": !matches!(item.get("enabled"), Some(Value::Bool(false))),
         // manual 的字段原样带出（编辑弹窗要回显，含密码 —— 与账号代理表单同一口径：
@@ -610,4 +614,17 @@ pub fn record_test(id: &str, result: &TestOutcome) -> Result<Vec<Value>, String>
     object.insert("lastTest".to_string(), last_test);
     write_items(&items)?;
     Ok(list())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_item_keeps_group_tag_and_defaults_empty() {
+        let tagged = normalize_item(&serde_json::json!({"name":"a","host":"1.2.3.4","port":8080,"group":"kilo"}), None).unwrap();
+        assert_eq!(tagged["group"], "kilo");
+        let plain = normalize_item(&serde_json::json!({"name":"b","host":"1.2.3.5","port":8080}), None).unwrap();
+        assert_eq!(plain["group"], "");
+    }
 }
