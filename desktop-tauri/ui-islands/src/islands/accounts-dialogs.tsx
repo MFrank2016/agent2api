@@ -78,7 +78,7 @@ export type ProxyPayload =
   | { source: 'pool'; proxyId: string }
   | { source: 'clash'; listenerUid: string }
   | { source: 'custom'; protocol: 'http' | 'socks5'; host: string; port: number; username: string; password: string }
-  | { source: 'pool-rotate'; group: string; strategy: 'round-robin' | 'random' | 'least-latency'; onError: 'next' | 'none' }
+  | { source: 'pool-rotate'; group: string; proxyIds: string[]; strategy: 'round-robin' | 'random' | 'least-latency'; onError: 'next' | 'none' }
 
 export type ProxyDraft = {
   mode: 'none' | 'pool' | 'clash' | 'custom' | 'pool-rotate'
@@ -92,6 +92,8 @@ export type ProxyDraft = {
   password: string
   /** 轮询组名（mode === 'pool-rotate'） */
   group: string
+  /** pool-rotate 的显式成员 id（导入时写入；UI 不编辑，保存时原样保留） */
+  proxyIds: string[]
   /** 轮询策略（mode === 'pool-rotate'；缺省 round-robin） */
   strategy: 'round-robin' | 'random' | 'least-latency'
   /** 失败自动换出口（mode === 'pool-rotate'；缺省 next） */
@@ -102,6 +104,12 @@ export type ProxyDraft = {
 export function draftOfProxy(proxy: AccountRecord['proxy']): ProxyDraft {
   const source = proxy?.config?.source || proxy?.source
   const config = proxy?.config || null
+  // 后端 pool-rotate 支持显式成员 id（proxyIds）：UI 不提供编辑，但要原样带过保存，
+  // 否则「按 id 引用」的账号（可能只有 proxyIds、没有 group）会在任何一次保存时被丢掉
+  const rawProxyIds = (config as { proxyIds?: unknown } | null)?.proxyIds
+  const proxyIds = Array.isArray(rawProxyIds)
+    ? rawProxyIds.filter((item): item is string => typeof item === 'string')
+    : []
   return {
     mode: source === 'pool' ? 'pool' : source === 'clash' ? 'clash' : source === 'custom' ? 'custom'
       : source === 'pool-rotate' ? 'pool-rotate' : 'none',
@@ -113,6 +121,7 @@ export function draftOfProxy(proxy: AccountRecord['proxy']): ProxyDraft {
     username: config?.username || '',
     password: config?.password || '',
     group: source === 'pool-rotate' ? String(config?.group || '') : '',
+    proxyIds,
     strategy: config?.strategy === 'random' || config?.strategy === 'least-latency' ? config.strategy : 'round-robin',
     onError: config?.onError === 'none' ? 'none' : 'next',
   }
@@ -131,8 +140,9 @@ export function readProxyDraft(draft: ProxyDraft): ProxyPayload {
   }
   if (draft.mode === 'pool-rotate') {
     const group = draft.group.trim()
-    if (!group) throw new Error('请填写轮询组名（或从已有分组中选择）')
-    return { source: 'pool-rotate', group, strategy: draft.strategy, onError: draft.onError }
+    // 仅当组名与显式成员 id 都为空才算非法：只带 proxyIds 的账号必须仍可保存
+    if (!group && !draft.proxyIds.length) throw new Error('请填写轮询组名（或从已有分组中选择）')
+    return { source: 'pool-rotate', group, proxyIds: draft.proxyIds, strategy: draft.strategy, onError: draft.onError }
   }
   const host = draft.host.trim()
   const port = Number(draft.port)
@@ -213,8 +223,6 @@ export function ProxyForm({
         setPoolError(errorMessage(error))
       })
   }, [])
-  // 只有选中（或初始就是）池引用 / 轮询组时才真正去读 —— 其余档的用户不必为一次多余的
-  // 请求买单；读完缓存住，切到这一档不会再打网络
   // 只有选中（或初始就是）池引用 / 轮询组时才真正去读 —— 其余档的用户不必为一次多余的
   // 请求买单；读完缓存住，切到这一档不会再打网络
   React.useEffect(() => {
@@ -358,6 +366,7 @@ export function ProxyForm({
                 ))}
               </span>
             ) : null}
+            <Button variant='outline' size='sm' onClick={() => loadPool(true)}>重新读取</Button>
           </div>
           <div className='field-row mt-2.5'>
             <label htmlFor={`${idPrefix}-rotate-strategy`}>策略</label>
@@ -389,6 +398,11 @@ export function ProxyForm({
                   ? '本账号按策略在该组全部启用出口间轮换；出口与分组在「网络代理」页管理'
                   : '「网络代理」页还没有带分组的出口 —— 去那里给出口填一个「分组」标签'}
           </div>
+          {draft.proxyIds.length ? (
+            <p className='detail mt-1.5'>
+              该账号还带有 {draft.proxyIds.length} 个显式成员 id（导入时写入）：保存时会原样保留。
+            </p>
+          ) : null}
         </div>
       ) : null}
 
