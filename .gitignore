@@ -34,3 +34,6 @@ dist/
 # Docker 部署：密钥与运行数据不入库
 .env
 data/
+
+# 运行时数据备份（升级/迁移时由程序生成在数据目录旁）
+data.backup.*.tar.gz
