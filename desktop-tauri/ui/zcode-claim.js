@@ -104,10 +104,16 @@
       + '</label></li>';
   }
 
-  /** 额度 → 紧凑串（`100000000` → `1亿`）：活动发的就是这种 9 位数，原样显示读不动 */
+  /**
+   * 额度 → 紧凑串（`100000000` → `1亿`）：活动发的就是这种 9 位数，原样显示读不动。
+   * 量级词优先走 units.js 的共享实现（按界面语言给万/亿、万/億、만/억、k/M，并跟随
+   * 设置页的中文口径开关）；它没就位时回落到下面这份紧凑除法 + 亿/万 后缀。
+   */
   function formatUnits(value) {
     const number = Number(value);
     if (!Number.isFinite(number)) return String(value ?? '');
+    const shared = window.wbUnits?.formatTokens;
+    if (typeof shared === 'function') return shared(number);
     const compact = (scaled, suffix) => {
       const text = scaled.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
       return `${text}${suffix}`;
