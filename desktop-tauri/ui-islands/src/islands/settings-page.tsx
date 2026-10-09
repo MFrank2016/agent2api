@@ -12,8 +12,6 @@ import {
   DialogTitle,
   Input,
   Label,
-  RadioGroup,
-  RadioGroupItem,
   SegmentedControl,
   Select,
   SelectContent,
@@ -24,7 +22,6 @@ import {
 } from '@ui'
 import {
   CATEGORIES,
-  LANGUAGES,
   NOTES,
   PROMPT_MODES,
   QUEUE_FIELDS,
@@ -120,6 +117,7 @@ import {
   PromptTextButton,
   gatewayEditedText,
 } from './settings-prompt-editor'
+import { t } from '../i18n'
 
 /**
  * Agent2API · 设置页（React 岛）。
@@ -391,12 +389,14 @@ function GeneralPane({ snap }: { snap: SettingsSnapshot }) {
       )}
 
       <section className='panel'>
-        <PanelHead title='计量单位' tip={TIPS.units} />
+        <PanelHead title='Token 读数量级' tip={TIPS.units} />
         <div className='panel-body'>
           <div className='settings-switches'>
+            {/* 标签不再写死「中文」：开启是「万 / 亿」式本地量级词，繁体 / 日文 / 韩文各自
+                有对应的量级词（萬 / 億、만 / 억），译文里这句话描述的正是那些语言用户看到的东西 */}
             <SwitchRow
               id='settings-chinese-units'
-              label='使用中文单位（亿 / 万）'
+              label='使用本地量级词（万 / 亿式）'
               checked={snap.unitsChinese}
               onCheckedChange={applyUnits}
             />
@@ -453,7 +453,6 @@ function DisplayPane() {
   }, [])
 
   const zoomLabel = zoom === 100 ? '100%（默认）' : `${zoom}%`
-  const language = LANGUAGES[0]
 
   return (
     <>
@@ -518,21 +517,56 @@ function DisplayPane() {
       <section className='panel'>
         <PanelHead title='语言设置' tip={TIPS.displayLanguage} />
         <div className='panel-body'>
-          <div className='settings-switches'>
-            {/* 单选项而不是下拉：语种少的时候一眼看得见全部可选、选中的也一目了然。
-                目前只有一项 —— 选中它就是「当前语言」，改不动任何东西；等真有了第二种
-                语言，这里会自己长出第二行（表在 settings-model 的 LANGUAGES）。 */}
-            <RadioGroup value={language.value} onValueChange={() => {}}>
-              <Label className='flex cursor-pointer items-center gap-2 text-[12.5px] font-medium'>
-                <RadioGroupItem value={language.value} />
-                {language.label}
-              </Label>
-            </RadioGroup>
-          </div>
-          <div className='settings-state'>{STATES.languageOnly}</div>
+          <LanguageRow />
+          <div className='settings-state'>{STATES.languageHint}</div>
         </div>
       </section>
     </>
+  )
+}
+
+/**
+ * 「界面语言」一行：下拉选 auto 或某个具体语言，选中即整页刷新。
+ *
+ * ── 为什么不进 settings-state 的后端模型 ──────────────────────
+ * 语言只改本机界面文案：不碰转发、不碰账号，跟「主题 / 缩放 / 计量单位」同属纯前端
+ * 偏好。所以它只读写 localStorage（键 workbuddy-desktop-locale，见 ui/i18n.js），
+ * 与后端 desktop-settings.json 无关，也正因如此这里不需要受控 state —— 切换会
+ * location.reload()，重载后本行自然按新值重新渲染。
+ *
+ * ── 选项文案为什么不都走 t() ─────────────────────────────────
+ * 'auto' 的标签是中文键（跟随系统），要翻译；其余语言的 label 是**各语言自己的写法**
+ * （English / 日本語 / 한국어 …），选之前就该看得懂，所以照搬 wbI18n.LOCALES，不翻译。
+ */
+function LanguageRow() {
+  const api = window.wbI18n
+  const value = api?.rawLocale?.() ?? 'auto'
+  const locales = api?.LOCALES ?? []
+  const labelOf = (code: string): string => (
+    code === 'auto' ? t('跟随系统') : (locales.find(item => item.code === code)?.label ?? code)
+  )
+
+  return (
+    <div className='retention-list'>
+      <div className='retention-row'>
+        <label htmlFor='settings-language'>{t('界面语言')}</label>
+        <span className='prompt-input'>
+          {/* 与「界面缩放」同一个 Select 形态：展示文案显式给 SelectValue，不依赖 value 自动显示。
+              组件的 onValueChange 可能给 null（被清空），这里只在拿到非空值时切换 */}
+          <Select value={value} onValueChange={next => { if (next) api?.setLocale(next) }}>
+            <SelectTrigger id='settings-language' className='w-[200px]' aria-label={t('界面语言')}>
+              <SelectValue>{labelOf(value)}</SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value='auto'>{t('跟随系统')}</SelectItem>
+              {locales.map(item => (
+                <SelectItem key={item.code} value={item.code}>{item.label}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </span>
+      </div>
+    </div>
   )
 }
 

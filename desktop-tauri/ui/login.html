@@ -3,7 +3,40 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Agent2API · 登录</title>
+  <title data-i18n="Agent2API · 登录">Agent2API · 登录</title>
+  <script>
+    // 语言引导：在 head 解析期定下界面语言，再同步注入词典（与 index.html 同一套，
+    // 解析规则与 ui/i18n.js 的 resolveLocale 逐字一致，改一处要一起改）。
+    // 登录页的静态文案只有 <title>；卡片内容由 React 岛渲染，本页内联登录脚本里的
+    // 中文属后续批次，这里不碰。
+    (function () {
+      var CODES = ['zh-Hans', 'zh-Hant', 'en', 'ja', 'ko', 'pt-BR'];
+      var raw = null;
+      try { raw = localStorage.getItem('workbuddy-desktop-locale'); } catch (e) { /* 存储被禁：按 auto 处理 */ }
+      var locale = 'en';
+      if (raw && raw !== 'auto' && CODES.indexOf(raw) >= 0) {
+        locale = raw;
+      } else {
+        var tags = (navigator.languages && navigator.languages.length) ? navigator.languages : [navigator.language];
+        for (var i = 0; i < tags.length; i++) {
+          var tag = String(tags[i] || '').toLowerCase();
+          if (!tag) continue;
+          if (tag === 'zh-tw' || tag === 'zh-hk' || tag === 'zh-mo' || tag.indexOf('hant') >= 0) { locale = 'zh-Hant'; break; }
+          if (tag.indexOf('zh') === 0) { locale = 'zh-Hans'; break; }
+          if (tag.indexOf('ja') === 0) { locale = 'ja'; break; }
+          if (tag.indexOf('ko') === 0) { locale = 'ko'; break; }
+          if (tag.indexOf('pt') === 0) { locale = 'pt-BR'; break; }
+        }
+      }
+      document.documentElement.lang = locale;
+      if (locale === 'zh-Hans') return; // 简体无词典：查不到即显示简体原文
+      document.write('<script src="i18n/manifest.js"><\/script>');
+      var domains = window.__WB_I18N_DOMAINS || [];
+      for (var d = 0; d < domains.length; d++) {
+        document.write('<script src="i18n/' + locale + '/' + domains[d] + '.js"><\/script>');
+      }
+    })();
+  </script>
   <!-- 组件库产物（ui-kit + Tailwind，由 ui-islands 构建）：与主面板同一份。
        页面外壳的取值也改走它的 --ui-* 令牌，不再自己硬编码一套深色变量。 -->
   <link rel="stylesheet" href="islands/ui.css">
@@ -88,6 +121,9 @@
     panel-captcha[state='error'] .pc-label { color: var(--ui-destructive); }
     @keyframes pc-spin { to { transform: rotate(360deg); } }
   </style>
+  <!-- 多语言运行时（词典已在上面 head 的引导脚本里同步注入）：排在所有 css 之后，
+       且早于 body 末尾的 islands/ui.js 与 panel-captcha.js。 -->
+  <script src="i18n.js"></script>
 </head>
 <body>
   <!-- 整页界面由 React 岛渲染（ui-islands/src/islands/login-page.tsx，随 islands/ui.js

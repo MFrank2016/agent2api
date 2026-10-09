@@ -427,7 +427,7 @@ export function renderUnits(): void {
 export function applyUnits(on: boolean): void {
   shared().wbUnits?.setChinese?.(on)
   renderUnits()
-  toast(on ? '✅ 已改用中文单位（亿 / 万）' : '✅ 已改用英文单位（M / k）')
+  toast(on ? '✅ 已改用本地量级词（万 / 亿式）' : '✅ 已改用 k / M 缩写')
 }
 
 /* ─── 启动与托盘 ───────────────────────────── */
