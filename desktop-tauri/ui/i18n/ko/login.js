@@ -1,2 +1,2 @@
 /* Agent2API 词典构建产物：ko/login —— 由 desktop-tauri/i18n/build.mjs 生成，请勿手改；源头是 i18n-src/*.json */
-window.wbI18nDict = window.wbI18nDict || {};
+window.wbI18nDict = window.wbI18nDict || {}; Object.assign(window.wbI18nDict, { "Agent2API · 登录": "Agent2API · 로그인", "OpenAI 兼容网关 · 管理面板": "OpenAI 호환 게이트웨이 · 관리 패널", "密码": "비밀번호", "我不是机器人": "로봇이 아닙니다", "登录后可在「网关 Key」页为 API 客户端创建密钥": "로그인 후 「게이트웨이 키」 페이지에서 API 클라이언트용 키를 만들 수 있습니다", "管理员账号": "관리자 계정", "继续": "계속", "至少 8 位": "8자리 이상", "验证中…": "확인 중…", "验证失败，请重试": "확인에 실패했습니다. 다시 시도하세요", "验证成功": "확인 완료" });
