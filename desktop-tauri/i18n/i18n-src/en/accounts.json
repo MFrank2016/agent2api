@@ -55,6 +55,7 @@
   "✅ 已重新读取 Clash Verge 配置": "✅ Clash Verge config reloaded",
   "✅ 账号设置已保存": "✅ Account settings saved",
   "　出口 IP {ip}": " Exit IP {ip}",
+  "、": ", ",
   "、补官方会话头、请求体补两个占位工具（上游免费档的三道校验）。": ", adds official session headers, and adds two placeholder tools to the request body (the three checks of the upstream free tier).",
   "「{name}」本身": "\"{name}\" itself",
   "「已保存的代理」": "\"Saved proxy\"",
@@ -432,5 +433,6 @@
   "，{countdown}重置": ", {countdown} until reset",
   "，只对 OpenCode Zen 这类上游有意义，别的家请关掉。": ", so it only matters for upstreams like OpenCode Zen — turn it off for other providers.",
   "，已达到上限": ", limit reached",
-  "：到「网络代理」页点「同步 Clash Verge」把出口导进池后即可选 —— 那样能集中测试、也能被多个账号共用。": ": on the Network proxy page, click \"Sync Clash Verge\" to import exits into the pool and then select them — that centralizes testing and lets several accounts share them."
+  "：到「网络代理」页点「同步 Clash Verge」把出口导进池后即可选 —— 那样能集中测试、也能被多个账号共用。": ": on the Network proxy page, click \"Sync Clash Verge\" to import exits into the pool and then select them — that centralizes testing and lets several accounts share them.",
+  "；": "; "
 }
