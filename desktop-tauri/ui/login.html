@@ -245,12 +245,12 @@
         var registered = data && data.data && data.data.registered;
         isSetup = !registered;
         tip.textContent = isSetup
-          ? '首次使用：创建一个管理员账号，用于登录此面板'
-          : '请输入管理员账号与密码';
-        $('submit').textContent = isSetup ? '创建账号并进入面板' : '登录';
-        if (isSetup) $('password').placeholder = '设置密码（至少 8 位）';
+          ? wbI18n.t('首次使用：创建一个管理员账号，用于登录此面板')
+          : wbI18n.t('请输入管理员账号与密码');
+        $('submit').textContent = isSetup ? wbI18n.t('创建账号并进入面板') : wbI18n.t('登录');
+        if (isSetup) $('password').placeholder = wbI18n.t('设置密码（至少 8 位）');
       }).catch(function () {
-        tip.textContent = '无法连接网关，请确认服务已启动';
+        tip.textContent = wbI18n.t('无法连接网关，请确认服务已启动');
       });
 
       async function doSubmit(username, password) {
@@ -288,12 +288,12 @@
           // 后端的错误信封是 {success:false, error:"账号或密码不正确"}，error
           // 是字符串；也兼容 {message:"…"} 形态的对象
           if (detail && typeof detail === 'object') detail = detail.message;
-          errorEl.textContent = detail || '请求失败，请重试';
+          errorEl.textContent = detail || wbI18n.t('请求失败，请重试');
           button.disabled = false;
           captchaPayload = null; // payload 是一次性的：失败后重新验证
           if (captchaRequired) widget.reset();
         }).catch(function () {
-          errorEl.textContent = '无法连接网关';
+          errorEl.textContent = wbI18n.t('无法连接网关');
           button.disabled = false;
           captchaPayload = null;
           if (captchaRequired) widget.reset();
@@ -306,11 +306,11 @@
         var username = $('username').value.trim();
         var password = $('password').value;
         if (!username || !password) {
-          errorEl.textContent = '请填写账号与密码';
+          errorEl.textContent = wbI18n.t('请填写账号与密码');
           return;
         }
         if (captchaRequired && !captchaPayload) {
-          errorEl.textContent = '请先勾选「我不是机器人」完成验证';
+          errorEl.textContent = wbI18n.t('请先勾选「我不是机器人」完成验证');
           return;
         }
         doSubmit(username, password);
