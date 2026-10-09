@@ -100,9 +100,9 @@ pub mod accio;
 /// Antigravity（Google 的 AI IDE，推理走 **Google Cloud Code Assist**
 /// `v1internal`）。适配实现在 `antigravity/`：账号管理（粘贴 Google
 /// refresh token）+ token 刷新（Google OAuth 的 form 端点）+ 模型目录
-/// （`:fetchAvailableModels`，本步只列 Gemini）已接通，**会话转发留待下一步**
-/// （`build_chat_request` 返回 501；`is_stateful` 恒 false —— 下一步走
-/// 「`UpstreamResponse` 新变体 + Gemini SSE 翻译层」，见 `antigravity/mod.rs`）。
+/// （`:fetchAvailableModels`，只列 Gemini）+ **会话转发**（`build_chat_request`
+/// 构造 v1internal 信封，响应走 `UpstreamResponse::AntigravityGemini` 那条
+/// Gemini SSE 翻译层）全部已接通；`is_stateful` 恒 false，见 `antigravity/mod.rs`）。
 pub mod antigravity;
 pub mod autoclaw;
 pub mod catalog;
@@ -422,8 +422,8 @@ pub enum ProviderKind {
     CommandCode,
     /// Antigravity（Google 的 AI IDE）。适配实现在 `antigravity/`：
     /// 账号管理（**粘贴 Google refresh token**）、token 刷新、模型目录
-    /// （**只接 Gemini**）已接通；**会话转发留待下一步**
-    /// （`build_chat_request` 返回 501，见 `antigravity/mod.rs` 的模块头）。
+    /// （**只接 Gemini**）、**会话转发**（`build_chat_request` 构造 v1internal
+    /// 信封）全部已接通，见 `antigravity/mod.rs` 的模块头）。
     ///
     /// ── 上游长什么样（规格 `_recon/antigravity-spec.md`，参考
     /// `Acankao/Antigravity-Manager` + `Acankao/9router`）────────────
@@ -437,11 +437,12 @@ pub enum ProviderKind {
     /// 规格 §6：本家没有 region 参数、端点全球统一（`sandbox`/`daily`/`prod`
     /// 是**环境**不是地区），因此不需要地区拆分，也不需要 `region.rs`。
     ///
-    /// ── 转发路线（下一步接）───────────────────────────────────
+    /// ── 转发路线（已落地）─────────────────────────────────────
     /// 上游是**无状态**（一次 HTTP 请求 = 一次生成），只是响应帧是 Gemini 方言：
-    /// 下一步照 Command Code / ZCode 的先例，给
-    /// [`adapter::UpstreamResponse`] 加一个变体 + 一层翻译器，
-    /// **`is_stateful` 保持 false**（不要走 `forward_conversation`）。
+    /// 照 Command Code / ZCode 的先例给了
+    /// [`adapter::UpstreamResponse`] 一个新变体（`AntigravityGemini`）+ 一层
+    /// 翻译器（`protocol::antigravity_outbound` / `antigravity_stream`），
+    /// **`is_stateful` 保持 false**（不走 `forward_conversation`）。
     Antigravity,
 }
 

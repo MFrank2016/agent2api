@@ -22,13 +22,16 @@
 //! 前缀白名单而不是「黑名单排除 claude/gpt-oss」是刻意的：将来上游再下发
 //! 别的家族（veo 之类）时，默认仍是「不接」而不是「误广告一个没实现的通道」。
 //!
-//! ── 兜底清单的 id 与「发给上游的名字」是两回事（留给下一步的 TODO）──
+//! ── 兜底清单的 id 与「发给上游的名字」是两回事（本步已落地映射表）──
 //! 规格 §5.2 的 id 是**本家对外的名字**：`gemini-3.6-flash` 发出去时上游要的是
 //! `gemini-3.6-flash-tiered`，`gemini-3.1-pro-high` 对应上游真名
-//! `gemini-pro-agent`（`gemini-3-pro-high` 同理）。本步不接通聊天，因此
-//! **不做这层映射**，只在模块头记下它是下一步的第一件事；届时也应以线上
-//! `fetchAvailableModels` 实际下发的 id 为准（规格 §5.2 末句 / §8.11）。
-//! 此外图片模型的组合后缀（`-2k/-4k` × 六个比例）在规格里只给了后缀集合、
+//! `gemini-pro-agent`（`gemini-3-pro-high` 同理）。映射表见
+//! [`upstream_model_id`]（出处：Manager `CLAUDE_TO_GEMINI` 的 Gemini 部分 +
+//! `is_bare_gemini_v36_or_above_flash` 的 tiered 规则；9router registry 的 id
+//! 集合交叉验证）。**对不上的 id 原样透传** —— 远程
+//! `fetchAvailableModels` 下发的 id 本身就是上游真名（规格 §5.2 末句 /
+//! §8.11），不该被这张表改写。
+//! 图片模型的组合后缀（`-2k/-4k` × 六个比例）在规格里只给了后缀集合、
 //! 没给拼接形态，**不猜**：兜底清单只放 `gemini-3-pro-image` 与
 //! `gemini-3.1-flash-image` 两条基础 id（TODO 见报告）。
 //!
@@ -64,6 +67,117 @@ const TTL_MS: i64 = 10 * 60 * 1000;
 
 /// 单次目录请求超时
 const REQUEST_TIMEOUT_MS: u64 = 20_000;
+
+/// 本家对外 id → 上游模型 id 的**精确**别名表（规格 §5.2 括号里的真名；
+/// Manager `CLAUDE_TO_GEMINI` 的 Gemini 部分逐条）：
+///
+/// ```text
+///   gemini-3.6/3.7/3.8-flash  → <同 id>-tiered    （无后缀 Flash 走自适应档）
+///   gemini-3.1-pro-high       → gemini-pro-agent  （Manager 表逐字）
+///   gemini-3-pro-high         → gemini-pro-agent  （同上）
+///   gemini-2.5-flash-lite     → gemini-2.5-flash  （Manager 表逐字；9router
+///                               registry 不含这条 id，属两个参考的差异）
+/// ```
+///
+/// 表里没有的一律原样透传（见模块头：远程目录下发的 id 就是上游真名）。
+const UPSTREAM_ALIASES: [(&str, &str); 6] = [
+    ("gemini-3.6-flash", "gemini-3.6-flash-tiered"),
+    ("gemini-3.7-flash", "gemini-3.7-flash-tiered"),
+    ("gemini-3.8-flash", "gemini-3.8-flash-tiered"),
+    ("gemini-3.1-pro-high", "gemini-pro-agent"),
+    ("gemini-3-pro-high", "gemini-pro-agent"),
+    ("gemini-2.5-flash-lite", "gemini-2.5-flash"),
+];
+
+/// 对外 id（或上游真名）→ 真正发给 v1internal 的模型 id。
+///
+/// 顺序：精确别名表 → 「无后缀 `gemini-<x.y>-flash`（x.y ≥ 3.6）加 `-tiered`」
+/// 的动态规则（Manager `is_bare_gemini_v36_or_above_flash` 的语义）→
+/// 原样返回。大小写不敏感匹配（客户端常发小写），但**返回值保留调用方给的
+/// 原始大小写**（与 Manager `format!("{}-tiered", original_model)` 同口径）。
+pub fn upstream_model_id(id: &str) -> String {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    for (alias, target) in UPSTREAM_ALIASES {
+        if lowered == alias {
+            return target.to_string();
+        }
+    }
+    if let Some(tiered) = tiered_flash_id(trimmed, &lowered) {
+        return tiered;
+    }
+    trimmed.to_string()
+}
+
+/// 「无后缀、版本 ≥ 3.6 的 `gemini-<x.y>-flash`」→ 追加 `-tiered`；
+/// 其余（已有档位/变体后缀、版本不够、不是 flash）返回 None。
+///
+/// 逐条对齐 Manager `is_bare_gemini_v36_or_above_flash`：先排除一切已知后缀
+/// （`-high` / `-medium` / `-low` / `-extra-low` / `-tiered` / `-preview` /
+/// `-agent` / `-thinking` / `-image`），再解析 `gemini-` 之后的版本段
+/// （取到第一个非数字非点号的字符为止）要求 ≥ 3.6。
+fn tiered_flash_id(original: &str, lowered: &str) -> Option<String> {
+    for suffix in [
+        "-high", "-medium", "-low", "-extra-low", "-tiered", "-preview", "-agent", "-thinking",
+        "-image",
+    ] {
+        if lowered.contains(suffix) {
+            return None;
+        }
+    }
+    if !lowered.contains("flash") {
+        return None;
+    }
+    let rest = lowered.strip_prefix("gemini-")?;
+    let version: String = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+        .collect();
+    let version = version.trim_end_matches('.').parse::<f64>().ok()?;
+    if version < 3.6 {
+        return None;
+    }
+    Some(format!("{original}-tiered"))
+}
+
+/// 按 id 取**目录条目**（远程清单优先，其次内置兜底）。
+///
+/// 取值链：给定 id 直查 → 它映射出的上游真名再查一次。两个方向都需要：
+/// 调用方可能拿着**对外 id**（内置兜底清单的键），也可能拿着**上游真名**
+/// （远程目录的键，规格 §8.11 说明线上下发的可能是真名）。
+pub fn entry(id: &str) -> Option<Value> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let models = list();
+    for candidate in [trimmed.to_string(), upstream_model_id(trimmed)] {
+        if candidate.is_empty() {
+            continue;
+        }
+        if let Some(item) = models
+            .iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some(candidate.as_str()))
+        {
+            return Some(item.clone());
+        }
+    }
+    None
+}
+
+/// 目录条目里的一个数值键（远程清单的 `thinkingBudget` / `maxOutputTokens`；
+/// 内置兜底没有这些键 → None）
+pub fn entry_number(id: &str, key: &str) -> Option<i64> {
+    entry(id).and_then(|item| item.get(key).and_then(Value::as_i64))
+}
+
+/// 目录条目里的一个布尔键（`supportsThinking` / `supportsImages`）
+pub fn entry_bool(id: &str, key: &str) -> Option<bool> {
+    entry(id).and_then(|item| item.get(key).and_then(Value::as_bool))
+}
 
 /// 内置兜底清单（规格 §5.2 的 Gemini id **逐字**，只保留 `gemini-` 家族）。
 ///

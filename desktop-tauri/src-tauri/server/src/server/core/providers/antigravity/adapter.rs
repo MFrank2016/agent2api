@@ -1,23 +1,26 @@
-//! Antigravity 的 `ProviderAdapter` 实现（**本步只接账号 / 刷新 / 模型目录**）。
+//! Antigravity 的 `ProviderAdapter` 实现：账号 / token 刷新 / 模型目录 /
+//! **聊天转发**。
 //!
-//! ── 本步的边界（读这段再动这个文件）────────────────────────────
-//! 本步交付的是**骨架**：账号可添加、token 可刷新、模型目录可刷、注册接线全通；
-//! **聊天转发未接通** —— [`AntigravityAdapter::build_chat_request`] 返回一条明确的
-//! 501（而不是构造一个半成品请求发出去）。
-//!
-//! ── 为什么 `is_stateful` 保持默认 false（下一步的路线在此定）────
+//! ── 转发的落点（一句话：加一个 `UpstreamResponse` 变体 + 一层翻译）────
 //! 上游是**无状态 HTTP**（一次 `POST …:streamGenerateContent?alt=sse` = 一次生成），
 //! 只是「响应帧不是 OpenAI 方言」：SSE 每帧是 v1internal 的信封
 //! （`data: {"response":{…gemini 响应…}}`，规格 §4.2），且字段路径、思考位、
 //! 工具调用全按 Gemini 的形状给。本仓对这类上游的既定解法是
 //! [`UpstreamResponse`](crate::server::core::providers::adapter::UpstreamResponse)
-//! **加一个变体 + 翻译层**（Command Code 的 NDJSON、ZCode 的 Anthropic 都是这条
-//! 路线），于是账号轮换、限额冷却、退避重试、usage 记账与取消处理全部留在编排层。
+//! **加一个变体 + 翻译层** —— 本家落的正是 `UpstreamResponse::AntigravityGemini`：
+//! ```text
+//!   请求转换   core::protocol::antigravity_outbound（信封）
+//!             + core::protocol::antigravity_schema（工具 schema 清洗）
+//!   响应翻译   core::protocol::antigravity_stream（Gemini SSE → chat SSE）
+//!             壳：core::upstream::translate::AntigravityToChatStream
+//!   分派       core::upstream::provider_loop 的第三个分支
+//! ```
+//! 于是账号轮换、限额冷却、退避重试、usage 记账与取消处理全部留在编排层。
 //! 改成 `is_stateful = true` + `forward_conversation` 会把那五样在适配器里重写
 //! 一遍，而本家并没有多步会话协议 —— 没有理由付那份代价。
 //!
 //! ── 本家没有的东西（如实声明，别照抄别家）──────────────────────
-//!   - **没有网页登录**（`supports_web_login` 保持默认 false）：本步只做粘贴式
+//!   - **没有网页登录**（`supports_web_login` 保持默认 false）：只做粘贴式
 //!     （评估见 `mod.rs` 的模块头）；
 //!   - **没有签到**（`core::auto_checkin` 的清单不含本家：Antigravity 没有可自动
 //!     领取的奖励活动）；
@@ -35,13 +38,15 @@ use serde_json::Value;
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::providers::adapter::{
-    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, RetryAdvice, UpstreamErrorClass,
+    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, ReasoningPatch, RetryAdvice,
+    UpstreamErrorClass,
 };
 use crate::server::core::providers::{content_block, ProviderKind};
+use crate::server::core::{model_rules, protocol};
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 
-use super::{credentials, models, oauth, project};
+use super::{credentials, endpoints, models, oauth, project};
 
 /// Antigravity 适配器（无状态单例；身份全在账号记录里）
 pub struct AntigravityAdapter;
@@ -59,49 +64,156 @@ impl ProviderAdapter for AntigravityAdapter {
         models::list()
     }
 
-    /// **本步未接通**：聊天转发留待下一步（信封 + `UpstreamResponse` 新变体 +
-    /// Gemini SSE 翻译层，见模块头）。
+    /// 构造 v1internal 的 `:streamGenerateContent?alt=sse` 请求（信封见
+    /// `protocol::antigravity_outbound` 的模块头；响应协议标
+    /// `UpstreamResponse::AntigravityGemini`）。
     ///
-    /// 返回 501（Not Implemented）而不是 503：503 在本仓的语义是「上游暂时不可用、
-    /// 可以换账号重试」，501 才是「这个能力还没实现」—— 用户与排障者一眼能分清
-    /// 「本家坏了」与「本家还没接」。
+    /// ── 为什么流式与非流式客户端都用流式端点 ─────────────────────
+    /// 非流式客户端由编排层把翻译后的 chat SSE 聚合出完整响应
+    /// （`provider_loop` 的两处出口共用同一台翻译机）。两个端点的信封完全一样
+    /// （规格 §3.3），只维护一条 URL 判定就少一处「非流式走了另一套信封」的
+    /// 分叉面；真要用 `:generateContent` 也只是换 `endpoints::generate_url`。
+    ///
+    /// ── 基址为什么取 daily（不是 sandbox，也不是 prod）───────────
+    /// 规格 §3.1：Manager 优先 sandbox、9router 的聊天流量**固定 daily**。
+    /// 编排层的重试是「换账号 / 换家」而不是「换域名」（本仓没有
+    /// per-URL fallback 的钩子），所以这里选两参考交集里被 9router 长期使用、
+    /// 且不是最容易 429 的 prod 的那条 —— **端点级 failover（规格 §7.15）本步
+    /// 未实现**，报告中已列为下一步（`endpoints::V1_BASE_URLS` 已经有三条基址，
+    /// 缺的只是编排层让适配器换 URL 重发的那条通路）。
+    ///
+    /// ── 账号字段从哪读（会话形态，与另外几家同一约定）────────────
+    /// `auth.accessToken`（公开形态里没有它）＋ 本家的两个会话附加键
+    /// （`account_store::store` 的 `session_from_record` 注入）：`projectId`
+    /// （cloudaicompanionProject，OAuth 刷新与目录刷新时发现并回写）与 `email`
+    /// （决定信封里的 `userAgent` 标记：非 gmail/googlemail → `jetski`，
+    /// Manager 的判定逐字）。`projectId` 缺失时不写信封里的 `project` 键并留
+    /// 一行日志 —— 上游可能因此限制这次请求（规格 §7.16），但账号在添加 /
+    /// 刷新 / 拉目录时都会尽力发现一次，走到这里为空是少数路径。
     fn build_chat_request(
         &self,
-        _account: &Value,
-        _body: &Value,
+        account: &Value,
+        body: &Value,
         _client_headers: &HeaderMap,
     ) -> Result<ChatRequestPlan, GatewayError> {
-        Err(GatewayError::with_status(
-            501,
-            "Antigravity 的会话转发尚未接通（本步只接入账号、token 刷新与模型目录）：\
-             请先用其它提供商转发，或等待下一步接入",
-        ))
+        let access_token = account
+            .pointer("/auth/accessToken")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if access_token.is_empty() {
+            return Err(GatewayError::with_status(
+                401,
+                "Antigravity 账号缺少 access token，无法转发（请重新粘贴 refresh token，\
+                 或等令牌自动刷新后再试）",
+            ));
+        }
+        let requested = body
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if requested.is_empty() {
+            return Err(GatewayError::with_status(
+                400,
+                "Antigravity 请求缺少 model 字段（本家的模型名放在请求体里，\
+                 没有路径段的模型名可用）",
+            ));
+        }
+        // 对外 id → 上游真名（表见 models.rs；对不上的原样透传）
+        let wire_model = models::upstream_model_id(requested);
+        if wire_model != requested {
+            logging::verbose(
+                "[Antigravity]",
+                &format!("按本家映射表改写模型名 {requested} → {wire_model}"),
+            );
+        }
+        let project = account
+            .get("projectId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if project.is_empty() {
+            logging::verbose(
+                "[Antigravity]",
+                "账号缺 cloudaicompanionProject，本次信封不带 project 字段\
+                 （上游可能限制该请求；拉一次模型目录或重新登录即可发现）",
+            );
+        }
+        let email = account
+            .get("email")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        let enterprise = !email.is_empty()
+            && !email.ends_with("@gmail.com")
+            && !email.ends_with("@googlemail.com");
+        let envelope =
+            protocol::antigravity_outbound::antigravity_request_from_chat(
+                body,
+                &wire_model,
+                project,
+                enterprise,
+            )
+            .map_err(|message| {
+                GatewayError::with_status(
+                    400,
+                    format!("Antigravity 请求转换失败：{message}"),
+                )
+            })?;
+        let url = endpoints::stream_generate_url(endpoints::V1_BASE_URL_DAILY);
+        // content 请求的头集合（不带 `x-goog-user-project`、不带
+        // `x-goog-api-client`，见 endpoints.rs 的模块头）
+        let headers = endpoints::content_headers(access_token);
+        Ok(ChatRequestPlan::antigravity_gemini(url, headers, envelope))
     }
 
-    /// **本步如实声明「还没有转发能力」**（`false`）——下一步接通转发后改回 true。
+    /// 转发已接通（`build_chat_request` 返回
+    /// `UpstreamResponse::AntigravityGemini` 那条翻译通道）。
     ///
-    /// ── 为什么这一个是 false（而 `is_stateful` 那一个是「保持默认」）──
-    /// `is_stateful=false` 说的是「上游是无状态 HTTP」（协议事实，下一步也不变）；
-    /// 本方法说的是「这条账号现在**能不能承接请求**」（能力事实，本步就是不能）。
-    /// trait 的文档把这一位留给的正是本家现在这种过渡态：「先上账号管理、后接
-    /// 转发的 provider 仍需要它」（Qoder 接推理协议之前就是 false）。
-    ///
-    /// 两个消费方，两个后果，都是我们想要的：
-    ///   1. `account_store::pick_current`（全局队首）：排进队首会让顶栏把这条账号
-    ///      显示成「当前登录态」，而「退出登录」按队首**删除账号** —— 一条还不能
-    ///      转发的账号被当成登录态删掉，是本步最不该发生的事；
-    ///   2. 公开形态的 `chatSupported`：界面据此如实说明「这家还没接通转发」，
-    ///      而不是让用户以为加了账号就能用。
-    ///
-    /// **不影响的**：账号添加、token 刷新、模型目录刷新与 `/v1/models` 的广告
-    /// （那几处的判据是「有没有可用凭证 / 清单是否非空」，与这一位无关）——
-    /// 于是本步交付的四件事照常成立，而「点名一个 Antigravity 模型」会在转发层
-    /// 得到 `build_chat_request` 那条明确的 501。
-    ///
-    /// **下一步的 TODO**：`build_chat_request` 接上真身的同时，把这一位改回
-    /// `true`（两件事必须同一步改，否则界面会继续说「未接通」或反过来）。
+    /// 骨架期这里曾是 `false`（「先上账号管理、后接转发」的过渡态，trait 的
+    /// 文档把它留给的正是那种情形）；现在 `build_chat_request` 已接真身，
+    /// 两件事必须同步改 —— 否则界面会继续说「未接通」、`pick_current` 也不会
+    /// 把本家账号排进队首（`supports_chat` 的两个消费方见 trait 的文档）。
     fn supports_chat(&self) -> bool {
-        false
+        true
+    }
+
+    /// 把「映射上绑的思考等级」翻译成本家认的字段：写成 body 顶层的
+    /// `reasoning_effort`，由请求转换（`protocol::antigravity_outbound` 的
+    /// `thinking_budget`）映射成 `generationConfig.thinkingConfig.thinkingBudget`。
+    ///
+    /// ── 为什么中间落一个通用字段而不是直接改信封 ──────────────────
+    /// `build_chat_request` 的入参是 **chat 形态**的 body（此时还没有信封），
+    /// 而本仓的注入点（`upstream::payload::apply_reasoning`）只做「按适配器给的
+    /// 字段名写进 body」。于是这里复用客户端本来就会用的通用键
+    /// `reasoning_effort`（`model_rules::read_client_level` 的第一优先键）：
+    ///   1. 请求转换读它 → 档位进 `thinkingBudget`（Manager 的档位规范值）；
+    ///   2. `outbound_reasoning`（默认实现）也读它 → 请求日志的「上游等级」列
+    ///      因此能看到绑定生效后的档位，与另外两家的显示口径一致。
+    ///
+    /// 判据（三条，与 CatPaw / Qoder 的实现同一闸门）：
+    ///   - 客户端已显式指定档位 → 让位（用户的明确意图比映射默认值更具体）；
+    ///   - `off` / `none`：注入点已经拦下（不会问到这里，见 trait 的文档）；
+    ///   - 表外自定义等级（`model_rules::reasoning_rank` 返回 None）→ 不注入。
+    fn reasoning_patch(&self, level: &str, _model: &str, body: &Value) -> ReasoningPatch {
+        if model_rules::read_client_level(body)
+            .filter(|value| !model_rules::reasoning_is_off(value))
+            .is_some()
+        {
+            return ReasoningPatch::Skip {
+                reason: "客户端请求体里已指定思考档位",
+            };
+        }
+        if model_rules::reasoning_rank(level).is_none() {
+            return ReasoningPatch::Skip {
+                reason: "该等级不在本家接受的档位内（本家只认通用档位）",
+            };
+        }
+        ReasoningPatch::Set {
+            field: "reasoning_effort",
+            value: Value::String(level.trim().to_string()),
+        }
     }
 
     /// 上游错误分类（规格 §7 的映射表 + 本仓的四档口径）。
@@ -257,6 +369,19 @@ impl ProviderAdapter for AntigravityAdapter {
 
     /// 有远程目录（`POST {base}:fetchAvailableModels`，见 `models.rs`）
     fn supports_model_refresh(&self) -> bool {
+        true
+    }
+
+    /// SSE 下发帧的 `model` 回写成**客户端请求的那个名字**。
+    ///
+    /// 翻译状态机产出的帧带的是**上游真名**（`gemini-3.6-flash-tiered` /
+    /// `gemini-pro-agent` …，见 `models::upstream_model_id` 的映射表），而客户端
+    /// 请求的是对外 id（`gemini-3.6-flash` / `gemini-3.1-pro-high`）——
+    /// 正是 `sse_model_rewrite` 要处理的那种「上游回的名字与请求名不同」。
+    /// 与 raccoon / AutoClaw / Cline 同一取舍（那三家的上游也回内部名）；
+    /// Command Code / ZCode 那两条翻译通道没开它，是因为它们的发送名与请求名
+    /// 逐字相同，没有可改写的差异。
+    fn sse_model_rewrite(&self) -> bool {
         true
     }
 

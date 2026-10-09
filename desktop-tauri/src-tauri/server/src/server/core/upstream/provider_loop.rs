@@ -1271,11 +1271,14 @@ async fn attempt_queue(
 
         // ── 上游响应协议（适配器在构造请求时一并给出）──────────────────
         // 绝大多数上游说 chat SSE（`ForwardStream` / 聚合器的默认输入）；
-        // 两条例外各有一台翻译状态机（见 `upstream::translate` 的模块头）：
+        // 三条例外各有一台翻译状态机（见 `upstream::translate` 的模块头）：
         //   - ZCode 的活动套餐通道说 Anthropic SSE；
         //   - Command Code 说 NDJSON（`application/x-ndjson`，**HTTP 恒 200**、
         //     错误在流内），那家返回的 200 不代表这一轮生成成功 —— 成败由
-        //     翻译状态机折出的错误帧表达，与另外两处出口共用同一套下行语义。
+        //     翻译状态机折出的错误帧表达，与另外两处出口共用同一套下行语义；
+        //   - Antigravity 说 Gemini v1internal SSE（`data: {"response":{…}}`
+        //     信封，字段路径是 Gemini 方言）——上游状态码仍是成败判据，
+        //     翻译机只折字节形态（流内错误另走错误帧）。
         // 翻译在**两处出口之前**做，于是流式与非流式共用同一条下行语义：
         // reasoning 合并、usage 提取、model 回写、取消处理全都不需要第二套。
         // 说 chat 的家（含自定义家）跳过这一整段，直接走下面的原生路径。
@@ -1298,6 +1301,13 @@ async fn attempt_queue(
                 ),
                 UpstreamResponse::CommandCodeNdjson => Box::pin(
                     super::translate::CommandCodeToChatStream::new(
+                        response,
+                        &wire_model,
+                        ctx.telemetry,
+                    ),
+                ),
+                UpstreamResponse::AntigravityGemini => Box::pin(
+                    super::translate::AntigravityToChatStream::new(
                         response,
                         &wire_model,
                         ctx.telemetry,

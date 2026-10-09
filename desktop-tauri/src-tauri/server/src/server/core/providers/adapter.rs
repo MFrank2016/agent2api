@@ -142,9 +142,12 @@ pub struct ChatRequestPlan {
 impl ChatRequestPlan {
     /// 标准形态：上游说 OpenAI Chat（请求体与响应帧都是 chat 形态）。
     ///
-    /// 七家内置上游里的六家（以及自定义家）都是这一种；只有 ZCode 的活动套餐
-    /// 通道说 Anthropic（见 [`UpstreamResponse::Anthropic`]）。写成构造器而不是
-    /// 让各家手写字段，是为了「响应协议」这一个新字段不给七处调用点各留一次
+    /// 绝大多数内置上游（以及自定义家）都是这一种；三处例外各有一个专用
+    /// 构造器：ZCode 的活动套餐通道说 Anthropic（[`UpstreamResponse::Anthropic`]）、
+    /// Command Code 说 NDJSON（[`UpstreamResponse::CommandCodeNdjson`]）、
+    /// Antigravity 说 Gemini v1internal 信封
+    /// （[`UpstreamResponse::AntigravityGemini`]）。写成构造器而不是
+    /// 让各家手写字段，是为了「响应协议」这一个新字段不给各处调用点各留一次
     /// 写错的机会。
     pub fn chat(url: String, headers: Vec<(String, String)>, body: Value) -> Self {
         Self {
@@ -170,6 +173,27 @@ impl ChatRequestPlan {
             headers,
             body,
             response: UpstreamResponse::CommandCodeNdjson,
+        }
+    }
+
+    /// Antigravity 形态：请求体是 Cloud Code Assist 的 v1internal 信封
+    /// （`{project, model, userAgent, requestId, request:{…}}`），响应是
+    /// **Gemini SSE**（`data: {"response":{…}}`，见
+    /// [`UpstreamResponse::AntigravityGemini`]）。
+    ///
+    /// 与另外两个构造器同一动机（调用点只回答「响应是哪套协议」），
+    /// 单独一个名字是因为它要连**请求信封**一起表达 —— 那种信封只有
+    /// `antigravity_outbound` 会造。
+    pub fn antigravity_gemini(
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Value,
+    ) -> Self {
+        Self {
+            url,
+            headers,
+            body,
+            response: UpstreamResponse::AntigravityGemini,
         }
     }
 }
@@ -199,6 +223,16 @@ pub enum UpstreamResponse {
     /// 走翻译层的理由与 Anthropic 那条逐字相同：账号轮换、限额冷却、退避重试、
     /// usage 记账与取消处理全部留在编排层，只有字节形态在翻译器里变。
     CommandCodeNdjson,
+    /// Antigravity 的 **Gemini v1internal 信封 + SSE**：上游是 Google Cloud Code
+    /// Assist 的 `:streamGenerateContent?alt=sse`，每帧是 `data: {json}`，且真正的
+    /// Gemini 响应在 `response` 键下（缺省回退顶层，见规格 §4.2）。
+    /// 字段路径（`candidates[0].content.parts[*]`、`usageMetadata`、
+    /// `finishReason`、`thought` 位、`thoughtSignature`）全是 Gemini 方言，
+    /// 因此与 Anthropic / NDJSON 并列另开一台状态机（`upstream::translate` 的
+    /// `AntigravityToChatStream` ← `protocol::antigravity_stream`）。
+    /// 走翻译层的理由同上：账号轮换、限额冷却、退避重试、usage 记账与取消处理
+    /// 全部留在编排层，只有字节形态在翻译器里变。
+    AntigravityGemini,
 }
 
 /// 上游错误分类（架构文档 §4.2；三个动作的语义见模块头）。
@@ -1025,9 +1059,9 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // 生成）、粘贴 `user_` API Key、响应是 NDJSON（`UpstreamResponse::
         // CommandCodeNdjson`，见 `commandcode/mod.rs` 的模块头）
         ProviderKind::CommandCode => &super::commandcode::COMMANDCODE_ADAPTER,
-        // Antigravity（Google 的 AI IDE）：账号 / token 刷新 / 模型目录已接通，
-        // **会话转发留待下一步**（`build_chat_request` 返回 501；`is_stateful`
-        // 保持默认 false，见 `antigravity/mod.rs` 与 `antigravity/adapter.rs`）
+        // Antigravity（Google 的 AI IDE）：账号 / token 刷新 / 模型目录 / 会话转发
+        // 全部已接通（转发走 `UpstreamResponse::AntigravityGemini` 那条翻译层，
+        // 见 `antigravity/mod.rs` 与 `antigravity/adapter.rs`）
         ProviderKind::Antigravity => &super::antigravity::ANTIGRAVITY_ADAPTER,
     }
 }
@@ -1118,11 +1152,10 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // （`GET /provider/v1/models`，失败回落内置 26 项清单）—— 必须在列表里，
         // 否则目录刷新循环不会问它。
         ProviderKind::CommandCode,
-        // Antigravity 已接真身（账号 / token 刷新 / 目录），且有远程目录
+        // Antigravity 已接真身（账号 / token 刷新 / 目录 / 转发），且有远程目录
         // （`POST {base}:fetchAvailableModels`）—— 必须在列表里，否则目录刷新
-        // 循环不会问它。**会话转发本步留空**（`build_chat_request` 返回 501），
-        // 但这不影响「已接线」这个判定：本列表回答的是「这家接线了没有」，
-        // 不是「这家的转发能不能用」（与 MonkeyCode 同一处置）。
+        // 循环不会问它。转发走 `UpstreamResponse::AntigravityGemini` 那条翻译层
+        // （Gemini v1internal 信封 + SSE），`build_chat_request` 已接真身。
         ProviderKind::Antigravity,
     ]
 }

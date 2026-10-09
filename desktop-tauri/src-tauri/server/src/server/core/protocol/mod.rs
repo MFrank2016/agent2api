@@ -32,6 +32,11 @@
 //!                         `api.commandcode.ai` 的 `/alpha/generate` 返回
 //!                         `application/x-ndjson`，HTTP 恒 200、错误在流内；
 //!                         见该文件模块头）
+//!   antigravity_outbound.rs chat → Antigravity 的 Gemini v1internal 信封请求
+//!                         （内置家：Google Cloud Code Assist；见该文件模块头）
+//!   antigravity_schema.rs 工具参数 JSON Schema 清洗（规格坑 #13 的纯函数库，
+//!                         从 antigravity_outbound 拆出）
+//!   antigravity_stream.rs 上游 Gemini v1internal SSE → chat SSE（同上拆出）
 //!   history.rs           内部 Chat 体的历史 sanitize（客户端带来的畸形工具历史）
 //!
 //! 出站两个文件与回程两个文件方向相反：回程服务「下游说 X」的入口
@@ -46,6 +51,9 @@
 
 pub mod anthropic;
 pub mod anthropic_outbound;
+pub mod antigravity_outbound;
+pub mod antigravity_schema;
+pub mod antigravity_stream;
 pub mod commandcode_outbound;
 pub mod freeform;
 pub mod history;
