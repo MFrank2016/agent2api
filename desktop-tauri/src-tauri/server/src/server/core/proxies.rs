@@ -31,6 +31,8 @@ pub use crate::server::core::clash::{clash_proxy_options, CLASH_MIXED_UID};
 const MAX_HOST_LENGTH: usize = 255;
 const MAX_USER_LENGTH: usize = 200;
 const MAX_LABEL_LENGTH: usize = 100;
+const MAX_GROUP_LENGTH: usize = 60;
+const MAX_ROTATION_MEMBERS: usize = 64;
 
 /// 代理配置错误（对应 Node 版 ProxyConfigError，状态码固定 400）。
 ///
@@ -131,6 +133,49 @@ pub fn normalize_account_proxy(input: &Value) -> Result<Option<Value>, ProxyConf
             return Err(ProxyConfigError::new("缺少代理池条目 id"));
         }
         return Ok(Some(json!({ "source": "pool", "proxyId": proxy_id })));
+    }
+    if source == "pool-rotate" {
+        let group = clean_string(object.get("group"), MAX_GROUP_LENGTH);
+        let proxy_ids = match object.get("proxyIds") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(items)) => {
+                let mut ids: Vec<String> = Vec::new();
+                for item in items {
+                    let id = clean_string(Some(item), MAX_LABEL_LENGTH);
+                    if id.is_empty() {
+                        return Err(ProxyConfigError::new("轮询出口的 proxyIds 含空项"));
+                    }
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+                if ids.len() > MAX_ROTATION_MEMBERS {
+                    return Err(ProxyConfigError::new(format!("轮询出口成员过多（最多 {MAX_ROTATION_MEMBERS}）")));
+                }
+                ids
+            }
+            Some(_) => return Err(ProxyConfigError::new("轮询出口的 proxyIds 必须是数组")),
+        };
+        if group.is_empty() && proxy_ids.is_empty() {
+            return Err(ProxyConfigError::new("轮询出口缺少成员（group 或 proxyIds）"));
+        }
+        let strategy = {
+            let raw = clean_string(object.get("strategy"), 20).to_lowercase();
+            if raw.is_empty() { Strategy::RoundRobin }
+            else { Strategy::parse(&raw).ok_or_else(|| ProxyConfigError::new("轮询策略必须是 round-robin / random / least-latency"))? }
+        };
+        let on_error = {
+            let raw = clean_string(object.get("onError"), 10).to_lowercase();
+            if raw.is_empty() { OnError::Next }
+            else { OnError::parse(&raw).ok_or_else(|| ProxyConfigError::new("onError 必须是 next 或 none"))? }
+        };
+        return Ok(Some(json!({
+            "source": "pool-rotate",
+            "group": group,
+            "proxyIds": proxy_ids,
+            "strategy": strategy.as_str(),
+            "onError": on_error.as_str(),
+        })));
     }
     if source != "custom" {
         return Err(ProxyConfigError::new(format!("不支持的代理来源: {source}")));
@@ -646,5 +691,21 @@ mod tests {
     fn account_egress_from_json_falls_back_to_direct_on_garbage() {
         assert!(matches!(AccountEgress::from_json(&serde_json::json!({"source":"pool-rotate","members":[]})), AccountEgress::Direct));
         assert!(matches!(AccountEgress::from_json(&serde_json::json!(42)), AccountEgress::Direct));
+    }
+
+    #[test]
+    fn normalize_pool_rotate_accepts_and_rejects() {
+        let ok = normalize_account_proxy(&serde_json::json!({
+            "source":"pool-rotate","group":"kilo","strategy":"least-latency","onError":"none"
+        })).unwrap().unwrap();
+        assert_eq!(ok["strategy"], "least-latency");
+        assert_eq!(ok["onError"], "none");
+
+        // 空成员
+        assert!(normalize_account_proxy(&serde_json::json!({"source":"pool-rotate"})).is_err());
+        // 非法策略
+        assert!(normalize_account_proxy(&serde_json::json!({"source":"pool-rotate","group":"x","strategy":"fastest"})).is_err());
+        // proxyIds 非数组
+        assert!(normalize_account_proxy(&serde_json::json!({"source":"pool-rotate","proxyIds":"a"})).is_err());
     }
 }
