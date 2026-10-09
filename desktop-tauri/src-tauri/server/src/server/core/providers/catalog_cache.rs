@@ -92,6 +92,10 @@ pub const SCOPE_CODEARTS: &str = "codearts";
 pub const SCOPE_TRAE: &str = "trae";
 /// Loomy（讯飞；`GET {集成网关}/api/v1/models`，OpenAI 格式目录）
 pub const SCOPE_LOOMY: &str = "loomy";
+/// MonkeyCode 国内版（`GET {站点}/api/v1/users/models`）
+pub const SCOPE_MONKEYCODE_CN: &str = "monkeycodeCn";
+/// MonkeyCode 国际版（两个站点各一份清单，缓存分开）
+pub const SCOPE_MONKEYCODE_INTL: &str = "monkeycodeIntl";
 
 /// 全部 scope（事实来源：`cached_scopes` 按它遍历；新增一家时加在这里）。
 pub const ALL_SCOPES: &[&str] = &[
@@ -109,6 +113,8 @@ pub const ALL_SCOPES: &[&str] = &[
     SCOPE_CODEARTS,
     SCOPE_TRAE,
     SCOPE_LOOMY,
+    SCOPE_MONKEYCODE_CN,
+    SCOPE_MONKEYCODE_INTL,
 ];
 
 /// 一份清单缓存

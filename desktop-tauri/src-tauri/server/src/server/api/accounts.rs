@@ -655,6 +655,54 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
                 if import_desktop { "desktop" } else { "manual" },
             )
         }
+        // MonkeyCode（长亭科技）：**粘贴 session**（`monkeycode_ai_session` cookie）
+        // → 先向上游 `GET /api/v1/users/status` 校验并归一化，再落账号（`login.rs`
+        // 里顺带 best-effort 发现 image_id）。两个站点走同一份实现、按地区参数化
+        // （provider id 是权威，见 `monkeycode::region`）。
+        //
+        // `importDesktop` 不提供：本家的登录态就是浏览器 cookie，没有客户端
+        // 「auth.json」那种可读文件（与 Accio / ZCode 同一处境）。
+        Some(kind @ (crate::server::core::providers::ProviderKind::MonkeyCode
+            | crate::server::core::providers::ProviderKind::MonkeyCodeIntl)) => {
+            let region = crate::server::core::providers::monkeycode::Region::from_kind(kind)
+                .unwrap_or(crate::server::core::providers::monkeycode::Region::Cn);
+            if import_desktop {
+                return management_error(
+                    400,
+                    format!(
+                        "MonkeyCode {}不支持导入桌面端登录态，请粘贴 session（monkeycode_ai_session）添加账号",
+                        region.label()
+                    ),
+                );
+            }
+            let session = payload
+                .get("session")
+                .or_else(|| payload.get("accessToken"))
+                .or_else(|| payload.get("token"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+            if session.is_empty() {
+                return management_error(400, "请粘贴 MonkeyCode 的 session cookie（monkeycode_ai_session）");
+            }
+            let provided_image = payload
+                .get("imageId")
+                .or_else(|| payload.get("image_id"))
+                .and_then(Value::as_str);
+            match crate::server::core::providers::monkeycode::login::verify_session(
+                region,
+                &session,
+                provided_image,
+            )
+            .await
+            {
+                Ok(credentials) => {
+                    store.add_monkeycode_account(region, &credentials, import_name, "manual")
+                }
+                Err(error) => return management_error(error.status_code, error.message),
+            }
+        }
         // WorkBuddy 系的两家（国内版 / 国际版）：同一套凭证形态与落账号路径，
         // 差别只有归属 —— provider id 自己就是归属（拆家后不再从 payload 里的
         // `edition` 反推：那是账号的属性，而落哪一家是身份问题）。
@@ -958,6 +1006,23 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
             "CatPaw 登录态没有刷新机制：请在 CatPaw 桌面端重新登录，\
              然后在本页重新导入桌面端登录态（或重新粘贴新的登录凭证）",
         );
+    }
+    // MonkeyCode 的两个站点：同样**没有刷新机制**（session 30 天硬限制，
+    // 上游无 refresh 接口，见 `providers::monkeycode::credentials` 的模块头）。
+    // 不显式拦下的话会落到下面的 workbuddy 兜底链路，用户会收到一条与腾讯
+    // 鉴权端点相关的错误 —— 与 CatPaw 漏登记时的症状同一性质。
+    for region in crate::server::core::providers::monkeycode::Region::ALL {
+        if state
+            .store()
+            .monkeycode_account_record(region, &id)
+            .is_some()
+        {
+            return management_error(
+                400,
+                "MonkeyCode 登录态没有刷新机制（会话 30 天、上游无续期接口）：\
+                 请在浏览器重新取一次 session cookie 后在本页重新粘贴",
+            );
+        }
     }
     // WorkBuddy 系（国内版 / 国际版）的兜底：两条链路都按**账号自己的**
     // endpoint / prefixPath / platform / edition 续期

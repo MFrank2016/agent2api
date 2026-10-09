@@ -990,6 +990,12 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // 分配算力 → SSE），账号管理走粘贴 Cookie / 导入本机登录态
         // （见 `kuku/mod.rs` 的模块头）
         ProviderKind::Kuku => &super::kuku::KUKU_ADAPTER,
+        // MonkeyCode（长亭科技）：账号管理（粘贴 session）+ 模型目录已接通，
+        // **会话转发本步留空**（`is_stateful` 为 true，转发入口返回 501，
+        // 见 `monkeycode/mod.rs` 与 `monkeycode/adapter.rs` 的模块头）。
+        // 两个站点是两个 provider、两个实例（同一份实现按地区参数化）
+        ProviderKind::MonkeyCode => &super::monkeycode::MONKEYCODE_ADAPTER,
+        ProviderKind::MonkeyCodeIntl => &super::monkeycode::MONKEYCODE_INTL_ADAPTER,
     }
 }
 
@@ -1068,6 +1074,13 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // （`/wenchain/genflowpro/model_list`）—— 必须在列表里，否则刷新循环
         // 不会问它（与 Trae 同一理由）。
         ProviderKind::Kuku,
+        // MonkeyCode 的两个站点各算一家：适配器已接线（账号 / 目录已通），
+        // 且有远程目录（`GET /api/v1/users/models`）—— 必须在列表里，否则
+        // 目录刷新循环不会问它。**会话转发本步留空**（`forward_conversation`
+        // 返回 501），但这不影响「已接线」这个判定：本列表回答的是「这家
+        // 接线了没有」，不是「这家的转发能不能用」。
+        ProviderKind::MonkeyCode,
+        ProviderKind::MonkeyCodeIntl,
     ]
 }
 

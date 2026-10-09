@@ -118,6 +118,11 @@ pub mod content_block;
 pub mod custom;
 pub mod kuku;
 pub mod loomy;
+/// MonkeyCode（长亭科技的开源 AI 开发平台）。适配实现在 `monkeycode/`：
+/// 账号管理（粘贴 session）+ 模型目录（`GET /api/v1/users/models`）已接通，
+/// **会话转发留空由下一步接入**（上游是「建任务 → WebSocket 任务流」，
+/// `is_stateful` 为 true，见 `monkeycode/mod.rs` 的模块头）。
+pub mod monkeycode;
 pub mod onboarding_memory;
 pub mod qoder;
 pub mod raccoon;
@@ -361,6 +366,25 @@ pub enum ProviderKind {
     /// `core::auto_checkin`（清单里列 `kuku`），claim 见 `kuku::checkin`。
     /// 业务会话靠换发的 genflowpro STOKEN（`kuku::engine`）。
     Kuku,
+    /// MonkeyCode（长亭科技）**国内版**（`monkeycode-ai.com`）。适配实现在
+    /// `monkeycode/`：账号管理（**粘贴 session cookie**）与模型目录
+    /// （`GET /api/v1/users/models`）已接通；**会话转发留空由下一步接入**
+    /// （上游是「建任务 → WebSocket 任务流」，`is_stateful()` 为 true）。
+    ///
+    /// ── 与 [`ProviderKind::MonkeyCodeIntl`] 是同一套协议的两个站点 ────
+    /// 与 AutoClaw / Qoder / ZCode 的两地同一思路：地区是**provider 身份**
+    /// 而不是账号属性。地区 → 域名 / 身份的互查在 `monkeycode::Region`
+    /// （`kind` / `provider_id` / `from_provider_id`），别处不要再写
+    /// `"monkeycode-intl"` 这类字面量。
+    MonkeyCode,
+    /// MonkeyCode **国际版**（`monkeycode-ai.net`，官方托管入口）。与
+    /// [`ProviderKind::MonkeyCode`] 同一套协议、不同站点。
+    ///
+    /// ── 参考资料的覆盖面（一处必须知道的事实）────────────────────
+    /// 逆向参考只覆盖国内站 `.com`；`.net` 的站点存在由官方发布渠道确认，
+    /// 但参考没有 `.net` 的实测端点 / cookie 名差异记录。本家按「同协议换站点」
+    /// 建模，差异待实测（见 `monkeycode/region.rs` 的模块头）。
+    MonkeyCodeIntl,
 }
 
 /// 一个提供商的静态元数据。
@@ -433,6 +457,12 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // KukuAI（百度文库库库 AI）：单一地区、单一入口（粘贴 Cookie / 导入本机
     // 客户端登录态），没有国际版伴生。排在末尾（2026-10 接入，后到居后）。
     ProviderMeta { id: "kuku", label: "KukuAI" },
+    // MonkeyCode（长亭科技）的两个站点**相邻**排列（与 AutoClaw / Qoder /
+    // ZCode 同一理由：同一条产品线的两个版本，中间隔着别家会让「找国际版」
+    // 变成一次扫描）。顺序也决定模型目录合并时同名模型先归谁家 ——
+    // 国内版在前（用户直觉里「MonkeyCode 就是国内那个站」）。
+    ProviderMeta { id: "monkeycode", label: "MonkeyCode" },
+    ProviderMeta { id: "monkeycode-intl", label: "MonkeyCode 国际版" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -511,6 +541,8 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "trae" => Some(ProviderKind::Trae),
         "loomy" => Some(ProviderKind::Loomy),
         "kuku" => Some(ProviderKind::Kuku),
+        "monkeycode" => Some(ProviderKind::MonkeyCode),
+        "monkeycode-intl" => Some(ProviderKind::MonkeyCodeIntl),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -547,6 +579,8 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::Trae => "trae",
         ProviderKind::Loomy => "loomy",
         ProviderKind::Kuku => "kuku",
+        ProviderKind::MonkeyCode => "monkeycode",
+        ProviderKind::MonkeyCodeIntl => "monkeycode-intl",
     }
 }
 
