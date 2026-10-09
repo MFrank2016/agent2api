@@ -183,11 +183,13 @@ fn pool_references(state: &ServerState) -> std::collections::HashMap<String, Vec
     references
 }
 
-/// 池列表的响应体：`{items, clash}`。
+/// 池列表的响应体：`{items, clash, groups}`。
 ///
 /// 每个条目注入 `usedBy`（引用它的账号）—— 删除确认框要用它提示
 /// 「有 N 个账号正在使用」；`clash` 是实时快照，前端据此显示「Clash 是否可用 /
-/// 有几个出口」。所有写操作也返回这份（与模型管理页的写接口同约定：前端就地替换）。
+/// 有几个出口」；`groups` 是去重后的分组摘要（`[{name, count}]`，按名称升序），
+/// 供（后续的）分组下拉框渲染。所有写操作也返回这份（与模型管理页的写接口同约定：
+/// 前端就地替换）。
 fn pool_payload(state: &ServerState) -> Value {
     let references = pool_references(state);
     let items: Vec<Value> = proxy_pool::list()
@@ -205,9 +207,20 @@ fn pool_payload(state: &ServerState) -> Value {
             item
         })
         .collect();
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for item in proxy_pool::list() {
+        if let Some(group) = item.get("group").and_then(Value::as_str).filter(|g| !g.is_empty()) {
+            *counts.entry(group.to_string()).or_insert(0) += 1;
+        }
+    }
+    let groups: Vec<Value> = counts
+        .into_iter()
+        .map(|(name, count)| json!({"name": name, "count": count}))
+        .collect();
     json!({
         "items": items,
         "clash": crate::server::core::proxies::clash_proxy_options(),
+        "groups": groups,
     })
 }
 
