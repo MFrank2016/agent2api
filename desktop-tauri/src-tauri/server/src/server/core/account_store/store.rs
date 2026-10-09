@@ -616,11 +616,10 @@ impl AccountStore {
         if !record.has_credentials() {
             return None;
         }
-        let (proxy, egress, proxy_error) = split_egress(resolve_account_egress(Some(&record.proxy())));
+        let (_proxy, egress, proxy_error) = split_egress(resolve_account_egress(Some(&record.proxy())));
         Some(SessionById {
             id: record.id().to_string(),
             session: self.session_from_record(&record),
-            proxy,
             egress,
             proxy_error,
         })

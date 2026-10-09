@@ -161,13 +161,33 @@ fn test_egress_primary(
 
 // ─── 代理池（「网络代理」页）─────────────────────────────────
 
-/// 引用统计：`proxyId → [{id, name}]`（引用它的账号）。
+/// 引用统计：`poolItemId → [{id, name, enabled}]`（引用它的账号）。
 ///
-/// 只认 `proxy.config.source == "pool"` 的记录：账号里存的 pool 引用在
-/// describe 之后的形态是 `{source:'pool', ..., config:{source:'pool', proxyId}}`
-/// （见 `core::proxies::describe_account_proxy`）—— 解析失败的记录 config 也在，
-/// 所以「引用了一个已被删掉的代理」同样统计得到（那正是最需要提醒用户的情况）。
-fn pool_references(state: &ServerState) -> std::collections::HashMap<String, Vec<Value>> {
+/// 两类引用都统计：
+///   - `source == "pool"`：账号直接引用了某条目（按 `proxyId`）。存的是引用
+///     而非快照，所以「引用了一个已被删掉的代理」同样统计得到（那正是最需要
+///     提醒用户的情况）。
+///   - `source == "pool-rotate"`：轮询组账号能用到的**每个**成员条目都算一次
+///     引用 —— 命中判据与 `proxy_pool::members_for` 同口径：条目的 `group`
+///     等于配置里的非空 `group`，或条目的 `id` 列在配置的 `proxyIds` 里。
+///     删除确认框据此提示「有 N 个账号正在使用」，轮询组也算数。
+///
+/// `items` 是本次池快照（由 `pool_payload` 读一次后传入），避免重复读库。
+fn pool_references(
+    state: &ServerState,
+    items: &[Value],
+) -> std::collections::HashMap<String, Vec<Value>> {
+    fn push_reference(
+        references: &mut std::collections::HashMap<String, Vec<Value>>,
+        key: &str,
+        account: &Value,
+    ) {
+        references.entry(key.to_string()).or_default().push(json!({
+            "id": account.get("id").cloned().unwrap_or(Value::Null),
+            "name": account.get("name").cloned().unwrap_or(Value::Null),
+            "enabled": account.get("enabled").cloned().unwrap_or(Value::Bool(true)),
+        }));
+    }
     let mut references: std::collections::HashMap<String, Vec<Value>> =
         std::collections::HashMap::new();
     let snapshot = state.store().list_accounts();
@@ -178,17 +198,33 @@ fn pool_references(state: &ServerState) -> std::collections::HashMap<String, Vec
         let Some(config) = account.get("proxy").and_then(|proxy| proxy.get("config")) else {
             continue;
         };
-        if config.get("source").and_then(Value::as_str) != Some("pool") {
-            continue;
+        match config.get("source").and_then(Value::as_str) {
+            Some("pool") => {
+                let Some(proxy_id) = config.get("proxyId").and_then(Value::as_str) else {
+                    continue;
+                };
+                push_reference(&mut references, proxy_id, account);
+            }
+            Some("pool-rotate") => {
+                let group = config.get("group").and_then(Value::as_str).unwrap_or("");
+                let proxy_ids: Vec<&str> = config
+                    .get("proxyIds")
+                    .and_then(Value::as_array)
+                    .map(|ids| ids.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                for item in items {
+                    let Some(item_id) = item.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let group_match = !group.is_empty()
+                        && item.get("group").and_then(Value::as_str) == Some(group);
+                    if group_match || proxy_ids.contains(&item_id) {
+                        push_reference(&mut references, item_id, account);
+                    }
+                }
+            }
+            _ => {}
         }
-        let Some(proxy_id) = config.get("proxyId").and_then(Value::as_str) else {
-            continue;
-        };
-        references.entry(proxy_id.to_string()).or_default().push(json!({
-            "id": account.get("id").cloned().unwrap_or(Value::Null),
-            "name": account.get("name").cloned().unwrap_or(Value::Null),
-            "enabled": account.get("enabled").cloned().unwrap_or(Value::Bool(true)),
-        }));
     }
     references
 }
@@ -201,10 +237,12 @@ fn pool_references(state: &ServerState) -> std::collections::HashMap<String, Vec
 /// 供（后续的）分组下拉框渲染。所有写操作也返回这份（与模型管理页的写接口同约定：
 /// 前端就地替换）。
 fn pool_payload(state: &ServerState) -> Value {
-    let references = pool_references(state);
-    let items: Vec<Value> = proxy_pool::list()
-        .into_iter()
-        .map(|mut item| {
+    let items_all = proxy_pool::list();
+    let references = pool_references(state, &items_all);
+    let items: Vec<Value> = items_all
+        .iter()
+        .map(|item| {
+            let mut item = item.clone();
             let used = item
                 .get("id")
                 .and_then(Value::as_str)
@@ -218,7 +256,7 @@ fn pool_payload(state: &ServerState) -> Value {
         })
         .collect();
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    for item in proxy_pool::list() {
+    for item in &items_all {
         if let Some(group) = item.get("group").and_then(Value::as_str).filter(|g| !g.is_empty()) {
             *counts.entry(group.to_string()).or_insert(0) += 1;
         }

@@ -24,6 +24,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::server::core::egress;
+use crate::server::core::proxies::{AccountEgress, OnError, RotationPlan};
 use crate::server::errors::GatewayError;
 
 /// 单次对话请求的总超时（除退避重试外的等待时间）。
@@ -137,6 +138,18 @@ pub async fn read_upstream_error(
     UpstreamErrorDetail { code, message }
 }
 
+/// 轮询计划一次请求会尝试的出口数（spec §9 的 N）：`onError=next` 试全部成员，
+/// `onError=none` 只试首选；至少 1（成员为空理论上不可达 —— `resolve_account_egress`
+/// 对空成员直接回 `Failed`，这里防御性兜底，免得文案出现「0 个出口」）。
+fn rotation_attempts(plan: &RotationPlan) -> usize {
+    let count = if plan.on_error == OnError::Next {
+        plan.members.len()
+    } else {
+        1
+    };
+    count.max(1)
+}
+
 /// 发一次上游请求（不读 body，保留原始响应给流式转发与错误解析）。
 ///
 /// 与 `core::auth_http::send_raw` 的分工：那个把响应读成文本，用于管理接口；
@@ -157,11 +170,13 @@ pub async fn send_chat_request(
         }
         builder
     });
-    // 出口说明（失败文案用）：文案照抄 Node 的 fetchViaProxy
-    let via = match plan.egress.primary() {
-        Some(proxy) if !proxy.label.is_empty() => format!("经代理 {}", proxy.label),
-        Some(proxy) => format!("经代理 {}", proxy.host),
-        None => "直连".to_string(),
+    // 出口说明（失败文案用）：按**出口类型**描述，而不是 `primary()` 指到的
+    // 第一个成员 —— 轮询组可能在别的成员上尝试 / 成功，点名首个成员会误导。
+    let via = match &plan.egress {
+        AccountEgress::Direct => "直连".to_string(),
+        AccountEgress::Single(proxy) if !proxy.label.is_empty() => format!("经代理 {}", proxy.label),
+        AccountEgress::Single(proxy) => format!("经代理 {}", proxy.host),
+        AccountEgress::Rotate(plan) => format!("轮询组（{} 个出口）", rotation_attempts(plan)),
     };
     // 等待响应头有上限（见 headers_timeout 的说明）：超时后 future 被丢弃，
     // 上游连接随之关闭（与客户端断开时的取消是同一机制）
@@ -183,10 +198,19 @@ pub async fn send_chat_request(
             let message = if error.is_timeout() {
                 format!("连接中超时({}秒，出口 {via})", connect_timeout_seconds())
             } else {
-                format!(
-                    "上游请求失败（{via}）: {}",
-                    egress::describe_error_detail(&error)
-                )
+                let detail = egress::describe_error_detail(&error);
+                // 轮询组 onError=next：到这里说明**所有成员都连不上**，按 spec §9
+                // 补上「已尝试 N 个出口」。via 里已是「轮询组（N 个出口）」，这里换
+                // 一种写法避免再套一层括号（可读性）。
+                match &plan.egress {
+                    AccountEgress::Rotate(plan) if plan.on_error == OnError::Next => {
+                        format!(
+                            "上游请求失败（轮询组，已尝试 {} 个出口）: {detail}",
+                            rotation_attempts(plan)
+                        )
+                    }
+                    _ => format!("上游请求失败（{via}）: {detail}"),
+                }
             };
             Err(UpstreamRequestError { message, reason })
         }

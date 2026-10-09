@@ -624,6 +624,26 @@ pub fn resolve_account_proxy(config: Option<&Value>) -> Option<ProxyResolution> 
 #[derive(Clone, Debug)]
 pub enum EgressResolution { Resolved(AccountEgress), Failed(String) }
 
+/// 轮询计划的进程内状态键：成员端点串**排序**后拼接（`protocol://host:port`）。
+///
+/// 排序是为了让「同一组成员、不同书写顺序」的账号落到同一个键 —— 否则它们
+/// 各自持有一份游标 / EWMA，round-robin 与延迟择优都会各转各的。
+fn rotation_group_key(members: &[ResolvedProxy]) -> String {
+    let mut keys: Vec<String> = members
+        .iter()
+        .map(|m| {
+            format!(
+                "{}://{}:{}",
+                m.protocol,
+                m.host,
+                m.port.map(|p| p.to_string()).unwrap_or_default()
+            )
+        })
+        .collect();
+    keys.sort();
+    keys.join("|")
+}
+
 /// 把账号里存的代理配置解析成统一出口（Direct / Single / Rotate）。
 pub fn resolve_account_egress(config: Option<&Value>) -> EgressResolution {
     let Some(config) = config else { return EgressResolution::Resolved(AccountEgress::Direct) };
@@ -643,11 +663,7 @@ pub fn resolve_account_egress(config: Option<&Value>) -> EgressResolution {
         }
         let strategy = object.get("strategy").and_then(Value::as_str).and_then(Strategy::parse).unwrap_or(Strategy::RoundRobin);
         let on_error = object.get("onError").and_then(Value::as_str).and_then(OnError::parse).unwrap_or(OnError::Next);
-        let group_key = members
-            .iter()
-            .map(|m| format!("{}://{}:{}", m.protocol, m.host, m.port.map(|p| p.to_string()).unwrap_or_default()))
-            .collect::<Vec<_>>()
-            .join("|");
+        let group_key = rotation_group_key(&members);
         return EgressResolution::Resolved(AccountEgress::Rotate(RotationPlan { members, strategy, on_error, group_key }));
     }
     match resolve_account_proxy(Some(config)) {
@@ -744,6 +760,19 @@ mod tests {
             }
             other => panic!("expected rotate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rotation_group_key_is_order_independent() {
+        let member = |host: &str, port: u16| ResolvedProxy {
+            source: "pool".into(), protocol: "http".into(), host: host.into(),
+            port: Some(port), username: String::new(), password: String::new(), label: String::new(),
+        };
+        // 同一组成员、两种书写顺序 → 同一个键（否则游标 / EWMA 不共享）
+        let forward = rotation_group_key(&[member("1.2.3.4", 8080), member("5.6.7.8", 9090)]);
+        let reversed = rotation_group_key(&[member("5.6.7.8", 9090), member("1.2.3.4", 8080)]);
+        assert_eq!(forward, reversed);
+        assert_eq!(forward, "http://1.2.3.4:8080|http://5.6.7.8:9090");
     }
 
     #[test]
