@@ -288,9 +288,9 @@ pub async fn ensure_fresh(
 ///   - `expiresAt`：`now + expires_in`（规格 §2 的 `expiry_timestamp` 口径）；
 ///   - `projectId`：本次**刷到了**才写（见下）。
 ///
-/// ── project 的发现时机（本步的取舍）──────────────────────────
+/// ── project 的发现时机 ──────────────────────────────────────
 /// `project` 只影响聊天请求（规格 §3.4：目录 / 额度 / loadCodeAssist 都忽略它），
-/// 而聊天本步未接通，所以这里只做**一次** best-effort 补齐：账号记录里没有
+/// 因此这里只做**一次** best-effort 补齐：账号记录里没有
 /// projectId 时顺手发现一次，失败只打日志、不影响刷新结果（用户加账号时
 /// `login.rs` 不阻塞同一条路径）。
 async fn refresh_and_save(

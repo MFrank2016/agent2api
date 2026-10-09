@@ -46,17 +46,19 @@
 //!      通用层不出现任何 provider 分支 —— 与 `retry_advice` 同一分工。
 //!   5. `supports_refresh` + `credentials_expiring`（凭证自动维护）：
 //!      「这家能不能主动续期」「这个账号的凭证此刻算不算临期」是**各家的知识**
-//!      （过期时间在哪个字段、用什么窗口，四家各不相同），因此由适配器回答，
+//!      （过期时间在哪个字段、用什么窗口，各家各不相同），因此由适配器回答，
 //!      维护任务（`core::credential_maintenance`）只负责遍历与调用。
 //!      放在这里而不是壳侧：壳侧只能按账号公开形态里的字段名判断，而那个字段名
-//!      四家不同（小浣熊的过期时间在 `tokenExpiresAt`，公开形态里没有 `expiresAt`）
+//!      各家不同（小浣熊的过期时间在 `tokenExpiresAt`，公开形态里没有 `expiresAt`）
 //!      —— 写死一个名字就会让别家的账号永远被判成「无需刷新」。
 //!      契约：**判不出来就返回 false**（没有过期信息 / 账号不存在），
 //!      宁可漏刷也不要凭猜测去打上游。
 //!   6. `is_stateful` + `forward_conversation`（W4a 加钩子，W5-T-d4 接上消费方，
 //!      架构文档 §4.2.1）：本 provider 的上游是不是**多步会话协议**
 //!      （CatPaw 是：round → turn → 工具循环 → completed）。默认 false；
-//!      当前唯一的 true 是 `catpaw::CatPawAdapter`。`forward_conversation` 是
+//!      覆写成 true 的是走会话式转发（`forward_conversation`）的家（CatPaw /
+//!      Qoder / Accio / CodeArts / Trae / Kuku / MonkeyCode，见各自 `mod.rs`
+//!      的模块头）。`forward_conversation` 是
 //!      会话式转发的入口（默认 503，只有有状态 provider 覆写），编排层的
 //!      `provider_loop` 按 `is_stateful` 分流到它 —— 分流落地后本文件不再需要
 //!      任何死代码抑制。
@@ -72,7 +74,7 @@
 //!      凭证、落账号走哪条添加路径」全是 provider 知识，与 `sse_model_rewrite`
 //!      同一性质；路由层只该回答「这家支不支持」，不该认识小浣熊的字段名。
 //!   8. `supports_usage` + `query_usage`（余额 / 积分查询）：「这家有没有余额概念」
-//!      「这个账号的余额怎么查」是 provider 知识（四家的接口地址、鉴权头、
+//!      「这个账号的余额怎么查」是 provider 知识（各家的接口地址、鉴权头、
 //!      凭证来源全不相同：workbuddy 走腾讯计费接口、小浣熊要 Bearer JWT、
 //!      CatPaw 要网页会话 cookie `token2`、AutoClaw 走带签名的 userapi 域），
 //!      所以由适配器回答，`api::accounts` 只负责并发调度与单账号失败的收敛。
@@ -81,8 +83,9 @@
 //!      统一形状的契约写在 [`ProviderAdapter::query_usage`] 的文档里。
 //!   9. `supports_model_refresh` + `refresh_models(force)`（「刷新模型清单」）：
 //!      「这家有没有远程目录可拉」与「这次要不要绕过缓存」是两件事，拆成两个
-//!      入口（前者恒定能力，后者单次语义）。**五家现在都覆写成 true** ——
-//!      每家都有远程目录：WorkBuddy `GET /v3/config`、小浣熊
+//!      入口（前者恒定能力，后者单次语义）。**现在各家都覆写成 true** ——
+//!      每家都有远程目录（下列是早期五家的接口，后来接入的家见各自
+//!      `models.rs` 的模块头）：WorkBuddy `GET /v3/config`、小浣熊
 //!      `GET {llmBase}/model_catalog`、Qoder `GET {gateway}algo/api/v2/model/list`、
 //!      CatPaw `POST /api/agent/maas/model-types`、AutoClaw
 //!      `GET .../proxy/autoclaw-model-config`。
@@ -102,7 +105,7 @@
 //!      接一家要有一家的证据，没证据就注入等于把未知参数推给上游。
 //!
 //! ── 未注册的 provider 怎么办 ────────────────────────────────
-//! 四家 provider 在 [`adapter_for`] 里各自接上真身，那个 match 是穷举的：
+//! 各家 provider 在 [`adapter_for`] 里各自接上真身，那个 match 是穷举的：
 //! 加新 kind 时编译器强制在这里给出分支，「注册了 provider 却忘了接线」的
 //! 情形在编译期就被拦住。过渡期曾用它返回一个占位适配器
 //! （`pending::PendingAdapter`，W4a–W5 期间 CatPaw / AutoClaw 借它顶着，
@@ -265,7 +268,7 @@ pub enum UpstreamErrorClass {
     ///
     /// 它是「误报」信号而不是账号问题：账号余额健康、未限流、session 未死，
     /// 换账号再试只会白扔另一个账号的额度（同一份 body 换谁发都会被拦）。
-    /// 判定规则是五家共用的（见 `providers::content_block`），编排层的动作见
+    /// 判定规则是各家共用的（见 `providers::content_block`），编排层的动作见
     /// `upstream::provider_loop` 的「动作 0」。
     ContentBlocked {
         status: u16,
@@ -319,7 +322,7 @@ pub struct RetryAdvice {
 pub enum ReasoningPatch {
     /// 注入：把 body 顶层的 `field` 设成 `value`（覆盖同名的旧值）。
     ///
-    /// `Value` 而不是 `String`：当前两家（CatPaw / Qoder）要的都是字符串档位，
+    /// `Value` 而不是 `String`：当前覆写这个钩子的几家要的都是字符串档位，
     /// 但上游表达「开思考 + 档位」的形态未必都是字符串（布尔开关、嵌套对象
     /// 都常见），留成 `Value` 让将来那家不必先改这个枚举的**形状**。
     Set {
@@ -387,13 +390,13 @@ pub trait ProviderAdapter: Send + Sync {
     /// 哪些模型」，写错会把用户真能用的模型挡在门外。
     ///
     /// ── `store` 为什么是参数（而不是让实现自己造一个）──────────
-    /// 需要按账号状态收窄的实现（当前只有 Cline 按额度池）必须读**调用方手上
-    /// 那个 store 句柄**：`AccountStore` 是 `Clone` 但每个 `with_config_dir()`
+    /// 需要按账号状态收窄的实现必须读**调用方手上那个 store 句柄**：
+    /// `AccountStore` 是 `Clone` 但每个 `with_config_dir()`
     /// 各自持一把锁，自己再造一个就成了「绕过主句柄的第二把锁」——
     /// 读到的可能不是最新状态，而且它保护的读-改-写周期与主句柄互不可见。
     /// 由调用方传入既省一次文件读，也让「读的是同一份账号状态」这件事成立。
     ///
-    /// 默认恒等（另外五家没有「同一个模型的两个通道」这种结构），
+    /// 默认恒等（现在各家都没有「同一个模型的两个通道」这种结构），
     /// 因此默认实现忽略 `store`。
     fn advertise_models(&self, _store: &AccountStore, manifest: Vec<Value>) -> Vec<Value> {
         manifest
@@ -448,9 +451,10 @@ pub trait ProviderAdapter: Send + Sync {
     ///
     /// ── 为什么默认是「不接」而不是「透传一个通用字段」────────────
     /// 默认实现返回 `Skip`，且**所有没覆写的家都应当保持它**。理由是本项目的
-    /// 一条既有事实：五家里有三家（workbuddy / 小浣熊 / Cline）的
-    /// `build_chat_request` 是 `body.clone()` 原样透传，另外两家的上游协议由
-    /// 各自的 resolver 现算档位 —— **没有任何证据**表明它们认识一个通用档位
+    /// 一条既有事实：多数家（workbuddy / 小浣熊 / Cline 等）的
+    /// `build_chat_request` 是 `body.clone()` 原样透传，需要翻译档位的家
+    /// 各有各的现算路径（见各适配器对 [`Self::reasoning_patch`] 的覆写）——
+    /// **没有任何证据**表明它们认识一个通用档位
     /// 字段。给上游塞一个它不认识的键不叫「让绑定生效」，只是把未知参数推过去：
     /// 好一点的情况是被忽略（用户以为生效了，其实没有），坏一点是 400。
     /// 所以接一家要有一家的证据（上游枚举、实测、上游自己的 resolver 认这个键），
@@ -470,7 +474,7 @@ pub trait ProviderAdapter: Send + Sync {
     /// 编排层在按家改写模型名时才解析出来（同一处，见 `catalog::WireTarget`）；
     /// 把它塞进 `build_chat_request` 会让适配器看到一份与它无关的编排层状态，
     /// 也会让 `forward_conversation` 那条有状态路径（CatPaw / Qoder 都走它）
-    /// 拿不到这个值 —— 而这两家恰恰是唯一要翻译的两家。
+    /// 拿不到这个值 —— 而这两家恰恰也需要翻译档位。
     ///
     /// `model` 是**即将发给上游的那个名字**（已按家改写，见 `WireTarget.model`）：
     /// 需要按模型判断档位的家（Qoder 要拿它去查模型的 `efforts`）用它，
@@ -628,7 +632,7 @@ pub trait ProviderAdapter: Send + Sync {
         true
     }
 
-    /// 本 provider 是否有**已接入的推理转发能力**（五家现在都是 true）。
+    /// 本 provider 是否有**已接入的推理转发能力**（各家现在都是 true）。
     ///
     /// ── 这条声明曾经区分过什么（历史，别误会成现在还有 false）─────
     /// Qoder 在接入推理协议之前返回 false（它当时只有账号管理能力），
@@ -654,7 +658,8 @@ pub trait ProviderAdapter: Send + Sync {
     /// 本 provider 是否有**可拉取的远程模型目录**（模块头扩展 9）。
     ///
     /// 判据与 `supports_refresh` 同一口径：**上游到底有没有那个接口**，
-    /// 不是「我们想不想实现」。当前五家**全部覆写成 true**：
+    /// 不是「我们想不想实现」。当前各家**全部覆写成 true**（下表是早期五家，
+    /// 后来接入的家见各自 `models.rs` 的模块头）：
     /// ```text
     ///   WorkBuddy   GET  /v3/config
     ///   小浣熊       GET  {llmBase}/model_catalog
@@ -787,14 +792,16 @@ pub trait ProviderAdapter: Send + Sync {
     /// **会话式转发入口** [`Self::forward_conversation`]；产出与无状态路径同一种
     /// `ForwardOutcome`，于是 `chat.rs` 的其余链路（脱敏、记账、错误写出）零改动。
     ///
-    /// 唯一的 true 是 `catpaw::CatPawAdapter`（W5-T-d4 接线后）。
+    /// 覆写成 true 的是走会话式转发入口的家（CatPaw / Qoder / Accio /
+    /// CodeArts / Trae / Kuku / MonkeyCode，见各自 `mod.rs` 的模块头）。
     fn is_stateful(&self) -> bool {
         false
     }
 
     /// **会话式转发入口**（模块头扩展 6 的配套；架构文档 §4.2.1）。
     ///
-    /// 只有有状态 provider 覆写它（当前是 CatPaw）。默认实现返回 503：走到这里
+    /// 只有有状态 provider 覆写它（`is_stateful` 为 true 的家，见各自 `mod.rs`）。
+    /// 默认实现返回 503：走到这里
     /// 说明编排层把一家无状态 provider 当成了有状态的 —— 那是**内部契约错误**，
     /// 报错比让 `build_chat_request` 与 `forward_conversation` 各发一半安全。
     ///
@@ -901,7 +908,7 @@ pub trait ProviderAdapter: Send + Sync {
 
     /// 本 provider 是否支持**余额 / 积分查询**（模块头扩展 8）。
     ///
-    /// 默认 false。四家里四家都支持，但语义各不相同：
+    /// 默认 false。支持的家各有各的语义，下面举四家为例：
     ///   - workbuddy：腾讯计费接口的「积分简报」（`core::billing`，改造前唯一有的一家）；
     ///   - 小浣熊：官方积分钱包 + 订阅权益（`raccoon/balance.rs`）；
     ///   - CatPaw：美团 credit 域的额度接口，**需要额外配置网页会话凭证 token2**
@@ -982,11 +989,12 @@ pub const USAGE_NOT_CONFIGURED_CODE: &str = "usage_not_configured";
 /// 「该账号没有配置余额查询凭证」的统一文案（`GatewayError::code` 同为
 /// [`USAGE_NOT_CONFIGURED_CODE`]）。
 ///
-/// ── 为什么这条要四家共用一份，而不是各家自己拼 ─────────────────
+/// ── 为什么这条要各家共用一份，而不是各家自己拼 ─────────────────
 /// 前端按 `code`（不是文案）判定「这是未配置、不是失败」，但**文案仍会显示
-/// 在面板上**；各家各写一句会让同一个「去设置里补一下凭证」的动作在四家账号上
-/// 呈现四种措辞。CatPaw 是当前唯一会真正走到这里的一家（它的余额接口要的是
-/// 网页会话凭证 `token2`，与转发用的 `X-Passport-Token` 不是同一个东西）。
+/// 在面板上**；各家各写一句会让同一个「去设置里补一下凭证」的动作在不同家
+/// 的账号上呈现不同措辞。会真正走到这里的是「余额接口另需一份查询凭证」的家
+/// （如 CatPaw 的网页会话凭证 `token2`、ZCode 的 Coding Plan JWT —— 见各自
+/// 的 `balance.rs`）。
 ///
 /// `field_hint` 说明去哪儿补（「账号设置里的余额查询凭证」），拼进 message；
 /// 状态码用 **400**：这是前置条件缺失、用户自己能修，不是服务端故障 ——
@@ -1004,7 +1012,7 @@ pub fn usage_not_configured(provider_label: &str, field_hint: &str) -> GatewayEr
 
 /// 注册表：provider → 适配器实现。
 ///
-/// **四家都已实现**：各自返回自己的静态实例。这个 match 是穷举的：加新 kind 时
+/// **各家都已实现**：各自返回自己的静态实例。这个 match 是穷举的：加新 kind 时
 /// 编译器会强制在这里给出一个分支，于是「注册了 provider 却忘了接线」这种事在
 /// 编译期就被拦住。
 ///
@@ -1049,9 +1057,9 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // 分配算力 → SSE），账号管理走粘贴 Cookie / 导入本机登录态
         // （见 `kuku/mod.rs` 的模块头）
         ProviderKind::Kuku => &super::kuku::KUKU_ADAPTER,
-        // MonkeyCode（长亭科技）：账号管理（粘贴 session）+ 模型目录已接通，
-        // **会话转发本步留空**（`is_stateful` 为 true，转发入口返回 501，
-        // 见 `monkeycode/mod.rs` 与 `monkeycode/adapter.rs` 的模块头）。
+        // MonkeyCode（长亭科技）：账号管理（粘贴 session）+ 模型目录 + 会话转发
+        // 全部已接通（建任务 → WebSocket 任务流 → ACP 事件翻译，`is_stateful`
+        // 为 true，见 `monkeycode/mod.rs` 与 `monkeycode/adapter.rs` 的模块头）。
         // 两个站点是两个 provider、两个实例（同一份实现按地区参数化）
         ProviderKind::MonkeyCode => &super::monkeycode::MONKEYCODE_ADAPTER,
         ProviderKind::MonkeyCodeIntl => &super::monkeycode::MONKEYCODE_INTL_ADAPTER,
@@ -1073,8 +1081,8 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
 /// 注册表项都在、但适配器是占位」的中间态，那时它**不在本列表里**；
 /// W4b-T-c2 接上真身（`autoclaw::adapter::AUTOCLAW_ADAPTER`）后列入本表 ——
 /// 与 CatPaw 在 W5-T-d4 走过的路径相同。Qoder 也走过同一条路：接入推理转发
-/// 之前它只有账号管理能力，本波次接上真身后列入。**现在八家全部在列表里**
-/// （AutoClaw 的两个地区算两家），与 `PROVIDERS` 的 id 集合一一对应
+/// 之前它只有账号管理能力，本波次接上真身后列入。**现在注册表里的各家全部在
+/// 列表里**，与 `PROVIDERS` 的 id 集合一一对应
 /// （过渡期的占位实现已在 W6 随 `pending.rs` 删除）。
 ///
 /// Cline 算两家（`ClineFree` / `ClinePass`）：它们是两个 provider、两份清单，
@@ -1141,11 +1149,9 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // （`/wenchain/genflowpro/model_list`）—— 必须在列表里，否则刷新循环
         // 不会问它（与 Trae 同一理由）。
         ProviderKind::Kuku,
-        // MonkeyCode 的两个站点各算一家：适配器已接线（账号 / 目录已通），
-        // 且有远程目录（`GET /api/v1/users/models`）—— 必须在列表里，否则
-        // 目录刷新循环不会问它。**会话转发本步留空**（`forward_conversation`
-        // 返回 501），但这不影响「已接线」这个判定：本列表回答的是「这家
-        // 接线了没有」，不是「这家的转发能不能用」。
+        // MonkeyCode 的两个站点各算一家：适配器已接线（账号 / 目录 / 会话转发
+        // 全部已通），且有远程目录（`GET /api/v1/users/models`）—— 必须在
+        // 列表里，否则目录刷新循环不会问它。
         ProviderKind::MonkeyCode,
         ProviderKind::MonkeyCodeIntl,
         // Command Code 已接真身（账号 / 目录 / 转发），且有远程目录
@@ -1164,8 +1170,8 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
 ///
 /// ── 为什么不用 `core::models::RefreshOutcome` ────────────────────
 /// 那个类型是 **workbuddy 单家**的既有契约（`{refreshed, count, source, reason}`，
-/// 与 Node 版逐字对应），拴在 `ModelCatalog` 上。适配器层还要表达另外三家的事实
-/// （小浣熊的「TTL 跳过」、静态表的「没有远程目录」），拿它覆盖四家会逼着三家填
+/// 与 Node 版逐字对应），拴在 `ModelCatalog` 上。适配器层还要表达另外几家的不同事实
+/// （小浣熊的「TTL 跳过」、没有远程目录的家的「跳过」等），拿它覆盖各家会逼着这些家填
 /// 无意义的 `source`/`reason`，还要动 `core::models` 的既有类型。本类型是**最小
 /// 适配器层形态**：workbuddy 在实现里把自己的 `RefreshOutcome` 搬运过来即可。
 ///

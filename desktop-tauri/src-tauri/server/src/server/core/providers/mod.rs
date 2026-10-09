@@ -3,9 +3,8 @@
 //! ── 为什么要有这个模块 ──────────────────────────────────────
 //! 改造前整个网关只有 WorkBuddy 一个上游，provider 概念是隐含的：账号就是
 //! workbuddy 账号、端点常量写在 `endpoints.rs`、鉴权逻辑写在 `auth.rs`。
-//! 多提供商（注册表现有七家：WorkBuddy / 小浣熊 raccoon / CatPaw / AutoClaw /
-//! Qoder / Cline Free / Cline Pass，七家都参与推理转发，见各自的 `mod.rs`），
-//! 后两家分别由 W5-T-d4 与 W4b-T-c2 接上各自的适配器）之后，
+//! 多提供商（注册表见 [`PROVIDERS`]，各家都参与推理转发，见各自的
+//! `mod.rs` 模块头）之后，
 //! 「这个账号属于哪家」「这一家叫什么名字」需要一个
 //! 全局唯一的定义点 —— 就是本模块。
 //!
@@ -32,7 +31,7 @@
 //! 经 `kind_from_id` 判定」自动派生，不需要再改那些文件里的任何 id 清单。
 //!
 //! ── 静态注册表为什么用切片而不是 HashMap ─────────────────────
-//! provider 是**编译期内置**的（内置五家，不是插件），数量个位数；
+//! provider 是**编译期内置**的（不是插件），数量有限（见 [`PROVIDERS`]）；
 //! 用 `&'static [ProviderMeta]` 可以让 `meta()` 直接返回 `&'static` 引用
 //! （没有生命周期纠缠、也没有锁），且列表顺序稳定 —— 前端拿到的 `providers`
 //! 数组顺序稳定，便于比对与展示。
@@ -114,7 +113,8 @@ pub mod catpaw;
 pub mod cline;
 /// CodeArts（华为云 snap-access）。适配器实现在 `codearts/`，
 /// 语义来源与施工计划见 `cpa-deploy/notes/agent2api-codearts-port-plan.md`。
-/// 目前只落了签名层，尚未进 `ProviderKind`（不参与目录与转发）。
+/// 全链已接齐（账号 / 目录 / 会话式转发 / 余额 / 每日福利），见
+/// `codearts/mod.rs` 的模块头。
 pub mod codearts;
 /// Command Code（`api.commandcode.ai`）：无状态转发（一次 HTTP 请求 = 一次
 /// 生成）+ 粘贴式 `user_` API Key。上游响应是 **NDJSON** 而不是 SSE、且
@@ -131,17 +131,19 @@ pub mod custom;
 pub mod kuku;
 pub mod loomy;
 /// MonkeyCode（长亭科技的开源 AI 开发平台）。适配实现在 `monkeycode/`：
-/// 账号管理（粘贴 session）+ 模型目录（`GET /api/v1/users/models`）已接通，
-/// **会话转发留空由下一步接入**（上游是「建任务 → WebSocket 任务流」，
-/// `is_stateful` 为 true，见 `monkeycode/mod.rs` 的模块头）。
+/// 账号管理（粘贴 session）+ 模型目录（`GET /api/v1/users/models`）+
+/// **会话转发**（上游是「建任务 → WebSocket 任务流」，ACP 事件翻译为 chat 帧，
+/// 含工具自动批准与提问自动应答）全部已接通；`is_stateful` 为 true，
+/// 见 `monkeycode/mod.rs` 的模块头。
 pub mod monkeycode;
 pub mod onboarding_memory;
 pub mod qoder;
 pub mod raccoon;
 pub mod refresh_flight;
 pub mod router;
-/// Trae（字节 AI IDE）。目前只有"形状层"（签名无关的 body/头/SSE 判定），
-/// 适配器与账号存储在后续里程碑接入 —— 先挂模块是为了让向量测试能跑。
+/// Trae（字节 AI IDE）。适配实现在 `trae/`：登录 / 凭据 / 目录 / 会话式转发
+/// 已接通（只支持国内 SOLO 通道；国际版是另一套协议，将来另立 kind），见
+/// `trae/mod.rs` 的模块头。
 pub mod trae;
 pub mod workbuddy;
 pub mod zcode;
@@ -379,9 +381,9 @@ pub enum ProviderKind {
     /// 业务会话靠换发的 genflowpro STOKEN（`kuku::engine`）。
     Kuku,
     /// MonkeyCode（长亭科技）**国内版**（`monkeycode-ai.com`）。适配实现在
-    /// `monkeycode/`：账号管理（**粘贴 session cookie**）与模型目录
-    /// （`GET /api/v1/users/models`）已接通；**会话转发留空由下一步接入**
-    /// （上游是「建任务 → WebSocket 任务流」，`is_stateful()` 为 true）。
+    /// `monkeycode/`：账号管理（**粘贴 session cookie**）、模型目录
+    /// （`GET /api/v1/users/models`）与**会话转发**（建任务 → WebSocket 任务流
+    /// → ACP 事件翻译为 chat 帧）全部已接通；`is_stateful()` 为 true。
     ///
     /// ── 与 [`ProviderKind::MonkeyCodeIntl`] 是同一套协议的两个站点 ────
     /// 与 AutoClaw / Qoder / ZCode 的两地同一思路：地区是**provider 身份**

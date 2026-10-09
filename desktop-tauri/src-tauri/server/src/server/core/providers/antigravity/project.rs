@@ -155,7 +155,8 @@ async fn post_json(
 /// 发现 `cloudaicompanionProject`：`loadCodeAssist` → 无 project 时 `onboardUser`。
 ///
 /// 返回 `Err` 表示**这次没拿到**（网络 / 权限 / 该账号无资格）。调用点按
-/// 「best-effort 增强」处理：不影响账号可用性，只影响聊天（下一步）。
+/// 「best-effort 增强」处理：不影响账号可用性，只影响聊天（project 缺失时
+/// 上游可能限制该请求，见 `adapter.rs`）。
 pub async fn discover_project(
     access_token: &str,
     proxy: Option<&ResolvedProxy>,
@@ -175,7 +176,7 @@ pub async fn discover_project(
     if !(200..300).contains(&status) {
         // `x-goog-user-project` 在非 content 方法上可能触发 403（规格坑 #3）：
         // 这里 body 里没有 project，所以只可能是别的原因；如实报一句，
-        // 调用点按「project 缺失」继续（聊天本步未接通）。
+        // 调用点按「project 缺失」继续（聊天照发，上游可能因此限制该请求）。
         let detail = describe_body(&payload, &text);
         logging::verbose(
             "[Antigravity]",

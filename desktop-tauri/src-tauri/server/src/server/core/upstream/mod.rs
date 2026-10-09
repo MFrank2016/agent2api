@@ -27,7 +27,7 @@
 //! 本目录只通过 `ProviderAdapter` 契约（`providers::adapter`）使用它们。
 //! 这里出现的 `ProviderKind` 只作**身份标识**使用（候选链的元素、
 //! 日志里的 provider id、记账槽里的 provider 字段），没有任何
-//! 「如果 provider 是 X 就怎么做」的分支 —— 四家 provider 在 `adapter_for`
+//! 「如果 provider 是 X 就怎么做」的分支 —— 各家 provider 在 `adapter_for`
 //! 里都已接上真身适配器（那个 match 是穷举的，加新 kind 会在编译期被拦住），
 //! 编排层不需要为任何一家写特判。
 //!

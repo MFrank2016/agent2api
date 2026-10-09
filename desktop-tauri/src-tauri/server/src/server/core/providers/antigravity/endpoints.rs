@@ -18,8 +18,8 @@
 //! 的形态，本家不用），模型名放在请求体里：
 //!
 //! ```text
-//!   POST {base}:streamGenerateContent?alt=sse     流式推理（下一步接）
-//!   POST {base}:generateContent                   非流式推理（下一步接）
+//!   POST {base}:streamGenerateContent?alt=sse     流式推理（聊天转发走这条）
+//!   POST {base}:generateContent                   非流式推理（登记备用，见 adapter.rs）
 //!   POST {base}:fetchAvailableModels              模型目录 + 每模型配额
 //!   POST {base}:retrieveUserQuotaSummary          分组额度（周 / 5 小时窗）
 //!   POST {base}:loadCodeAssist                    订阅档 + cloudaicompanionProject
@@ -103,9 +103,9 @@ pub const V1_BASE_URLS: [&str; 3] = [V1_BASE_URL_SANDBOX, V1_BASE_URL_DAILY, V1_
 /// 个调用（规格 §3.4 + 9router 的注释原话）。
 pub const PROJECT_BASE_URL: &str = V1_BASE_URL_PROD;
 
-/// 流式推理方法名（冒号拼在基址之后；`?alt=sse` 必带）—— 下一步接
+/// 流式推理方法名（冒号拼在基址之后；`?alt=sse` 必带）—— 聊天转发走这条
 pub const METHOD_STREAM_GENERATE: &str = "streamGenerateContent";
-/// 非流式推理方法名 —— 下一步接
+/// 非流式推理方法名 —— 登记备用（本仓聊天一律走流式端点，见 `adapter.rs`）
 pub const METHOD_GENERATE: &str = "generateContent";
 /// 模型目录 + 每模型配额
 pub const METHOD_FETCH_AVAILABLE_MODELS: &str = "fetchAvailableModels";
@@ -238,12 +238,12 @@ pub fn method_url(base: &str, method: &str) -> String {
     format!("{base}:{method}")
 }
 
-/// 流式推理端点（`{base}:streamGenerateContent?alt=sse`）—— 下一步接
+/// 流式推理端点（`{base}:streamGenerateContent?alt=sse`）—— 聊天转发走这条
 pub fn stream_generate_url(base: &str) -> String {
     format!("{base}:{METHOD_STREAM_GENERATE}{STREAM_QUERY}")
 }
 
-/// 非流式推理端点（`{base}:generateContent`）—— 下一步接
+/// 非流式推理端点（`{base}:generateContent`）—— 登记备用（本仓聊天一律走流式端点）
 pub fn generate_url(base: &str) -> String {
     method_url(base, METHOD_GENERATE)
 }
@@ -281,7 +281,8 @@ pub fn bearer_header(access_token: &str) -> (String, String) {
 ///
 /// 未带的两个指纹头（`x-machine-id` / `x-vscode-sessionid`）：规格 §8.2 明确
 /// 它们**不是硬性必需**（9router 只带 Content-Type / Authorization / UA 也能通），
-/// 本步不实现设备指纹采集，故如实缺席 —— TODO 留给下一步（转发）时一起定。
+/// 本仓不实现设备指纹采集，故如实缺席（转发已接通，仍未引入 —— 见
+/// `adapter.rs` 的模块头）。
 pub fn content_headers(access_token: &str) -> Vec<(String, String)> {
     vec![
         ("Content-Type".to_string(), "application/json".to_string()),
