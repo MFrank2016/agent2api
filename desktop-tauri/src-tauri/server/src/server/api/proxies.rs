@@ -96,31 +96,26 @@ pub async fn test_proxy(state: &ServerState, body: &Bytes) -> Response {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
     {
-        let Some(creds) = state.store().get_credentials_by_id(id) else {
+        let Some(_) = state.store().get_credentials_by_id(id) else {
             return management_error(404, "账号不存在");
         };
-        if let Some(error) = creds.proxy_error {
-            return management_error(400, error);
-        }
-        // 账号记录里的出口已经是解析后的形态（带 label）
-        match crate::server::core::proxies::ResolvedProxy::from_json(&creds.proxy) {
-            Ok(resolved) => proxy = resolved,
-            Err(reason) => return management_error(400, reason),
+        // 账号记录里存的是**原始**配置：按 egress 语义自己解析，
+        // 这样 `pool-rotate` 也能测（首选成员），而不是报「不支持的代理来源」。
+        let raw = state.store().proxy_config_by_id(id);
+        match test_egress_primary(raw.as_ref()) {
+            Ok(Some(resolved)) => proxy = Some(resolved),
+            Ok(None) => {}
+            Err(message) => return management_error(400, message),
         }
     } else if let Some(config_value) = payload.get("proxy") {
         let config = match normalize_account_proxy(config_value) {
             Ok(value) => value,
             Err(error) => return proxy_error(error),
         };
-        if let Some(config) = config {
-            if let Some(resolution) =
-                crate::server::core::proxies::resolve_account_proxy(Some(&config))
-            {
-                if let Some(error) = resolution.error() {
-                    return management_error(400, error);
-                }
-                proxy = resolution.resolved().cloned();
-            }
+        match test_egress_primary(config.as_ref()) {
+            Ok(Some(resolved)) => proxy = Some(resolved),
+            Ok(None) => {}
+            Err(message) => return management_error(400, message),
         }
         // config 为 None（payload.proxy === null）= 测直连，proxy 保持 None
     }
@@ -147,6 +142,21 @@ pub async fn test_proxy(state: &ServerState, body: &Bytes) -> Response {
         object.insert("proxy".to_string(), egress::describe_public(proxy.as_ref()));
     }
     ok_json(data)
+}
+
+/// 解析出「该配置的测试出口」：直连 → None；单出口 → 该出口；
+/// 轮询组 → 首选成员（`members.first()`，与转发层 `primary()` 同口径）；
+/// 解析失败 → 原因（调用方 400）。
+fn test_egress_primary(
+    config: Option<&Value>,
+) -> Result<Option<crate::server::core::proxies::ResolvedProxy>, String> {
+    use crate::server::core::proxies::{resolve_account_egress, AccountEgress, EgressResolution};
+    match resolve_account_egress(config) {
+        EgressResolution::Resolved(AccountEgress::Direct) => Ok(None),
+        EgressResolution::Resolved(AccountEgress::Single(proxy)) => Ok(Some(proxy)),
+        EgressResolution::Resolved(AccountEgress::Rotate(plan)) => Ok(plan.members.first().cloned()),
+        EgressResolution::Failed(message) => Err(message),
+    }
 }
 
 // ─── 代理池（「网络代理」页）─────────────────────────────────
@@ -362,4 +372,36 @@ pub async fn pool_test(state: &ServerState, body: &Bytes) -> Response {
         );
     }
     ok_json(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_egress_primary_handles_direct_single_and_empty_rotation() {
+        // 直连（None / null）→ 没有可测出口
+        assert!(matches!(test_egress_primary(None), Ok(None)));
+
+        // 单出口 → 解析出那一个出口
+        let single = test_egress_primary(Some(&serde_json::json!({
+            "source": "custom", "protocol": "http", "host": "1.2.3.4", "port": 8080
+        })));
+        match single {
+            Ok(Some(resolved)) => assert_eq!(resolved.host, "1.2.3.4"),
+            other => panic!("expected a single egress, got {other:?}"),
+        }
+
+        // 轮询组无成员（测试库为空）→ 真原因，而不是旧的「不支持的代理来源」
+        let rotate = test_egress_primary(Some(&serde_json::json!({
+            "source": "pool-rotate", "group": "__nope__"
+        })));
+        match rotate {
+            Err(message) => {
+                assert_eq!(message, "轮询组没有可用出口");
+                assert_ne!(message, "不支持的代理来源: pool-rotate");
+            }
+            other => panic!("expected a resolution failure, got {other:?}"),
+        }
+    }
 }

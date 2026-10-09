@@ -602,6 +602,13 @@ impl AccountStore {
         })
     }
 
+    /// 账号记录里**原始**的代理配置（未解析）；给需要按 egress 语义自己解析的
+    /// 读路径用（如 `POST /api/proxies/test`）。不存在时 None。
+    pub fn proxy_config_by_id(&self, id: &str) -> Option<Value> {
+        let _guard = self.guard();
+        self.record_by_id(&_guard, id).map(|record| record.proxy())
+    }
+
     /// 指定账号的完整会话形态（Node 版 getSessionById）；不存在/无凭证时 None
     pub fn get_session_by_id(&self, id: &str) -> Option<SessionById> {
         let _guard = self.guard();
