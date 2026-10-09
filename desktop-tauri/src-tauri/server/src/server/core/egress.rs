@@ -49,7 +49,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::server::config::TimeoutSettings;
-use crate::server::core::proxies::ResolvedProxy;
+use crate::server::core::proxies::{AccountEgress, OnError, ResolvedProxy};
 use crate::server::logging;
 
 /// 默认 User-Agent，**必须设置**。
@@ -310,6 +310,48 @@ fn lock_clients() -> std::sync::MutexGuard<'static, Option<ClientCache>> {
     }
 }
 
+/// 按出口类型发一次请求：Direct/Single 直发；Rotate 按候选顺序发，连接失败换下一个。
+///
+/// 只在「一个响应字节都没收到」的连接/传输错误时换出口；一旦拿到响应
+/// （含 4xx/5xx）立即返回，交回账号降级链处理。
+pub async fn dispatch<F>(egress: &AccountEgress, build: F) -> Result<reqwest::Response, reqwest::Error>
+where
+    F: Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+{
+    let candidates = crate::server::core::egress_rotation::candidates(egress);
+    if candidates.is_empty() {
+        return build(&client_for(None)).send().await;
+    }
+    let limit = match egress {
+        AccountEgress::Rotate(plan) if plan.on_error == OnError::None => 1,
+        _ => candidates.len(),
+    };
+    let penalty = crate::server::config::timeout_settings().connect_ms() as f64;
+    let mut last_error: Option<reqwest::Error> = None;
+    for proxy in candidates.iter().take(limit) {
+        let started = logging::now_ms();
+        match build(&client_for(Some(proxy))).send().await {
+            Ok(response) => {
+                if let AccountEgress::Rotate(plan) = egress {
+                    crate::server::core::egress_rotation::record_success(plan, proxy, (logging::now_ms() - started) as f64);
+                }
+                return Ok(response);
+            }
+            Err(error) => {
+                if let AccountEgress::Rotate(plan) = egress {
+                    crate::server::core::egress_rotation::record_failure(plan, proxy, penalty);
+                }
+                last_error = Some(error);
+            }
+        }
+    }
+    // 至少尝试了一个出口（candidates 非空、limit ≥ 1）
+    match last_error {
+        Some(error) => Err(error),
+        None => build(&client_for(None)).send().await,
+    }
+}
+
 // ─── 出口连通性测试 ─────────────────────────────────────────
 
 /// 出口连通性测试结果（对应 Node 版 testProxyConnectivity 的返回对象）。
@@ -468,5 +510,17 @@ pub fn describe_public(proxy: Option<&ResolvedProxy>) -> Value {
             "host": proxy.host,
             "port": proxy.port_json(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dispatch_direct_hits_an_unreachable_port_and_errors() {
+        let egress = AccountEgress::Direct;
+        let result = dispatch(&egress, |client| client.get("http://127.0.0.1:1/")).await;
+        assert!(result.is_err());
     }
 }
