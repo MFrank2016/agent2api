@@ -52,6 +52,12 @@ url = "2"
 axum = "0.8"
 # 出站请求：rustls（纯 Rust，不依赖系统 openssl）+ socks5 出网代理
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks"] }
+# MonkeyCode 会话转发的 WebSocket 任务流（providers/monkeycode/stream.rs）：
+# 上游是 `wss://…/api/v1/users/tasks/stream`，TLS 走 rustls —— 与 reqwest 的
+# `rustls-tls` 同一条栈（rustls + tokio-rustls 各一份；根证书同为 webpki-roots
+# 的 Mozilla 根集，只是两家依赖锁在 0.26 / 1.x 两个版本上，属同一套数据，
+# 不是第二套 TLS 栈；刻意不用 native-roots，免得再拉平台证书库那一串依赖）。
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 serde_yaml = "0.9"
 sha2 = "0.10"
 # Loomy 账号（CAccount）请求签名的 HMAC-SHA1（复刻客户端指纹，不是安全边界，

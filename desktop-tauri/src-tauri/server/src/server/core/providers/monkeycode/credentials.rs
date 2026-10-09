@@ -8,10 +8,11 @@
 //! 过期只能重新粘贴 —— 因此 `supports_refresh = false`，本模块比别家薄。
 //!
 //! ── image_id 为什么是账号字段 ────────────────────────────────
-//! 创建任务（下一步的 WS 转发）必须带 `image_id`（VM 镜像 UUID），而它**不在**
-//! 登录响应里：参考实现 `discoverImageId` 从**已有任务列表**的 `task.image.id`
-//! 里取 —— 新用户一个任务都没有时取不到，必须手动填。因此本模块把它作为账号
-//! 记录的一个字段（可为空串），并在 `login.rs` 里做一次 best-effort 自动发现。
+//! 创建任务（`task.rs` 的会话转发第一步）必须带 `image_id`（VM 镜像 UUID），
+//! 而它**不在**登录响应里：参考实现 `discoverImageId` 从**已有任务列表**的
+//! `task.image.id` 里取 —— 新用户一个任务都没有时取不到，必须手动填。因此本
+//! 模块把它作为账号记录的一个字段（可为空串），并在 `login.rs` 里做一次
+//! best-effort 自动发现。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
@@ -54,8 +55,8 @@ impl MonkeyCodeCredentials {
             && self.expires_at - EXPIRY_MARGIN_MS <= crate::server::logging::now_ms()
     }
 
-    /// 创建任务是否具备必要条件（session + image_id）。下一步的转发入口用它
-    /// 在真正建任务前给出可读的错误，而不是把空 image_id 发给上游。
+    /// 创建任务是否具备必要条件（session + image_id）。转发入口（`chat.rs`）
+    /// 用它在自己真正建任务前给出可读的错误，而不是把空 image_id 发给上游。
     pub fn ready_for_task(&self) -> bool {
         !self.session.trim().is_empty() && !self.image_id.trim().is_empty()
     }

@@ -9,19 +9,23 @@
 //! 因此 `is_stateful()` 为 true —— 与 Kuku / CatPaw / Qoder 同一处境
 //! （「一次发送要适配器自己完成」）。
 //!
-//! ── 本步（骨架）的边界 ──────────────────────────────────────
-//! 账号管理（粘贴 session 登录 + 公开形态）、模型目录（`GET /users/models`）
-//! 已接通；**会话转发留空** —— [`Self::forward_conversation`] 返回一个明确的
-//! `GatewayError`，下一步在 `chat.rs` 里接上「建任务 → WS 流 → ACP 翻译」。
-//! 本步不引入任何 WebSocket 依赖（`Cargo.toml` 不动，那是下一步的事）。
+//! ── 会话转发的实现分工（本步接线）────────────────────────────
+//! 协议实现收在同目录的几个文件里，本文件只做装配（转调 `chat::run_chat`）：
+//!   `task.rs`      输入侧翻译（messages → prompt + system）与建任务（含错误码翻译）
+//!   `stream.rs`    WS 连接 / 起始消息（auto-approve + user-input）/ 心跳 / 超时 /
+//!                  四个终态出口（task-ended、task-error、断连、超时）
+//!   `translate.rs` 下行消息与 ACP 事件 → OpenAI chunk（含自动回复 Agent 提问）
+//!   `chat.rs`      装配（凭证 → 目录反查 → 建任务 → 连流 → 流式或聚合）
 //!
 //! ── 本家没有的东西（如实声明，别照抄别家）──────────────────────
 //!   - **没有续期**：session 30 天硬限制，上游无 refresh 接口 →
 //!     `supports_refresh = false`（与 Loomy 同一处境）；
 //!   - **没有网页登录**：登录要么带验证码、要么要 OAuth 窗口，本网关只接
 //!     「粘贴 session」这一条 → `supports_web_login` 保持默认 false；
-//!   - **本步不做签到与余额**：`supports_usage` 保持默认 false，
-//!     `query_usage` 走 trait 默认实现。
+//!   - **不做签到与余额**：没有实测可用的余额接口，
+//!     `supports_usage` 保持默认 false，`query_usage` 走 trait 默认实现；
+//!   - **任务流不挂账号代理**：tokio-tungstenite 没有代理支持，参考实现同样
+//!     只给 REST 调用挂代理（见 `stream::connect` 的说明）。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
@@ -45,7 +49,7 @@ use super::{credentials, models};
 ///
 /// 拆家后两个地区是两家 provider（`monkeycode` 国内版 / `monkeycode-intl`
 /// 国际版），两个静态实例由 `adapter_for` 按 kind 给出；地区 → 身份的互查在
-/// `region::Region`。适配器内部链路（凭证、目录、下一步的转发）一律以本字段
+/// `region::Region`。适配器内部链路（凭证、目录、会话转发）一律以本字段
 /// 的 `region` 为准。
 pub struct MonkeyCodeAdapter {
     region: Region,
@@ -94,17 +98,33 @@ impl ProviderAdapter for MonkeyCodeAdapter {
 
     /// 上游错误分类：
     ///   - HTTP 401 / 403 → `TokenExpired`（登录态失效，重新粘贴 session）；
+    ///   - HTTP 402 → `Fatal`（额度不足：换账号也没用，用户得去官网处理）；
     ///   - HTTP 429 → `QuotaLimited`（上游不给结构化恢复时间）；
-    ///   - 其余 → `Fatal`（本家的错误在转发链路里已归一到 `GatewayError`，
-    ///     正常路径走不到这里 —— 与 Kuku 同一核对结论）。
+    ///   - 其余 → `Fatal`。
+    ///
+    /// ── 这条路径在本家事实上走不到（如实说明）──────────────────
+    /// 本家是 `is_stateful`，所有上游错误都在 `task.rs` / `stream.rs` 里现场
+    /// 归一到 `GatewayError`（状态码与文案已按建任务 / 任务流的码表翻译好，
+    /// 见那两个模块头）；`classify_error` 只服务单请求路径，而
+    /// `build_chat_request` 是防御性 503。保留这些分支是让契约完整 +
+    /// 排障时一眼看到码表的映射意图；402 的具体文案在 `task::status_error`。
     fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass {
-        let message = error_body
+        let upstream_message = error_body
             .get("message")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|text| !text.is_empty())
-            .map(|text| format!("上游返回 {status}: {text}"))
-            .unwrap_or_else(|| format!("上游返回 HTTP {status}"));
+            .map(str::to_string);
+        let hint = match status {
+            402 => Some("（账户额度不足，请在 MonkeyCode 官网确认订阅 / 余额）"),
+            _ => None,
+        };
+        let message = match (upstream_message, hint) {
+            (Some(text), Some(hint)) => format!("上游返回 {status}: {text}{hint}"),
+            (Some(text), None) => format!("上游返回 {status}: {text}"),
+            (None, Some(hint)) => format!("上游返回 HTTP {status}{hint}"),
+            (None, None) => format!("上游返回 HTTP {status}"),
+        };
         if status == 401 || status == 403 {
             return UpstreamErrorClass::TokenExpired { message };
         }
@@ -208,22 +228,21 @@ impl ProviderAdapter for MonkeyCodeAdapter {
         })
     }
 
-    /// **会话式转发入口（本步留空）**。
+    /// **会话式转发入口**：转调 `chat::run_chat`。
     ///
-    /// 下一步在这里接上：`credentials::from_record` → 校验 `image_id`（缺了报
-    /// 可读错误）→ `POST /api/v1/users/tasks` 建任务 → 连
-    /// `wss://…/api/v1/users/tasks/stream` → 把 ACP 事件翻成 OpenAI chunk，
-    /// 产出与无状态路径同形的 `ForwardOutcome`。WebSocket 依赖（`tokio-tungstenite`
-    /// 一类的选择）也在下一步加进 `Cargo.toml`。
+    /// 本函数只做装配：把编排层给的散装入参（`store` / `account_id` / 原始
+    /// body / 出网代理 / 流式标志 / 记账槽）原样交给 `chat.rs`。协议时序
+    /// （建任务 → WS → ACP 翻译）与各处错误码翻译都在那三个文件里，
+    /// 账号选路 / 限额冷却 / telemetry 记账仍在编排层。
     fn forward_conversation<'a>(
         &'a self,
-        _store: &'a AccountStore,
-        _account_id: &'a str,
-        _body: &'a Value,
+        store: &'a AccountStore,
+        account_id: &'a str,
+        body: &'a Value,
         _client_headers: &'a HeaderMap,
-        _proxy: Option<crate::server::core::proxies::ResolvedProxy>,
-        _stream: bool,
-        _telemetry: &'a std::sync::Arc<crate::server::core::upstream::usage::RequestTelemetry>,
+        proxy: Option<crate::server::core::proxies::ResolvedProxy>,
+        stream: bool,
+        telemetry: &'a std::sync::Arc<crate::server::core::upstream::usage::RequestTelemetry>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -232,17 +251,22 @@ impl ProviderAdapter for MonkeyCodeAdapter {
                 + 'a,
         >,
     > {
-        let label = self.region.label();
         Box::pin(async move {
-            Err(GatewayError::with_status(
-                501,
-                format!("MonkeyCode {label} 的会话转发尚未接通"),
-            ))
+            super::chat::run_chat(
+                store,
+                self.region,
+                account_id,
+                body,
+                proxy,
+                stream,
+                telemetry,
+            )
+            .await
         })
     }
 }
 
-/// 接口类型 → CLI 名的转发口（供下一步与排障复用；判据唯一写在 `endpoints`）
+/// 接口类型 → CLI 名的转发口（供会话转发与排障复用；判据唯一写在 `endpoints`）
 pub fn cli_name(interface_type: &str) -> &'static str {
     cli_name_for(interface_type)
 }

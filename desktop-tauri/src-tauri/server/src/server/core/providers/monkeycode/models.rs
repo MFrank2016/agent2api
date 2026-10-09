@@ -3,7 +3,7 @@
 //! ── 上游形态（`mvp/models.py::list_models` + `docs/03-llm/01-model-management-api.md`）──
 //! `{"code":0,"data":{"models":[{…}]}}`（也有 `{"models":[…]}` 的兼容形态）。
 //! 每个条目的关键字段（参考 `domain/model.go` 的 Model 实体）：
-//!   - `id`           模型 UUID（**创建任务时用的 `model_id`**，下一步要用）；
+//!   - `id`           模型 UUID（**创建任务时用的 `model_id`**，`task.rs` 反查它）；
 //!   - `provider`     提供商名（`siliconflow` / `openai` / …）；
 //!   - `model`        上游模型名（`gpt-4o` / `Qwen/Qwen3.5-Plus`）；
 //!   - `display_name` 展示名（可能为空）；
@@ -14,11 +14,11 @@
 //! 参考实现（`proxy/src/models.ts`）给下游的模型 id 是
 //! `monkeycode/{provider}/{model}` —— 本模块的目录 `id` 采用同一形态
 //! （`{provider}/{model}`，provider 为空时退化成 `model`），并把 UUID 与
-//! `interface_type` 归一到下一步转发要用的字段名（`upstreamId` / `cliName`），
+//! `interface_type` 归一到转发链路要用的字段名（`upstreamId` / `cliName`），
 //! 聚合层（`models::list_item`）会忽略不认识的键。
 //!
 //! ── 目录的 id 与「发什么给上游」是两回事 ────────────────────────
-//! 客户端请求的 `id` 是本目录的 `{provider}/{model}`；下一步转发时要用
+//! 客户端请求的 `id` 是本目录的 `{provider}/{model}`；转发时要用
 //! `upstreamId`（UUID）+ `cliName`（由 `interface_type` 映射）去建任务 ——
 //! 因此这两个键必须保留在目录条目里，不能只留展示字段。
 //!
@@ -101,7 +101,7 @@ fn text_of(row: &Value, key: &str) -> String {
 /// 键名对照 `core/models/shape.rs::list_item`：`id` / `name` /
 /// `maxInputTokens` / `maxOutputTokens` / `supportsImages` / `supportsVideo` /
 /// `supportsReasoning` / `supportsToolCall` / `isDefault`。另有三个**非聚合层**
-/// 的键是下一步转发要用的：`upstreamId`（UUID）、`cliName`、`interfaceType`
+/// 的键是转发要用的：`upstreamId`（UUID）、`cliName`、`interfaceType`
 /// （聚合层原样忽略未知键）。
 ///
 /// 没有 `model` 字段的条目直接跳过（没有上游模型名就无法建任务）；
@@ -140,7 +140,7 @@ fn map_entry(row: &Value) -> Option<Value> {
         "interfaceType".to_string(),
         Value::String(interface_type.clone()),
     );
-    // interface_type → coding agent（CLI）名，下一步建任务时用
+    // interface_type → coding agent（CLI）名，建任务时用
     item.insert(
         "cliName".to_string(),
         Value::String(endpoints::cli_name_for(&interface_type).to_string()),
@@ -192,6 +192,80 @@ pub fn parse_models(payload: &Value) -> Vec<Value> {
         .cloned()
         .unwrap_or_default();
     rows.iter().filter_map(map_entry).collect()
+}
+
+/// 建任务要用的目录字段（客户端请求的模型名 → 上游 UUID / Agent 类型）。
+///
+/// `model_id` 是建任务的 `model_id`（上游模型 UUID），`cli_name` 决定 VM 里
+/// 装哪个 coding agent（opencode / codex / claude）—— 两者都**不在**展示字段
+/// 里，只能从目录条目反查，因此本结构是转发链路的必需输入（`task.rs`）。
+pub struct TaskTarget {
+    /// 上游模型 UUID（建任务的 `model_id`）
+    pub model_id: String,
+    /// Agent 类型（建任务的 `cli_name`）
+    pub cli_name: String,
+    /// 上游模型名（日志与报错文案用）
+    pub model: String,
+}
+
+/// 按客户端请求的名字反查建任务参数。
+///
+/// ── 判据链（都是精确匹配，不做模糊 / 默认回落）──────────────────
+///   1. 目录 id（`{provider}/{model}`，客户端点名的就是这个）—— 主判据；
+///   2. 上游真名 `model`（客户端可能直接写上游名）；
+///   3. 展示名 `name`；
+///   4. `upstreamId`（UUID，排障时可能直接点）。
+/// 全部大小写不敏感。取到的条目必须带**非空** `upstreamId`（没有 UUID 就建不出
+/// 任务），否则视为查不到 —— 返回 `None` 让调用方报可读错误，而不是拿空串去撞
+/// 上游的 400。
+///
+/// ── 为什么不做参考实现那样的「模糊匹配 + 默认模型回落」────────────
+/// 参考的 `resolveModel` 在找不到时回落到 `is_default` / `models[0]`。网关侧
+/// 不能这么做：入口校验已按**广告视图**解析过模型名（`api::pipeline`），走到
+/// 转发这一步时名字必然是清单里的某一个；把「找不到」静默换成另一个模型，
+/// 就是「选了 A、用的是 B」—— 本仓对这类静默错误一律报错（见
+/// `account_store::session_for_account` 的同一条纪律）。
+pub fn resolve_task_model(region: Region, requested: &str) -> Option<TaskTarget> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return None;
+    }
+    let models = list(region);
+    let matched = models
+        .iter()
+        .find(|item| text_of(item, "id").eq_ignore_ascii_case(requested))
+        .or_else(|| {
+            models
+                .iter()
+                .find(|item| text_of(item, "model").eq_ignore_ascii_case(requested))
+        })
+        .or_else(|| {
+            models
+                .iter()
+                .find(|item| text_of(item, "name").eq_ignore_ascii_case(requested))
+        })
+        .or_else(|| {
+            models
+                .iter()
+                .find(|item| text_of(item, "upstreamId").eq_ignore_ascii_case(requested))
+        })?;
+    let model_id = text_of(matched, "upstreamId");
+    if model_id.is_empty() {
+        return None;
+    }
+    let cli_name = {
+        let stored = text_of(matched, "cliName");
+        if stored.is_empty() {
+            endpoints::cli_name_for(&text_of(matched, "interfaceType")).to_string()
+        } else {
+            stored
+        }
+    };
+    Some(TaskTarget {
+        model_id,
+        cli_name,
+        model: text_of(matched, "model"),
+    })
 }
 
 /// 当前模型清单（内存 → 落盘缓存；都没有时为空，由刷新路径填）
