@@ -45,7 +45,8 @@ import { formatTime, poolItemLabel, POOL_VALUE_PREFIX, shared, type AccountRecor
 import {
   accountTags, activeLimits, balanceBlockedOf, claimDoneTitle, claimedToday,
   displayNameOf, editionSuffix, expiryMillis, formatIntervalSeconds, formatResetText,
-  formatTokenCount, identifierOf, isDesktopAccount, isEnabled, planBadgeLabel, providerFeatures,
+  formatTokenCount, identifierOf, isDesktopAccount, isEnabled, isFreePlan, planBadgeLabel,
+  providerFeatures,
   providerOf, RESET_UNKNOWN, supportsClaim, supportsUsage, supportsUsageDetail,
   tokenBlockedOf, tokenCountdownText, tokenDisableTriggeredOf, tokenReadingForRule,
   tokenRulesOf, tokenWindowInfo,
@@ -481,6 +482,9 @@ type UsageDetail = {
   unit: string
   /** 套餐徽标文案（试用版 / 免费版 / 原名）与积分重置日期 */
   plan: string
+  /** 上游原始套餐名是否 free（`plan-chip.free` 样式类按它判 —— 不能比 plan 展示文案，
+   *  后者随界面语言变，见 accounts-domain 的 isFreePlan） */
+  free: boolean
   resetDate: string
   /** 半次失败（两台网关有一台没回话）与「没有福利池」的中性说明 */
   missing: string[]
@@ -609,6 +613,7 @@ function usageDetailOf(entry: UsageEntry): UsageDetail | null {
     total: numberOrNull(data.available),
     unit,
     plan: planBadgeLabel(subscription.planName),
+    free: isFreePlan(subscription.planName),
     resetDate: String(subscription.resetDate || ''),
     missing,
     benefitAbsent: data.benefitAbsent === true,
@@ -763,7 +768,7 @@ function UsageDetailCell({ summary, detail, blockedBadge, tokenSub }: {
     <span className={open ? 'usage-cell open' : 'usage-cell'}>
       <span className='usage-plan'>
         {detail.plan
-          ? <span className={`plan-chip${detail.plan === '免费版' ? ' free' : ''}`}>{detail.plan}</span>
+          ? <span className={`plan-chip${detail.free ? ' free' : ''}`}>{detail.plan}</span>
           : null}
         {detail.resetDate
           ? <span className='plan-sub' title={t('套餐积分的重置日期')}>{t('重置 {date}', { date: detail.resetDate })}</span>

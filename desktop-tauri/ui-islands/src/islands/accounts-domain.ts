@@ -707,6 +707,17 @@ export function supportsUsageDetail(account: AccountRecord | null | undefined): 
 }
 
 /**
+ * 上游套餐名是否为免费版（`^free$`，不区分大小写）。
+ *
+ * 判定必须比**上游原始名**（后端 `plan_name` 取 `package_name_en`，现网给过 `Free`），
+ * 不能比 `planBadgeLabel` 的输出 —— 那是随界面语言变的展示文案（余额格的
+ * `plan-chip.free` 样式类就按这个判）。单独导出，与 `planBadgeLabel` 共用同一口径。
+ */
+export function isFreePlan(planName: unknown): boolean {
+  return /^free$/i.test(String(planName ?? '').trim())
+}
+
+/**
  * 上游套餐名 → 界面徽标文案。
  *
  * 后端 `plan_name` 取 `package_name_en` 优先（见 balance.rs），本家现网给过
@@ -716,7 +727,7 @@ export function supportsUsageDetail(account: AccountRecord | null | undefined): 
 export function planBadgeLabel(planName: unknown): string {
   const name = String(planName ?? '').trim()
   if (/^trial$/i.test(name)) return t('试用版')
-  if (/^free$/i.test(name)) return t('免费版')
+  if (isFreePlan(name)) return t('免费版')
   return name
 }
 
