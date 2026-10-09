@@ -620,6 +620,43 @@ pub fn resolve_account_proxy(config: Option<&Value>) -> Option<ProxyResolution> 
     }))
 }
 
+/// 出口解析结果：成功给可用出口，失败给原因（转发层回退直连）。
+#[derive(Clone, Debug)]
+pub enum EgressResolution { Resolved(AccountEgress), Failed(String) }
+
+/// 把账号里存的代理配置解析成统一出口（Direct / Single / Rotate）。
+pub fn resolve_account_egress(config: Option<&Value>) -> EgressResolution {
+    let Some(config) = config else { return EgressResolution::Resolved(AccountEgress::Direct) };
+    if config.is_null() { return EgressResolution::Resolved(AccountEgress::Direct); }
+    let Some(object) = config.as_object() else {
+        return EgressResolution::Failed("不支持的代理来源: undefined".to_string());
+    };
+    if object.get("source").and_then(Value::as_str) == Some("pool-rotate") {
+        let group = object.get("group").and_then(Value::as_str).unwrap_or("");
+        let proxy_ids: Vec<String> = object
+            .get("proxyIds").and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default();
+        let members = crate::server::core::proxy_pool::members_for(group, &proxy_ids);
+        if members.is_empty() {
+            return EgressResolution::Failed("轮询组没有可用出口".to_string());
+        }
+        let strategy = object.get("strategy").and_then(Value::as_str).and_then(Strategy::parse).unwrap_or(Strategy::RoundRobin);
+        let on_error = object.get("onError").and_then(Value::as_str).and_then(OnError::parse).unwrap_or(OnError::Next);
+        let group_key = members
+            .iter()
+            .map(|m| format!("{}://{}:{}", m.protocol, m.host, m.port.map(|p| p.to_string()).unwrap_or_default()))
+            .collect::<Vec<_>>()
+            .join("|");
+        return EgressResolution::Resolved(AccountEgress::Rotate(RotationPlan { members, strategy, on_error, group_key }));
+    }
+    match resolve_account_proxy(Some(config)) {
+        None => EgressResolution::Resolved(AccountEgress::Direct),
+        Some(ProxyResolution::Resolved(proxy)) => EgressResolution::Resolved(AccountEgress::Single(proxy)),
+        Some(ProxyResolution::Failed(message)) => EgressResolution::Failed(message),
+    }
+}
+
 /// 账号代理的展示描述（公开形态，不带单独字段的密码 —— 与 Node 版一致，
 /// 密码只在 config 里原样带回）。
 ///
@@ -707,5 +744,19 @@ mod tests {
         assert!(normalize_account_proxy(&serde_json::json!({"source":"pool-rotate","group":"x","strategy":"fastest"})).is_err());
         // proxyIds 非数组
         assert!(normalize_account_proxy(&serde_json::json!({"source":"pool-rotate","proxyIds":"a"})).is_err());
+    }
+
+    #[test]
+    fn resolve_egress_passes_through_single_and_reports_empty_rotation() {
+        // 单出口沿用既有解析
+        let single = resolve_account_egress(Some(&serde_json::json!({"source":"custom","protocol":"http","host":"1.2.3.4","port":8080})));
+        assert!(matches!(single, EgressResolution::Resolved(AccountEgress::Single(_))));
+
+        // 无配置 → Direct
+        assert!(matches!(resolve_account_egress(None), EgressResolution::Resolved(AccountEgress::Direct)));
+
+        // 轮询但池里无成员 → Failed（测试库为空）
+        let rot = resolve_account_egress(Some(&serde_json::json!({"source":"pool-rotate","group":"__nope__"})));
+        assert!(matches!(rot, EgressResolution::Failed(_)));
     }
 }
