@@ -246,7 +246,7 @@ function renderCheckResult(): void {
   if (info.hasUpdate === true) {
     setBadge(t('有新版本'), 'warn')
     setState(t('发现新版本 {latest}（当前 {current}）。{at}', {
-      latest: info.latestVersion,
+      latest: String(info.latestVersion || ''),
       current: String(info.currentVersion || ''),
       at,
     }))
