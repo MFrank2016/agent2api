@@ -1,2 +1,2 @@
 /* Agent2API 词典构建产物：en/login —— 由 desktop-tauri/i18n/build.mjs 生成，请勿手改；源头是 i18n-src/*.json */
-window.wbI18nDict = window.wbI18nDict || {};
+window.wbI18nDict = window.wbI18nDict || {}; Object.assign(window.wbI18nDict, { "Agent2API · 登录": "Agent2API · Sign in", "OpenAI 兼容网关 · 管理面板": "OpenAI-compatible Gateway · Admin panel", "密码": "Password", "我不是机器人": "I'm not a robot", "登录后可在「网关 Key」页为 API 客户端创建密钥": "After signing in, you can create keys for API clients on the Gateway Key page", "管理员账号": "Admin account", "继续": "Continue", "至少 8 位": "At least 8 characters", "验证中…": "Verifying…", "验证失败，请重试": "Verification failed. Please try again.", "验证成功": "Verified" });
