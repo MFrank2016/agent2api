@@ -24,7 +24,6 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::server::core::egress;
-use crate::server::core::proxies::ResolvedProxy;
 use crate::server::errors::GatewayError;
 
 /// 单次对话请求的总超时（除退避重试外的等待时间）。
@@ -68,7 +67,7 @@ pub struct TransportRequest {
     /// 已序列化的请求体（由编排层从适配器的 `plan.body` 序列化而来）
     pub payload: String,
     /// 出网代理（账号级；与 provider 无关，由编排层解析后带上）
-    pub proxy: Option<ResolvedProxy>,
+    pub egress: crate::server::core::proxies::AccountEgress,
 }
 
 /// 归一化后的上游错误：`{code, message}`
@@ -145,16 +144,21 @@ pub async fn read_upstream_error(
 pub async fn send_chat_request(
     plan: &TransportRequest,
 ) -> Result<reqwest::Response, UpstreamRequestError> {
-    let client = egress::client_for(plan.proxy.as_ref());
-    let mut builder = client.post(&plan.url).body(plan.payload.clone());
-    for (key, value) in &plan.headers {
-        builder = builder.header(key, value);
-    }
-    if let Some(timeout) = NO_TOTAL_TIMEOUT {
-        builder = builder.timeout(Duration::from_millis(timeout));
-    }
+    let url = plan.url.clone();
+    let payload = plan.payload.clone();
+    let headers = plan.headers.clone();
+    let response = crate::server::core::egress::dispatch(&plan.egress, |client| {
+        let mut builder = client.post(&url).body(payload.clone());
+        for (key, value) in &headers {
+            builder = builder.header(key, value);
+        }
+        if let Some(timeout) = NO_TOTAL_TIMEOUT {
+            builder = builder.timeout(Duration::from_millis(timeout));
+        }
+        builder
+    });
     // 出口说明（失败文案用）：文案照抄 Node 的 fetchViaProxy
-    let via = match &plan.proxy {
+    let via = match plan.egress.primary() {
         Some(proxy) if !proxy.label.is_empty() => format!("经代理 {}", proxy.label),
         Some(proxy) => format!("经代理 {}", proxy.host),
         None => "直连".to_string(),
@@ -162,7 +166,8 @@ pub async fn send_chat_request(
     // 等待响应头有上限（见 headers_timeout 的说明）：超时后 future 被丢弃，
     // 上游连接随之关闭（与客户端断开时的取消是同一机制）
     let headers_budget = headers_timeout();
-    match tokio::time::timeout(headers_budget, builder.send()).await {
+    let response = tokio::time::timeout(headers_budget, response).await;
+    match response {
         Ok(Ok(response)) => Ok(response),
         Ok(Err(error)) => {
             // `send()` 阶段的超时只可能来自连接（等待响应头由外层计时器管，

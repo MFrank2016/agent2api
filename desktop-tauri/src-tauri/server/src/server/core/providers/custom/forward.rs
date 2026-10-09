@@ -78,7 +78,7 @@ use crate::server::core::account_store::AccountStore;
 use crate::server::core::custom_providers;
 use crate::server::core::model_rules;
 use crate::server::core::protocol::{anthropic_outbound, responses_outbound};
-use crate::server::core::proxies::ResolvedProxy;
+use crate::server::core::proxies::{AccountEgress, ResolvedProxy};
 use crate::server::core::providers::custom::emulation;
 use crate::server::core::upstream::connections::ConnectionGuard;
 use crate::server::core::upstream::request::{read_upstream_error, send_chat_request, TransportRequest};
@@ -105,7 +105,7 @@ pub(crate) async fn forward(
     provider_id: &str,
     account_id: &str,
     body: &Value,
-    proxy: Option<ResolvedProxy>,
+    egress: AccountEgress,
     stream: bool,
     telemetry: &Arc<RequestTelemetry>,
     slot: &mut Option<InFlightGuard>,
@@ -176,7 +176,7 @@ pub(crate) async fn forward(
             &base_url,
             &quirks,
             body,
-            proxy,
+            egress,
             stream,
             telemetry,
             slot,
@@ -254,7 +254,7 @@ pub(crate) async fn forward(
         &format!(
             "POST {url} model={} stream={stream} account={account_id} 出口={}{}",
             if requested.is_empty() { "(默认)" } else { &requested },
-            describe_proxy(proxy.as_ref()),
+            describe_proxy(egress.primary()),
             if quirks.emulate_opencode { " 伪装=opencode" } else { "" },
         ),
     );
@@ -262,7 +262,7 @@ pub(crate) async fn forward(
         url,
         headers,
         payload,
-        proxy,
+        egress,
     };
     let response = send_chat_request(&transport)
         .await
@@ -449,7 +449,7 @@ async fn forward_translated(
     base_url: &str,
     quirks: &ProviderQuirks,
     body: &Value,
-    proxy: Option<ResolvedProxy>,
+    egress: AccountEgress,
     stream: bool,
     telemetry: &Arc<RequestTelemetry>,
     slot: &mut Option<InFlightGuard>,
@@ -564,14 +564,14 @@ async fn forward_translated(
             "POST {url} protocol={} model={} stream={stream} account={account_id} 出口={}",
             kind.label(),
             if wire_model.is_empty() { "(默认)" } else { &wire_model },
-            describe_proxy(proxy.as_ref()),
+            describe_proxy(egress.primary()),
         ),
     );
     let transport = TransportRequest {
         url,
         headers,
         payload,
-        proxy,
+        egress,
     };
     let response = send_chat_request(&transport)
         .await

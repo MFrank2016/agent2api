@@ -43,7 +43,6 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
-use crate::server::core::proxies::ResolvedProxy;
 use crate::server::core::routing;
 use crate::server::errors::{self, GatewayError};
 use crate::server::logging;
@@ -118,7 +117,7 @@ pub(super) async fn select_target_account(
             provider: providers.first().copied().unwrap_or_default().to_string(),
             account_id: None,
             account: None,
-            proxy: None,
+            egress: crate::server::core::proxies::AccountEgress::Direct,
             priority: None,
             proxy_notice: None,
         });
@@ -157,7 +156,7 @@ pub(super) async fn select_target_account(
             break;
         };
         if let Some(entry) = service.store.get_session_by_id(&id) {
-            return Ok(with_proxy_notice(picked, entry.proxy, entry.proxy_error, id));
+            return Ok(with_proxy_notice(picked, entry.egress, entry.proxy_error, id));
         }
         excluded.push(id);
     }
@@ -231,7 +230,7 @@ pub(super) async fn select_target_account(
         if let Some(account) = squeeze_by_headroom(&enabled, &counts, tried_ids, keys, now) {
             if let Some(id) = routing::account_id(&account).map(str::to_string) {
                 if let Some(entry) = service.store.get_session_by_id(&id) {
-                    return Ok(with_proxy_notice(account, entry.proxy, entry.proxy_error, id));
+                    return Ok(with_proxy_notice(account, entry.egress, entry.proxy_error, id));
                 }
             }
         }
@@ -239,7 +238,7 @@ pub(super) async fn select_target_account(
     if let Some(account) = best_effort {
         if let Some(id) = routing::account_id(&account).map(str::to_string) {
             if let Some(entry) = service.store.get_session_by_id(&id) {
-                return Ok(with_proxy_notice(account, entry.proxy, entry.proxy_error, id));
+                return Ok(with_proxy_notice(account, entry.egress, entry.proxy_error, id));
             }
         }
     }
@@ -247,7 +246,7 @@ pub(super) async fn select_target_account(
         provider: providers.first().copied().unwrap_or_default().to_string(),
         account_id: None,
         account: None,
-        proxy: None,
+        egress: crate::server::core::proxies::AccountEgress::Direct,
         priority: None,
         proxy_notice: None,
     })
@@ -300,36 +299,27 @@ pub(super) fn accounts_in_providers(
 /// 现在把文案挂在 `RouteTarget::proxy_notice` 上，由转发层记进本轮尝试明细
 /// （见那个字段的说明），运行日志不再写。
 ///
-/// 两个来源合并成一条文案：账号存储里记的 `proxyError`（上次解析失败的原因）
-/// 与本次现场解析失败的原因。**后者优先** —— 它说明的是「这次为什么直连」，
-/// 而 `proxyError` 可能是更早的旧状态。
+/// 提示文案来自账号存储里记的 `proxyError`（该账号代理解析失败的原因）：
+/// 它说明的是「这次为什么直连」。
 pub(super) fn with_proxy_notice(
     account: Value,
-    proxy: Value,
+    egress: Value,
     proxy_error: Option<String>,
     account_id: String,
 ) -> RouteTarget {
-    let mut notice = proxy_error.map(|error| {
+    let notice = proxy_error.map(|error| {
         format!(
             "账号「{}」代理不可用，本次直连: {error}",
             account_display(&account)
         )
     });
-    let resolved = match ResolvedProxy::from_json(&proxy) {
-        Ok(proxy) => proxy,
-        Err(reason) => {
-            // 会话里的 proxy 由账号存储解析过（成功才会带过来），
-            // 这里失败说明数据在两次读盘之间变了：按直连兜底
-            notice = Some(format!("账号代理不可用（{reason}），本次回退直连"));
-            None
-        }
-    };
+    let egress = crate::server::core::proxies::AccountEgress::from_json(&egress);
     RouteTarget {
         provider: provider_of(&account).to_string(),
         account_id: Some(account_id),
         priority: priority_of(&account),
         account: Some(account),
-        proxy: resolved,
+        egress,
         proxy_notice: notice,
     }
 }

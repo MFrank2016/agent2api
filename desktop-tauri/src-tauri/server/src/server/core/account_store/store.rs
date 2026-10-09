@@ -39,7 +39,7 @@ use crate::server::core::account_store::state::{
 };
 use crate::server::core::endpoints::resolve_edition;
 use crate::server::core::providers::DEFAULT_PROVIDER_ID;
-use crate::server::core::proxies::{resolve_account_proxy, ProxyResolution};
+use crate::server::core::proxies::{resolve_account_egress, resolve_account_proxy, ProxyResolution};
 use crate::server::db::Db;
 
 /// 账号存储错误（对应 Node 版 AccountStoreError，带状态码 → 路由层直接用）。
@@ -486,8 +486,7 @@ impl AccountStore {
     /// 本函数不制造错误（它是被 CRUD 与选路大量复用的纯取值路径）。
     fn session_from_record(&self, record: &StoredAccount) -> Value {
         let edition = resolve_edition(record.edition().as_deref());
-        let resolution = resolve_account_proxy(Some(&record.proxy()));
-        let (proxy, proxy_error) = split_resolution(resolution);
+        let (proxy, egress, proxy_error) = split_egress(resolve_account_egress(Some(&record.proxy())));
         let proxy_error_value = proxy_error
             .clone()
             .map(Value::String)
@@ -519,6 +518,7 @@ impl AccountStore {
             "platform": record.platform().unwrap_or_else(|| edition.platform.to_string()),
             "edition": edition.id,
             "proxy": proxy,
+            "egress": egress,
             "proxyError": proxy_error_value,
             "auth": {
                 "accessToken": access_token,
@@ -609,12 +609,12 @@ impl AccountStore {
         if !record.has_credentials() {
             return None;
         }
-        let resolution = resolve_account_proxy(Some(&record.proxy()));
-        let (proxy, proxy_error) = split_resolution(resolution);
+        let (proxy, egress, proxy_error) = split_egress(resolve_account_egress(Some(&record.proxy())));
         Some(SessionById {
             id: record.id().to_string(),
             session: self.session_from_record(&record),
             proxy,
+            egress,
             proxy_error,
         })
     }
@@ -719,6 +719,25 @@ fn split_resolution(resolution: Option<ProxyResolution>) -> (Value, Option<Strin
             (json!(proxy_json(proxy)), None)
         }
         Some(ProxyResolution::Failed(message)) => (Value::Null, Some(message)),
+    }
+}
+
+/// 出口解析结果拆成 `(proxy, egress, proxyError)`：Single 时 proxy 与 egress 同形，
+/// Rotate 时 proxy 为 null（轮询计划只进 `egress`）；失败时两者皆 null、error 说明原因。
+fn split_egress(
+    resolution: crate::server::core::proxies::EgressResolution,
+) -> (Value, Value, Option<String>) {
+    use crate::server::core::proxies::{AccountEgress, EgressResolution};
+    match resolution {
+        EgressResolution::Resolved(egress) => {
+            let json = egress.to_json();
+            let proxy = match &egress {
+                AccountEgress::Single(_) => json.clone(),
+                _ => Value::Null,
+            };
+            (proxy, json, None)
+        }
+        EgressResolution::Failed(message) => (Value::Null, Value::Null, Some(message)),
     }
 }
 

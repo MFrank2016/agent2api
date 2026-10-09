@@ -21,7 +21,6 @@
 
 use serde_json::{Value, json};
 
-use crate::server::core::proxies::ResolvedProxy;
 use crate::server::core::upstream::request::TransportRequest;
 
 use super::Region;
@@ -68,20 +67,19 @@ pub fn build_daily_activity_request(
     headers.push(("Origin".to_string(), "https://www.workbuddy.ai".to_string()));
     headers.push(("Referer".to_string(), "https://www.workbuddy.ai/".to_string()));
     headers.push(("X-Requested-With".to_string(), "XMLHttpRequest".to_string()));
-    let proxy = match ResolvedProxy::from_json(session.get("proxy").unwrap_or(&Value::Null)) {
-        Ok(proxy) => proxy,
-        Err(reason) => {
-            crate::server::logging::log(
-                "[Upstream]",
-                &format!("⚠️ 账号代理不可用（{reason}），活跃请求回退直连"),
-            );
-            None
-        }
-    };
+    // 会话里的出口：Direct/Single 与 `proxy` 同形，Rotate 是轮询计划。
+    // 旧形态会话可能没有 `egress` 键，回落到 `proxy`（两者同形，行为不变）；
+    // 畸形数据由 `AccountEgress::from_json` 回退直连（与改造前一致）。
+    let egress = crate::server::core::proxies::AccountEgress::from_json(
+        session
+            .get("egress")
+            .or_else(|| session.get("proxy"))
+            .unwrap_or(&Value::Null),
+    );
     Ok(TransportRequest {
         url: chat_completions_url(session, Region::Intl),
         headers,
         payload,
-        proxy,
+        egress,
     })
 }

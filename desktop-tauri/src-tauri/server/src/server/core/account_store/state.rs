@@ -630,6 +630,9 @@ pub struct SessionById {
     pub id: String,
     pub session: Value,
     pub proxy: Value,
+    /// 本次请求的完整出口（`AccountEgress` 的序列化形态）：Direct/Single 与 `proxy` 同形，
+    /// Rotate 时为轮询计划（此时 `proxy` 为 null）。转发层按它选出口。
+    pub egress: Value,
     pub proxy_error: Option<String>,
 }
 

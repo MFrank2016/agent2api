@@ -53,7 +53,7 @@ use crate::server::core::account_store::state::{mark_name_custom, StoredAccount}
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
 use crate::server::core::account_store::store_util::{token_tail_of, truncate_chars};
 use crate::server::core::custom_providers;
-use crate::server::core::proxies::{resolve_account_proxy, ResolvedProxy};
+use crate::server::core::proxies::{resolve_account_egress, AccountEgress};
 use crate::server::logging;
 
 /// 账号 id 前缀。**与 provider id 的 `custom-` 不同形**（理由见模块头）。
@@ -513,18 +513,18 @@ pub struct CustomCredential {
     pub no_auth: bool,
     /// 账号上的 baseUrl **覆盖项**（None = 未覆盖，转发回落提供商的 baseUrl）
     pub base_url_override: Option<String>,
-    /// 出网代理（None = 未配置 / 解析失败 → 直连）
-    pub proxy: Option<ResolvedProxy>,
+    /// 出网出口（`Direct` = 未配置 / 解析失败 → 直连）
+    pub egress: AccountEgress,
 }
 
 /// 一条记录 → 凭证快照（两个入口共用一份取数口径，不会各漂一份）
 fn credential_of_record(record: &StoredAccount) -> CustomCredential {
     let fields = record.fields();
-    let proxy = match resolve_account_proxy(Some(&record.proxy())) {
-        Some(resolution) => resolution.resolved().cloned(),
-        // 无代理配置 → 直连（与「解析失败回退直连」在出网行为上等价，
+    let egress = match resolve_account_egress(Some(&record.proxy())) {
+        crate::server::core::proxies::EgressResolution::Resolved(egress) => egress,
+        // 无代理配置 / 解析失败 → 直连（与「解析失败回退直连」在出网行为上等价，
         // 区别只在日志：这里没有请求上下文可挂 notice，静默直连即可）
-        None => None,
+        crate::server::core::proxies::EgressResolution::Failed(_) => AccountEgress::Direct,
     };
     CustomCredential {
         account_id: record.id().to_string(),
@@ -540,7 +540,7 @@ fn credential_of_record(record: &StoredAccount) -> CustomCredential {
             .and_then(Value::as_str)
             .map(str::to_string)
             .filter(|text| !text.is_empty()),
-        proxy,
+        egress,
     }
 }
 

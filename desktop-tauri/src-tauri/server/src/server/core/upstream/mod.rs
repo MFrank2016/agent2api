@@ -236,7 +236,7 @@ pub(super) struct RouteTarget {
     pub account_id: Option<String>,
     /// 账号公开形态（限额事件与日志用；无账号列表时为 null）
     pub account: Option<Value>,
-    pub proxy: Option<ResolvedProxy>,
+    pub egress: crate::server::core::proxies::AccountEgress,
     pub priority: Option<i64>,
     /// 选路阶段的提示（目前只有「账号代理不可用、本次回退直连」）。
     ///

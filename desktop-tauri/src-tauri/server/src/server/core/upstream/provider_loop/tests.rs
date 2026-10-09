@@ -38,7 +38,7 @@ async fn mock_upstream(
             url,
             headers: vec![("Content-Type".into(), "application/json".into())],
             payload: r#"{"stream":true}"#.into(),
-            proxy: None,
+            egress: crate::server::core::proxies::AccountEgress::Direct,
         },
         hits,
         task,

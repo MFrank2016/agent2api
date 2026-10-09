@@ -812,7 +812,7 @@ pub async fn fetch_upstream_models(
             "请先添加账号：拉取模型清单需要一条启用且可用（填了 apiKey，或声明了无需鉴权）的账号"
                 .to_string()
         })?;
-    let client = egress::client_for(credential.proxy.as_ref());
+    let client = egress::client_for(credential.egress.primary());
     let mut builder = client
         .get(&url)
         .timeout(Duration::from_millis(FETCH_MODELS_TIMEOUT_MS));

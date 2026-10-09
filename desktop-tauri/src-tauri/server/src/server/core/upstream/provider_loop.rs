@@ -864,7 +864,7 @@ async fn attempt_queue(
                         .priority
                         .map(|value| value.to_string())
                         .unwrap_or_else(|| "-".to_string()),
-                    describe_proxy(target.proxy.as_ref()),
+                    describe_proxy(target.egress.primary()),
                     ctx.body
                         .get("messages")
                         .and_then(Value::as_array)
@@ -876,7 +876,7 @@ async fn attempt_queue(
                 url: plan.url,
                 headers: plan.headers,
                 payload,
-                proxy: target.proxy.clone(),
+                egress: target.egress.clone(),
             };
             // ── 调试模式：抓一份即将发出去的原始报文 ──────────────────
             // 位置在 `build_chat_request` 之后（URL / 头 / body 都已定稿）。
@@ -1415,7 +1415,7 @@ async fn attempt_custom(
                 .priority
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string()),
-            describe_proxy(target.proxy.as_ref()),
+            describe_proxy(target.egress.primary()),
         ),
     );
     match custom_forward::forward(
@@ -1423,7 +1423,7 @@ async fn attempt_custom(
         &provider_id,
         target.account_id.as_deref().unwrap_or(""),
         &send.body,
-        target.proxy.clone(),
+        target.egress.clone(),
         ctx.stream,
         ctx.telemetry,
         slot,
@@ -1582,7 +1582,7 @@ async fn attempt_stateful(
                 .priority
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string()),
-            describe_proxy(target.proxy.as_ref()),
+            describe_proxy(target.egress.primary()),
         ),
     );
     match adapter
@@ -1591,7 +1591,7 @@ async fn attempt_stateful(
             target.account_id.as_deref().unwrap_or(""),
             body,
             ctx.client_headers,
-            target.proxy.clone(),
+            target.egress.primary().cloned(),
             ctx.stream,
             ctx.telemetry,
         )
