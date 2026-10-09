@@ -96,6 +96,8 @@ pub const SCOPE_LOOMY: &str = "loomy";
 pub const SCOPE_MONKEYCODE_CN: &str = "monkeycodeCn";
 /// MonkeyCode 国际版（两个站点各一份清单，缓存分开）
 pub const SCOPE_MONKEYCODE_INTL: &str = "monkeycodeIntl";
+/// Command Code（`GET /provider/v1/models`；单一域名、无地区之分，单格即可）
+pub const SCOPE_COMMANDCODE: &str = "commandcode";
 
 /// 全部 scope（事实来源：`cached_scopes` 按它遍历；新增一家时加在这里）。
 pub const ALL_SCOPES: &[&str] = &[
@@ -115,6 +117,7 @@ pub const ALL_SCOPES: &[&str] = &[
     SCOPE_LOOMY,
     SCOPE_MONKEYCODE_CN,
     SCOPE_MONKEYCODE_INTL,
+    SCOPE_COMMANDCODE,
 ];
 
 /// 一份清单缓存

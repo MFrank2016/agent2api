@@ -703,6 +703,36 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
                 Err(error) => return management_error(error.status_code, error.message),
             }
         }
+        // Command Code（`api.commandcode.ai`）：**粘贴 API Key**（`user_` 开头）
+        // → 本地归一化（剥引号 / `Authorization: Bearer …` 整行 / 尾部杂字段）
+        // + 形态检查，随后一次 best-effort 探活（`GET /alpha/billing/credits`
+        // 的 401/403 才判无效）→ 落账号。key 本身也是上游的账号身份
+        // （没有 userId 可解析，账号 id 由 key 摘要派生，见
+        // `commandcode_accounts.rs` 的模块头）。
+        //
+        // `importDesktop` 不提供：本家的凭证就是一枚 API Key，没有客户端
+        // 「auth.json」那种可读登录态（与 Loomy / MonkeyCode 同一处境）。
+        Some(crate::server::core::providers::ProviderKind::CommandCode) => {
+            if import_desktop {
+                return management_error(
+                    400,
+                    "Command Code 不支持导入桌面端登录态，请粘贴 API Key（user_ 开头）添加账号",
+                );
+            }
+            let raw = payload
+                .get("apiKey")
+                .or_else(|| payload.get("accessToken"))
+                .or_else(|| payload.get("token"))
+                .or_else(|| payload.get("key"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let credentials =
+                match crate::server::core::providers::commandcode::login::verify_key(raw).await {
+                    Ok(credentials) => credentials,
+                    Err(error) => return management_error(error.status_code, error.message),
+                };
+            store.add_commandcode_account(&credentials, import_name, "manual")
+        }
         // WorkBuddy 系的两家（国内版 / 国际版）：同一套凭证形态与落账号路径，
         // 差别只有归属 —— provider id 自己就是归属（拆家后不再从 payload 里的
         // `edition` 反推：那是账号的属性，而落哪一家是身份问题）。
@@ -864,9 +894,10 @@ pub async fn batch_accounts(state: &ServerState, body: &Bytes) -> Response {
 ///
 /// workbuddy 账号走既有的 `AuthService::refresh_account`；小浣熊、AutoClaw、
 /// CodeArts、**Trae / ZCode**、Accio、Cline 账号各走自家适配器的
-/// `refresh_access_token`；**CatPaw 账号没有可刷新的东西**
-/// （§9.1：`X-Passport-Token` 过期只能在桌面端重新登录，没有 refreshToken），
-/// 因此这里明确报 400 并说明做法 —— 静默走 workbuddy 的刷新会拿 CatPaw 的凭证
+/// `refresh_access_token`；**CatPaw / MonkeyCode / Command Code 账号没有可刷新的
+/// 东西**（§9.1：`X-Passport-Token` 过期只能在桌面端重新登录，没有 refreshToken；
+/// 后两家是静态 session / API Key，上游根本没有续期接口），
+/// 因此这里明确报 400 并说明做法 —— 静默走 workbuddy 的刷新会拿别家的凭证
 /// 去打腾讯的鉴权接口。
 ///
 /// 漏登记的实际代价（两条都是生产抓到的）：CodeArts 漏的时候用户点「刷新 Token」
@@ -1023,6 +1054,17 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
                  请在浏览器重新取一次 session cookie 后在本页重新粘贴",
             );
         }
+    }
+    // Command Code：同样**没有刷新机制**（单枚静态 API Key、上游无 refresh
+    // 接口，见 `providers::commandcode::credentials` 的模块头）。不显式拦下的
+    // 话会落到下面的 workbuddy 兜底链路，用户会收到一条与腾讯鉴权端点相关的
+    // 错误 —— 与 CatPaw / MonkeyCode 漏登记时的症状同一性质。
+    if state.store().commandcode_account_record(&id).is_some() {
+        return management_error(
+            400,
+            "Command Code 的 API Key 没有刷新机制（静态 key、上游无续期接口）：\
+             请在 commandcode.ai/studio 重新获取后在本页重新粘贴",
+        );
     }
     // WorkBuddy 系（国内版 / 国际版）的兜底：两条链路都按**账号自己的**
     // endpoint / prefixPath / platform / edition 续期

@@ -109,6 +109,11 @@ pub mod cline;
 /// 语义来源与施工计划见 `cpa-deploy/notes/agent2api-codearts-port-plan.md`。
 /// 目前只落了签名层，尚未进 `ProviderKind`（不参与目录与转发）。
 pub mod codearts;
+/// Command Code（`api.commandcode.ai`）：无状态转发（一次 HTTP 请求 = 一次
+/// 生成）+ 粘贴式 `user_` API Key。上游响应是 **NDJSON** 而不是 SSE、且
+/// **HTTP 恒 200**（错误在流内），因此走
+/// `UpstreamResponse::CommandCodeNdjson` 那条翻译层，见 `commandcode/mod.rs`。
+pub mod commandcode;
 pub mod content_block;
 /// 自定义提供商的**运行期接线**（目录聚合的追加段 + Chat Completions 协议
 /// 转发）。它不进本文件的身份体系（`ProviderKind` / `PROVIDERS`，见
@@ -385,6 +390,29 @@ pub enum ProviderKind {
     /// 但参考没有 `.net` 的实测端点 / cookie 名差异记录。本家按「同协议换站点」
     /// 建模，差异待实测（见 `monkeycode/region.rs` 的模块头）。
     MonkeyCodeIntl,
+    /// Command Code（`api.commandcode.ai`）。适配实现在 `commandcode/`：
+    /// 账号管理（**粘贴 `user_` 开头的 API Key**）**加推理转发**。
+    ///
+    /// ── 上游长什么样（规格 `_recon/commandcode-spec.md`，参考
+    /// `Acankao/commandcode-proxy/`）──────────────────────────────
+    /// 单一域名、单一 API Key（无 OAuth / 设备码 / 续期）。生成走
+    /// `POST /alpha/generate`、请求体是自有 8 键信封；响应是
+    /// **NDJSON**（`application/x-ndjson`，一行一个 JSON 事件）且 **HTTP 恒
+    /// 200**，错误在流内以 `{"type":"error"}` 表达；发正式请求前还要先上报
+    /// 「设备指纹 + 生命周期」两条预请求（指纹由 apiKey 确定性派生）。
+    ///
+    /// ── 为什么是**一家**（没有地区伴生）─────────────────────────
+    /// 规格 §9 明确：参考里出现的 Command Code 主机只有
+    /// `https://api.commandcode.ai`，没有 cn / intl 双域名、没有 region 头、
+    /// 模型 id 也不分地区 —— 拆地区没有依据（出口 IP 风控是代理层选项，
+    /// 不是协议里的地区）。
+    ///
+    /// ── 转发路线（为什么无状态却能说两套协议）──────────────────
+    /// 本家是**无状态**（一次 HTTP 请求 = 一次生成），只是响应协议是 NDJSON：
+    /// 走 [`adapter::UpstreamResponse::CommandCodeNdjson`] 那条翻译层
+    /// （`upstream::translate::CommandCodeToChatStream`），`is_stateful` 恒
+    /// false —— 账号轮换 / 冷却 / 重试 / usage / 取消全部由编排层承担。
+    CommandCode,
 }
 
 /// 一个提供商的静态元数据。
@@ -463,6 +491,10 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // 国内版在前（用户直觉里「MonkeyCode 就是国内那个站」）。
     ProviderMeta { id: "monkeycode", label: "MonkeyCode" },
     ProviderMeta { id: "monkeycode-intl", label: "MonkeyCode 国际版" },
+    // Command Code：单一域名、单一入口（粘贴 user_ API Key），没有国际版伴生
+    // （规格 §9：参考里只有 api.commandcode.ai 一个主机）。排在末尾
+    // （2026-10 接入，后到居后，与 Kuku 同一处置）。
+    ProviderMeta { id: "commandcode", label: "Command Code" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -543,6 +575,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "kuku" => Some(ProviderKind::Kuku),
         "monkeycode" => Some(ProviderKind::MonkeyCode),
         "monkeycode-intl" => Some(ProviderKind::MonkeyCodeIntl),
+        "commandcode" => Some(ProviderKind::CommandCode),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -581,6 +614,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::Kuku => "kuku",
         ProviderKind::MonkeyCode => "monkeycode",
         ProviderKind::MonkeyCodeIntl => "monkeycode-intl",
+        ProviderKind::CommandCode => "commandcode",
     }
 }
 

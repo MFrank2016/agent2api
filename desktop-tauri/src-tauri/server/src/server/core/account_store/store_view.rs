@@ -285,6 +285,10 @@ impl AccountStore {
             // 公开形态带 uid(=uk) / loginName(=昵称) / tokenTail（见
             // `kuku_accounts.rs`）
             self.to_kuku_public_account(record)
+        } else if record.provider() == super::COMMANDCODE_PROVIDER_ID {
+            // Command Code：单一入口（粘贴 `user_` API Key），公开形态去掉 key
+            // 本体、只留尾号与「有没有 key」（见 `commandcode_accounts.rs`）
+            self.to_commandcode_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)

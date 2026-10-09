@@ -28,6 +28,10 @@
 //!   anthropic.rs         Anthropic Messages ↔ Chat（同上）
 //!   responses_outbound.rs chat → Responses 上游的出站翻译（自定义提供商转发）
 //!   anthropic_outbound.rs chat → Anthropic 上游的出站翻译（同上）
+//!   commandcode_outbound.rs 上游 Command Code NDJSON → chat SSE（内置家：
+//!                         `api.commandcode.ai` 的 `/alpha/generate` 返回
+//!                         `application/x-ndjson`，HTTP 恒 200、错误在流内；
+//!                         见该文件模块头）
 //!   history.rs           内部 Chat 体的历史 sanitize（客户端带来的畸形工具历史）
 //!
 //! 出站两个文件与回程两个文件方向相反：回程服务「下游说 X」的入口
@@ -42,6 +46,7 @@
 
 pub mod anthropic;
 pub mod anthropic_outbound;
+pub mod commandcode_outbound;
 pub mod freeform;
 pub mod history;
 pub mod native_tool;

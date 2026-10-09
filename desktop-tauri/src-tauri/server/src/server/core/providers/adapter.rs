@@ -154,6 +154,24 @@ impl ChatRequestPlan {
             response: UpstreamResponse::Chat,
         }
     }
+
+    /// Command Code 形态：请求体是自有信封（`config` / `params` 那套），
+    /// 响应是 NDJSON（见 [`UpstreamResponse::CommandCodeNdjson`]）。
+    ///
+    /// 与 [`Self::chat`] 同一动机：调用点只回答「响应是哪套协议」，
+    /// 不自己拼 `ChatRequestPlan` 的字段。
+    pub fn commandcode_ndjson(
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Value,
+    ) -> Self {
+        Self {
+            url,
+            headers,
+            body,
+            response: UpstreamResponse::CommandCodeNdjson,
+        }
+    }
 }
 
 /// 上游响应的协议（**请求体与响应必须同源**：这套标记由适配器在构造请求时
@@ -174,6 +192,13 @@ pub enum UpstreamResponse {
     Chat,
     /// Anthropic Messages SSE：下发前折回标准 chat SSE（见 `upstream::translate`）
     Anthropic,
+    /// Command Code 的 **NDJSON**（`application/x-ndjson`）：一行一个 JSON 事件、
+    /// **HTTP 恒 200**、错误以流内 `{"type":"error"}` 表达，因此连接的成败与
+    /// 「这一轮生成成没成」是两件事。下发前折回标准 chat SSE
+    /// （见 `upstream::translate` 与 `protocol::commandcode_outbound`）——
+    /// 走翻译层的理由与 Anthropic 那条逐字相同：账号轮换、限额冷却、退避重试、
+    /// usage 记账与取消处理全部留在编排层，只有字节形态在翻译器里变。
+    CommandCodeNdjson,
 }
 
 /// 上游错误分类（架构文档 §4.2；三个动作的语义见模块头）。
@@ -996,6 +1021,10 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // 两个站点是两个 provider、两个实例（同一份实现按地区参数化）
         ProviderKind::MonkeyCode => &super::monkeycode::MONKEYCODE_ADAPTER,
         ProviderKind::MonkeyCodeIntl => &super::monkeycode::MONKEYCODE_INTL_ADAPTER,
+        // Command Code（`api.commandcode.ai`）：无状态（一次 HTTP 请求 = 一次
+        // 生成）、粘贴 `user_` API Key、响应是 NDJSON（`UpstreamResponse::
+        // CommandCodeNdjson`，见 `commandcode/mod.rs` 的模块头）
+        ProviderKind::CommandCode => &super::commandcode::COMMANDCODE_ADAPTER,
     }
 }
 
@@ -1081,6 +1110,10 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // 接线了没有」，不是「这家的转发能不能用」。
         ProviderKind::MonkeyCode,
         ProviderKind::MonkeyCodeIntl,
+        // Command Code 已接真身（账号 / 目录 / 转发），且有远程目录
+        // （`GET /provider/v1/models`，失败回落内置 26 项清单）—— 必须在列表里，
+        // 否则目录刷新循环不会问它。
+        ProviderKind::CommandCode,
     ]
 }
 

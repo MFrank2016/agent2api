@@ -86,6 +86,8 @@
 //!                网页登录共用入口）、续期回写、公开形态（含 edition）
 //!   monkeycode_accounts.rs MonkeyCode 账号（两个站点各一家 provider）：粘贴
 //!                session 添加（session + imageId + userId）、公开形态（含 edition）
+//!   commandcode_accounts.rs Command Code 账号（单一 provider）：粘贴 `user_`
+//!                开头的 API Key 添加、公开形态（只给尾号）
 
 pub mod accio_accounts;
 pub mod autoclaw_accounts;
@@ -94,6 +96,7 @@ pub mod catpaw_accounts;
 pub mod catpaw_import;
 pub mod cline_accounts;
 pub mod codearts_accounts;
+pub mod commandcode_accounts;
 pub mod custom_accounts;
 pub mod kuku_accounts;
 pub mod loomy_accounts;
@@ -193,6 +196,12 @@ pub(crate) const MONKEYCODE_INTL_PROVIDER_ID: &str = crate::server::core::provid
 pub(crate) fn is_monkeycode_family(provider_id: &str) -> bool {
     provider_id == MONKEYCODE_PROVIDER_ID || provider_id == MONKEYCODE_INTL_PROVIDER_ID
 }
+
+/// Command Code provider id（账号存储内部多处要用；**从注册表推导**）。
+/// 账号形态见 `commandcode_accounts.rs`（单一 provider、没有地区之分）。
+pub(crate) const COMMANDCODE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::CommandCode,
+);
 
 /// Cline **免费池** provider id（账号存储内部多处要用；**从注册表推导**，同
 /// [`RACCOON_PROVIDER_ID`] 的口径）。账号形态见 `cline_accounts.rs`。

@@ -1271,23 +1271,48 @@ async fn attempt_queue(
 
         // ── 上游响应协议（适配器在构造请求时一并给出）──────────────────
         // 绝大多数上游说 chat SSE（`ForwardStream` / 聚合器的默认输入）；
-        // ZCode 的活动套餐通道说 Anthropic，先过一层翻译折成 chat 帧
-        // （见 `upstream::translate` 与 `providers::zcode::plan`）。
+        // 两条例外各有一台翻译状态机（见 `upstream::translate` 的模块头）：
+        //   - ZCode 的活动套餐通道说 Anthropic SSE；
+        //   - Command Code 说 NDJSON（`application/x-ndjson`，**HTTP 恒 200**、
+        //     错误在流内），那家返回的 200 不代表这一轮生成成功 —— 成败由
+        //     翻译状态机折出的错误帧表达，与另外两处出口共用同一套下行语义。
         // 翻译在**两处出口之前**做，于是流式与非流式共用同一条下行语义：
         // reasoning 合并、usage 提取、model 回写、取消处理全都不需要第二套。
+        // 说 chat 的家（含自定义家）跳过这一整段，直接走下面的原生路径。
         if response_protocol
-            == crate::server::core::providers::adapter::UpstreamResponse::Anthropic
+            != crate::server::core::providers::adapter::UpstreamResponse::Chat
         {
+            use crate::server::core::providers::adapter::UpstreamResponse;
             // 状态码要在 consume response 之前取（与 chat 路径同一时机）
             let status = response.status().as_u16();
             let translated: futures::stream::BoxStream<
                 'static,
                 Result<bytes::Bytes, std::io::Error>,
-            > = Box::pin(super::translate::AnthropicToChatStream::new(
-                response,
-                &wire_model,
-                ctx.telemetry,
-            ));
+            > = match response_protocol {
+                UpstreamResponse::Anthropic => Box::pin(
+                    super::translate::AnthropicToChatStream::new(
+                        response,
+                        &wire_model,
+                        ctx.telemetry,
+                    ),
+                ),
+                UpstreamResponse::CommandCodeNdjson => Box::pin(
+                    super::translate::CommandCodeToChatStream::new(
+                        response,
+                        &wire_model,
+                        ctx.telemetry,
+                    ),
+                ),
+                // 外层 `if` 已排除它，这一支只为 match 的穷尽性存在，**不可能
+                // 走到**。真走到说明分派被改坏了：报内部错误而不是 panic
+                // （release 是 `panic=abort`，一处 panic 带走整个网关）。
+                UpstreamResponse::Chat => {
+                    return Err(GatewayError::with_status(
+                        500,
+                        "内部错误：Chat 协议不该进入上游响应翻译分派",
+                    ))
+                }
+            };
             if ctx.stream {
                 return Ok(ForwardOutcome::Stream {
                     status,

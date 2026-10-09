@@ -154,6 +154,13 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
                 super::monkeycode::models::last_refreshed_at(region),
             )
         }
+        // Command Code：清单来自 `GET /provider/v1/models`（单一域名、无地区），
+        // 拉不到时回落内置 26 项 —— 「有远程内容」才算远程来源（`remote_refreshed`
+        // 只看落地的那些，不看兜底表）。
+        ProviderKind::CommandCode => (
+            super::commandcode::models::remote_refreshed(),
+            super::commandcode::models::last_refreshed_at(),
+        ),
     }
 }
 
