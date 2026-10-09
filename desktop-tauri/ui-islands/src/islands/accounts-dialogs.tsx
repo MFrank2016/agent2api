@@ -887,7 +887,7 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
 
   const hint = holder
     ? <span className='text-destructive'>{t('已被「{name}」占用', { name: labelOf(holder) })}</span>
-    : (used.length ? t('同提供商已占用：{names}', { names: used.join('、') }) : t('同提供商内暂无其他账号占用优先级'))
+    : (used.length ? t('同提供商已占用：{names}', { names: used.join(t('、')) }) : t('同提供商内暂无其他账号占用优先级'))
 
   // 「凭证与套餐」按家出现：有什么配什么（CatPaw 余额凭证 / 自定义账号凭证与
   // 提供商 / ZCode 套餐通道）。内置家什么都没有时整组不出现。
@@ -1119,13 +1119,13 @@ function BatchDialog({ ids, action, onClose }: { ids: string[]; action: string; 
       const succeeded = current === 'remove' ? removedCount : okCount
       const verb = { enable: t('启用'), disable: t('禁用'), proxy: t('修改代理'), remove: t('删除') }[current] || current
       if (failed.length) {
-        const detail = failed.slice(0, 3).map(item => labelOf(findAccount(String(item.id))) || item.id).join('、')
+        const detail = failed.slice(0, 3).map(item => labelOf(findAccount(String(item.id))) || item.id).join(t('、'))
         toast(t('{verb}完成：成功 {ok} 个，失败 {fail} 个（{detail}{more}）', {
           verb, ok: succeeded, fail: failed.length, detail, more: failed.length > 3 ? t(' 等') : '',
         }), 'err')
         setResult(
           <span className='text-destructive'>{t('失败 {count} 个：', { count: failed.length })}
-            {failed.map(item => `${labelOf(findAccount(String(item.id))) || item.id}（${item.error}）`).join('；')}
+            {failed.map(item => `${labelOf(findAccount(String(item.id))) || item.id}（${item.error}）`).join(t('；'))}
           </span>,
         )
       } else {
@@ -1150,7 +1150,7 @@ const verb = { enable: t('启用'), disable: t('禁用'), proxy: t('修改代理
         <DialogBody>
           <DialogSection>
             <h3>{t('将作用于以下账号')}</h3>
-            <p style={{ maxHeight: 84, overflowY: 'auto' }}>{accounts.map(account => labelOf(account)).join('、')}</p>
+            <p style={{ maxHeight: 84, overflowY: 'auto' }}>{accounts.map(account => labelOf(account)).join(t('、'))}</p>
           </DialogSection>
           <DialogSection>
             <h3>{t('操作')}</h3>

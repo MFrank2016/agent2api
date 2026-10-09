@@ -457,7 +457,7 @@ function HistoryItem({ entry }: {
       <div className='ck-tl-sub'>
         {historyLine(entry)}
         {failed > 0 && Array.isArray(entry.failed) && entry.failed.length > 0
-          ? <><br /><span className='fail'>{entry.failed.join('；')}</span></>
+          ? <><br /><span className='fail'>{entry.failed.join(t('；'))}</span></>
           : null}
       </div>
     </div>
@@ -478,7 +478,7 @@ function AutoCheckinCard({ store }: { store: CheckinStore }) {
   const keepalive = store.snapshot?.keepalive
   const keepaliveModels = Array.isArray(keepalive?.models) ? keepalive!.models : []
   const defaultModels = Array.isArray(keepalive?.defaultModels) ? keepalive!.defaultModels : []
-  const keepaliveText = store.keepaliveDraft ?? keepaliveModels.join('、')
+  const keepaliveText = store.keepaliveDraft ?? keepaliveModels.join(t('、'))
   return (
     <section className='panel'>
       <div className='panel-head'>
@@ -562,7 +562,7 @@ function AutoCheckinCard({ store }: { store: CheckinStore }) {
         </div>
         <div className='ck-note'>
           {t('「保活模型链」是 WorkBuddy 国际版领日活时用来保活的免费模型，按顺序逐个尝试、 第一个成功即止；清空提交恢复缺省（{defaults}）。 当天去重 + 幂等领取：重复执行只会拿到「已领取」，不会重复加分。 自动签到的设置以这里为准，「定时任务」页只保留间隔型任务。', {
-            defaults: defaultModels.join('、'),
+            defaults: defaultModels.join(t('、')),
           })}
         </div>
         {last ? (
@@ -670,7 +670,7 @@ function CheckinPage() {
           </div>
           <div className='ck-stat-foot'>
             {picked.length
-              ? options.filter(option => picked.includes(option.id)).map(option => option.label).join('、')
+              ? options.filter(option => picked.includes(option.id)).map(option => option.label).join(t('、'))
               : t('未勾选任何提供商')}
           </div>
         </div>
@@ -731,7 +731,7 @@ function CheckinPage() {
                     // 列表项里的 provider 名与原因都是后端数据（snapshot 的 outOfScope），原样透出
                     list: daily!.outOfScope
                       .map(item => t('{label} ×{count}（{reason}）', { label: item.label, count: item.count, reason: item.reason }))
-                      .join('；'),
+                      .join(t('；')),
                   })}
                 </div>
               ) : null}

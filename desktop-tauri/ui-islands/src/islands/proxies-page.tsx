@@ -142,7 +142,7 @@ function ProxiesPage() {
             <b>{item.name || t('未命名')}</b>
             {used.length ? (
               <span className='text-[11px] text-subtle'
-                title={used.map(entry => String(entry.name || entry.id || '')).join('、')}>
+                title={used.map(entry => String(entry.name || entry.id || '')).join(t('、'))}>
                 {t('{n} 个账号在用', { n: used.length })}
               </span>
             ) : null}

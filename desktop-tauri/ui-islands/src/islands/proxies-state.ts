@@ -381,7 +381,7 @@ export async function removeItem(item: ProxyPoolItem): Promise<void> {
   const usedHtml = used.length
     ? `<p style="margin-top:6px">${t('有 <strong>{n}</strong> 个账号正在使用它（{names}）—— 删除后这些账号会回退直连。', {
         n: used.length,
-        names: used.map(entry => escapeHtml(String(entry.name || entry.id || ''))).join('、'),
+        names: used.map(entry => escapeHtml(String(entry.name || entry.id || ''))).join(t('、')),
       })}</p>`
     : ''
   const ok = await wb().wbConfirm?.ask?.({
@@ -478,7 +478,7 @@ export async function batchRemove(): Promise<void> {
       : t('没有可删除的条目'), 'err')
     return
   }
-  const names = deletable.slice(0, 8).map(item => escapeHtml(itemName(item))).join('、')
+  const names = deletable.slice(0, 8).map(item => escapeHtml(itemName(item))).join(t('、'))
   const namesText = deletable.length > 8
     ? t('{names} 等 {n} 条', { names, n: deletable.length })
     : names
@@ -515,7 +515,7 @@ export async function batchRemove(): Promise<void> {
   const parts = [t('已删除 {n} 个代理', { n: done })]
   if (skipped) parts.push(t('跳过 {n} 个（Clash 同步）', { n: skipped }))
   if (failed) parts.push(t('失败 {n} 个（{reason}）', { n: failed, reason: firstError }))
-  toast(failed ? parts.join('，') : `✅ ${parts.join('，')}`, failed ? 'err' : 'ok')
+  toast(failed ? parts.join(t('，')) : `✅ ${parts.join(t('，'))}`, failed ? 'err' : 'ok')
 }
 
 /** 新建 / 编辑提交（表单已在弹窗里校验过形状） */

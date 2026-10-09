@@ -455,14 +455,14 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
   const targetTip = [
     t('以模型本名直发'),
     aliases.length
-      ? t('另有 {n} 条别名映射（{aliases}），别名不参与本次', { n: aliases.length, aliases: aliases.join('、') })
+      ? t('另有 {n} 条别名映射（{aliases}），别名不参与本次', { n: aliases.length, aliases: aliases.join(t('、')) })
       : '',
     defaultClosed
       ? t('该行当前未启用：测试照常按本名直发（「先测通、再决定要不要启用」正是这颗按钮的用法），但本行的思考等级绑定不参与本次，生产路由也要等绑定打开后才会放行')
       : boundLevel
         ? t('映射上绑定的思考等级是 {level}，「跟随映射」按它注入', { level: boundLevel })
         : t('映射上未绑定思考等级，「跟随映射」等于这次不注入'),
-  ].filter(Boolean).join('；') + t('。')
+  ].filter(Boolean).join(t('；')) + t('。')
   const accountOptions = usable.map(account => ({
     value: account.id,
     // 「限额中」按**这个模型**判（限额是按模型记的：一个账号可能对 A 模型限额、对 B 模型正常）

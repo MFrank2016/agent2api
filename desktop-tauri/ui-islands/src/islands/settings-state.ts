@@ -692,7 +692,7 @@ export async function importAccounts(): Promise<void> {
     const extras: string[] = []
     if (skipped) extras.push(t('跳过 {n} 个', { n: skipped }))
     if (failed) extras.push(t('失败 {n} 个', { n: failed }))
-    const suffix = extras.length ? t('，{items}', { items: extras.join('、') }) : ''
+    const suffix = extras.length ? t('，{items}', { items: extras.join(t('、')) }) : ''
     const providerNote = (customAdded || customUpdated)
       ? t('，自定义提供商新增 {added} 个、更新 {updated} 个', { added: customAdded, updated: customUpdated })
       : ''
@@ -712,7 +712,7 @@ export async function importAccounts(): Promise<void> {
           const message = item?.message ?? t('未知原因')
           return t('{label}（{message}）', { label, message })
         })
-        .join('；')
+        .join(t('；'))
       publish({ ioFailure: { failed, detail, more: errors.length > 3 } })
     } else {
       toast(t('✅ 导入完成：{summary}', { summary }))

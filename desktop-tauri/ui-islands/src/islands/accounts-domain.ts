@@ -693,7 +693,7 @@ export function claimedToday(account: AccountRecord | null | undefined): boolean
 /** 「今天领过 N 份」的悬停说明：列出领过的套餐，并说清还能继续领别的 */
 export function claimDoneTitle(account: AccountRecord | null | undefined): string {
   const planIds = claimedPlanIdsToday(account)
-  const names = planIds.length ? t('（{plans}）', { plans: planIds.join('、') }) : ''
+  const names = planIds.length ? t('（{plans}）', { plans: planIds.join(t('、')) }) : ''
   return t('今天（北京时间 {day}）已领取 {n} 份{names}；还有其他可领套餐时，点这里可以继续领；活动按自然日发新套餐，明天可再领', {
     day: beijingDay(), n: planIds.length, names,
   })

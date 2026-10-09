@@ -304,7 +304,7 @@ function restrictionText(k: KeyEntry): string {
   if (!providers.length && !models.length) return t('不限制')
   const parts: string[] = []
   // providerLabel 的输出是展示名（providers.js 侧已处理多语言），原样透出
-  if (providers.length) parts.push(providers.map(providerLabel).join('、'))
+  if (providers.length) parts.push(providers.map(providerLabel).join(t('、')))
   // 模型那半边只报个数：一屏 Row 里塞不下十几个模型名，悬停由 title 给全量
   if (models.length) parts.push(t('{n} 个模型', { n: models.length }))
   return t('限制：{text}', { text: parts.join(' / ') })
@@ -318,8 +318,8 @@ function restrictionTitle(k: KeyEntry): string {
     return t('这把 Key 不限制提供商与模型（可用全部上游与全部对外模型）')
   }
   const lines: string[] = []
-  if (providers.length) lines.push(t('可用提供商：{names}', { names: providers.map(providerLabel).join('、') }))
-  if (models.length) lines.push(t('可用模型：{names}', { names: models.join('、') }))
+  if (providers.length) lines.push(t('可用提供商：{names}', { names: providers.map(providerLabel).join(t('、')) }))
+  if (models.length) lines.push(t('可用模型：{names}', { names: models.join(t('、')) }))
   return lines.join('\n')
 }
 
@@ -333,8 +333,8 @@ function restrictionSummary(providers: readonly string[], models: readonly strin
     return t('当前不限制：这把 Key 可以用全部提供商与全部对外模型')
   }
   const parts: string[] = []
-  if (providers.length) parts.push(t('提供商：{names}', { names: providers.map(providerLabel).join('、') }))
-  if (models.length) parts.push(t('模型：{names}', { names: models.join('、') }))
+  if (providers.length) parts.push(t('提供商：{names}', { names: providers.map(providerLabel).join(t('、')) }))
+  if (models.length) parts.push(t('模型：{names}', { names: models.join(t('、')) }))
   // 只限制了模型、没限制提供商（旧数据里可能存在这种组合）：模型候选此刻只剩已勾的
   // 那几个（没有提供商就没有并集可铺），要说清怎么把候选拿回来 —— 否则用户会以为
   // 「模型清单坏了，加不了新的」

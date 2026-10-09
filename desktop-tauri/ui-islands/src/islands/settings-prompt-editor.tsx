@@ -280,7 +280,7 @@ function GatewayEditor({ id, title, official, over, enabled, disabled, onClose }
             <p>
               {t('上游按')}<strong>{t('结构')}</strong>
               {t('校验身份：这三段必须各自成块排在最前（实测：三段并成一段会被回 405 / 3012）。因此这里按段编辑，不能合成一段。改过的段以你的文本为准，没改的段继续用官方原文；清空某一段 = 那一段恢复官方原文。')}
-              {editedNow.length ? t('当前已改过：{edited}。', { edited: editedNow.join('、') }) : t('当前三段都是官方原文。')}
+              {editedNow.length ? t('当前已改过：{edited}。', { edited: editedNow.join(t('、')) }) : t('当前三段都是官方原文。')}
               {/* 开关关着时改这里的文本不会发出（`apply_start_plan` 直接跳过官方段，
                   连覆盖一起跳过）—— 不说这句，用户会以为自己改的生效了 */}
               {enabled ? '' : t('注意：这一家的「网关自带」开关现在是关的，改过的正文要等开关打开才生效。')}
@@ -379,5 +379,5 @@ export function gatewayEditedText(over: GatewayBlocks | undefined): string {
   return BLOCK_FIELDS
     .filter(field => (over[field.key] || '').trim())
     .map(field => field.short)
-    .join('、')
+    .join(t('、'))
 }

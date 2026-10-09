@@ -127,7 +127,7 @@ function modelNote(item: ImportProvider): string {
     .map(entry => String(entry || '').trim())
     .filter(Boolean)
   if (!models.length) return ''
-  const head = models.slice(0, 2).join('、')
+  const head = models.slice(0, 2).join(t('、'))
   const rest = models.length > 2 ? t(' 等 {n} 个', { n: models.length }) : ''
   return t(' · 模型 {head}{rest}', { head, rest })
 }

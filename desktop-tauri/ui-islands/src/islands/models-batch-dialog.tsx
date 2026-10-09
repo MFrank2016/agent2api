@@ -169,7 +169,7 @@ export function ModelBatchDialog({ models, onClose, onDone }: {
         <DialogBody>
           <DialogSection>
             <h3>{t('将作用于以下模型')}</h3>
-            <p style={{ maxHeight: 84, overflowY: 'auto' }}>{models.map(modelName).join('、')}</p>
+            <p style={{ maxHeight: 84, overflowY: 'auto' }}>{models.map(modelName).join(t('、'))}</p>
           </DialogSection>
           <DialogSection>
             <h3>{t('操作')}</h3>
