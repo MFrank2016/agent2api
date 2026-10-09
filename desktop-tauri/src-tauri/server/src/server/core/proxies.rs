@@ -243,6 +243,102 @@ impl ResolvedProxy {
     }
 }
 
+/// 轮询策略（账号出口为 `pool-rotate` 时生效）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Strategy { RoundRobin, Random, LeastLatency }
+
+impl Strategy {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "round-robin" => Some(Self::RoundRobin),
+            "random" => Some(Self::Random),
+            "least-latency" => Some(Self::LeastLatency),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self { Self::RoundRobin => "round-robin", Self::Random => "random", Self::LeastLatency => "least-latency" }
+    }
+}
+
+/// 连接失败时是否换下一个出口。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnError { Next, None }
+
+impl OnError {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value { "next" => Some(Self::Next), "none" => Some(Self::None), _ => None }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Next => "next", Self::None => "none" }
+    }
+}
+
+/// 轮询计划：成员 + 策略 + 失败语义 + 进程内状态键。
+#[derive(Clone, Debug)]
+pub struct RotationPlan {
+    pub members: Vec<ResolvedProxy>,
+    pub strategy: Strategy,
+    pub on_error: OnError,
+    /// 游标 / EWMA 的状态键（成员端点排序拼接，见 `core::egress_rotation`）。
+    pub group_key: String,
+}
+
+/// 一次请求可用的出网出口（`Direct` ≡ 无代理）。
+#[derive(Clone, Debug)]
+pub enum AccountEgress { Direct, Single(ResolvedProxy), Rotate(RotationPlan) }
+
+/// 出口 → JSON（与 `account_store::proxy_json` 同形）。
+pub(crate) fn proxy_to_json(proxy: &ResolvedProxy) -> Value {
+    json!({
+        "source": proxy.source, "protocol": proxy.protocol, "host": proxy.host,
+        "port": proxy.port, "username": proxy.username, "password": proxy.password, "label": proxy.label,
+    })
+}
+
+impl AccountEgress {
+    /// 从会话/计划里的 JSON 还原；畸形数据一律回退 `Direct`（可用性优先）。
+    pub fn from_json(value: &Value) -> Self {
+        if value.as_object().and_then(|o| o.get("source")).and_then(Value::as_str) == Some("pool-rotate") {
+            let members: Vec<ResolvedProxy> = value
+                .get("members").and_then(Value::as_array)
+                .map(|items| items.iter().filter_map(|it| ResolvedProxy::from_json(it).ok().flatten()).collect())
+                .unwrap_or_default();
+            if members.is_empty() { return Self::Direct; }
+            let strategy = value.get("strategy").and_then(Value::as_str).and_then(Strategy::parse).unwrap_or(Strategy::RoundRobin);
+            let on_error = value.get("onError").and_then(Value::as_str).and_then(OnError::parse).unwrap_or(OnError::Next);
+            let group_key = value.get("groupKey").and_then(Value::as_str).unwrap_or("").to_string();
+            return Self::Rotate(RotationPlan { members, strategy, on_error, group_key });
+        }
+        match ResolvedProxy::from_json(value) {
+            Ok(Some(proxy)) => Self::Single(proxy),
+            _ => Self::Direct,
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        match self {
+            Self::Direct => Value::Null,
+            Self::Single(proxy) => proxy_to_json(proxy),
+            Self::Rotate(plan) => json!({
+                "source": "pool-rotate",
+                "members": plan.members.iter().map(proxy_to_json).collect::<Vec<_>>(),
+                "strategy": plan.strategy.as_str(),
+                "onError": plan.on_error.as_str(),
+                "groupKey": plan.group_key,
+            }),
+        }
+    }
+
+    pub fn primary(&self) -> Option<&ResolvedProxy> {
+        match self {
+            Self::Direct => None,
+            Self::Single(proxy) => Some(proxy),
+            Self::Rotate(plan) => plan.members.first(),
+        }
+    }
+}
+
 /// 会话里的出口（`session.proxy`）。
 ///
 /// 账号存储组装的会话已经带上了 `proxy`（解析成功）或 `proxyError`（解析失败，
@@ -516,5 +612,39 @@ pub fn describe_account_proxy(config: Option<&Value>) -> Value {
             "error": Value::Null,
             "config": config,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_egress_round_trips_a_rotation_plan() {
+        let plan = RotationPlan {
+            members: vec![ResolvedProxy {
+                source: "pool".into(), protocol: "http".into(), host: "1.2.3.4".into(),
+                port: Some(8080), username: "u".into(), password: "p".into(), label: "a".into(),
+            }],
+            strategy: Strategy::LeastLatency,
+            on_error: OnError::Next,
+            group_key: "g".into(),
+        };
+        let json = AccountEgress::Rotate(plan).to_json();
+        match AccountEgress::from_json(&json) {
+            AccountEgress::Rotate(back) => {
+                assert_eq!(back.strategy, Strategy::LeastLatency);
+                assert_eq!(back.on_error, OnError::Next);
+                assert_eq!(back.members.len(), 1);
+                assert_eq!(back.members[0].host, "1.2.3.4");
+            }
+            other => panic!("expected rotate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn account_egress_from_json_falls_back_to_direct_on_garbage() {
+        assert!(matches!(AccountEgress::from_json(&serde_json::json!({"source":"pool-rotate","members":[]})), AccountEgress::Direct));
+        assert!(matches!(AccountEgress::from_json(&serde_json::json!(42)), AccountEgress::Direct));
     }
 }
