@@ -266,6 +266,50 @@ pub fn resolve_item(item: &Value) -> Option<ProxyResolution> {
     resolve_account_proxy(Some(&config))
 }
 
+/// 收集一个条目为成员（跳过已见 / 已禁用 / 解析失败）。
+fn push_member(
+    item: &Value,
+    seen: &mut std::collections::HashSet<String>,
+    out: &mut Vec<crate::server::core::proxies::ResolvedProxy>,
+) {
+    let id = text_of(item, "id");
+    if id.is_empty() || !seen.insert(id) {
+        return;
+    }
+    if matches!(item.get("enabled"), Some(Value::Bool(false))) {
+        return;
+    }
+    if let Some(ProxyResolution::Resolved(proxy)) = resolve_item(item) {
+        out.push(proxy);
+    }
+}
+
+/// 按「分组标签 ∪ 显式 id」收集成员：先 group（按池内顺序），再 proxyIds（按传入顺序），按条目 id 去重。
+pub(crate) fn select_members(
+    items: &[Value],
+    group: &str,
+    proxy_ids: &[String],
+) -> Vec<crate::server::core::proxies::ResolvedProxy> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    if !group.is_empty() {
+        for item in items.iter().filter(|it| text_of(it, "group") == group) {
+            push_member(item, &mut seen, &mut out);
+        }
+    }
+    for id in proxy_ids {
+        if let Some(item) = items.iter().find(|it| text_of(it, "id") == *id) {
+            push_member(item, &mut seen, &mut out);
+        }
+    }
+    out
+}
+
+/// 读库后按分组/显式 id 收集可用出口（供 `proxies::resolve_account_egress`）。
+pub fn members_for(group: &str, proxy_ids: &[String]) -> Vec<crate::server::core::proxies::ResolvedProxy> {
+    select_members(&read_items(), group, proxy_ids)
+}
+
 /// 池引用的解析（`core::proxies` 的 pool 分支调它）。
 ///
 /// 三态（`Err` 的两种分开报：用户看到「已禁用」才会想到去代理页启用它，
@@ -626,5 +670,19 @@ mod tests {
         assert_eq!(tagged["group"], "kilo");
         let plain = normalize_item(&serde_json::json!({"name":"b","host":"1.2.3.5","port":8080}), None).unwrap();
         assert_eq!(plain["group"], "");
+    }
+
+    #[test]
+    fn select_members_unions_group_and_ids_skipping_disabled() {
+        let items = vec![
+            serde_json::json!({"id":"a","name":"a","source":"manual","enabled":true,"protocol":"http","host":"1.1.1.1","port":1,"group":"kilo"}),
+            serde_json::json!({"id":"b","name":"b","source":"manual","enabled":false,"protocol":"http","host":"2.2.2.2","port":2,"group":"kilo"}),
+            serde_json::json!({"id":"c","name":"c","source":"manual","enabled":true,"protocol":"http","host":"3.3.3.3","port":3,"group":"other"}),
+        ];
+        let ids = vec!["c".to_string(), "a".to_string()];
+        let members = select_members(&items, "kilo", &ids);
+        // a（group）在前，c（proxyIds）在后；b 被禁用跳过；a 去重
+        let hosts: Vec<&str> = members.iter().map(|m| m.host.as_str()).collect();
+        assert_eq!(hosts, vec!["1.1.1.1", "3.3.3.3"]);
     }
 }
