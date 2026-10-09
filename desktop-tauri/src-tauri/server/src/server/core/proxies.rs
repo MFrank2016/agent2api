@@ -666,6 +666,28 @@ pub fn describe_account_proxy(config: Option<&Value>) -> Value {
     let Some(config) = config.filter(|value| !value.is_null()) else {
         return Value::Null;
     };
+    // 轮询组（pool-rotate）走独立的出口解析：`resolve_account_proxy` 不认识
+    // 这个 source，会报「不支持的代理来源」造成账号列表里的假告警。转发路径
+    // （`resolve_account_egress`）本来就支持它，这里用同一套解析保证两端一致。
+    if config.get("source").and_then(Value::as_str) == Some("pool-rotate") {
+        return match resolve_account_egress(Some(config)) {
+            EgressResolution::Resolved(AccountEgress::Rotate(plan)) => json!({
+                "source": "pool-rotate",
+                "label": format!("轮询组（{} 个出口）", plan.members.len()),
+                "error": Value::Null,
+                "config": config,
+            }),
+            EgressResolution::Failed(message) => json!({
+                "source": "pool-rotate",
+                "label": "解析失败",
+                "error": message,
+                "config": config,
+            }),
+            // resolve_account_egress 对 pool-rotate 配置只会给出 Rotate；
+            // Direct/Single 在此不可达，防御性兜底。
+            _ => Value::Null,
+        };
+    }
     let Some(resolution) = resolve_account_proxy(Some(config)) else {
         return Value::Null;
     };
@@ -758,5 +780,26 @@ mod tests {
         // 轮询但池里无成员 → Failed（测试库为空）
         let rot = resolve_account_egress(Some(&serde_json::json!({"source":"pool-rotate","group":"__nope__"})));
         assert!(matches!(rot, EgressResolution::Failed(_)));
+    }
+
+    #[test]
+    fn describe_account_proxy_special_cases_pool_rotate() {
+        // 轮询组在池里无成员（测试库默认空）→ 走 Failed 分支：文案是
+        // 「轮询组没有可用出口」，而不是旧路径的「不支持的代理来源: pool-rotate」。
+        let failed = describe_account_proxy(Some(&serde_json::json!({
+            "source": "pool-rotate", "group": "__nope__"
+        })));
+        assert_eq!(failed["source"], "pool-rotate");
+        assert_eq!(failed["label"], "解析失败");
+        assert_eq!(failed["error"], "轮询组没有可用出口");
+        assert_ne!(failed["error"], "不支持的代理来源: pool-rotate");
+
+        // 回归护栏：普通 custom 配置仍走既有 resolve_account_proxy 路径。
+        let custom = describe_account_proxy(Some(&serde_json::json!({
+            "source": "custom", "protocol": "http", "host": "1.2.3.4", "port": 8080
+        })));
+        assert_eq!(custom["source"], "custom");
+        assert_eq!(custom["error"], Value::Null);
+        assert_eq!(custom["label"], "http://1.2.3.4:8080");
     }
 }
