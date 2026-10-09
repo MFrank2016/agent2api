@@ -289,6 +289,11 @@ impl AccountStore {
             // Command Code：单一入口（粘贴 `user_` API Key），公开形态去掉 key
             // 本体、只留尾号与「有没有 key」（见 `commandcode_accounts.rs`）
             self.to_commandcode_public_account(record)
+        } else if record.provider() == super::ANTIGRAVITY_PROVIDER_ID {
+            // Antigravity（Google）：单一入口（粘贴 Google refresh token），
+            // 公开形态去掉 token 本体、只留 refresh token 尾号与
+            // 「有没有 refreshToken / accessToken」（见 `antigravity_accounts.rs`）
+            self.to_antigravity_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)

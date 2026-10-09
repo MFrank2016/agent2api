@@ -733,6 +733,32 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
                 };
             store.add_commandcode_account(&credentials, import_name, "manual")
         }
+        // Antigravity（Google 的 AI IDE）：**粘贴 Google refresh token**
+        // → 本地归一化（剥引号 / `refresh_token=` 整行 / 空白；`1//` 是令牌本体，
+        // 不剥）→ 打一次 Google token 端点做**真实校验**（refresh_token 没有可判
+        // 的本地形态，不像 `user_` 那种有前缀可查），顺带拿到 access_token /
+        // 到期时间 → best-effort 发现 `cloudaicompanionProject` → 落账号
+        // （见 `providers::antigravity::login` 的模块头）。
+        //
+        // `importDesktop` 不提供：本家的登录态在 Antigravity IDE 自己的存储里
+        // （与 Accio / ZCode / Loomy 同一处境）—— 给了入口只会稳定失败。
+        Some(crate::server::core::providers::ProviderKind::Antigravity) => {
+            if import_desktop {
+                return management_error(
+                    400,
+                    "Antigravity 不支持导入桌面端登录态，请粘贴 Google refresh token（1// 开头）添加账号",
+                );
+            }
+            let credentials = match crate::server::core::providers::antigravity::login::verify_paste(
+                &payload, None,
+            )
+            .await
+            {
+                Ok(credentials) => credentials,
+                Err(error) => return management_error(error.status_code, error.message),
+            };
+            store.add_antigravity_account(&credentials, import_name, "manual")
+        }
         // WorkBuddy 系的两家（国内版 / 国际版）：同一套凭证形态与落账号路径，
         // 差别只有归属 —— provider id 自己就是归属（拆家后不再从 payload 里的
         // `edition` 反推：那是账号的属性，而落哪一家是身份问题）。
@@ -1065,6 +1091,14 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
             "Command Code 的 API Key 没有刷新机制（静态 key、上游无续期接口）：\
              请在 commandcode.ai/studio 重新获取后在本页重新粘贴",
         );
+    }
+    // Antigravity：**有**可刷新的 refreshToken（Google OAuth），走自家适配器的
+    // 强制刷新（`grant_type=refresh_token` 打 `oauth2.googleapis.com/token`）。
+    // 这条分派不能省：漏了就落到下面的 workbuddy 兜底链路，用户点「刷新 Token」
+    // 收到的是腾讯鉴权端点的错 —— 与 Command Code / Trae 漏登记时同一性质
+    // （`refresh_account` 的文档里把这条列为「加带 refreshToken 的家时必须一起加」）。
+    if state.store().antigravity_account_record(&id).is_some() {
+        return refresh_provider_account(state, &id, ProviderKind::Antigravity).await;
     }
     // WorkBuddy 系（国内版 / 国际版）的兜底：两条链路都按**账号自己的**
     // endpoint / prefixPath / platform / edition 续期

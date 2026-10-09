@@ -161,6 +161,13 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             super::commandcode::models::remote_refreshed(),
             super::commandcode::models::last_refreshed_at(),
         ),
+        // Antigravity：清单来自 `POST {base}:fetchAvailableModels`（三个环境
+        // 轮流打，但只有**一格**缓存 —— 环境不是地区）。拉不到时回落内置的
+        // Gemini 兜底清单，所以同样「有远程内容」才算远程来源。
+        ProviderKind::Antigravity => (
+            super::antigravity::models::remote_refreshed(),
+            super::antigravity::models::last_refreshed_at(),
+        ),
     }
 }
 

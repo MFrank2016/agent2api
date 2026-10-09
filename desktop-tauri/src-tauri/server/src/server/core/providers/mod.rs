@@ -97,6 +97,13 @@
 
 pub mod adapter;
 pub mod accio;
+/// Antigravity（Google 的 AI IDE，推理走 **Google Cloud Code Assist**
+/// `v1internal`）。适配实现在 `antigravity/`：账号管理（粘贴 Google
+/// refresh token）+ token 刷新（Google OAuth 的 form 端点）+ 模型目录
+/// （`:fetchAvailableModels`，本步只列 Gemini）已接通，**会话转发留待下一步**
+/// （`build_chat_request` 返回 501；`is_stateful` 恒 false —— 下一步走
+/// 「`UpstreamResponse` 新变体 + Gemini SSE 翻译层」，见 `antigravity/mod.rs`）。
+pub mod antigravity;
 pub mod autoclaw;
 pub mod catalog;
 /// 远程模型清单的**持久化缓存**（各家的清单在进程重启后由它读回，见模块头）。
@@ -413,6 +420,29 @@ pub enum ProviderKind {
     /// （`upstream::translate::CommandCodeToChatStream`），`is_stateful` 恒
     /// false —— 账号轮换 / 冷却 / 重试 / usage / 取消全部由编排层承担。
     CommandCode,
+    /// Antigravity（Google 的 AI IDE）。适配实现在 `antigravity/`：
+    /// 账号管理（**粘贴 Google refresh token**）、token 刷新、模型目录
+    /// （**只接 Gemini**）已接通；**会话转发留待下一步**
+    /// （`build_chat_request` 返回 501，见 `antigravity/mod.rs` 的模块头）。
+    ///
+    /// ── 上游长什么样（规格 `_recon/antigravity-spec.md`，参考
+    /// `Acankao/Antigravity-Manager` + `Acankao/9router`）────────────
+    /// 推理走 **Google Cloud Code Assist**（`v1internal`，不是
+    /// `generativelanguage.googleapis.com`）：`POST {base}:streamGenerateContent?alt=sse`，
+    /// 鉴权是 Google OAuth 的 Bearer 令牌，每帧 SSE 都裹一层
+    /// `{"response":{…gemini 响应…}}` 信封；鉴权链是 Google 的
+    /// `oauth2.googleapis.com/token`（refresh_token 换 access_token）。
+    ///
+    /// ── 为什么是**一家**（没有地区伴生）─────────────────────────
+    /// 规格 §6：本家没有 region 参数、端点全球统一（`sandbox`/`daily`/`prod`
+    /// 是**环境**不是地区），因此不需要地区拆分，也不需要 `region.rs`。
+    ///
+    /// ── 转发路线（下一步接）───────────────────────────────────
+    /// 上游是**无状态**（一次 HTTP 请求 = 一次生成），只是响应帧是 Gemini 方言：
+    /// 下一步照 Command Code / ZCode 的先例，给
+    /// [`adapter::UpstreamResponse`] 加一个变体 + 一层翻译器，
+    /// **`is_stateful` 保持 false**（不要走 `forward_conversation`）。
+    Antigravity,
 }
 
 /// 一个提供商的静态元数据。
@@ -495,6 +525,10 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // （规格 §9：参考里只有 api.commandcode.ai 一个主机）。排在末尾
     // （2026-10 接入，后到居后，与 Kuku 同一处置）。
     ProviderMeta { id: "commandcode", label: "Command Code" },
+    // Antigravity（Google）：单一入口（粘贴 Google refresh token）、没有地区
+    // 伴生（规格 §6：没有 region 参数，sandbox/daily/prod 是环境不是地区）。
+    // 排在末尾（2026-10 接入，后到居后，与 Kuku / Command Code 同一处置）。
+    ProviderMeta { id: "antigravity", label: "Antigravity" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -576,6 +610,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "monkeycode" => Some(ProviderKind::MonkeyCode),
         "monkeycode-intl" => Some(ProviderKind::MonkeyCodeIntl),
         "commandcode" => Some(ProviderKind::CommandCode),
+        "antigravity" => Some(ProviderKind::Antigravity),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -615,6 +650,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::MonkeyCode => "monkeycode",
         ProviderKind::MonkeyCodeIntl => "monkeycode-intl",
         ProviderKind::CommandCode => "commandcode",
+        ProviderKind::Antigravity => "antigravity",
     }
 }
 

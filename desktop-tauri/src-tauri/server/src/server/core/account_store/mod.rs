@@ -88,8 +88,11 @@
 //!                session 添加（session + imageId + userId）、公开形态（含 edition）
 //!   commandcode_accounts.rs Command Code 账号（单一 provider）：粘贴 `user_`
 //!                开头的 API Key 添加、公开形态（只给尾号）
+//!   antigravity_accounts.rs Antigravity 账号（单一 provider）：粘贴 Google
+//!                refresh token 添加、刷新回写（比较-再写）、公开形态（只给尾号）
 
 pub mod accio_accounts;
+pub mod antigravity_accounts;
 pub mod autoclaw_accounts;
 pub mod autoclaw_import;
 pub mod catpaw_accounts;
@@ -201,6 +204,13 @@ pub(crate) fn is_monkeycode_family(provider_id: &str) -> bool {
 /// 账号形态见 `commandcode_accounts.rs`（单一 provider、没有地区之分）。
 pub(crate) const COMMANDCODE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
     crate::server::core::providers::ProviderKind::CommandCode,
+);
+
+/// Antigravity provider id（账号存储内部多处要用；**从注册表推导**）。
+/// 账号形态见 `antigravity_accounts.rs`（单一 provider、没有地区之分 ——
+/// `sandbox`/`daily`/`prod` 是环境不是地区，规格 §6）。
+pub(crate) const ANTIGRAVITY_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::Antigravity,
 );
 
 /// Cline **免费池** provider id（账号存储内部多处要用；**从注册表推导**，同

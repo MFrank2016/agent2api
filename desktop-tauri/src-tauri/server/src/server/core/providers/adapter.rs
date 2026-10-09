@@ -1025,6 +1025,10 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // 生成）、粘贴 `user_` API Key、响应是 NDJSON（`UpstreamResponse::
         // CommandCodeNdjson`，见 `commandcode/mod.rs` 的模块头）
         ProviderKind::CommandCode => &super::commandcode::COMMANDCODE_ADAPTER,
+        // Antigravity（Google 的 AI IDE）：账号 / token 刷新 / 模型目录已接通，
+        // **会话转发留待下一步**（`build_chat_request` 返回 501；`is_stateful`
+        // 保持默认 false，见 `antigravity/mod.rs` 与 `antigravity/adapter.rs`）
+        ProviderKind::Antigravity => &super::antigravity::ANTIGRAVITY_ADAPTER,
     }
 }
 
@@ -1114,6 +1118,12 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // （`GET /provider/v1/models`，失败回落内置 26 项清单）—— 必须在列表里，
         // 否则目录刷新循环不会问它。
         ProviderKind::CommandCode,
+        // Antigravity 已接真身（账号 / token 刷新 / 目录），且有远程目录
+        // （`POST {base}:fetchAvailableModels`）—— 必须在列表里，否则目录刷新
+        // 循环不会问它。**会话转发本步留空**（`build_chat_request` 返回 501），
+        // 但这不影响「已接线」这个判定：本列表回答的是「这家接线了没有」，
+        // 不是「这家的转发能不能用」（与 MonkeyCode 同一处置）。
+        ProviderKind::Antigravity,
     ]
 }
 
