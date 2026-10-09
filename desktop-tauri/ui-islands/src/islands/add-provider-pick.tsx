@@ -17,6 +17,7 @@ import { accountCountOf, shared } from './add-account-bridge'
 import type { CustomProviderRecord } from './add-account-bridge'
 import { WORKBUDDY_ENTRY_LABEL, WORKBUDDY_PROVIDER } from './add-account-configs'
 import { ADD_SEG_CLASS } from './add-provider-blocks'
+import { t } from '../i18n'
 
 /** 第 1 步的账号类型：Agent（内置八家）/ 预置 API / 自定义 / 导入 */
 export type AccountType = 'proxy' | 'preset' | 'custom' | 'import'
@@ -177,9 +178,9 @@ function Logo({ item }: { item: CardItem }): React.ReactElement {
  * 分开了，整段都是同一类，再给每张卡挂一枚「预置 / 自定义」徽章只是噪音。
  */
 function cardMeta(item: CardItem): string {
-  if (item.preset) return '点开即预填，填 Key 接入'
-  if (item.custom) return item.count ? `${item.count} 个账号，点击添加` : '点击添加账号'
-  return item.count ? `${item.count} 个账号` : '还没有账号'
+  if (item.preset) return t('点开即预填，填 Key 接入')
+  if (item.custom) return item.count ? t('{n} 个账号，点击添加', { n: item.count }) : t('点击添加账号')
+  return item.count ? t('{n} 个账号', { n: item.count }) : t('还没有账号')
 }
 
 function ProviderCard({ item, onPick }: { item: CardItem; onPick: (id: string) => void }): React.ReactElement {
@@ -216,8 +217,8 @@ function NewProviderCard({ onPick }: { onPick: (id: string) => void }): React.Re
     >
       <span className='add-provider-logo is-new'>＋</span>
       <span className='add-provider-info'>
-        <span className='add-provider-name'>新建自定义提供商</span>
-        <span className='add-provider-meta'>接入一个兼容上游</span>
+        <span className='add-provider-name'>{t('新建自定义提供商')}</span>
+        <span className='add-provider-meta'>{t('接入一个兼容上游')}</span>
       </span>
       <span className='add-provider-go'>›</span>
     </button>
@@ -258,18 +259,18 @@ export function PickStep({
     // 分段与列表同一块：两者是同一个问题的两面（「给什么形态的上游加账号」→
     // 「给哪一家加」），分两块带边框会让人以为是两个独立步骤
     <DialogSection>
-      <h3>选择提供商</h3>
+      <h3>{t('选择提供商')}</h3>
       {/* 分段与搜索同一行：左边选形态，右边是这一屏的过滤器 */}
       <div className='add-pick-row' style={importing ? { display: 'none' } : undefined}>
         <SegmentedControl
-          aria-label='账号类型'
+          aria-label={t('账号类型')}
           className={ADD_SEG_CLASS}
           options={[
             { value: TYPE_PROXY, label: 'Agent' },
-            { value: TYPE_PRESET, label: '预置 API' },
-            { value: TYPE_CUSTOM, label: '自定义' },
+            { value: TYPE_PRESET, label: t('预置 API') },
+            { value: TYPE_CUSTOM, label: t('自定义') },
             // 「导入」分段暂时收起（见 IMPORT_SEGMENT_ENABLED）：整段不生成
-            ...(IMPORT_SEGMENT_ENABLED ? [{ value: TYPE_IMPORT, label: '导入' }] : []),
+            ...(IMPORT_SEGMENT_ENABLED ? [{ value: TYPE_IMPORT, label: t('导入') }] : []),
           ]}
           value={accountType}
           onValueChange={value => onAccountTypeChange(typeValueOf(value))}
@@ -280,9 +281,9 @@ export function PickStep({
             <InputGroupInput
               id='add-provider-search'
               type='search'
-              placeholder='搜索提供商…'
+              placeholder={t('搜索提供商…')}
               autoComplete='off'
-              aria-label='搜索提供商'
+              aria-label={t('搜索提供商')}
               value={search}
               onChange={event => onSearchChange(event.currentTarget.value)}
             />
@@ -296,13 +297,13 @@ export function PickStep({
         className='add-provider-grid'
         id='add-provider-grid'
         role='listbox'
-        aria-label='选择要添加账号的提供商'
+        aria-label={t('选择要添加账号的提供商')}
         style={importing ? { display: 'none' } : undefined}
       >
         {newCard ? <NewProviderCard onPick={onPick} /> : null}
         {hit.map(item => <ProviderCard key={item.id} item={item} onPick={onPick} />)}
         {!hit.length && keyword ? (
-          <div className='add-provider-empty'>{`没有匹配「${search.trim()}」的提供商`}</div>
+          <div className='add-provider-empty'>{t('没有匹配「{keyword}」的提供商', { keyword: search.trim() })}</div>
         ) : null}
       </div>
     </DialogSection>
