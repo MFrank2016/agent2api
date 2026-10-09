@@ -65,6 +65,7 @@ pub mod custom_providers;
 pub mod debug_traffic;
 pub mod degrade;
 pub mod egress;
+pub mod egress_rotation;
 pub mod endpoints;
 pub mod import_ccswitch;
 pub mod key_scope;
