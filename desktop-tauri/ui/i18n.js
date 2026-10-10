@@ -12,11 +12,13 @@
  * 是划算的取舍。
  *
  * ── 词典从哪来、什么时候到 ────────────────────────────────────
- * 词典**不在**本文件里，而是由 index.html / login.html 的 head 引导脚本按
- * `workbuddy-desktop-locale` 解析出的语言，用 document.write 同步注入
- * i18n/manifest.js + i18n/<locale>/<domain>.js（构建产物，见 desktop-tauri/i18n/）。
- * 这些 <script> 会往 window.wbI18nDict 上 Object.assign。所以本脚本执行时词典
- * 已在位；即便某条缺失或某域文件 404，t() 也只是回落简体，页面不会报错。
+ * 词典**不在**本文件里。index.html / login.html 的 head 引导脚本按
+ * `workbuddy-desktop-locale` 解析出的语言，只 document.write 注入 i18n/manifest.js
+ * —— 那是域清单（window.__WB_I18N_DOMAINS）；各域词典文件由本脚本在执行时补写
+ * （此刻清单已就位、页面仍在解析期，写出的 <script> 插在本脚本之后、业务脚本之前）。
+ * 这些词典脚本（构建产物，见 desktop-tauri/i18n/）会往 window.wbI18nDict 上
+ * Object.assign，且都在任何业务脚本之前执行完毕；即便某条缺失或某域文件 404，
+ * t() 也只是回落简体，页面不会报错。
  *
  * ── 回落策略只有一条 ──────────────────────────────────────────
  * 非空字符串才算译到位，其余（undefined / 空串 / 非字符串）一律回落键本身。
@@ -149,6 +151,18 @@
 
   const current = locale()
   document.documentElement.lang = current
+
+  // 各域词典注入：head 引导脚本只写 manifest.js（域清单）—— 它在 document.write
+  // 之后同步读不到 __WB_I18N_DOMAINS（manifest 要等引导脚本块结束才执行），所以
+  // 各域文件挪到这里补写。本脚本静态排在 manifest.js 之后执行，此刻清单已就位；
+  // 且页面仍在解析期，写出的 <script> 会插在本脚本之后、所有业务脚本之前。
+  // 简体没有词典目录（查不到即显示键本身），跳过。
+  if (current !== 'zh-Hans' && document.readyState === 'loading') {
+    const domains = window.__WB_I18N_DOMAINS || []
+    for (const domain of domains) {
+      document.write('<script src="i18n/' + current + '/' + domain + '.js"><\/script>')
+    }
+  }
 
   window.wbI18n = {
     t,

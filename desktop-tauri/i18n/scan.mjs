@@ -9,8 +9,10 @@
  *
  * ── 扫什么 ────────────────────────────────────────────────────
  *   ① 代码里的 `t('...')` / `t("...")` / `wbI18n.t('...')` —— 只认字符串字面量首参；
- *   ② HTML 里的 `data-i18n="..."` 及属性族 `data-i18n-title` / `-placeholder`
- *      / `-tip` / `-aria-label` 的**显式值**。
+ *   ② HTML 文件里的 `data-i18n="..."` 及属性族 `data-i18n-title` / `-placeholder`
+ *      / `-tip` / `-aria-label` 的**显式值**及内联脚本里同样按 ① 提的 t() 字面量。
+ * 注：HTML 文件两条提取通道都跑（data-i18n 属性 + 内联脚本 t()），结果合并去重；
+ * 喂给代码提取器的是剥掉 HTML 注释后的源码，注释里写的调用示例不会被误采。
  * 模板串、变量传参这类非字面量**不提取**，只在报告里列为 warning 待人工处理
  * （键拿不到，只能人去看那处到底要不要翻译）。
  *
@@ -190,7 +192,7 @@ function extractFromCode(source, file, warnings) {
   return keys
 }
 
-/** HTML 文件：data-i18n* 的显式值（先剥掉 HTML 注释，注释里的样例不算） */
+/** HTML 文件：data-i18n* 的显式值（先剥掉 HTML 注释，注释里的样例不算；内联脚本的 t() 由 extractFromCode 另行提取） */
 function extractFromHtml(source, file, warnings) {
   const keys = []
   const clean = source.replace(/<!--[\s\S]*?-->/g, '')
@@ -224,8 +226,14 @@ function scan() {
       warnings.push(`${path.relative(DESKTOP, file)} 未登记域归属，已暂归 common（请在 scan.mjs 的 DOMAIN_RULES 里登记）`)
     }
     const source = fs.readFileSync(file, 'utf8')
+    // HTML 文件两条通道都跑：data-i18n 属性 + 内联脚本里的 t()/wbI18n.t() 字面量。
+    // 代码提取器喂剥掉 HTML 注释的源码（与 extractFromHtml 内部一致），注释里的示例不会被误采；
+    // 结果直接拼接，交给 Set 去重。
     const keys = base.endsWith('.html')
-      ? extractFromHtml(source, file, warnings)
+      ? [
+        ...extractFromHtml(source, file, warnings),
+        ...extractFromCode(source.replace(/<!--[\s\S]*?-->/g, ''), file, warnings),
+      ]
       : extractFromCode(source, file, warnings)
     for (const key of keys) perDomain.get(domain).add(key)
   }

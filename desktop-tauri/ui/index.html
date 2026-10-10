@@ -24,10 +24,10 @@
     })();
   </script>
   <script>
-    // 语言引导：在 head 解析期定下界面语言，再同步注入词典 —— 必须早于所有业务脚本，
-    // 否则首屏会先按简体渲染再跳一下。解析规则与 ui/i18n.js 的 resolveLocale 逐字一致
-    // （那份供运行时查表用，这份供词典注入用，因为 i18n.js 本身也要等这段先定语言；
-    // 改一处必须同步改另一处与 login.html）。
+    // 语言引导：在 head 解析期定下界面语言，再注入词典域清单（各域词典文件改由 i18n.js
+    // 执行时补写，原因见下方）—— 必须早于所有业务脚本，否则首屏会先按简体渲染再跳一下。
+    // 解析规则与 ui/i18n.js 的 resolveLocale 逐字一致（那份供运行时查表用，这份供词典
+    // 注入用，因为 i18n.js 本身也要等这段先定语言；改一处必须同步改另一处与 login.html）。
     (function () {
       var CODES = ['zh-Hans', 'zh-Hant', 'en', 'ja', 'ko', 'pt-BR'];
       var raw = null;
@@ -48,14 +48,13 @@
         }
       }
       document.documentElement.lang = locale;
-      // 简体没有词典目录（查不到即显示简体原文），不必注入；其余语言注入 manifest + 各域文件。
+      // 简体没有词典目录（查不到即显示简体原文），不必注入；其余语言只注入域清单 manifest。
       // locale 已过白名单校验，拼进 src 安全；某域文件缺失时该 <script> 404，静默无害。
       if (locale === 'zh-Hans') return;
+      // 只写域清单 manifest；各域词典文件由 i18n.js 在自己执行时补写 ——
+      // document.write 之后同步读 __WB_I18N_DOMAINS 拿到的是 undefined（manifest
+      // 要等本脚本块结束才执行），在这里循环只会写出 0 个。
       document.write('<script src="i18n/manifest.js"><\/script>');
-      var domains = window.__WB_I18N_DOMAINS || [];
-      for (var d = 0; d < domains.length; d++) {
-        document.write('<script src="i18n/' + locale + '/' + domains[d] + '.js"><\/script>');
-      }
     })();
   </script>
   <link rel="stylesheet" href="css/tokens.css">
@@ -93,7 +92,8 @@
        顺序其实已不影响结果，但保持「后加载的是更新的体系」这条阅读线索。 -->
   <link rel="stylesheet" href="islands/ui.css">
   <!-- 多语言运行时：查表 t() + 静态文案扫描器（data-i18n 系列）。
-       词典已由上面 head 里的引导脚本同步注入（document.write），这里只放运行时逻辑。
+       域清单（manifest.js）已由上面 head 里的引导脚本注入（document.write），各域词典
+       由 i18n.js 执行时补写。这里只放运行时逻辑。
        必须排在 units.js / app.js 等业务脚本之前 —— 它们在加载期就可能读 window.wbI18n；
        排在 head 末尾天然满足。 -->
   <script src="i18n.js"></script>
