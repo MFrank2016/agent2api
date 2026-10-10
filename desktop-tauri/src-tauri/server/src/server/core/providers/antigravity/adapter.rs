@@ -19,9 +19,11 @@
 //! 改成 `is_stateful = true` + `forward_conversation` 会把那五样在适配器里重写
 //! 一遍，而本家并没有多步会话协议 —— 没有理由付那份代价。
 //!
-//! ── 本家没有的东西（如实声明，别照抄别家）──────────────────────
-//!   - **没有网页登录**（`supports_web_login` 保持默认 false）：只做粘贴式
-//!     （评估见 `mod.rs` 的模块头）；
+//! ── 本家有 / 没有的东西（如实声明，别照抄别家）────────────────
+//!   - **有网页登录**（`supports_web_login = true`）：Google OAuth 授权码 +
+//!     loopback 回调（授权地址由本模块的 `build_login_url` 本地拼、回调落网关
+//!     `/oauth-callback`、换码见 `oauth::exchange_code`）。与粘贴 refresh token
+//!     两条入口共用 `add_antigravity_account` 落账号；
 //!   - **没有签到**（`core::auto_checkin` 的清单不含本家：Antigravity 没有可自动
 //!     领取的奖励活动）；
 //!   - **没有余额查询**（`supports_usage` 保持默认 false）：额度是「每模型剩余
@@ -351,6 +353,44 @@ impl ProviderAdapter for AntigravityAdapter {
     /// 本家有续期手段（`refresh_token` + Google token 端点）——维护任务要问本家。
     fn supports_refresh(&self) -> bool {
         true
+    }
+
+    /// Antigravity 支持网页登录（trait 扩展 7）：Google OAuth 授权码 + loopback
+    /// 回调。授权页是 `accounts.google.com`，回调落到**本网关自己的端口**
+    /// （`http://localhost:{port}/oauth-callback`，见 `oauth::CALLBACK_PATH`）。
+    fn supports_web_login(&self) -> bool {
+        true
+    }
+
+    /// 授权地址 + state（`antigravity::oauth::build_authorize_url`）。
+    ///
+    /// state 的生成复用 `raccoon::oauth::new_login_state()`（`new_request_id`
+    /// 的 uuid v4 形态）：项目里没有 `rand` / `uuid` 依赖，为一个 state 引进
+    /// 依赖不合算 —— 与 raccoon 的模块头同一条论证，也满足 trait 文档
+    /// 「必须用不可预测随机源」的契约。逐字比对在
+    /// `core::login::submit_login_callback` 的 Antigravity 分支里做。
+    ///
+    /// 返回 None = 回调端口还没写进进程级常量（bootstrap 之前）；上层会给
+    /// 「未能生成网页登录授权地址，请重试」的通用文案。
+    fn build_login_url(&self) -> Option<(String, String)> {
+        let state = crate::server::core::providers::raccoon::oauth::new_login_state();
+        let url = oauth::build_authorize_url(&state)?;
+        Some((url, state))
+    }
+
+    /// 用回调里的一次性 `code` 换 Google 凭证并落账号（`oauth::exchange_code`）。
+    ///
+    /// `state` 由调用方逐字比对过（任务表按它索引）；实现里再做一次
+    /// 非空 / 长度校验作为深度防御（trait 文档的要求）。
+    fn exchange_login_code<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        code: &'a str,
+        state: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async move { oauth::exchange_code(store, code, state).await })
     }
 
     /// 后台凭证维护问「这条账号是不是快到期了」（判据与刷新用的是同一把尺）。

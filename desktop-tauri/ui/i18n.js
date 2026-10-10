@@ -41,14 +41,20 @@
   /** 具体语言代码（不含 'auto'）：白名单，拼 src 前也靠它校验 */
   const CODES = ['zh-Hans', 'zh-Hant', 'en', 'ja', 'ko', 'pt-BR']
 
-  /** 界面语言下拉的选项：label 恒用「该语言自己的写法」，不翻译（选了也看得懂） */
+  /**
+   * 界面语言下拉的选项：label 恒用「该语言自己的写法」，不翻译（选了也看得懂）；
+   * nameKey 是这门外语的中文名，供设置页用 t() 译成**当前界面语言**，拼出
+   * 「English（英语）」式双语选项（两者相同则只显示一次）—— 见 settings-page 的
+   * LanguageRow。中文名同样以「中文即键」进词典：en/ja/ko/pt-BR 有人工译文，
+   * zh-Hant 由 opencc 生成。
+   */
   const LOCALES = [
-    { code: 'zh-Hans', label: '简体中文' },
-    { code: 'zh-Hant', label: '繁體中文' },
-    { code: 'en', label: 'English' },
-    { code: 'ja', label: '日本語' },
-    { code: 'ko', label: '한국어' },
-    { code: 'pt-BR', label: 'Português (Brasil)' },
+    { code: 'zh-Hans', label: '简体中文', nameKey: '简体中文' },
+    { code: 'zh-Hant', label: '繁體中文', nameKey: '繁体中文' },
+    { code: 'en', label: 'English', nameKey: '英语' },
+    { code: 'ja', label: '日本語', nameKey: '日语' },
+    { code: 'ko', label: '한국어', nameKey: '韩语' },
+    { code: 'pt-BR', label: 'Português (Brasil)', nameKey: '巴西葡萄牙语' },
   ]
 
   /** 属性族 → 就地替换的目标属性（data-i18n-tip 写回 data-tip，供 tooltip.js 用） */

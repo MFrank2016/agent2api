@@ -18,7 +18,7 @@ type WbI18nApi = {
   rawLocale(): string
   setLocale(value: string): void
   sweep(root?: ParentNode): void
-  LOCALES: ReadonlyArray<{ code: string; label: string }>
+  LOCALES: ReadonlyArray<{ code: string; label: string; nameKey: string }>
 }
 
 declare global {

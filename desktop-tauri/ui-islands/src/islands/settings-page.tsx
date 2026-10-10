@@ -305,6 +305,58 @@ function lanStateText(snap: SettingsSnapshot): string {
   return t('已开启：其他设备把 API 地址指向 {url}{panel}。', { url: `${base}/v1`, panel })
 }
 
+/**
+ * 「界面语言」一行：下拉选 auto 或某个具体语言，选中即整页刷新。
+ *
+ * ── 为什么不进 settings-state 的后端模型 ──────────────────────
+ * 语言只改本机界面文案：不碰转发、不碰账号，跟「主题 / 缩放 / 计量单位」同属纯前端
+ * 偏好。所以它只读写 localStorage（键 workbuddy-desktop-locale，见 ui/i18n.js），
+ * 与后端 desktop-settings.json 无关，也正因如此这里不需要受控 state —— 切换会
+ * location.reload()，重载后本行自然按新值重新渲染。
+ *
+ * ── 选项为什么是双语的 ──────────────────────────────────────
+ * 'auto' 的标签是中文键（跟随系统），走 t()；其余语言名称分两半：label 是**各语言
+ * 自己的写法**（English / 日本語 / 한국어 …）—— 选之前就该看得懂，不翻译；nameKey
+ * 是这门外语的中文名，用 t() 译成当前界面语言，拼成「English（英语）」式双语选项
+ * （两者相同则只给一次）。触发器（收起态）只显示 label，避免长名字在窄控件里截断。
+ */
+function LanguageRow() {
+  const api = window.wbI18n
+  const value = api?.rawLocale?.() ?? 'auto'
+  const locales = api?.LOCALES ?? []
+  /** 选项的双语名：本地写法 + 当前界面语言的写法（相同时只给一次） */
+  const nameOf = (item: { label: string; nameKey: string }): string => {
+    const translated = t(item.nameKey)
+    return translated && translated !== item.label ? `${item.label}（${translated}）` : item.label
+  }
+  const labelOf = (code: string): string => (
+    code === 'auto' ? t('跟随系统') : (locales.find(item => item.code === code)?.label ?? code)
+  )
+
+  return (
+    <div className='retention-list'>
+      <div className='retention-row'>
+        <label htmlFor='settings-language'>{t('界面语言')}</label>
+        <span className='prompt-input'>
+          {/* 与「界面缩放」同一个 Select 形态：展示文案显式给 SelectValue，不依赖 value 自动显示。
+              组件的 onValueChange 可能给 null（被清空），这里只在拿到非空值时切换 */}
+          <Select value={value} onValueChange={next => { if (next) api?.setLocale(next) }}>
+            <SelectTrigger id='settings-language' className='w-[200px]' aria-label={t('界面语言')}>
+              <SelectValue>{labelOf(value)}</SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value='auto'>{t('跟随系统')}</SelectItem>
+              {locales.map(item => (
+                <SelectItem key={item.code} value={item.code}>{nameOf(item)}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </span>
+      </div>
+    </div>
+  )
+}
+
 function GeneralPane({ snap }: { snap: SettingsSnapshot }) {
   const app = snap.app
   // 轻量模式只挂在「关闭到托盘」上（关闭即退出时没有窗口可轻量），
@@ -319,6 +371,14 @@ function GeneralPane({ snap }: { snap: SettingsSnapshot }) {
 
   return (
     <>
+      <section className='panel'>
+        <PanelHead title={t('语言设置')} tip={TIPS.displayLanguage} />
+        <div className='panel-body'>
+          <LanguageRow />
+          <div className='settings-state'>{STATES.languageHint}</div>
+        </div>
+      </section>
+
       <section className='panel'>
         <PanelHead
           title={t('启动与托盘')}
@@ -420,9 +480,9 @@ function themeStateText(mode: ThemeMode): string {
 }
 
 /**
- * 显示分类：显示模式 / 界面缩放 / 语言。
+ * 显示分类：显示模式 / 界面缩放。
  *
- * 三项都是**纯前端偏好** —— 与后端配置无关，所以不参与 settings-state 的 load
+ * 两项都是**纯前端偏好** —— 与后端配置无关，所以不参与 settings-state 的 load
  * （那边一次并行取全部后端设置），这里自己持两个受控值就够了。
  *
  * 主题与缩放的**唯一应用入口都在 app.js**（见 settings-model 的显示偏好一节）：
@@ -512,60 +572,7 @@ function DisplayPane() {
           </div>
         </div>
       </section>
-
-      <section className='panel'>
-        <PanelHead title={t('语言设置')} tip={TIPS.displayLanguage} />
-        <div className='panel-body'>
-          <LanguageRow />
-          <div className='settings-state'>{STATES.languageHint}</div>
-        </div>
-      </section>
     </>
-  )
-}
-
-/**
- * 「界面语言」一行：下拉选 auto 或某个具体语言，选中即整页刷新。
- *
- * ── 为什么不进 settings-state 的后端模型 ──────────────────────
- * 语言只改本机界面文案：不碰转发、不碰账号，跟「主题 / 缩放 / 计量单位」同属纯前端
- * 偏好。所以它只读写 localStorage（键 workbuddy-desktop-locale，见 ui/i18n.js），
- * 与后端 desktop-settings.json 无关，也正因如此这里不需要受控 state —— 切换会
- * location.reload()，重载后本行自然按新值重新渲染。
- *
- * ── 选项文案为什么不都走 t() ─────────────────────────────────
- * 'auto' 的标签是中文键（跟随系统），要翻译；其余语言的 label 是**各语言自己的写法**
- * （English / 日本語 / 한국어 …），选之前就该看得懂，所以照搬 wbI18n.LOCALES，不翻译。
- */
-function LanguageRow() {
-  const api = window.wbI18n
-  const value = api?.rawLocale?.() ?? 'auto'
-  const locales = api?.LOCALES ?? []
-  const labelOf = (code: string): string => (
-    code === 'auto' ? t('跟随系统') : (locales.find(item => item.code === code)?.label ?? code)
-  )
-
-  return (
-    <div className='retention-list'>
-      <div className='retention-row'>
-        <label htmlFor='settings-language'>{t('界面语言')}</label>
-        <span className='prompt-input'>
-          {/* 与「界面缩放」同一个 Select 形态：展示文案显式给 SelectValue，不依赖 value 自动显示。
-              组件的 onValueChange 可能给 null（被清空），这里只在拿到非空值时切换 */}
-          <Select value={value} onValueChange={next => { if (next) api?.setLocale(next) }}>
-            <SelectTrigger id='settings-language' className='w-[200px]' aria-label={t('界面语言')}>
-              <SelectValue>{labelOf(value)}</SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value='auto'>{t('跟随系统')}</SelectItem>
-              {locales.map(item => (
-                <SelectItem key={item.code} value={item.code}>{item.label}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </span>
-      </div>
-    </div>
   )
 }
 

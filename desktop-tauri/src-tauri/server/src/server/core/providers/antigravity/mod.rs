@@ -9,8 +9,8 @@
 //!
 //! ```text
 //!   站点     全球统一（没有地区参数、没有国内/国际双站点 —— 规格 §6）
-//!   鉴权     Google OAuth 2.0（授权码 + loopback；本仓只做粘贴 refresh_token）
-//!             → Authorization: Bearer {access_token}
+//!   鉴权     Google OAuth 2.0（授权码 + loopback：粘贴 refresh token
+//!             与网页登录两条入口）→ Authorization: Bearer {access_token}
 //!   推理     POST {base}/v1internal:streamGenerateContent?alt=sse
 //!             （chat 用 daily 基址；信封与翻译见 protocol::antigravity_*）
 //!   目录     POST {base}/v1internal:fetchAvailableModels
@@ -42,30 +42,29 @@
 //!   ✅ 注册接线：ProviderKind / 注册表 / adapter_for / 目录缓存 / 账号存储 / 添加分支
 //!   ✅ 聊天转发：build_chat_request 构造 v1internal 信封 → 响应走
 //!      protocol::antigravity_stream 翻译回 chat SSE（supports_chat = true）
-//!   ❌ 网页登录：仍不开窗口（supports_web_login 保持 false，见下）
+//!   ✅ 网页登录：Google OAuth 授权码 + loopback（授权页 accounts.google.com，
+//!      回调落网关 `/oauth-callback`；state 校验 → 换码 → 落账号，见 oauth.rs）
 //! ```
 //!
-//! ── 网页登录接起来便不便宜（评估结论，**仍未实现**）──────────
-//! 结论：**中等偏便宜，但不是「几行」**，且有一处未确认的前提。
-//!   - 便宜的半边：Antigravity 没有自己的登录页 —— 它直接用 **Google OAuth
-//!     授权码 + loopback 回调**（规格 §1.2/§1.3：临时端口 + 任意路径
-//!     `/oauth-callback`，无 PKCE、无设备码）。本仓已有同形态的两套先例
-//!     （raccoon 的自定义协议回调、Trae 的 `callback_server.rs` loopback 监听），
-//!     骨架（起 listener → 校验 state → 换 token → 落账号）可以直接照搬。
-//!   - 不便宜的部分：授权 URL 的 6 个 scope、`access_type=offline` +
-//!     `prompt=consent` 的组合、以及「Google 是否接受这个 client 的动态
-//!     loopback 端口」都还没实测过（规格 §8.5 把「官方确切 redirect_uri 注册值」
-//!     列为**未确认**）。另需一个回调服务器 + 状态管理（约 200–300 行，
-//!     与 Trae 的 `callback_server.rs` 同量级），并把登录窗口域名白名单
-//!     （壳侧 `src/login.rs::allowed_hosts`）加上 `accounts.google.com`。
-//!   - 判断：**值得做，但排在聊天链路实测之后**；粘贴式已覆盖「从已登录的
-//!     IDE / 参考实现里导出 refresh_token」这条主路径。
+//! ── 网页登录为什么这么做（实现时的三条取舍）────────────────────
+//!   1. **回调落在网关自己身上**：redirect_uri 取
+//!      `http://localhost:{网关端口}/oauth-callback`（参考实现
+//!      `oauth_server.rs` 逐字使用的形态；Google 的 desktop 型 client 允许
+//!      loopback 任意端口），因此不需要另起 listener，也不需要壳侧拦截回调 ——
+//!      浏览器 / 内嵌窗口 / 系统浏览器登录都能自己走回网关（与 Accio 同款形态）。
+//!   2. **state 是唯一的一次性凭据**：这条链路没有 PKCE（规格 §1.2），state
+//!      由适配器生成、随任务表进出、回调时逐字比对（`core::login` 的
+//!      Antigravity 分支）；手工粘贴整条回调 URL 的入口共用同一段收尾。
+//!   3. **换码与刷新共用 token 端点**：`POST oauth2.googleapis.com/token`，
+//!      只是 `grant_type` 不同（`authorization_code` vs `refresh_token`），
+//!      错误分类因此分开（同一个 `invalid_grant` 在两条链路上含义不同）。
 //!
 //! ── 子模块分工 ──────────────────────────────────────────────
 //! ```text
 //!   endpoints.rs    OAuth 常量 / v1internal 三个环境基址 / 方法名 / 请求头 / UA 约束
 //!   credentials.rs  账号凭证（refreshToken 主 + accessToken 缓存）+ 临期判定
-//!   oauth.rs        Google token 端点刷新（form）+ 单飞 + 比较再写 + invalid_grant 处置
+//!   oauth.rs        Google token 端点：网页登录换码 + 刷新（form）+ 单飞 +
+//!                   比较再写 + invalid_grant 处置 + loopback 端口常量
 //!   project.rs      cloudaicompanionProject 发现（loadCodeAssist → onboardUser）
 //!   models.rs       :fetchAvailableModels（只列 Gemini）+ 内置兜底 + 对外 id → 上游真名映射表
 //!   login.rs        粘贴式归一化（1// 前缀 / 引号 / Bearer）+ 一次校验刷新

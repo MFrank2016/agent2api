@@ -1,4 +1,5 @@
-//! Antigravity 的 token 刷新：`grant_type=refresh_token` 打 Google 的 token 端点。
+//! Antigravity 的 Google OAuth：**授权码换 token（网页登录）** +
+//! `grant_type=refresh_token` 刷新（同一个 token 端点）。
 //!
 //! ── 协议（规格 §1.5，两套参考实现逐字一致）────────────────────
 //! ```text
@@ -15,6 +16,36 @@
 //! ```
 //! **`refresh_token` 通常不回传**（Google 只在首次授权时下发）：那时保留旧值，
 //! 绝不把已有字段洗成空（与 Trae / Qoder 的同一条规矩）。
+//!
+//! ── 网页登录：授权码 + loopback（规格 §1.1–§1.4）───────────────
+//! 与别家的网页登录同形（授权页 → 回调 → 换码 → 落账号），Google 侧的三步
+//! 逐字取自参考实现（`Antigravity-Manager/src-tauri/src/modules/oauth.rs` +
+//! `oauth_server.rs`）：
+//! ```text
+//! ① 授权页  https://accounts.google.com/o/oauth2/v2/auth
+//!      client_id / redirect_uri / response_type=code
+//!      scope = 6 个空格连接（openid、cloud-platform、userinfo.email、
+//!              userinfo.profile、cclog、experimentsandconfigs）
+//!      access_type=offline + prompt=consent   ← 保证下发 refresh_token
+//!      include_granted_scopes=true + state=<一次性随机串>
+//! ② 回调    http://localhost:{网关端口}/oauth-callback
+//!          （参考实现双栈可绑定时逐字用 `localhost`，路径 `/oauth-callback`；
+//!           Google 的 desktop 型 client 允许 loopback 任意端口）
+//! ③ 换码    POST https://oauth2.googleapis.com/token（form）
+//!      client_id / client_secret / code
+//!      redirect_uri（与 ① 逐字相同！）/ grant_type=authorization_code
+//! ```
+//! `redirect_uri` 的端口来自进程级常量（[`set_loopback_port`]，bootstrap 写一次）：
+//! `ProviderAdapter::build_login_url()` 是同步无参的 trait 契约，拿不到
+//! `ServerState`，因此照 accio / codearts 的先例开机写一次、之后只读。
+//! **没有 PKCE、没有设备码**（规格 §1.2）：state 是这条链路上唯一的一次性
+//! CSRF 凭据，由适配器用 `raccoon::oauth::new_login_state()` 生成（本仓唯一的
+//! 不可预测随机源），逐字比对在 `core::login::submit_login_callback` 里做。
+//!
+//! userinfo（`GET .../oauth2/v2/userinfo`，Bearer）只为取 `email`：它是展示名
+//! 与账号身份（`account_store::antigravity_accounts` 的 id 优先按 email 派生）。
+//! 失败**不阻断落账号** —— 取不到就空着，id 退到令牌摘要（v2 失败再试 v1，
+//! 规格 §8.4：两套参考各用一个版本，都能返回 email）。
 //!
 //! ── `invalid_grant` 的处置（与规格 §1.6 的差异，有意）───────────
 //! Manager 收到 `invalid_grant` 会**停用账号**（写 `disabled: true` 并摘出
@@ -43,7 +74,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::server::core::account_store::{AccountStore, CredentialWrite};
 use crate::server::core::egress;
@@ -64,6 +95,80 @@ const DEFAULT_EXPIRES_IN_SECONDS: i64 = 3600;
 
 /// 上游错误文在报错里的截断长度（Google 的错误体可能很长）
 const MAX_ERROR_CHARS: usize = 300;
+
+/// 本网关 loopback 回调路径：参考实现 `oauth_server.rs` 逐字使用
+/// `/oauth-callback`（Google 的 desktop 型 client 允许 loopback 任意端口；
+/// 换码时回传的 redirect_uri 必须与授权时逐字相同，两处都取自
+/// [`login_redirect_uri`]，因此不会各写一份而对不上）。
+pub const CALLBACK_PATH: &str = "/oauth-callback";
+
+/// 授权码长度上限（Google 的 code 很短；给一个防呆上限而不是信任输入）
+const MAX_CODE_LENGTH: usize = 8192;
+
+/// state 长度上限（本仓生成的 uuid 形态远短于此；防的是手工粘贴的长串）
+const MAX_STATE_LENGTH: usize = 512;
+
+/// userinfo 请求超时（它是顺手取一次 email，不该拖住落账号）
+const USERINFO_TIMEOUT_MS: u64 = 20_000;
+
+/// 本网关的监听端口（`ServerState::bootstrap` 时写入）。
+///
+/// ── 为什么是一个进程级常量 ──────────────────────────────────
+/// `ProviderAdapter::build_login_url()` 是同步、无参的（trait 契约），拿不到
+/// `ServerState`；而授权地址里必须拼上本机的回调地址。端口在进程生命周期内
+/// 不变，因此开机写一次、之后只读 —— 与 accio / codearts 的 `set_loopback_port`
+/// 同一手法（本家自成一份，理由同 codearts：各家将来若分叉，改一处不影响别家）。
+static LOOPBACK_PORT: OnceLock<u16> = OnceLock::new();
+
+/// 记录本进程的监听端口（`ServerState::bootstrap` 调一次，重复调用无害）
+pub fn set_loopback_port(port: u16) {
+    let _ = LOOPBACK_PORT.set(port);
+}
+
+/// 本机回调基址。用 `localhost` 而不是 `127.0.0.1`：参考实现在双栈可绑定时
+/// 逐字用的就是 `http://localhost:{port}/oauth-callback`（另一支才是显式 IP），
+/// 而浏览器对 `localhost` 会自己尝试 IPv4 / IPv6 两条栈 —— 网关只监听 IPv4
+/// 时浏览器能落到 127.0.0.1。端口未知时 None，错误由上层文案说清。
+pub fn loopback_base() -> Option<String> {
+    LOOPBACK_PORT.get().map(|port| format!("http://localhost:{port}"))
+}
+
+/// 本家登录回调地址（授权时拼进授权 URL、换码时逐字回传，见 [`CALLBACK_PATH`]）。
+pub fn login_redirect_uri() -> Option<String> {
+    loopback_base().map(|base| format!("{base}{CALLBACK_PATH}"))
+}
+
+/// 拼 Google 授权地址（规格 §1.2；参数与顺序照参考实现的
+/// `get_auth_url_with_client` 逐字）。
+///
+/// 参数表：
+/// ```text
+///   client_id              内置的公开客户端（endpoints::CLIENT_ID）
+///   redirect_uri           http://localhost:{网关端口}/oauth-callback
+///   response_type          code
+///   scope                  6 个 scope 空格连接（endpoints::SCOPES，顺序照参考）
+///   access_type            offline   ← 与 prompt=consent 一起保证下发 refresh_token
+///   prompt                 consent
+///   include_granted_scopes true      ← Manager 有、9router 无（非必需，照 Manager）
+///   state                  一次性随机串（生成与比对见模块头）
+/// ```
+///
+/// 返回 None = 回调端口还没定（bootstrap 之前）。`build_login_url` 的 Option
+/// 正好接住它，由通用文案「未能生成网页登录授权地址」兜底。
+pub fn build_authorize_url(state: &str) -> Option<String> {
+    let redirect_uri = login_redirect_uri()?;
+    let mut url = url::Url::parse(endpoints::AUTH_URL).ok()?;
+    url.query_pairs_mut()
+        .append_pair("client_id", endpoints::CLIENT_ID)
+        .append_pair("redirect_uri", &redirect_uri)
+        .append_pair("response_type", "code")
+        .append_pair("scope", &endpoints::SCOPES.join(" "))
+        .append_pair("access_type", "offline")
+        .append_pair("prompt", "consent")
+        .append_pair("include_granted_scopes", "true")
+        .append_pair("state", state);
+    Some(url.to_string())
+}
 
 /// 单飞表（键 = 账号文件 + 账号 id + refresh_token 指纹，见 [`ensure_fresh`]）
 static FLIGHTS: OnceLock<Table<AntigravityCredentials>> = OnceLock::new();
@@ -129,17 +234,19 @@ fn expires_in_of(payload: &Value) -> i64 {
     }
 }
 
-/// 解析成功响应（200 且带 `access_token`）
-fn parse_token_response(payload: &Value) -> Result<TokenResponse, GatewayError> {
+/// 解析成功响应（200 且带 `access_token`）。
+///
+/// 刷新与换码的响应形态相同（`TokenResponse`），差的只是 `access_token` 缺失
+/// 时的文案语境（刷新 =「旧凭证未被覆盖」，换码 =「账号未保存」），因此由调用
+/// 方把文案递进来。
+fn read_token_response(payload: &Value, missing_access_token: &str) -> Result<TokenResponse, GatewayError> {
     let access_token = payload
         .get("access_token")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| {
-            GatewayError::with_status(502, "Antigravity 刷新响应缺少 access_token，旧凭证未被覆盖")
-        })?;
+        .ok_or_else(|| GatewayError::with_status(502, missing_access_token))?;
     let refresh_token = payload
         .get("refresh_token")
         .and_then(Value::as_str)
@@ -160,6 +267,11 @@ fn parse_token_response(payload: &Value) -> Result<TokenResponse, GatewayError> 
         expires_in,
         token_type,
     })
+}
+
+/// 解析刷新响应（`refresh_access_token` 的出口；文案见 [`read_token_response`]）
+fn parse_token_response(payload: &Value) -> Result<TokenResponse, GatewayError> {
+    read_token_response(payload, "Antigravity 刷新响应缺少 access_token，旧凭证未被覆盖")
 }
 
 /// 把一次失败响应翻成网关错误（见模块头的三档处置）。
@@ -242,6 +354,247 @@ pub async fn refresh_access_token(
         return Err(error);
     }
     parse_token_response(&payload)
+}
+
+// ─── 网页登录：授权码 → 换 token → 落账号 ────────────────────
+
+/// 换码失败的处置。
+///
+/// 与刷新那条 [`classify_failure`] 分开：同一个 `invalid_grant` 在两条链路上
+/// 指的是不同的事（刷新时 = refresh_token 被撤销，换码时 = 授权码过期 / 已用
+/// 过 / redirect_uri 与授权时不一致），照做的动作也不同（前者重新粘贴凭证，
+/// 后者重新发起网页登录）。
+fn classify_exchange_failure(status: u16, text: &str, payload: Option<&Value>) -> GatewayError {
+    let (code, description) = upstream_error(payload);
+    let detail = if description.is_empty() {
+        truncate(text)
+    } else {
+        truncate(&description)
+    };
+    let hint = if detail.is_empty() {
+        String::new()
+    } else {
+        format!("：{detail}")
+    };
+    match code.as_str() {
+        "invalid_grant" => GatewayError::with_status(
+            400,
+            format!("Antigravity 授权码已失效或已被使用，请重新发起网页登录{hint}"),
+        ),
+        "redirect_uri_mismatch" => GatewayError::with_status(
+            400,
+            format!("Antigravity 授权回调地址与发起时不一致，请重新发起网页登录{hint}"),
+        ),
+        "invalid_client" | "unauthorized_client" => GatewayError::with_status(
+            401,
+            format!("Antigravity 的 OAuth 客户端未被 Google 接受（{code}）：请重新发起网页登录{hint}"),
+        ),
+        _ => GatewayError::with_status(
+            502,
+            format!("Antigravity 网页登录换取凭证失败（{status}）{hint}"),
+        ),
+    }
+}
+
+/// 取 userinfo 的 `email`（best-effort）：v2 失败回落 v1，两个版本都失败返回
+/// None。调用点把它当纯展示 / 身份增强，**绝不因它失败而判登录失败**。
+///
+/// 日志口径与刷新一致：只记成败，不打印令牌本体。
+async fn fetch_email(access_token: &str) -> Option<String> {
+    let token = access_token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    let client = egress::client_for(None);
+    let (auth_key, auth_value) = endpoints::bearer_header(token);
+    for url in [endpoints::USERINFO_URL_V2, endpoints::USERINFO_URL_V1] {
+        let response = client
+            .get(url)
+            .header("User-Agent", endpoints::oauth_user_agent())
+            .header("Accept", "application/json")
+            .header(auth_key.clone(), auth_value.clone())
+            .timeout(Duration::from_millis(USERINFO_TIMEOUT_MS))
+            .send()
+            .await;
+        let Ok(response) = response else { continue };
+        if !response.status().is_success() {
+            continue;
+        }
+        let text = response.text().await.unwrap_or_default();
+        let payload: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let email = payload
+            .get("email")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if email.is_some() {
+            return email;
+        }
+    }
+    None
+}
+
+/// **网页登录**的收尾：授权码 → token 端点换凭证 → best-effort 取 email /
+/// project → 落账号；成功返回账号 id（调用方把它写进登录任务会话）。
+///
+/// ── state 为什么只校验非空（逐字比对不在这里）────────────────
+/// 逐字比对在 `core::login::submit_login_callback` 里做 —— 那里才持有本进程
+/// 刚生成的那个 state（任务表按它索引）。本函数是适配器契约的实现（trait
+/// 文档要求「再校验一次」做深度防御）：拿到的是调用方已比对过的值，这里只
+/// 拒绝空串 / 超长，避免一个畸形 state 被当成合法凭据往下走。
+///
+/// ── 落账号为什么不另写一份 ──────────────────────────────────
+/// 走 `AccountStore::add_antigravity_account`（`source = "web"`）—— 与粘贴式
+/// 那条路径**同一个入口**：id 派生（email → 令牌摘要）、撞 id 保护、优先级
+/// 分配、旧字段保留都在那里；另写一份只会让两条路慢慢分叉。
+///
+/// ── 失败语义 ────────────────────────────────────────────────
+///   - 授权码失效 / redirect_uri 不一致 → 400（不可重试，重新发起）；
+///   - OAuth 客户端被拒 → 401；其余上游失败 → 502（可重试）；
+///   - 换到了 token 但**没有 refresh_token** → 400：那种账号落下来也没有
+///     续期手段（refresh_token 才是本家主凭证），必须让用户照做（Google 只在
+///     `prompt=consent` + `access_type=offline` 的**首次**授权下发，重复授权
+///     可在 Google 账号的「第三方访问」里撤销后重试）。
+pub async fn exchange_code(
+    store: &AccountStore,
+    code: &str,
+    state: &str,
+) -> Result<String, GatewayError> {
+    let code = code.trim();
+    if code.is_empty() {
+        return Err(GatewayError::with_status(400, "缺少授权码，请重新发起网页登录"));
+    }
+    if code.chars().count() > MAX_CODE_LENGTH {
+        return Err(GatewayError::with_status(
+            400,
+            "授权码过长，请确认复制的是回调 URL 里的 code",
+        ));
+    }
+    let state = state.trim();
+    if state.is_empty() {
+        return Err(GatewayError::with_status(
+            400,
+            "缺少登录 state，无法确认这次登录由本机发起，请重新发起网页登录",
+        ));
+    }
+    if state.chars().count() > MAX_STATE_LENGTH {
+        return Err(GatewayError::with_status(400, "登录 state 过长，请重新发起网页登录"));
+    }
+    let redirect_uri = login_redirect_uri().ok_or_else(|| {
+        GatewayError::with_status(500, "网关还在启动中，回调端口尚未确定，请稍后重试")
+    })?;
+    // 出网用进程级出口：登录发生在账号存在之前，没有账号级代理可挂
+    // （与本文件刷新那条的唯一差别，其余 client 构造 / 错误处理逐字同款）。
+    let client = egress::client_for(None);
+    let response = client
+        .post(endpoints::TOKEN_URL)
+        .header("User-Agent", endpoints::oauth_user_agent())
+        .timeout(Duration::from_millis(REQUEST_TIMEOUT_MS))
+        .header("Accept", "application/json")
+        .form(&[
+            ("client_id", endpoints::CLIENT_ID),
+            ("client_secret", endpoints::CLIENT_SECRET),
+            ("code", code),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("grant_type", endpoints::GRANT_TYPE_AUTHORIZATION_CODE),
+        ])
+        .send()
+        .await
+        .map_err(|error| {
+            GatewayError::with_status(
+                502,
+                format!(
+                    "Antigravity 网页登录换码请求失败：{}",
+                    egress::describe_error_detail(&error)
+                ),
+            )
+        })?;
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap_or_default();
+    let payload: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    if !(200..300).contains(&status) {
+        let error = classify_exchange_failure(status, &text, Some(&payload));
+        logging::log(
+            "[Antigravity]",
+            &format!("❌ 网页登录换取凭证失败（HTTP {status}）：{}", error.message),
+        );
+        return Err(error);
+    }
+    let token = read_token_response(&payload, "Antigravity 换码响应缺少 access_token，账号未保存")?;
+    let Some(refresh_token) = token
+        .refresh_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        return Err(GatewayError::with_status(
+            400,
+            "Google 未返回 refresh token（该授权此前完成过，重复授权不会再次下发）：\
+             请在 Google 账号的「第三方访问 / 已授权的应用」里撤销本应用后重新发起网页登录",
+        ));
+    };
+    let access_token = token.access_token.trim().to_string();
+    // `expires_in` 越界（上游给了脏值）时按默认 1 小时算 —— 与刷新链路同一条处置
+    let expires_in = if (1..=7 * 24 * 3600).contains(&token.expires_in) {
+        token.expires_in
+    } else {
+        DEFAULT_EXPIRES_IN_SECONDS
+    };
+    let expires_at = logging::now_ms() + expires_in * 1000;
+    // email / project 都是 best-effort：失败只告警，不影响账号可用性
+    let email = fetch_email(&access_token).await.unwrap_or_default();
+    if email.is_empty() {
+        logging::verbose(
+            "[Antigravity]",
+            "网页登录未取到 email（账号照常保存，展示名与身份退到令牌摘要）",
+        );
+    }
+    let project_id = match project::discover_project(&access_token, None).await {
+        Ok(found) => found,
+        Err(error) => {
+            logging::verbose(
+                "[Antigravity]",
+                &format!("网页登录 project 未发现（不影响账号添加）：{}", error.message),
+            );
+            String::new()
+        }
+    };
+    // 键名与 `add_antigravity_account` 的读取对齐（refreshToken / accessToken /
+    // expiresAt / projectId / email），不另造形状。
+    let mut record = Map::new();
+    record.insert("refreshToken".to_string(), Value::String(refresh_token));
+    record.insert("accessToken".to_string(), Value::String(access_token));
+    record.insert("expiresAt".to_string(), Value::from(expires_at));
+    if !email.is_empty() {
+        record.insert("email".to_string(), Value::String(email));
+    }
+    if !project_id.trim().is_empty() {
+        record.insert("projectId".to_string(), Value::String(project_id));
+    }
+    let saved = store
+        .add_antigravity_account(&Value::Object(record), None, "web")
+        .map_err(|error| GatewayError::with_status(error.status_code, error.message))?;
+    let id = saved
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if id.is_empty() {
+        return Err(GatewayError::with_status(
+            500,
+            "网页登录成功但账号未能写入（数据缺少 id），请重试",
+        ));
+    }
+    logging::log(
+        "[Antigravity]",
+        &format!(
+            "✅ 网页登录成功，账号已加入列表: {}（{id}）",
+            saved.get("name").and_then(Value::as_str).unwrap_or("")
+        ),
+    );
+    Ok(id)
 }
 
 /// 取可用凭证（`force = true` 时不看临期窗口，401 之后强制刷一次）。

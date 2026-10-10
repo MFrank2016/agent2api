@@ -632,22 +632,30 @@ const COMMANDCODE: ProviderConfig = {
 /**
  * Antigravity（Google 的 AI IDE，本次接它提供的 Gemini 模型）。
  *
- * ── 粘贴 Google refresh token，本步唯一的登录方式 ─────────────
- * 网页登录要 loopback 回调 + 授权码换 token，而 Antigravity 的授权页与 scope
- * 还需逐一实测（Google 对「非官方客户端 + 动态 loopback 端口」的容忍度未
- * 确认），因此只做「用户自己拿到 refresh_token 后粘贴」这一条。令牌以 `1//`
- * 开头；直接粘贴含 `refresh_token=` 的整行也行（网关会归一化，`1//` 本体留着）。
+ * ── 网页登录（Google OAuth 授权码 + loopback）───────────────
+ * 后端适配器本地拼授权地址（`accounts.google.com`，6 个 scope +
+ * `access_token=offline` / `prompt=consent`），完成后浏览器回到**网关自己的**
+ * loopback 端口 `/oauth-callback`（redirect_uri 就是网关端口拼出来的，见
+ * `providers::antigravity::oauth`）。回调落在网关，因此内嵌窗口与系统浏览器
+ * 两种方式都能用（与 CatPaw 同款）；远程 / Docker 场景下浏览器到不了容器内
+ * 的 loopback 端口时，可把地址栏整条回调 URL 粘回登录弹窗。
+ *
+ * ── 粘贴 Google refresh token（仍保留的手工入口）──────────────
+ * 已从别处（官方 IDE / 参考实现）拿到 refresh_token 的用户可以直接粘贴；
+ * 令牌以 `1//` 开头，直接粘贴含 `refresh_token=` 的整行也行（网关会归一化，
+ * `1//` 本体留着）。
  *
  * ── 有自动续期 ─────────────────────────────────────────────
  * access_token 约一小时过期（Google 侧的 expires_in），refresh_token 是长寿命
- * 的主凭证：添加时打一次 Google token 端点做**真实校验**并顺手换回 access
- * token，之后到期由网关自动续期 —— 令牌丢了只能重新走 Google 授权。
+ * 的主凭证：网页登录与粘贴式都会在添加时打一次 Google token 端点做**真实校验**
+ * 并顺手拿到 access token，之后到期由网关自动续期 —— 令牌丢了只能重新走
+ * Google 授权。
  *
  * ── projectId 可以留空 ─────────────────────────────────────
  * `projectId`（`cloudaicompanionProject`）是聊天请求必需、但每个 Google 账号
  * 各不相同的值（不在 token 里）：留空时网关会 best-effort 自动发现
  * （`loadCodeAssist` → 无则 `onboardUser`），失败不阻断添加，刷模型清单时会
- * 再试。`email` 同样可选，只用于展示与身份识别。
+ * 再试。`email` 同样可选，只用于展示与身份识别（网页登录会自己取 userinfo）。
  *
  * ── 没有「导入桌面端登录态」────────────────────────────────
  * 登录态在 Antigravity IDE 自己的存储里，没有 `auth.json` 那种稳定可读的
@@ -657,8 +665,19 @@ const ANTIGRAVITY: ProviderConfig = {
   provider: 'antigravity',
   label: t('Antigravity'),
   desktop: false,
+  // 网页登录：Google 账号授权页 + loopback 回调。回调落在网关自己的端口，
+  // 所以两种打开方式都可用（会复用系统浏览器里已登录的 Google 账号）。
+  webLogin: {
+    noteHtml: t('在打开的窗口里登录 Google 账号（Antigravity 的授权页），授权完成后自动加入账号列表。'),
+    button: t('打开 Antigravity 网页登录'),
+    busyText: t('等待 Google 授权完成…'),
+    modes: [
+      { value: 'embedded', label: t('内嵌窗口（推荐）'), hint: t('内嵌窗口打开；完成后自动加入列表，关窗即取消等待') },
+      { value: 'external', label: t('系统浏览器'), hint: t('系统浏览器打开（复用已登录的 Google 账号）；完成后自动加入列表') },
+    ],
+  },
   manualTitle: t('粘贴 Google refresh token'),
-  manualNoteHtml: t('粘贴 Antigravity 的 Google refresh token（以 <code>1//</code> 开头；直接粘贴含 <code>refresh_token=</code> 的整行也行）。<br>这是本家唯一的登录入口。refresh token 不会过期，access token 到期由网关自动续期；令牌丢了只能重新走 Google 授权，请妥善保存。'),
+  manualNoteHtml: t('粘贴 Antigravity 的 Google refresh token（以 <code>1//</code> 开头；直接粘贴含 <code>refresh_token=</code> 的整行也行）。<br>这是网页登录之外的手工入口（例如从已登录的官方 IDE 里导出）。refresh token 不会过期，access token 到期由网关自动续期；令牌丢了只能重新走 Google 授权，请妥善保存。'),
   fields: [
     { key: 'refreshToken', label: 'refreshToken', rows: 2, placeholder: t('1// 开头的 Google refresh token（也可直接粘贴 refresh_token=… 整行）') },
     { key: 'projectId', label: 'projectId', optional: true, placeholder: t('可选（cloudaicompanionProject）：留空由网关自动发现') },

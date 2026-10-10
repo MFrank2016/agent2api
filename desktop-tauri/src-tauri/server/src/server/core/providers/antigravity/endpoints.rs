@@ -9,7 +9,7 @@
 //!                       https://www.googleapis.com/oauth2/v2/userinfo
 //!   Cloud Code Assist   https://<env>-cloudcode-pa.googleapis.com/v1internal
 //!                       （推理、模型目录、project 发现都在这一个平面上）
-//!   （无第三平面：没有网页登录页、没有签到、没有余额接口）
+//!   （没有自家的登录页：网页登录走 Google OAuth，见 `oauth.rs`）
 //! ```
 //!
 //! ── v1internal 的冒号语法（最容易写错的一处）────────────────────
@@ -59,7 +59,7 @@ pub const CLIENT_ID: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps
 /// 与 [`CLIENT_ID`] 配套的 client secret（同上，公开值）。
 pub const CLIENT_SECRET: &str = "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";
 
-/// 授权码端点（本步不实现网页登录，常量先登记 —— 见 `mod.rs` 的评估说明）
+/// 授权码端点（网页登录的 authorization endpoint，见 `oauth::build_authorize_url`）
 pub const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 
 /// token 端点：**取 token 与刷新都打这一个**（form 表单，见 `oauth.rs`）
@@ -85,7 +85,7 @@ pub const SCOPES: [&str; 6] = [
 
 /// 刷新用 grant_type（逐字；不是 `refreshToken`）
 pub const GRANT_TYPE_REFRESH: &str = "refresh_token";
-/// 授权码换 token 用 grant_type（本步不用，登记以免下一步写错）
+/// 授权码换 token 用 grant_type（网页登录用，见 `oauth::exchange_code`）
 pub const GRANT_TYPE_AUTHORIZATION_CODE: &str = "authorization_code";
 
 /// Cloud Code Assist 的三个环境基址（顺序 = 优先级，见模块头）。
