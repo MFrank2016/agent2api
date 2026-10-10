@@ -37,3 +37,6 @@ data/
 
 # 运行时数据备份（升级/迁移时由程序生成在数据目录旁）
 data.backup.*.tar.gz
+
+# OpenCode / OMO 工具状态目录（本机状态，不入库）
+.omo/
