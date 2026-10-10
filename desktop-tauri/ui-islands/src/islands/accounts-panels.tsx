@@ -58,6 +58,7 @@ import {
   proxyPoolSnapshot, queryUsageOnce, setAccountEnabled, setPanelOpen, tokenUsageOf,
   startZcodeClaim, toggleNamesHidden, usageEntryOf, usageFailureOf,
 } from './accounts-data'
+import { PROVIDER_ICONS } from './add-provider-pick'
 import { t } from '../i18n'
 
 /** 图标（icons.js 的内联 SVG 串）：整站共用一份图标集，这里只做注入 */
@@ -935,6 +936,8 @@ export function AccountCell({ account, namesHidden }: { account: AccountRecord; 
 /**
  * 提供商：一枚徽章，带版本后缀（「WorkBuddy 国际版」）—— 与 AutoClaw 那种「名字自带
  * 版本」的家同一种形态，不再提供商、版本两枚并排。
+ * 收录过图标的家（PROVIDER_ICONS，与模型管理页 / 签到中心同一份）在名字前挂
+ * 13px 小图标，没有的仍是纯文字 —— 与卡片图标的兜底口径一致。
  * 配色按 provider id 生成（`p-<id>` 类），未登记的家落到 CSS 里的中性兜底 ——
  * 加一家时不必改样式表，也不会显示成空白（所以这里不换组件库的 Badge：它没有按
  * provider 上色的档位，见最终报告的组件库缺口）。
@@ -944,9 +947,13 @@ export function ProviderCell({ account }: { account: AccountRecord }) {
   const label = shared().wbProviders?.labelOf?.(provider) || provider
   const edition = providerFeatures(provider).edition ? editionSuffix(account) : ''
   const text = edition ? `${label} ${edition}` : label
+  const icon = PROVIDER_ICONS[provider]
   return (
     <div className='pv'>
-      <span className={`pbadge p-${provider}`} title={t('提供商：{name}', { name: text })}>{text}</span>
+      <span className={`pbadge p-${provider}`} title={t('提供商：{name}', { name: text })}>
+        {icon ? <img className='pbadge-ico' src={icon} alt='' loading='lazy' /> : null}
+        <span className='pbadge-txt'>{text}</span>
+      </span>
     </div>
   )
 }

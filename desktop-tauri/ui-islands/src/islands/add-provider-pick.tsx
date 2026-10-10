@@ -19,7 +19,7 @@ import { WORKBUDDY_ENTRY_LABEL, WORKBUDDY_PROVIDER } from './add-account-configs
 import { ADD_SEG_CLASS } from './add-provider-blocks'
 import { t } from '../i18n'
 
-/** 第 1 步的账号类型：Agent（内置八家）/ 预置 API / 自定义 / 导入 */
+/** 第 1 步的账号类型：Agent（内置家）/ 预置 API / 自定义 / 导入 */
 export type AccountType = 'proxy' | 'preset' | 'custom' | 'import'
 
 export const TYPE_PROXY: AccountType = 'proxy'
@@ -51,13 +51,15 @@ export function typeValueOf(value: string): AccountType {
 
 /**
  * 内置家的真实图标：`id → assets/providers/<file>.png`，图取自各客户端安装目录
- * 内嵌的图标（与系统里显示的为同一张；AutoClaw 国内 / 国际版、Cline 两种账号、
- * Accio / ZCode 两地各自共用一张 —— 它们本来就是同一个客户端）。
+ * 内嵌的图标（与系统里显示的为同一张；AutoClaw / WorkBuddy 各自两地、Cline 两种
+ * 账号、Accio / ZCode 两地共用一张 —— 它们本来就是同一个客户端）。
  * 自定义家与没收录图标的家回落到首字母徽章。
- * 导出共用：签到中心的提供商行用同一份映射（checkin-page.tsx），别处不要照抄。
+ * 导出共用：账号表的提供商徽章（accounts-panels 的 ProviderCell）、模型管理页
+ * （models-page）与签到中心的提供商行（checkin-page）用同一份映射，别处不要照抄。
  */
 export const PROVIDER_ICONS: Record<string, string> = {
   workbuddy: 'assets/providers/workbuddy.png',
+  'workbuddy-intl': 'assets/providers/workbuddy.png',
   raccoon: 'assets/providers/raccoon.png',
   catpaw: 'assets/providers/catpaw.png',
   autoclaw: 'assets/providers/autoclaw.png',
@@ -79,7 +81,25 @@ export const PROVIDER_ICONS: Record<string, string> = {
   // KukuAI：取自客户端 `GenFlowPro.exe` 的 RT_ICON 资源（256×256 那张，
   // 与系统里显示的应用图标为同一张）
   kuku: 'assets/providers/kuku.png',
+  // MonkeyCode：取自客户端 asar 内嵌的应用图标（`electron/icon.png`，与系统里
+  // 显示的应用图标为同一张；国内 / 国际版共用这一张，同 AutoClaw 的形态）
+  monkeycode: 'assets/providers/monkeycode.png',
+  'monkeycode-intl': 'assets/providers/monkeycode.png',
+  // Command Code / Antigravity：这两家没有可解的本地安装包，图取自官方资产 ——
+  // Command Code 用官网 `apple-touch-icon.png`（黑底 + 白结的应用图标形态；官方
+  // brand 页那种「白描边框 + 满幅黑底」的变体在 13px 徽章里会糊），Antigravity
+  // 用官方 press 页的「Icon - Full Color」（antigravity.google/press）
+  commandcode: 'assets/providers/commandcode.png',
+  antigravity: 'assets/providers/antigravity.png',
 }
+
+/**
+ * 新接入、尚在观察期的家：添加账号页的卡片名字后跟一枚 `(beta)`（由
+ * `ProviderCard` 渲染）。它只是**入口页的提示**，不是家本身的属性 ——
+ * 账号表徽章、模型管理页都不跟着变；判据是「转发通道刚上线」，
+ * 观察期结束后从这张表里删掉即可。
+ */
+const BETA_PROVIDERS = new Set(['monkeycode', 'monkeycode-intl', 'commandcode', 'antigravity'])
 
 type CardItem = {
   id: string
@@ -87,11 +107,12 @@ type CardItem = {
   count: number
   preset?: boolean
   custom?: boolean
+  beta?: boolean
 }
 
 /**
  * 第 1 步的卡片列表数据，按账号类型分三段：
- *   · Agent —— 内置家来自 providers 摘要（现有八家）；
+ *   · Agent —— 内置家来自 providers 摘要；
  *   · 预置 API —— 预置目录的官方与托管端点，点一张卡 = 创建这一家并预填；
  *     **已建过同名家的预置卡不再出现**（那张已建卡就在「自定义」段里）；
  *   · 自定义 —— 已建的自定义家（customList），每张卡是「给这家加账号」的对象。
@@ -137,6 +158,7 @@ function providerCards(accountType: AccountType): CardItem[] {
         id,
         label: labelOf(id, String(item.label || item.id || '')),
         count: Number(item.count) || 0,
+        beta: BETA_PROVIDERS.has(id),
       }
     })
     : [{ id: WORKBUDDY_PROVIDER, label: WORKBUDDY_ENTRY_LABEL, count: accountCountOf(WORKBUDDY_PROVIDER) }]
@@ -194,7 +216,10 @@ function ProviderCard({ item, onPick }: { item: CardItem; onPick: (id: string) =
     >
       <Logo item={item} />
       <span className='add-provider-info'>
-        <span className='add-provider-name'>{item.label}</span>
+        <span className='add-provider-name'>
+          {item.label}
+          {item.beta ? <span className='add-provider-beta'>(beta)</span> : null}
+        </span>
         <span className='add-provider-meta'>{cardMeta(item)}</span>
       </span>
       <span className='add-provider-go'>›</span>

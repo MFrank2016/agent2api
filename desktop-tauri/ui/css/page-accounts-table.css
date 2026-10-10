@@ -241,6 +241,7 @@
 .pbadge {
   display: inline-flex;
   align-items: center;
+  gap: 5px;
   max-width: 100%;
   padding: 1px 8px;
   border: 1px solid var(--border);
@@ -252,6 +253,24 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* 收录过图标的家在名字前挂一枚 13px 小图（PROVIDER_ICONS，与卡片 / 模型管理页
+   同一份）。图与名字同一行居中；圆角略收，自带透明底的图不至于显得比文字重 */
+.pbadge .pbadge-ico {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+  border-radius: 3px;
+  object-fit: contain;
+}
+/* 名字段单独成盒才能吃到 ellipsis —— 裸文本节点在 flex 容器里只是匿名项，
+   父级的 text-overflow 对它不生效（图标固定 13px 不参与截断） */
+.pbadge .pbadge-txt {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .pbadge.p-workbuddy { background: var(--primary-soft); border-color: var(--primary-bd); color: var(--primary-fg); }
