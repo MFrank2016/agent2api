@@ -81,5 +81,7 @@ pub fn build_daily_activity_request(
         headers,
         payload,
         egress,
+        // 保活是转发链路的旁支，口径跟转发一致（workbuddy 不覆写能力位 = 直连）
+        system_proxy_when_unset: false,
     })
 }

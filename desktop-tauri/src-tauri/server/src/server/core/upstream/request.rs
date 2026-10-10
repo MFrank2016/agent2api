@@ -69,6 +69,9 @@ pub struct TransportRequest {
     pub payload: String,
     /// 出网代理（账号级；与 provider 无关，由编排层解析后带上）
     pub egress: crate::server::core::proxies::AccountEgress,
+    /// 账号未配代理时本家是否**跟随系统代理**出网（编排层按适配器的能力位填，
+    /// 默认 false = 直连）。为 true 的家见 `ProviderAdapter::system_proxy_when_unset`。
+    pub system_proxy_when_unset: bool,
 }
 
 /// 归一化后的上游错误：`{code, message}`
@@ -160,19 +163,24 @@ pub async fn send_chat_request(
     let url = plan.url.clone();
     let payload = plan.payload.clone();
     let headers = plan.headers.clone();
-    let response = crate::server::core::egress::dispatch(&plan.egress, |client| {
-        let mut builder = client.post(&url).body(payload.clone());
-        for (key, value) in &headers {
-            builder = builder.header(key, value);
-        }
-        if let Some(timeout) = NO_TOTAL_TIMEOUT {
-            builder = builder.timeout(Duration::from_millis(timeout));
-        }
-        builder
-    });
+    let response = crate::server::core::egress::dispatch(
+        &plan.egress,
+        plan.system_proxy_when_unset,
+        |client| {
+            let mut builder = client.post(&url).body(payload.clone());
+            for (key, value) in &headers {
+                builder = builder.header(key, value);
+            }
+            if let Some(timeout) = NO_TOTAL_TIMEOUT {
+                builder = builder.timeout(Duration::from_millis(timeout));
+            }
+            builder
+        },
+    );
     // 出口说明（失败文案用）：按**出口类型**描述，而不是 `primary()` 指到的
     // 第一个成员 —— 轮询组可能在别的成员上尝试 / 成功，点名首个成员会误导。
     let via = match &plan.egress {
+        AccountEgress::Direct if plan.system_proxy_when_unset => "跟随系统代理".to_string(),
         AccountEgress::Direct => "直连".to_string(),
         AccountEgress::Single(proxy) if !proxy.label.is_empty() => format!("经代理 {}", proxy.label),
         AccountEgress::Single(proxy) => format!("经代理 {}", proxy.host),
