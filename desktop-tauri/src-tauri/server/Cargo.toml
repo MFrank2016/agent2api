@@ -50,8 +50,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 flate2 = "1"
 url = "2"
 axum = "0.8"
-# 出站请求：rustls（纯 Rust，不依赖系统 openssl）+ socks5 出网代理
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks"] }
+# 出站请求：rustls（纯 Rust，不依赖系统 openssl）+ socks5 出网代理。
+# `system-proxy` 打开 hyper-util 的系统代理匹配器（Windows / macOS 系统设置 +
+# 环境变量）：只有「跟随系统代理」那条出口（`egress::client_for_system_proxy`，
+# 供登录链路与 Antigravity 未配代理的账号使用）依赖它 —— 显式出口（直连 /
+# 指定代理）都显式关掉了自动探测（见 `egress::build_client`），转发链路的
+# 「直连就是直连」语义不受影响。
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks", "system-proxy"] }
 # MonkeyCode 会话转发的 WebSocket 任务流（providers/monkeycode/stream.rs）：
 # 上游是 `wss://…/api/v1/users/tasks/stream`，TLS 走 rustls —— 与 reqwest 的
 # `rustls-tls` 同一条栈（rustls + tokio-rustls 各一份；根证书同为 webpki-roots

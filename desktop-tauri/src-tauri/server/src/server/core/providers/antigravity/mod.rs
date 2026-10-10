@@ -87,3 +87,29 @@ pub mod oauth;
 pub mod project;
 
 pub use adapter::{AntigravityAdapter, ANTIGRAVITY_ADAPTER};
+
+use std::sync::Arc;
+
+use crate::server::core::egress;
+use crate::server::core::proxies::ResolvedProxy;
+
+/// 本家出网 Client 的选择：**显式配了代理就用它，否则跟随系统代理**。
+///
+/// ── 为什么与别家不同（别照抄这一条去别家用）────────────────────
+/// 仓内默认口径是「直连就是直连」（`egress::build_client` 的直连分支显式
+/// `.no_proxy()`）：转发出口由账号的代理配置决定，不被机器环境悄悄改写。
+/// 那对国内可直连的上游是对的；本家的上游是 Google，多数网络里只有经代理
+/// 才可达 —— 而用户机器上「已经能打开 Google 的那个代理」就写在系统设置里
+/// （浏览器能打开授权页正是靠它）。因此本家的口径是**与浏览器一致**：
+///   1. 账号显式配了代理（`proxy` 为 Some）→ 走它，优先级最高；
+///   2. 没配 → `client_for_system_proxy()`（系统设置 + 环境变量）；
+///   3. 系统也没配代理 → reqwest 探测不到，等价于直连，不引入新的失败面。
+///
+/// 登录链路（换码 / userinfo / 粘贴校验 / project 发现）同理：此刻账号还不
+/// 存在，`proxy` 恒为 None，走第 2 条。
+pub(crate) fn client_for(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::Client> {
+    match proxy {
+        Some(proxy) => egress::client_for(Some(proxy)),
+        None => egress::client_for_system_proxy(),
+    }
+}

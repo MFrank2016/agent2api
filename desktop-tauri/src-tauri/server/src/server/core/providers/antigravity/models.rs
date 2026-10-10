@@ -474,7 +474,9 @@ async fn send_json(
     body: &Value,
     proxy: Option<&ResolvedProxy>,
 ) -> Result<HttpOutcome, String> {
-    let client = egress::client_for(proxy);
+    // 本家统一的出口口径：账号显式配了代理就用它，否则跟随系统代理
+    // （理由见 `super::client_for` 的文档）
+    let client = super::client_for(proxy);
     let headers = endpoints::admin_headers(access_token, project_id);
     let mut builder = client
         .post(url)

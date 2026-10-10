@@ -124,7 +124,9 @@ async fn post_json(
     body: &Value,
     proxy: Option<&ResolvedProxy>,
 ) -> Result<(u16, Value, String), GatewayError> {
-    let client = crate::server::core::egress::client_for(proxy);
+    // 本家统一的出口口径：显式配了代理就用它，否则跟随系统代理
+    // （project 发现多在登录链路里跑，那一步没有账号可挂，理由见 `super::client_for`）
+    let client = super::client_for(proxy);
     let headers = endpoints::admin_headers(access_token, project_id);
     let mut builder = client
         .post(url)

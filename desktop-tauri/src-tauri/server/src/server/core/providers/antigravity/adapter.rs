@@ -181,6 +181,23 @@ impl ProviderAdapter for AntigravityAdapter {
         true
     }
 
+    /// **账号未配代理时跟随系统代理**（`true`；仓内唯一覆写这一位的家）。
+    ///
+    /// ── 为什么本家是特例 ────────────────────────────────────────
+    /// 上游是 Google：多数网络里只有经代理才可达，直连必然 TCP 超时
+    /// （用户实测 `os error 10060`）。而用户机器上「已经能打开 Google 的
+    /// 那个代理」就写在系统设置里 —— 浏览器能打开授权页正是靠它。账号若
+    /// 没单独配代理，跟随它是唯一合理的默认；系统没配代理时 reqwest 探测
+    /// 不到，等价于直连，不引入新的失败面。
+    ///
+    /// 口径与登录链路一致（那边本来就无从挂账号代理，走
+    /// `egress::client_for_system_proxy()`；见 `super::client_for` 的文档）。
+    /// **别把这一位抄到别家** —— 对国内可直连的上游，「直连就是直连」才是
+    /// 正确口径（trait 文档里有完整论证）。
+    fn system_proxy_when_unset(&self) -> bool {
+        true
+    }
+
     /// 把「映射上绑的思考等级」翻译成本家认的字段：写成 body 顶层的
     /// `reasoning_effort`，由请求转换（`protocol::antigravity_outbound` 的
     /// `thinking_budget`）映射成 `generationConfig.thinkingConfig.thinkingBudget`。

@@ -891,6 +891,8 @@ async fn attempt_queue(
                 headers: plan.headers,
                 payload,
                 proxy: target.proxy.clone(),
+                // 能力位由适配器给；账号已配代理时它不参与（proxy 优先）
+                system_proxy_when_unset: adapter.system_proxy_when_unset(),
             };
             // ── 调试模式：抓一份即将发出去的原始报文 ──────────────────
             // 位置在 `build_chat_request` 之后（URL / 头 / body 都已定稿）。

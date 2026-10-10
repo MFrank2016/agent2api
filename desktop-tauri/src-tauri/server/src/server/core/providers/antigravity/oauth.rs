@@ -321,7 +321,7 @@ pub async fn refresh_access_token(
             "Antigravity 账号缺少 refresh token，请重新粘贴（Google OAuth 的 refresh_token）",
         ));
     }
-    let client = egress::client_for(proxy);
+    let client = super::client_for(proxy);
     let response = client
         .post(endpoints::TOKEN_URL)
         .header("User-Agent", endpoints::oauth_user_agent())
@@ -337,9 +337,19 @@ pub async fn refresh_access_token(
         .send()
         .await
         .map_err(|error| {
+            // 连接类失败（连不上 / 超时）在 Google 上游几乎都指向「出网路径不通」：
+            // 带上代理提示，用户才知道该往哪查（见 `super::client_for` 的口径）。
+            let hint = if error.is_connect() {
+                "（本机访问 Google 需经代理时：请开启系统代理，或给该账号配置出网代理）"
+            } else {
+                ""
+            };
             GatewayError::with_status(
                 502,
-                format!("Antigravity 刷新请求失败：{}", egress::describe_error_detail(&error)),
+                format!(
+                    "Antigravity 刷新请求失败：{}{hint}",
+                    egress::describe_error_detail(&error)
+                ),
             )
         })?;
     let status = response.status().as_u16();
@@ -405,7 +415,9 @@ async fn fetch_email(access_token: &str) -> Option<String> {
     if token.is_empty() {
         return None;
     }
-    let client = egress::client_for(None);
+    // 登录发生在账号存在之前，没有账号级代理可挂 → 跟随系统代理
+    // （与浏览器同口径；口径与理由见 `super::client_for` 的文档）。
+    let client = super::client_for(None);
     let (auth_key, auth_value) = endpoints::bearer_header(token);
     for url in [endpoints::USERINFO_URL_V2, endpoints::USERINFO_URL_V1] {
         let response = client
@@ -484,9 +496,10 @@ pub async fn exchange_code(
     let redirect_uri = login_redirect_uri().ok_or_else(|| {
         GatewayError::with_status(500, "网关还在启动中，回调端口尚未确定，请稍后重试")
     })?;
-    // 出网用进程级出口：登录发生在账号存在之前，没有账号级代理可挂
-    // （与本文件刷新那条的唯一差别，其余 client 构造 / 错误处理逐字同款）。
-    let client = egress::client_for(None);
+    // 出网跟随系统代理：登录发生在账号存在之前，没有账号级代理可挂
+    // （口径与理由见 `super::client_for` 的文档；与本文件刷新那条的唯一差别，
+    // 其余 client 构造 / 错误处理逐字同款）。
+    let client = super::client_for(None);
     let response = client
         .post(endpoints::TOKEN_URL)
         .header("User-Agent", endpoints::oauth_user_agent())
@@ -502,10 +515,17 @@ pub async fn exchange_code(
         .send()
         .await
         .map_err(|error| {
+            // 与刷新同款：连接类失败带上代理提示（用户报过 os error 10060 ——
+            // 直连 Google 超时，正是这条提示要指出的场景）
+            let hint = if error.is_connect() {
+                "（本机访问 Google 需经代理时：请开启系统代理后重试）"
+            } else {
+                ""
+            };
             GatewayError::with_status(
                 502,
                 format!(
-                    "Antigravity 网页登录换码请求失败：{}",
+                    "Antigravity 网页登录换码请求失败：{}{hint}",
                     egress::describe_error_detail(&error)
                 ),
             )
