@@ -85,7 +85,7 @@ export type ProxyPayload =
   | null
   | { source: 'pool'; proxyId: string }
   | { source: 'clash'; listenerUid: string }
-  | { source: 'custom'; protocol: 'http' | 'socks5'; host: string; port: number; username: string; password: string }
+  | { source: 'custom'; protocol: 'http' | 'socks5'; host: string; port: number; username: string; password: string; noReuse?: boolean }
   | { source: 'pool-rotate'; group: string; proxyIds: string[]; strategy: 'round-robin' | 'random' | 'least-latency'; onError: 'next' | 'none' }
 
 export type ProxyDraft = {
@@ -98,6 +98,8 @@ export type ProxyDraft = {
   port: string
   username: string
   password: string
+  /** 每请求换出口 IP（不复用连接池） */
+  noReuse: boolean
   /** 轮询组名（mode === 'pool-rotate'） */
   group: string
   /** pool-rotate 的显式成员 id（导入时写入；UI 不编辑，保存时原样保留） */
@@ -128,6 +130,7 @@ export function draftOfProxy(proxy: AccountRecord['proxy']): ProxyDraft {
     port: config?.port === undefined || config?.port === null ? '' : String(config.port),
     username: config?.username || '',
     password: config?.password || '',
+    noReuse: config?.noReuse === true,
     group: source === 'pool-rotate' ? String(config?.group || '') : '',
     proxyIds,
     strategy: config?.strategy === 'random' || config?.strategy === 'least-latency' ? config.strategy : 'round-robin',
@@ -163,6 +166,7 @@ export function readProxyDraft(draft: ProxyDraft): ProxyPayload {
     port,
     username: draft.username.trim(),
     password: draft.password,
+    noReuse: draft.noReuse,
   }
 }
 
@@ -487,6 +491,12 @@ export function ProxyForm({
             <label htmlFor={`${idPrefix}-pass`}>密码</label>
             <Input id={`${idPrefix}-pass`} type='password' placeholder='可选' autoComplete='new-password'
               value={draft.password} onChange={event => set({ password: event.currentTarget.value })} />
+          </div>
+          <div className='field-row mt-2.5'>
+            <label htmlFor={`${idPrefix}-noreuse`}>每请求换出口 IP</label>
+            <input id={`${idPrefix}-noreuse`} type='checkbox' checked={draft.noReuse}
+              onChange={event => set({ noReuse: event.currentTarget.checked })} />
+            <span className='detail'>不复用连接（代理出口每条请求新建隧道，适合会轮换出口的代理）</span>
           </div>
         </div>
       ) : null}

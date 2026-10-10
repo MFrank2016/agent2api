@@ -127,9 +127,10 @@ fn cache_key(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> Strin
     };
     // 两项传输层超时进键：见上面的说明
     format!(
-        "{egress}|c{}|r{}",
+        "{egress}|c{}|r{}|n{}",
         timeouts.connect_ms(),
-        timeouts.read_timeout_backstop_ms()
+        timeouts.read_timeout_backstop_ms(),
+        if proxy.map(|p| p.no_reuse).unwrap_or(false) { 1 } else { 0 }
     )
 }
 
@@ -201,6 +202,8 @@ fn describe_proxy(proxy: &ResolvedProxy) -> &str {
 /// 环境变量里的代理设置，不关掉的话用户机器上设了 `HTTPS_PROXY` 就会
 /// 「配置为直连却走了代理」。
 fn build_client(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> Result<reqwest::Client, String> {
+    // 每请求换出口 IP：不复用连接池 —— 每条请求新建到代理的隧道，从而拿到新出口 IP
+    let no_reuse = proxy.map(|p| p.no_reuse).unwrap_or(false);
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(timeouts.connect_ms()))
         // 单次读取超时（等响应头 + 数据块间隔的传输层后备，取两项设置的大者）；
@@ -209,8 +212,8 @@ fn build_client(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> Re
         .read_timeout(Duration::from_millis(timeouts.read_timeout_backstop_ms()))
         // 默认 UA（理由见 DEFAULT_USER_AGENT）：不设会被计费接口判为「请求不合法」
         .user_agent(DEFAULT_USER_AGENT)
-        .pool_idle_timeout(Some(Duration::from_secs(90)))
-        .pool_max_idle_per_host(8);
+        .pool_idle_timeout(if no_reuse { Some(Duration::from_secs(0)) } else { Some(Duration::from_secs(90)) })
+        .pool_max_idle_per_host(if no_reuse { 0 } else { 8 });
 
     match proxy {
         None => {

@@ -364,6 +364,7 @@ function ProxyModal({
   const [password, setPassword] = React.useState(item?.password || '')
   /** 轮询组标签（可选）：账号的 pool-rotate 出口按它选这一组条目 */
   const [group, setGroup] = React.useState(item?.group || '')
+  const [noReuse, setNoReuse] = React.useState(item?.noReuse === true)
   const [enabled, setEnabled] = React.useState(item ? item.enabled : true)
   const [saving, setSaving] = React.useState(false)
   const [testing, setTesting] = React.useState(false)
@@ -390,6 +391,7 @@ function ProxyModal({
         password,
         group: group.trim(),
         enabled,
+        noReuse,
       },
     }
   }
@@ -410,6 +412,7 @@ function ProxyModal({
       port: payload.port,
       username: payload.username,
       password: payload.password,
+      noReuse: payload.noReuse,
     }
     setTesting(true)
     setStatus('正在连接上游…')
@@ -511,6 +514,13 @@ function ProxyModal({
               一组出口轮流使用；留空则只作为普通代理条目。
             </p>
           </div>
+          <div className='flex flex-row items-center gap-2.5'>
+            <Switch checked={noReuse} onCheckedChange={setNoReuse} aria-label='每请求换出口 IP' />
+            <span className='text-[12.5px]'>
+              每请求换出口 IP（不复用连接）—— 代理出口每条请求新建隧道，适合会轮换出口的代理；静态代理不必开
+            </span>
+          </div>
+
 
           <div className='flex flex-row items-center gap-2.5'>
             <Switch checked={enabled} onCheckedChange={setEnabled} aria-label='启用这条代理' />

@@ -216,6 +216,10 @@ pub fn normalize_account_proxy(input: &Value) -> Result<Option<Value>, ProxyConf
         "password".to_string(),
         Value::String(clean_string(object.get("password"), MAX_USER_LENGTH)),
     );
+    normalized.insert(
+        "noReuse".to_string(),
+        Value::Bool(object.get("noReuse").and_then(Value::as_bool).unwrap_or(false)),
+    );
     normalized.insert("label".to_string(), Value::String(label));
     Ok(Some(Value::Object(normalized)))
 }
@@ -235,6 +239,8 @@ pub struct ResolvedProxy {
     pub username: String,
     pub password: String,
     pub label: String,
+    /// 每请求换出口 IP：不复用连接池（代理出口每次新建隧道）。默认 false。
+    pub no_reuse: bool,
 }
 
 impl ResolvedProxy {
@@ -284,6 +290,7 @@ impl ResolvedProxy {
             username: text("username"),
             password: text("password"),
             label: text("label"),
+            no_reuse: value.get("noReuse").and_then(Value::as_bool).unwrap_or(false),
         }))
     }
 }
@@ -338,6 +345,7 @@ pub(crate) fn proxy_to_json(proxy: &ResolvedProxy) -> Value {
     json!({
         "source": proxy.source, "protocol": proxy.protocol, "host": proxy.host,
         "port": proxy.port, "username": proxy.username, "password": proxy.password, "label": proxy.label,
+        "noReuse": proxy.no_reuse,
     })
 }
 
@@ -568,6 +576,7 @@ pub fn resolve_account_proxy(config: Option<&Value>) -> Option<ProxyResolution> 
                 .unwrap_or("")
                 .to_string(),
             label,
+            no_reuse: object.get("noReuse").and_then(Value::as_bool).unwrap_or(false),
         }));
     }
     if source != "clash" {
@@ -596,6 +605,7 @@ pub fn resolve_account_proxy(config: Option<&Value>) -> Option<ProxyResolution> 
             username: String::new(),
             password: String::new(),
             label: format!("Clash 混合端口 {port}"),
+            no_reuse: false,
         }));
     }
     let Some(listener) = snapshot.listeners.iter().find(|item| item.uid == listener_uid) else {
@@ -617,6 +627,7 @@ pub fn resolve_account_proxy(config: Option<&Value>) -> Option<ProxyResolution> 
         username: String::new(),
         password: String::new(),
         label: format!("{}（:{}）", listener.name, listener.port),
+        no_reuse: false,
     }))
 }
 
@@ -745,6 +756,7 @@ mod tests {
             members: vec![ResolvedProxy {
                 source: "pool".into(), protocol: "http".into(), host: "1.2.3.4".into(),
                 port: Some(8080), username: "u".into(), password: "p".into(), label: "a".into(),
+                no_reuse: false,
             }],
             strategy: Strategy::LeastLatency,
             on_error: OnError::Next,
@@ -767,6 +779,7 @@ mod tests {
         let member = |host: &str, port: u16| ResolvedProxy {
             source: "pool".into(), protocol: "http".into(), host: host.into(),
             port: Some(port), username: String::new(), password: String::new(), label: String::new(),
+            no_reuse: false,
         };
         // 同一组成员、两种书写顺序 → 同一个键（否则游标 / EWMA 不共享）
         let forward = rotation_group_key(&[member("1.2.3.4", 8080), member("5.6.7.8", 9090)]);

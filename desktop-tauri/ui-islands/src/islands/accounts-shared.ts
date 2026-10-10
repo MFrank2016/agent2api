@@ -36,6 +36,8 @@ export type ProxyConfig = {
     port?: number
     username?: string
     password?: string
+    /** 每请求换出口 IP：不复用连接池（代理出口每条请求新建隧道） */
+    noReuse?: boolean
   } | null
 }
 

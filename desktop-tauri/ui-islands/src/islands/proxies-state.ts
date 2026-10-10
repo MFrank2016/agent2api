@@ -35,6 +35,8 @@ export type ProxyPoolItem = {
   password: string
   /** 轮询组标签（可选）：账号的 pool-rotate 出口按它选这一组条目 */
   group?: string
+  /** 每请求换出口 IP：不复用连接池（代理出口每条请求新建隧道）。默认 false。 */
+  noReuse?: boolean
   listenerUid: string
   createdAt: number
   updatedAt: number

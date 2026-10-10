@@ -226,6 +226,10 @@ fn normalize_item(input: &Value, existing: Option<&Value>) -> Result<Value, Stri
         "password".to_string(),
         Value::String(clean_string(object.get("password"), MAX_USER_LENGTH)),
     );
+    normalized.insert(
+        "noReuse".to_string(),
+        Value::Bool(object.get("noReuse").and_then(Value::as_bool).unwrap_or(false)),
+    );
     normalized.insert("createdAt".to_string(), Value::from(created_at));
     normalized.insert("updatedAt".to_string(), Value::from(now));
     normalized.insert("lastTest".to_string(), last_test);
@@ -261,6 +265,7 @@ pub fn resolve_item(item: &Value) -> Option<ProxyResolution> {
             "port": item.get("port").cloned().unwrap_or(Value::Null),
             "username": text_of(item, "username"),
             "password": text_of(item, "password"),
+            "noReuse": Value::Bool(item.get("noReuse").and_then(Value::as_bool).unwrap_or(false)),
         })
     };
     resolve_account_proxy(Some(&config))
@@ -393,6 +398,7 @@ fn describe_item(item: &Value) -> Value {
         "port": item.get("port").cloned().unwrap_or(Value::Null),
         "username": text_of(item, "username"),
         "password": text_of(item, "password"),
+        "noReuse": item.get("noReuse").and_then(Value::as_bool).unwrap_or(false),
         // clash 的引用 uid（编辑弹窗选中它 + 前端标注「来自 Clash Verge」）
         "listenerUid": text_of(item, "listenerUid"),
         "createdAt": item.get("createdAt").cloned().unwrap_or(Value::from(0)),

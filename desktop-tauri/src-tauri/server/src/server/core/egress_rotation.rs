@@ -87,7 +87,7 @@ mod tests {
     use crate::server::core::proxies::OnError;
     fn m(host: &str) -> ResolvedProxy {
         ResolvedProxy { source: "pool".into(), protocol: "http".into(), host: host.into(),
-            port: Some(80), username: String::new(), password: String::new(), label: String::new() }
+            port: Some(80), username: String::new(), password: String::new(), label: String::new(), no_reuse: false }
     }
 
     #[test]
