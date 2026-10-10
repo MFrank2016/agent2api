@@ -1,6 +1,6 @@
 # Agent2API · Multi-Provider Local Gateway
 
-[简体中文](./README.md) | **English**
+[简体中文](./README.md) | **English** | [繁體中文](./README.zh-Hant.md) | [日本語](./README.ja.md) | [한국어](./README.ko.md) | [Português (BR)](./README.pt-BR.md)
 
 Wraps the login state of several AI desktop clients into a local **OpenAI-compatible API gateway**, exposing a single `base_url` and bundling multi-provider account management, model management (enable / disable / delete / alias), content redaction, egress proxying and request reporting — plus a ready-to-run Tauri desktop app. Any OpenAI client that accepts a custom `base_url` can call these providers' model quota through `http://127.0.0.1:3065/v1` — no API key, no client source changes needed.
 
@@ -84,6 +84,10 @@ print(resp.choices[0].message.content)
 ```
 
 **Pages running in a browser** (a self-built web UI, a single-file frontend app, …) that call this endpoint with `fetch` will fail with "cannot connect to the API": the gateway surface does **not** answer CORS by default, so the preflight (OPTIONS) lands on the API-key check and gets a 401 (a cross-origin preflight never carries the `Authorization` header) and the real request is never sent. Two ways out: ① turn on "Security → Gateway CORS" in Settings — the gateway then answers exactly like the panel does (preflight allowed, responses carry `Access-Control-Allow-*` with origin `*`, effective immediately). Note the gateway is the surface that really forwards upstream and spends quota: with `*` and no API key configured, any web page could drive your local gateway, so configure a "Gateway Key" as well; ② make the page same-origin — run a small local static server that also reverse-proxies `/v1` to `127.0.0.1:3065`, which removes cross-origin entirely and needs no relaxation at all.
+
+### LAN access
+
+By default the gateway only listens on `127.0.0.1`, so only this machine can use it. After turning on "Settings → General → LAN access", the gateway listens on all network adapters instead, and devices on the same LAN just point their API base URL at this machine's IP (the UI shows the full address, e.g. `http://192.168.1.5:3065/v1`) to share the same set of accounts. For safety, enabling it requires registering a panel administrator first: the management API then demands an admin session or a gateway key, and while no key is enabled the forwarding API refuses service too (the enable flow adds a "default" key automatically). You can also optionally expose the web management panel to the LAN (other devices open this machine's IP in a browser and manage it, with an admin login); it stays off by default, and the desktop panel is served only by the app itself. Changes take effect after the app restarts.
 
 ---
 
