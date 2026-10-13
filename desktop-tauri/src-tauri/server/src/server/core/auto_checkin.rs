@@ -1079,4 +1079,105 @@ mod tests {
         let patch = travel_patch_from_payload(&json!({ "locationId": null })).unwrap();
         assert!(patch.get("locationId").unwrap().is_null());
     }
+
+    // ── (a) write_travel_state 的合并语义（Review Focus 第 5 条）──
+
+    #[test]
+    fn merge_travel_preserves_other_travel_and_autocheckin_keys() {
+        let mut raw = Map::new();
+        raw.insert("enabled".into(), json!(true));
+        raw.insert("time".into(), json!("00:01"));
+        raw.insert("providers".into(), json!(["workbuddy", "raccoon"]));
+        raw.insert("travel".into(), json!({
+            "enabled": true, "claimTime": "06:00", "locationId": 3,
+            "lastDepartDate": "2026-10-12", "lastClaimDate": "2026-10-12"
+        }));
+        // 只写 lastDepartDate（tick 的派发轮落账路径）
+        let merged = merge_travel(&raw, &json!({ "lastDepartDate": "2026-10-13" }));
+        let travel = merged.get("travel").and_then(Value::as_object).unwrap();
+        // travel 的其它键一个不少
+        assert_eq!(travel.get("enabled"), Some(&json!(true)));
+        assert_eq!(travel.get("claimTime"), Some(&json!("06:00")));
+        assert_eq!(travel.get("locationId"), Some(&json!(3)));
+        assert_eq!(travel.get("lastClaimDate"), Some(&json!("2026-10-12")));
+        assert_eq!(travel.get("lastDepartDate"), Some(&json!("2026-10-13")));
+        // autoCheckin 顶层其它键一个不少
+        assert_eq!(merged.get("enabled"), Some(&json!(true)));
+        assert_eq!(merged.get("time"), Some(&json!("00:01")));
+        assert_eq!(merged.get("providers"), Some(&json!(["workbuddy", "raccoon"])));
+    }
+
+    #[test]
+    fn merge_travel_creates_travel_when_absent() {
+        let mut raw = Map::new();
+        raw.insert("enabled".into(), json!(false));
+        let merged = merge_travel(&raw, &json!({ "lastClaimDate": "2026-10-13" }));
+        assert_eq!(merged.get("travel"), Some(&json!({ "lastClaimDate": "2026-10-13" })));
+        assert_eq!(merged.get("enabled"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn merge_travel_overwrites_same_key_only() {
+        let mut raw = Map::new();
+        raw.insert("travel".into(), json!({ "enabled": true, "claimTime": "06:00" }));
+        let merged = merge_travel(&raw, &json!({ "enabled": false }));
+        let travel = merged.get("travel").and_then(Value::as_object).unwrap();
+        assert_eq!(travel.get("enabled"), Some(&json!(false)));
+        assert_eq!(travel.get("claimTime"), Some(&json!("06:00")));
+    }
+
+    // ── (b) tick 的轮次判定（每日至多一次 / 两轮互不串台）──
+
+    /// 构造北京时间的确定时刻（用于轮次判定的单测）。
+    fn beijing_at(hour: u32, minute: u32) -> DateTime<FixedOffset> {
+        beijing::offset()
+            .with_ymd_and_hms(2026, 10, 13, hour, minute, 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn round_due_is_daily_and_off_aware() {
+        let now = beijing_at(0, 5);
+        // 到点 + 今天没跑过 → 触发
+        assert!(round_due(true, "00:01", None, now));
+        // 今天已跑过 → 不再触发（每日至多一次）
+        assert!(!round_due(true, "00:01", Some("2026-10-13"), now));
+        // 开关关着 → 不触发
+        assert!(!round_due(false, "00:01", None, now));
+        // 没到点 → 不触发
+        assert!(!round_due(true, "06:00", None, now));
+    }
+
+    /// 旅行两轮各自去重、互不串台：派发绑主轮时刻、领取绑 claimTime。
+    #[test]
+    fn travel_rounds_do_not_cross_fire() {
+        let depart_time = "00:01";
+        let claim_time = "06:00";
+
+        // 00:05：派发到点（主轮时刻已过），领取还没到点
+        let early = beijing_at(0, 5);
+        assert!(round_due(true, depart_time, None, early), "00:05 应触发派发");
+        assert!(!round_due(true, claim_time, None, early), "00:05 不该触发领取");
+
+        // 06:05：派发今天已落账（lastDepartDate=今天）→ 不再触发；领取到点 → 触发
+        let late = beijing_at(6, 5);
+        assert!(!round_due(true, depart_time, Some("2026-10-13"), late), "派发今天已跑过不再触发");
+        assert!(round_due(true, claim_time, None, late), "06:05 应触发领取");
+        // 领取落账后不再触发
+        assert!(!round_due(true, claim_time, Some("2026-10-13"), late), "领取今天已跑过不再触发");
+
+        // 旅行关着时两轮都不触发
+        assert!(!round_due(false, depart_time, None, late));
+        assert!(!round_due(false, claim_time, None, late));
+    }
+
+    /// 旅行轮次的去重键与主轮 lastFiredDate 相互独立（Review Focus：「独立去重」）。
+    #[test]
+    fn travel_rounds_are_independent_of_main_last_fired() {
+        let now = beijing_at(0, 5);
+        // 主轮今天已跑过 → 主轮不触发
+        assert!(!round_due(true, "00:01", Some("2026-10-13"), now));
+        // 同一 tick 里，旅行派发用 lastDepartDate（None）→ 仍触发
+        assert!(round_due(true, "00:01", None, now));
+    }
 }

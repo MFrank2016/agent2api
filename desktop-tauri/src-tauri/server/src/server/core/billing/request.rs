@@ -468,3 +468,45 @@ pub(super) fn normalize_checkin(data: &Value) -> Value {
     result.insert("raw".to_string(), data.clone());
     Value::Object(result)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn session() -> Value {
+        json!({
+            "auth": { "accessToken": "t", "domain": "corp.example" },
+            "account": { "uid": "u1", "enterpriseId": "ent1" }
+        })
+    }
+
+    fn header_names(headers: &[(String, String)]) -> Vec<&str> {
+        headers.iter().map(|(name, _)| name.as_str()).collect()
+    }
+
+    #[test]
+    fn build_headers_keeps_identity_by_default() {
+        let headers = build_headers(&session(), &[], false);
+        let names = header_names(&headers);
+        assert!(names.contains(&"X-User-Id"));
+        assert!(names.contains(&"X-Enterprise-Id"));
+        assert!(names.contains(&"X-Tenant-Id"));
+        assert!(names.contains(&"X-Domain"));
+        assert!(names.contains(&"Authorization"));
+    }
+
+    #[test]
+    fn build_headers_suppresses_identity_when_asked() {
+        let headers = build_headers(&session(), &[], true);
+        let names = header_names(&headers);
+        assert!(!names.contains(&"X-User-Id"), "抑制时必须去掉 X-User-Id");
+        assert!(!names.contains(&"X-Enterprise-Id"));
+        assert!(!names.contains(&"X-Tenant-Id"));
+        assert!(!names.contains(&"X-Domain"));
+        // Bearer 与固定头照旧
+        assert!(names.contains(&"Authorization"));
+        assert!(names.contains(&"Accept"));
+        assert!(names.contains(&"Content-Type"));
+    }
+}

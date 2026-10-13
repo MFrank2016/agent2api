@@ -395,4 +395,88 @@ mod tests {
         assert!(message.contains("领取失败"), "应报告领取失败，实际: {message}");
         assert!(!message.contains("旅行中"), "不得误报「旅行中」，实际: {message}");
     }
+
+    /// 领取端点 HTTP 200 但业务 code≠0（如「已领取」/风控）的 mock：
+    /// 断言不得置 `claimed=true`，失败要收敛进 message（spec §8）。
+    async fn mock_script_claim_code(status_json: &'static str, claim_json: &'static str)
+        -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let claims = Arc::new(AtomicUsize::new(0));
+        let departs = Arc::new(AtomicUsize::new(0));
+        let c = claims.clone();
+        let d = departs.clone();
+        let app = axum::Router::new()
+            .route(TRAVEL_STATUS_PATH, axum::routing::get(move || async move {
+                (axum::http::StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")], status_json) }))
+            .route(TRAVEL_CONFIG_PATH, axum::routing::get(move || async move {
+                (axum::http::StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")],
+                 r#"{"code":0,"data":{"locations":[{"id":1}]}}"#) }))
+            .route(TRAVEL_CLAIM_PATH, axum::routing::post(move || { let c = c.clone(); async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                (axum::http::StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")], claim_json) } }))
+            .route(TRAVEL_DEPART_PATH, axum::routing::post(move || { let d = d.clone(); async move {
+                d.fetch_add(1, Ordering::SeqCst);
+                (axum::http::StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")],
+                 r#"{"code":0,"data":{"location":{"id":1}}}"#) } }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, claims, departs, task)
+    }
+
+    #[tokio::test]
+    async fn arrived_with_nonzero_claim_code_reports_failure_not_claimed() {
+        let (billing, _g) = service("travel-claim-nonzero");
+        let (base, claims, departs, _t) = mock_script_claim_code(
+            r#"{"code":0,"data":{"state":"arrived","reward_credit":8,"daily_limit_reached":false,"location":{"id":4}}}"#,
+            r#"{"code":10086,"msg":"今天已经领取过了"}"#).await;
+        let out = billing.travel_auto(&cn_session(&base), TravelOpts::default()).await;
+        assert_eq!(out.get("claimed").and_then(Value::as_bool), Some(false), "非 0 业务码不得置 claimed=true");
+        assert_eq!(out.get("rewardCredit").and_then(Value::as_i64), Some(0));
+        assert_eq!(claims.load(Ordering::SeqCst), 1, "应记一次领取调用");
+        assert_eq!(departs.load(Ordering::SeqCst), 0, "领取失败后不得继续派发");
+        let message = out.get("message").and_then(Value::as_str).unwrap_or("");
+        assert!(message.contains("领取失败"), "应报告领取失败，实际: {message}");
+        assert!(message.contains("今天已经领取过了"), "应带上上游 msg，实际: {message}");
+    }
+
+    /// spec §3.2：旅行请求只带 Bearer，不带 `X-User-Id`（/ 企业 / 域）。
+    #[tokio::test]
+    async fn travel_requests_carry_no_identity_headers() {
+        let (billing, _g) = service("travel-no-identity");
+        let seen: Arc<std::sync::Mutex<Vec<Option<String>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_status = seen.clone();
+        let sink_depart = seen.clone();
+        let app = axum::Router::new()
+            .route(TRAVEL_STATUS_PATH, axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let sink = sink_status.clone();
+                async move {
+                    sink.lock().unwrap().push(headers.get("x-user-id").map(|v| v.to_str().unwrap_or("").to_string()));
+                    (axum::http::StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")],
+                     r#"{"code":0,"data":{"state":"idle","daily_limit_reached":false}}"#)
+                }
+            }))
+            .route(TRAVEL_CONFIG_PATH, axum::routing::get(move || async move {
+                (axum::http::StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")],
+                 r#"{"code":0,"data":{"locations":[{"id":1}]}}"#) }))
+            .route(TRAVEL_DEPART_PATH, axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let sink = sink_depart.clone();
+                async move {
+                    sink.lock().unwrap().push(headers.get("x-user-id").map(|v| v.to_str().unwrap_or("").to_string()));
+                    (axum::http::StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")],
+                     r#"{"code":0,"data":{"location":{"id":1}}}"#)
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // cn_session 带 account.uid="u1"；若未抑制身份头，X-User-Id 会是 "u1"。
+        let _ = billing.travel_auto(&cn_session(&base), TravelOpts::default()).await;
+        task.abort();
+
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "至少要观测到一次旅行请求");
+        assert!(seen.iter().all(|value| value.is_none()), "旅行请求不得带 X-User-Id，实际: {seen:?}");
+    }
 }
