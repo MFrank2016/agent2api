@@ -229,7 +229,7 @@ impl BillingService {
         }
         // 头顺序与 Node 的 `{...base, ...extra, X-Enterprise-Id, ...}` 一致：
         // 条件头在 extra 之后（同名时后者胜，Node 的对象展开也是这个顺序）
-        let headers = build_headers(&session, &extra);
+        let headers = build_headers(&session, &extra, options.suppress_identity_headers);
 
         let body = if spec.method == "GET" || spec.method == "HEAD" {
             None

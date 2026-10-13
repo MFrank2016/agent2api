@@ -32,6 +32,11 @@ const TRAVEL_DEPART_SPEC: BillingSpec = BillingSpec { method: "POST", path: TRAV
 
 /// 旅行 host（按 edition 派生）。测试可经 session.travelBaseOverride 注入 mock 地址。
 fn travel_base(session: &Value) -> &'static str {
+    // 测试专用注入点：`travelBaseOverride` 只在测试构建里被读取（mock 服务器
+    // 监听随机端口）。`Box::leak` 是有意为之——它把测试注入的 host 变成
+    // `&'static str`；用 `#[cfg(test)]` 钉住，release 永不编译这段，
+    // 也就不存在「任意 host 注入 / 无界泄漏」的口子。
+    #[cfg(test)]
     if let Some(base) = session.get("travelBaseOverride").and_then(Value::as_str) {
         return Box::leak(base.to_string().into_boxed_str());
     }
@@ -83,6 +88,8 @@ impl BillingService {
             session: Some(session),
             base_url: Some(travel_base(session)),
             expect_code_ok: false,
+            // spec §3.2：旅行接口仅需 Bearer，不带 X-User-Id / 企业 / 域 身份头
+            suppress_identity_headers: true,
             ..Default::default()
         }).await
     }
@@ -121,6 +128,8 @@ impl BillingService {
             base_url: Some(travel_base(session)),
             body: Some(&json!({ "location_id": location_id })),
             expect_code_ok: false,
+            // spec §3.2：同上，派发也不带身份头
+            suppress_identity_headers: true,
             ..Default::default()
         }).await
     }
@@ -153,10 +162,24 @@ impl BillingService {
         if status.state == "arrived" {
             match self.travel_claim(session).await {
                 Ok(call) => {
-                    claimed = true;
-                    reward = call.data.get("reward_credit").and_then(Value::as_i64).unwrap_or(0);
-                    message = format!("已领取旅行积分 +{reward}");
-                    if let Ok(fresh) = self.travel_status(session).await { if fresh.available { status = fresh; } }
+                    // 成功必须以业务 code==0 为准（与 travel_status 同一判据）：
+                    // HTTP 2xx 只说明请求送达，非 0 code 是业务失败（如「已领取」
+                    // 或风控），不能置 claimed=true（spec §8：失败收敛进 message）。
+                    if call.code == Some(crate::server::core::endpoints::RESPONSE_CODE_OK) {
+                        claimed = true;
+                        reward = call.data.get("reward_credit").and_then(Value::as_i64).unwrap_or(0);
+                        message = format!("已领取旅行积分 +{reward}");
+                        if let Ok(fresh) = self.travel_status(session).await { if fresh.available { status = fresh; } }
+                    } else {
+                        let detail = call
+                            .msg
+                            .clone()
+                            .filter(|text| !text.is_empty())
+                            .unwrap_or_else(|| format!("领取返回 code={:?}", call.code));
+                        let msg = format!("行程已到达但领取失败: {detail}");
+                        logging::verbose("[Travel]", &msg);
+                        return travel_result(true, &status.state, false, 0, status.daily_limit_reached, status.location.clone(), &msg);
+                    }
                 }
                 Err(error) => {
                     let msg = format!("行程已到达但领取失败: {}", error.message);

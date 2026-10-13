@@ -405,21 +405,31 @@ fn write_state(patch: Value) {
     config::update_raw_field(CONFIG_KEY, Value::Object(merged));
 }
 
-/// 合并写回 `autoCheckin.travel`（不丢其它键，对应 spec 的 Review Focus 第 5 条）。
-fn write_travel_state(patch: Value) {
-    let mut raw = raw_object();
-    let mut travel = raw
+/// 纯合并：把 `patch` 的键并入现有 `travel` 子对象，保留 `travel` 里其它键与
+/// `autoCheckin` 顶层其它键（对应 spec 的 Review Focus 第 5 条）。
+///
+/// 抽成纯函数是为了能直接单测合并语义（不碰 config 全局）；
+/// `write_travel_state` 只是它 + 一次落盘。
+fn merge_travel(raw: &Map<String, Value>, patch: &Value) -> Map<String, Value> {
+    let mut merged = raw.clone();
+    let mut travel = merged
         .get("travel")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
     if let Value::Object(entries) = patch {
         for (key, value) in entries {
-            travel.insert(key, value);
+            travel.insert(key.clone(), value.clone());
         }
     }
-    raw.insert("travel".to_string(), Value::Object(travel));
-    config::update_raw_field(CONFIG_KEY, Value::Object(raw));
+    merged.insert("travel".to_string(), Value::Object(travel));
+    merged
+}
+
+/// 合并写回 `autoCheckin.travel`（不丢其它键，对应 spec 的 Review Focus 第 5 条）。
+fn write_travel_state(patch: Value) {
+    let merged = merge_travel(&raw_object(), &patch);
+    config::update_raw_field(CONFIG_KEY, Value::Object(merged));
 }
 
 /// 把 POST /api/auto-checkin 里的 `travel` 子对象归一成可合并的 patch。
@@ -494,6 +504,22 @@ impl Drop for RunningGuard {
 enum TravelPhase {
     Depart,
     Claim,
+}
+
+/// 一轮（主签到 / 旅行派发 / 旅行领取）是否应在本 tick 触发：
+/// 开关开 **且** 到点 **且** 今天该轮还没跑过。
+///
+/// 抽成纯函数是为了能直接单测「每日至多一次」与「两轮互不串台」的判定
+/// （tick 端到端要 config 全局 + 账号存储 + 调度循环，不适合做单测）。
+/// 主轮传 `state.time`/`lastFiredDate`；旅行派发同样绑 `state.time` 但用
+/// `lastDepartDate`；旅行领取传 `claimTime`/`lastClaimDate` —— 三轮各自独立去重。
+fn round_due(
+    enabled: bool,
+    time_text: &str,
+    last_date: Option<&str>,
+    now: DateTime<FixedOffset>,
+) -> bool {
+    enabled && due_now(time_text, now).is_some() && last_date != Some(date_key(now).as_str())
 }
 
 impl AutoCheckin {
@@ -762,6 +788,7 @@ impl AutoCheckin {
 
     // ─── 调度 ───────────────────────────────────────────────
 
+
     /// 轮询回调：到点且今天没签过就执行（对应 Node 版 tick）。
     ///
     /// ── Qoder 国际版的窗口补领（2026-10，issue #140）────────────
@@ -780,12 +807,9 @@ impl AutoCheckin {
             return;
         }
         let now = beijing::now();
-        let today = date_key(now);
 
-        // 主轮次：签到
-        if due_now(&state.time, now).is_some()
-            && state.last_fired_date.as_deref() != Some(today.as_str())
-        {
+        // 主轮次：签到（每日至多一次）
+        if round_due(state.enabled, &state.time, state.last_fired_date.as_deref(), now) {
             match self.fire("到点触发").await {
                 Some(result) => {
                     if result.get("qoderIntlPending").and_then(Value::as_bool) == Some(true) {
@@ -800,18 +824,13 @@ impl AutoCheckin {
             }
         }
 
-        // 旅行轮次（独立去重，不受主轮 lastFiredDate 影响）
-        if state.travel.enabled {
-            if due_now(&state.time, now).is_some()
-                && state.travel.last_depart_date.as_deref() != Some(today.as_str())
-            {
-                self.fire_travel(TravelPhase::Depart).await;
-            }
-            if due_now(&state.travel.claim_time, now).is_some()
-                && state.travel.last_claim_date.as_deref() != Some(today.as_str())
-            {
-                self.fire_travel(TravelPhase::Claim).await;
-            }
+        // 旅行轮次（独立去重，不受主轮 lastFiredDate 影响）：
+        // 派发绑主轮时刻，领取绑 claimTime —— 两轮各自 lastDepartDate / lastClaimDate。
+        if round_due(state.travel.enabled, &state.time, state.travel.last_depart_date.as_deref(), now) {
+            self.fire_travel(TravelPhase::Depart).await;
+        }
+        if round_due(state.travel.enabled, &state.travel.claim_time, state.travel.last_claim_date.as_deref(), now) {
+            self.fire_travel(TravelPhase::Claim).await;
         }
     }
 
