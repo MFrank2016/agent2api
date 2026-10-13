@@ -1,17 +1,23 @@
-//! GET/POST `/api/routing-strategy` —— 账号选路策略（全局默认 + 逐家覆盖）。
+//! GET/POST `/api/routing-strategy` —— **统一**的账号路由设置端点。
 //!
 //! ── 这条端点管什么 ──────────────────────────────────────────
-//! 网关在一组**可用账号**之间按什么规则挑一个来转发（见
-//! `core::routing::strategy` 的模块头）。今天有六档：`priority`（默认，行为与
-//! 改造前逐字相同）/ `least-connections` / `round-robin` / `least-recently-used`
-//! / `balance-weighted` / `priority-weighted`。全局默认对所有未单独配置的家
-//! 生效，`providers` 给某一家换一种（**稀疏表**：只写想单独配置的家）。
+//! 它把两套路由设置合成一份配置：
+//!   · **选路策略**（`core::routing::strategy` 的 6 档，**逐家**）：全局默认
+//!     `default` + 逐家覆盖 `providers`。取值 `priority`（默认，行为与改造前
+//!     逐字相同）/ `least-connections` / `round-robin` / `least-recently-used`
+//!     / `balance-weighted` / `priority-weighted`。
+//!   · **上游 v3.0.2 引入的四个维度**：会话粘性（`routingSticky`）、失败退避
+//!     （`routingFailoverBackoff`）、限流垫底（`routingSink`）、熔断
+//!     （`routingBreaker*`）。语义与默认值原样保留。
+//!
+//! `/api/routing`（`api::routing_api`）是本端点的**兼容别名**：读写同一份配置，
+//! 额外认一个旧的字符串字段 `routingStrategy`（`order` / `rotate` / `usage`）。
 //!
 //! ── 为什么与 /api/prompt 分成两条端点 ───────────────────────
 //! 两者读写的是不同的配置键、不同的语义；形状也不同（这条是「枚举 + 一张
-//! 逐家表」，那条还带提示词正文与降级状态）。与 `/api/retry` 更接近：多字段 +
-//! 允许部分更新 + 返回生效后的全量值 + 无副作用（保存后对下一个请求生效，
-//! 不重启进程）。
+//! 逐家表 + 四个附加维度」，那条还带提示词正文与降级状态）。与 `/api/retry`
+//! 更接近：多字段 + 允许部分更新 + 返回生效后的全量值 + 无副作用（保存后对
+//! 下一个请求生效，不重启进程）。
 //!
 //! ── 校验为什么在写侧做（与读侧的回落口径不同）───────────────
 //! 读侧（`config::routing_strategy_from`）遇到非法策略值会**回落到 `priority`**：
@@ -30,8 +36,8 @@ use axum::response::Response;
 use serde_json::{json, Map, Value};
 
 use crate::server::config::{
-    self, RoutingStrategyPatch, RoutingStrategySettings, KEY_ROUTING_STRATEGY_DEFAULT,
-    KEY_ROUTING_STRATEGY_PROVIDERS,
+    self, RoutingPatch, RoutingStrategyPatch, RoutingStrategySettings, StickyMode,
+    KEY_ROUTING_STRATEGY_DEFAULT, KEY_ROUTING_STRATEGY_PROVIDERS,
 };
 use crate::server::core::routing::RoutingStrategy;
 use crate::server::errors;
@@ -41,14 +47,13 @@ use crate::server::ServerState;
 
 /// GET /api/routing-strategy
 pub async fn get_routing_strategy(State(_state): State<ServerState>) -> Response {
-    ok_json(routing_json(&config::routing_strategy_settings()))
+    ok_json(routing_json())
 }
 
-/// POST /api/routing-strategy —— body `{ "default"?: <strategy>, "providers"?: { "<id>": <strategy> } }`
+/// POST /api/routing-strategy —— body 各键全部可选（不给 = 不动）。
 ///
-/// 允许部分字段（未出现的项保持原值，`null` 同义）。校验通过后：写配置库 →
-/// 返回**生效后**的值（前端直接用响应刷新界面，不必再 GET 一次）。
-/// 非法策略 id → 400 且什么都不改（先整单校验再落盘，与 `/api/retry` 同一顺序）。
+/// 校验通过后：写配置库 → 返回**生效后**的值（前端直接用响应刷新界面，不必再
+/// GET 一次）。非法值 → 400 且什么都不改（先整单校验再落盘，与 `/api/retry` 同一顺序）。
 pub async fn put_routing_strategy(State(_state): State<ServerState>, body: Bytes) -> Response {
     let payload = match parse_body(&body) {
         Ok(value) => value,
@@ -57,32 +62,49 @@ pub async fn put_routing_strategy(State(_state): State<ServerState>, body: Bytes
     let Some(object) = payload.as_object() else {
         return errors::management_error(400, "请求体必须是 JSON 对象");
     };
-    let patch = match parse_patch(object) {
-        Ok(patch) => patch,
-        Err(message) => return errors::management_error(400, message),
-    };
+    if let Err(message) = apply_object(object) {
+        return errors::management_error(400, message);
+    }
+    let strategies = config::routing_strategy_settings();
+    logging::log(
+        "[Config]",
+        &format!(
+            "路由设置已更新: 默认 {} / 逐家 {}",
+            strategies.default.as_str(),
+            describe_providers(&strategies)
+        ),
+    );
+    ok_json(routing_json())
+}
 
-    if !config::set_routing_strategy(patch) {
+/// 校验并落盘一份统一的路由 patch（`/api/routing` 与 `/api/routing-strategy`
+/// 共用）。非法值给**可直接显示**的 400 文案；成功返回 `Ok(())`。
+///
+/// 独立成纯逻辑（不碰 `State`）便于单测覆盖「非法档位 / 非对象 / 空 id / 越界」
+/// 等分支。
+pub(super) fn apply_object(object: &Map<String, Value>) -> Result<(), String> {
+    let (strategy_patch, routing_patch) = parse_patch(object)?;
+    let strategy_changed = strategy_patch.default.is_some() || strategy_patch.providers.is_some();
+    if strategy_changed && !config::set_routing_strategy(strategy_patch) {
         // 写盘失败：内存快照已更新（本次运行仍生效），但重启后会回到旧值 ——
         // 必须让用户知道，否则「改了设置重启又变回去」会被当成玄学问题
         logging::log("[Config]", "⚠️  选路策略设置写入失败，本次运行内仍生效");
     }
-    let settings = config::routing_strategy_settings();
-    logging::log(
-        "[Config]",
-        &format!(
-            "选路策略已更新: 默认 {} / 逐家 {}",
-            settings.default.as_str(),
-            describe_providers(&settings)
-        ),
-    );
-    ok_json(routing_json(&settings))
+    if !routing_patch_is_empty(&routing_patch) && !config::set_routing(routing_patch) {
+        logging::log("[Config]", "⚠️  路由附加设置写入失败，本次运行内仍生效");
+    }
+    Ok(())
 }
 
-/// 校验请求体、产出部分更新入参（非法值给**可直接显示**的 400 文案）。
-///
-/// 独立成纯函数（不碰 `State`）便于单测覆盖「非法档位 / 非对象 / 空 id」等分支。
-fn parse_patch(object: &Map<String, Value>) -> Result<RoutingStrategyPatch, String> {
+/// 校验请求体、产出两份部分更新入参（策略 + 附加维度）。
+fn parse_patch(object: &Map<String, Value>) -> Result<(RoutingStrategyPatch, RoutingPatch), String> {
+    let strategy = parse_strategy_patch(object)?;
+    let routing = parse_routing_patch(object)?;
+    Ok((strategy, routing))
+}
+
+/// 选路策略那半边的解析（`default` + `providers`）。
+fn parse_strategy_patch(object: &Map<String, Value>) -> Result<RoutingStrategyPatch, String> {
     let mut patch = RoutingStrategyPatch::default();
 
     // ── default（缺省 / null = 这一项不改）────────────────────────
@@ -90,10 +112,15 @@ fn parse_patch(object: &Map<String, Value>) -> Result<RoutingStrategyPatch, Stri
         None | Some(Value::Null) => {}
         Some(Value::String(text)) => match RoutingStrategy::parse(text) {
             Some(strategy) => patch.default = Some(strategy),
-            None => return Err(format!("{KEY_ROUTING_STRATEGY_DEFAULT} 只认 {}（收到: {text}）", allowed())),
+            None => {
+                return Err(format!(
+                    "{KEY_ROUTING_STRATEGY_DEFAULT} 只认 {}（收到: {text}）",
+                    allowed()
+                ))
+            }
         },
         Some(other) => {
-            return Err(format!("{KEY_ROUTING_STRATEGY_DEFAULT} 必须是字符串（收到: {other}）"));
+            return Err(format!("{KEY_ROUTING_STRATEGY_DEFAULT} 必须是字符串（收到: {other}）"))
         }
     }
 
@@ -101,13 +128,17 @@ fn parse_patch(object: &Map<String, Value>) -> Result<RoutingStrategyPatch, Stri
     if let Some(value) = object.get(KEY_ROUTING_STRATEGY_PROVIDERS) {
         if !value.is_null() {
             let Some(entries) = value.as_object() else {
-                return Err(format!("{KEY_ROUTING_STRATEGY_PROVIDERS} 必须是对象或 null（收到: {value}）"));
+                return Err(format!(
+                    "{KEY_ROUTING_STRATEGY_PROVIDERS} 必须是对象或 null（收到: {value}）"
+                ));
             };
             let mut table = std::collections::BTreeMap::new();
             for (id, item) in entries {
                 let id = id.trim();
                 if id.is_empty() {
-                    return Err(format!("{KEY_ROUTING_STRATEGY_PROVIDERS} 里出现了空的 provider id"));
+                    return Err(format!(
+                        "{KEY_ROUTING_STRATEGY_PROVIDERS} 里出现了空的 provider id"
+                    ));
                 }
                 let Some(text) = item.as_str() else {
                     return Err(format!(
@@ -129,17 +160,112 @@ fn parse_patch(object: &Map<String, Value>) -> Result<RoutingStrategyPatch, Stri
     Ok(patch)
 }
 
-/// 响应体（GET 与 POST 共用；前端直接用响应刷新界面，不必再 GET 一次）。
+/// 附加维度那半边的解析（粘性 / 退避 / 垫底 / 熔断）。
+fn parse_routing_patch(object: &Map<String, Value>) -> Result<RoutingPatch, String> {
+    let mut patch = RoutingPatch::default();
+
+    if let Some(value) = object.get(config::KEY_ROUTING_STICKY) {
+        if !value.is_null() {
+            let Some(text) = value.as_str() else {
+                return Err(format!("{} 必须是字符串", config::KEY_ROUTING_STICKY));
+            };
+            let known = [
+                config::STICKY_AUTO,
+                config::STICKY_SESSION,
+                config::STICKY_TURN,
+                config::STICKY_OFF,
+            ];
+            if !known.contains(&text) {
+                return Err(format!(
+                    "未知的会话粘性档位「{text}」（只支持 {}）",
+                    known.join(" / ")
+                ));
+            }
+            patch.sticky = Some(StickyMode::from_id(text));
+        }
+    }
+
+    patch.failover_backoff = parse_bool(object, config::KEY_ROUTING_FAILOVER_BACKOFF)?;
+    patch.sink = parse_bool(object, config::KEY_ROUTING_SINK)?;
+    patch.breaker_enabled = parse_bool(object, config::KEY_ROUTING_BREAKER_ENABLED)?;
+    patch.breaker_threshold = parse_bounded_int(
+        object,
+        config::KEY_ROUTING_BREAKER_THRESHOLD,
+        config::ROUTING_BREAKER_MIN_THRESHOLD,
+        config::ROUTING_BREAKER_MAX_THRESHOLD,
+    )?;
+    patch.breaker_timeout_seconds = parse_bounded_int(
+        object,
+        config::KEY_ROUTING_BREAKER_TIMEOUT,
+        config::ROUTING_BREAKER_MIN_TIMEOUT,
+        config::ROUTING_BREAKER_MAX_TIMEOUT,
+    )?;
+    patch.breaker_success_threshold = parse_bounded_int(
+        object,
+        config::KEY_ROUTING_BREAKER_SUCCESS,
+        config::ROUTING_BREAKER_MIN_SUCCESS,
+        config::ROUTING_BREAKER_MAX_SUCCESS,
+    )?;
+
+    Ok(patch)
+}
+
+/// `null` / 缺失 = 不动；布尔原样；其余 400。
+fn parse_bool(object: &Map<String, Value>, key: &str) -> Result<Option<bool>, String> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(format!("{key} 必须是布尔值")),
+    }
+}
+
+/// `null` / 缺失 = 不动；`min..=max` 的整数原样；其余 400。
+fn parse_bounded_int(
+    object: &Map<String, Value>,
+    key: &str,
+    min: i64,
+    max: i64,
+) -> Result<Option<i64>, String> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => match value.as_i64() {
+            Some(count) if (min..=max).contains(&count) => Ok(Some(count)),
+            _ => Err(format!("{key} 必须是 {min}~{max} 的整数")),
+        },
+    }
+}
+
+/// 附加维度是否一项都没给（全 `None` = 不写盘，省一次无意义的持久化）。
+fn routing_patch_is_empty(patch: &RoutingPatch) -> bool {
+    patch.sticky.is_none()
+        && patch.failover_backoff.is_none()
+        && patch.sink.is_none()
+        && patch.breaker_enabled.is_none()
+        && patch.breaker_threshold.is_none()
+        && patch.breaker_timeout_seconds.is_none()
+        && patch.breaker_success_threshold.is_none()
+}
+
+/// 统一的路由设置响应体（GET 与 POST 共用；`/api/routing` 别名也复用它）。
 ///
-/// 键名对前端是**契约**（`settings-panel.js` 逐字对齐），因此都用常量标识符
-/// 而不是手写字符串（与 `timeouts_json` 同一手法）。
-fn routing_json(settings: &RoutingStrategySettings) -> Value {
+/// 键名对前端是**契约**（`settings-state.ts` / `accounts-*` 逐字对齐），因此都用
+/// 常量标识符而不是手写字符串（与 `timeouts_json` 同一手法）。
+pub(super) fn routing_json() -> Value {
+    let strategies = config::routing_strategy_settings();
+    let settings = config::routing_settings();
     json!({
-        KEY_ROUTING_STRATEGY_DEFAULT: settings.default.as_str(),
-        KEY_ROUTING_STRATEGY_PROVIDERS: providers_json(settings),
+        KEY_ROUTING_STRATEGY_DEFAULT: strategies.default.as_str(),
+        KEY_ROUTING_STRATEGY_PROVIDERS: providers_json(&strategies),
         // 可选项清单（含中文 label / hint）：界面不写死任何一档 —— 新增一档时
         // 只改后端，下拉直接长出来
         "strategies": strategies_json(),
+        config::KEY_ROUTING_STICKY: settings.sticky.as_str(),
+        config::KEY_ROUTING_FAILOVER_BACKOFF: settings.failover_backoff,
+        config::KEY_ROUTING_SINK: settings.sink,
+        config::KEY_ROUTING_BREAKER_ENABLED: settings.breaker_enabled,
+        config::KEY_ROUTING_BREAKER_THRESHOLD: settings.breaker_threshold,
+        config::KEY_ROUTING_BREAKER_TIMEOUT: settings.breaker_timeout_seconds,
+        config::KEY_ROUTING_BREAKER_SUCCESS: settings.breaker_success_threshold,
     })
 }
 
@@ -203,14 +329,15 @@ mod tests {
 
     #[test]
     fn default_only_updates_default_and_keeps_providers() {
-        let patch = parse_patch(&object(json!({ "default": "round-robin" }))).unwrap_or_default();
+        let patch = parse_strategy_patch(&object(json!({ "default": "round-robin" })))
+            .unwrap_or_default();
         assert_eq!(patch.default, Some(RoutingStrategy::RoundRobin));
         assert!(patch.providers.is_none(), "未带 providers 时这张表不动");
     }
 
     #[test]
     fn providers_replace_table_and_accept_unknown_ids() {
-        let patch = parse_patch(&object(json!({
+        let patch = parse_strategy_patch(&object(json!({
             "providers": { "workbuddy": "least-connections", "unknown-x": "round-robin" }
         })))
         .unwrap_or_default();
@@ -221,27 +348,64 @@ mod tests {
 
     #[test]
     fn null_fields_leave_values_untouched() {
-        let patch = parse_patch(&object(json!({ "default": null, "providers": null }))).unwrap_or_default();
+        let patch = parse_strategy_patch(&object(json!({ "default": null, "providers": null })))
+            .unwrap_or_default();
         assert_eq!(patch.default, None);
         assert!(patch.providers.is_none());
+        let extra = parse_routing_patch(&object(json!({
+            "routingSticky": null,
+            "routingFailoverBackoff": null,
+            "routingBreakerThreshold": null,
+        })))
+        .unwrap_or_default();
+        assert!(routing_patch_is_empty(&extra));
     }
 
     #[test]
     fn invalid_default_is_rejected() {
-        let error = parse_patch(&object(json!({ "default": "bogus" })));
-        assert!(error.is_err());
+        assert!(parse_strategy_patch(&object(json!({ "default": "bogus" }))).is_err());
     }
 
     #[test]
     fn invalid_provider_strategy_is_rejected() {
-        let error = parse_patch(&object(json!({ "providers": { "workbuddy": "bogus" } })));
-        assert!(error.is_err());
+        assert!(parse_strategy_patch(&object(json!({
+            "providers": { "workbuddy": "bogus" }
+        })))
+        .is_err());
     }
 
     #[test]
     fn non_object_providers_is_rejected() {
-        let error = parse_patch(&object(json!({ "providers": "round-robin" })));
-        assert!(error.is_err());
+        assert!(parse_strategy_patch(&object(json!({ "providers": "round-robin" }))).is_err());
+    }
+
+    #[test]
+    fn extra_dimensions_parse_with_validation() {
+        let patch = parse_routing_patch(&object(json!({
+            "routingSticky": "session",
+            "routingFailoverBackoff": false,
+            "routingSink": true,
+            "routingBreakerEnabled": true,
+            "routingBreakerThreshold": 7,
+            "routingBreakerTimeoutSeconds": 120,
+            "routingBreakerSuccessThreshold": 3,
+        })))
+        .unwrap_or_default();
+        assert_eq!(patch.sticky, Some(StickyMode::Session));
+        assert_eq!(patch.failover_backoff, Some(false));
+        assert_eq!(patch.sink, Some(true));
+        assert_eq!(patch.breaker_enabled, Some(true));
+        assert_eq!(patch.breaker_threshold, Some(7));
+        assert_eq!(patch.breaker_timeout_seconds, Some(120));
+        assert_eq!(patch.breaker_success_threshold, Some(3));
+    }
+
+    #[test]
+    fn invalid_sticky_and_out_of_range_breaker_are_rejected() {
+        assert!(parse_routing_patch(&object(json!({ "routingSticky": "bogus" }))).is_err());
+        assert!(parse_routing_patch(&object(json!({ "routingBreakerThreshold": 0 }))).is_err());
+        assert!(parse_routing_patch(&object(json!({ "routingBreakerTimeoutSeconds": 5 }))).is_err());
+        assert!(parse_routing_patch(&object(json!({ "routingSink": "yes" }))).is_err());
     }
 
     #[test]

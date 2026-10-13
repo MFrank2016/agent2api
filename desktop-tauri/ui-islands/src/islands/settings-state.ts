@@ -33,6 +33,7 @@
 import * as React from 'react'
 import {
   CATEGORIES,
+  CAPTCHA_POOL_FIELDS,
   NO_RETRY_CODES_KEY,
   PROMPT_MODES,
   QUEUE_FIELDS,
@@ -41,9 +42,12 @@ import {
   RETRY_CODE_MIN,
   RETRY_FIELDS,
   RETRY_MAX_CODES,
+  ROUTE_STICKY_OPTIONS,
+  ROUTE_STRATEGIES,
   SETTINGS_CAT_KEY,
   TIMEOUT_FIELDS,
   errorMessage,
+  formatBytes,
   normalizeApp,
   normalizeNumbers,
   parseInteger,
@@ -55,6 +59,7 @@ import {
   type NumberField,
   type PromptPatch,
   type RoutingStrategyOption,
+  type RoutingStrategyPatch,
 } from './settings-model'
 import { t } from '../i18n'
 
@@ -75,15 +80,18 @@ export type BusyScope =
   | 'codes'
   | 'timeouts'
   | 'queue'
+  | 'captchaPool'
+  | 'routing'
   | 'debug'
   | 'sanitize'
   | 'clineHeaders'
   | 'cors'
   | 'prompt'
-  | 'routing'
   | 'captcha'
   | 'export'
   | 'import'
+  | 'dbExport'
+  | 'dbImport'
   | null
 
 /**
@@ -115,6 +123,7 @@ export type AppState = {
 /** 数值面板：values 为 null 时（loading / unavailable）各输入框保持禁用 */
 export type NumericState = { status: LoadStatus; values: Record<string, number> | null }
 
+
 export type DebugState = {
   status: LoadStatus
   on: boolean
@@ -137,17 +146,19 @@ export type ClineHeadersState = {
 export type CorsState = { status: LoadStatus; on: boolean }
 
 /**
- * 选路策略（网关分类）：全局默认 + 逐家覆盖。
+ * 账号路由（统一配置）：选路策略（全局默认 + 逐家覆盖）+ 会话粘性。
  *
  * `default` 是全局默认那一档；`providers` 只含**显式设过**的家（某一家回到
  * 「跟随默认」就从表里消失）—— 与后端 POST 的「完整表」语义一致。
  * `strategies` 是后端给的可选项（含 label / hint），界面不写死任何一档。
+ * `sticky` 是会话粘性档位（`auto` / `session` / `turn` / `off`）。
  */
 export type RoutingState = {
   status: LoadStatus
   default: string
   providers: Record<string, string>
   strategies: RoutingStrategyOption[]
+  sticky: string
 }
 
 export type PromptState = {
@@ -238,17 +249,25 @@ export type SettingsSnapshot = {
   retryCodes: number[] | null
   timeouts: NumericState
   queue: NumericState
+  captchaPool: NumericState
+  /** 账号路由：策略 + 会话粘性（「路由」分类） */
+  routing: RoutingState
   debug: DebugState
   sanitize: SanitizeState
   clineHeaders: ClineHeadersState
   cors: CorsState
   prompt: PromptState
-  routing: RoutingState
   storage: StorageState
   captcha: { available: boolean; enabled: boolean }
   ioFailure: IoFailure
   /** 保留期改小的确认框正文（非空即开着）；确认 / 取消都收口到 resolveRetentionConfirm */
   retentionConfirm: { head: string } | null
+  /**
+   * 整库备份 / 恢复（「数据」分类）：`dbIncludeLogs` 是导出复选框的当前值；
+   * `dbBackupConfirm` 非空 = 恢复确认弹窗开着（记录的是确认时要执行的参数集）。
+   */
+  dbIncludeLogs: boolean
+  dbBackupConfirm: { includeLogs: boolean } | null
   /** 局域网访问的确认框（非空即开着）；确认 / 取消都收口到 resolveLanConfirm */
   lanConfirm: LanConfirm
   /** 局域网开启流程的注册步（非空 = 弹窗切到注册表单） */
@@ -294,11 +313,12 @@ const INITIAL: SettingsSnapshot = {
   retryCodes: null,
   timeouts: { status: 'loading', values: null },
   queue: { status: 'loading', values: null },
+  captchaPool: { status: 'loading', values: null },
   debug: { status: 'loading', on: false, count: null, limit: null },
   sanitize: { status: 'loading', on: false },
   clineHeaders: { status: 'loading', defaults: {}, overrides: {}, effective: {} },
   cors: { status: 'loading', on: false },
-  routing: { status: 'loading', default: '', providers: {}, strategies: [] },
+  routing: { status: 'loading', default: '', providers: {}, strategies: [], sticky: 'auto' },
   prompt: {
     status: 'loading',
     mode: 'passthrough',
@@ -328,6 +348,9 @@ const INITIAL: SettingsSnapshot = {
   captcha: { available: true, enabled: false },
   ioFailure: null,
   retentionConfirm: null,
+  // 整库备份：默认包含日志与调试报文（完整备份）；恢复确认弹窗默认关闭
+  dbIncludeLogs: true,
+  dbBackupConfirm: null,
   lanConfirm: null,
   lanRegister: null,
   panelLogin: false,
@@ -746,6 +769,85 @@ export async function importAccounts(): Promise<void> {
   }
 }
 
+/* ─── 整库备份 / 恢复（替换语义，见 db::backup 的模块头） ──────────────── */
+
+/** 拨动「包含日志与调试报文」复选框（默认勾上；取消后只备业务数据） */
+export function toggleDbIncludeLogs(on: boolean): void {
+  publish({ dbIncludeLogs: on })
+}
+
+/**
+ * 整库备份：后端把整库导出为 SQL 文件直写到壳选的路径（文件不过壳中转）。
+ * 桌面端专属（web shim 没有这个方法），导出没有「空库不导」分支。
+ */
+export async function exportDatabase(): Promise<void> {
+  if (busyScope) return
+  beginBusy('dbExport')
+  try {
+    const api = shared().workbuddyDesktop
+    if (!api?.exportDatabase) {
+      toast(t('当前环境不支持整库备份（仅桌面端可用）'), 'err')
+      return
+    }
+    const result = await api.exportDatabase(snapshot.dbIncludeLogs)
+    if (result?.canceled) { toast(t('已取消导出')); return }
+    const size = Number(result?.bytes) || 0
+    const tables = Array.isArray(result?.tables) ? result.tables.length : 0
+    toast(t('✅ 已备份 {n} 张表（{size}）到 {file}', {
+      n: tables,
+      size: formatBytes(size),
+      file: result?.file || '',
+    }))
+  } catch (error) {
+    toast(t('操作失败：{message}', { message: errorMessage(error) }), 'err')
+  } finally {
+    endBusy()
+  }
+}
+
+/** 点「恢复」：先弹确认框（整库恢复是替换语义，二次确认后才开始） */
+export function confirmDbRestore(): void {
+  if (busyScope) return
+  publish({ dbBackupConfirm: { includeLogs: snapshot.dbIncludeLogs } })
+}
+
+/** 确认框出口（与 resolveRetentionConfirm 同形）：确认后才执行恢复 */
+export function resolveDbBackupConfirm(accepted: boolean): void {
+  publish({ dbBackupConfirm: null })
+  if (accepted) void proceedDbRestore()
+}
+
+/**
+ * 整库恢复本体。成功后**重拉整页设置与存储概况** —— 配置、桌面设置、账号、
+ * 日志全被替换成备份的状态，任何一块旧快照都不能再用；主界面同样刷新
+ * （账号列表、分组与模型清单都会变）。面板短效令牌由后端在恢复后清空，
+ * 浏览器下一次请求会自然落到重新登录。
+ */
+async function proceedDbRestore(): Promise<void> {
+  if (busyScope) return
+  const api = shared().workbuddyDesktop
+  if (!api?.importDatabase) {
+    toast(t('当前环境不支持整库恢复（仅桌面端可用）'), 'err')
+    return
+  }
+  beginBusy('dbImport')
+  try {
+    const result = await api.importDatabase()
+    const tables = Array.isArray(result?.tables) ? result.tables.length : 0
+    const note = result?.safetyBackup
+      ? t('，替换前的数据已备份为 {name}', { name: result.safetyBackup })
+      : ''
+    toast(t('✅ 已恢复 {n} 张表{note}', { n: tables, note }))
+    // 重拉整页（含启动/托盘设置、保留期、提示词、存储概况等全部面板）
+    await load()
+    await shared().wbApp?.refresh?.()
+  } catch (error) {
+    toast(t('恢复失败：{message}', { message: errorMessage(error) }), 'err')
+  } finally {
+    endBusy()
+  }
+}
+
 /* ─── 数据保留（三项保留天数） ─────────────── */
 
 export function renderRetention(data?: unknown): void {
@@ -875,7 +977,7 @@ async function commitRetention(field: NumberField, days: number, shrinking: bool
  * 直接换号」名单）由各自的代码实现，在数据到达 / 不可用时被回调一次。
  */
 type NumericPanel = {
-  scope: 'retry' | 'timeouts' | 'queue'
+  scope: 'retry' | 'timeouts' | 'queue' | 'captchaPool'
   fields: NumberField[]
   consoleLabel: string
   /** 取数 / 写回：桥不在时给 undefined（各调用点按「读不到」处理） */
@@ -958,6 +1060,31 @@ export async function loadQueue(): Promise<void> {
 export async function saveQueueField(field: NumberField, raw: string): Promise<void> {
   await saveNumericField(queuePanel, field, raw)
 }
+
+/* ─── 验证码令牌池 ─────────────────────────── */
+
+const captchaPoolPanel: NumericPanel = {
+  scope: 'captchaPool',
+  fields: CAPTCHA_POOL_FIELDS,
+  consoleLabel: '读取验证码令牌池设置',
+  get: () => shared().workbuddyDesktop?.getCaptchaPool(),
+  save: patch => shared().workbuddyDesktop?.saveCaptchaPool(patch),
+  read: () => snapshot.captchaPool,
+  write: state => publish({ captchaPool: state }),
+}
+
+export function renderCaptchaPool(data?: unknown): void {
+  renderNumericPanel(captchaPoolPanel, data)
+}
+
+export async function loadCaptchaPool(): Promise<void> {
+  await loadNumericPanel(captchaPoolPanel)
+}
+
+export async function saveCaptchaPoolField(field: NumberField, raw: string): Promise<void> {
+  await saveNumericField(captchaPoolPanel, field, raw)
+}
+
 
 /* ─── 请求重试 ─────────────────────────────── */
 
@@ -1253,7 +1380,10 @@ export async function saveCors(next: boolean): Promise<void> {
   }
 }
 
-/* ─── 选路策略（网关分类：全局默认 + 逐家覆盖）── */
+/* ─── 账号路由（统一配置：选路策略 + 会话粘性）── */
+
+/** 后端响应里会话粘性的键（与 `config::KEY_ROUTING_STICKY` 逐字对应） */
+const ROUTING_STICKY_KEY = 'routingSticky'
 
 /** 逐家覆盖表归一化：只认「id → 非空字符串」的项，其余丢掉（宁缺勿错） */
 function routingProviders(raw: unknown): Record<string, string> {
@@ -1282,6 +1412,13 @@ function routingStrategies(raw: unknown): RoutingStrategyOption[] {
     })
 }
 
+/** 会话粘性归一化：只认合法档位，认不出回落 'auto'（与后端默认一致） */
+function routingSticky(raw: unknown): string {
+  return typeof raw === 'string' && ROUTE_STICKY_OPTIONS.some(item => item.value === raw)
+    ? raw
+    : 'auto'
+}
+
 export function renderRouting(data?: unknown): void {
   if (data === undefined) return
   if (!data || typeof data !== 'object') {
@@ -1295,6 +1432,7 @@ export function renderRouting(data?: unknown): void {
       default: String(record.default || ''),
       providers: routingProviders(record.providers),
       strategies: routingStrategies(record.strategies),
+      sticky: routingSticky(record[ROUTING_STICKY_KEY]),
     },
   })
 }
@@ -1303,33 +1441,33 @@ async function loadRouting(): Promise<void> {
   try {
     renderRouting(await shared().workbuddyDesktop?.getRoutingStrategy())
   } catch (error) {
-    console.warn('读取选路策略设置失败:', errorMessage(error))
+    console.warn('读取路由设置失败:', errorMessage(error))
     renderRouting(null)
   }
 }
 
 /**
- * 提交一份选路策略（全局默认 + 逐家覆盖的**完整表**）。载荷两项俱全：后端 POST
- * 一旦带上 `providers` 就整体替换 —— 某一家改回「跟随默认」= 从表里删掉它。
- * 保存成功用响应重画；失败回滚到后端的真实值。
+ * 提交一份路由 patch（**部分字段**：未出现的项后端不动；`providers` 一旦出现
+ * 即整体替换）。保存成功用响应重画；失败回滚到后端的真实值。
  */
-async function commitRouting(nextDefault: string, nextProviders: Record<string, string>): Promise<void> {
+async function commitRoutingPatch(patch: RoutingStrategyPatch): Promise<void> {
   if (busyScope) { repaint(); return }
   beginBusy('routing')
-  publish({ routing: { ...snapshot.routing, default: nextDefault, providers: nextProviders } })
   try {
-    const saved = await shared().workbuddyDesktop?.saveRoutingStrategy({
-      default: nextDefault,
-      providers: nextProviders,
-    })
+    const saved = await shared().workbuddyDesktop?.saveRoutingStrategy(patch)
     renderRouting(saved)
-    toast('✅ 选路策略已保存')
+    toast('✅ 路由设置已保存')
   } catch (error) {
     toast(`保存失败：${errorMessage(error)}`, 'err')
     await loadRouting() // 回滚到后端的真实值
   } finally {
     endBusy()
   }
+}
+
+/** 提交全局默认 + 逐家覆盖的完整表（`providers` 出现即整体替换） */
+async function commitRouting(nextDefault: string, nextProviders: Record<string, string>): Promise<void> {
+  await commitRoutingPatch({ default: nextDefault, providers: nextProviders })
 }
 
 /** 改全局默认策略（逐家覆盖原样带上；非法档位直接忽略） */
@@ -1349,10 +1487,11 @@ export async function saveRoutingProvider(id: string, strategy: string): Promise
   await commitRouting(snapshot.routing.default, providers)
 }
 
-export async function refreshRouting(): Promise<void> {
-  await loadRouting()
-  toast('选路策略已刷新')
+/** 改单个附加维度（目前只有会话粘性；供「路由」分类的面板用） */
+export async function saveRoutingField(patch: { default?: string; providers?: Record<string, string>; sticky?: string }): Promise<void> {
+  await commitRoutingPatch(patch)
 }
+
 
 /* ─── 机器人校验（面板登录 / 注册的 ALTCHA 开关）── */
 
@@ -1883,11 +2022,12 @@ export async function load(): Promise<void> {
     loadRetry(),
     loadTimeouts(),
     loadQueue(),
+    loadCaptchaPool(),
+    loadRouting(),
     loadDebug(),
     loadSanitize(),
     loadClineHeaders(),
     loadCors(),
-    loadRouting(),
     loadPrompt(),
     loadStorage(),
     loadCaptcha(),
@@ -1916,6 +2056,16 @@ export async function refreshTimeouts(): Promise<void> {
 export async function refreshQueue(): Promise<void> {
   await loadQueue()
   toast(t('排队等待设置已刷新'))
+}
+
+export async function refreshCaptchaPool(): Promise<void> {
+  await loadCaptchaPool()
+  toast(t('验证码令牌池设置已刷新'))
+}
+
+export async function refreshRouting(): Promise<void> {
+  await loadRouting()
+  toast(t('路由设置已刷新'))
 }
 
 export async function refreshDebug(): Promise<void> {

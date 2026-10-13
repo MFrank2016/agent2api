@@ -339,6 +339,40 @@ pub(super) fn queue_from(map: &Map<String, Value>) -> QueueSettings {
     }
 }
 
+// ─── ZCode 验证码令牌池的解析（三项：目标 / 轮询间隔 / 单轮上限）──────
+
+/// 由原始 JSON 解析令牌池的三项（缺字段各自用默认值；越界回落默认）。
+///
+/// 与 `queue_from` 同一口径：范围校验在写侧（`zcode_captcha_pool_api`）是
+/// 400 报错，在这里是回落默认 —— 手改库写进一个越界值时，宁可回到出厂节奏，
+/// 也不要让铸造器拿到一个必然坏事的值（例如 0 毫秒的轮询会让它原地空转）。
+pub(super) fn captcha_pool_from(map: &Map<String, Value>) -> CaptchaPoolSettings {
+    let defaults = CaptchaPoolSettings::default();
+    CaptchaPoolSettings {
+        target: bounded_int_field(
+            map,
+            KEY_CAPTCHA_POOL_TARGET,
+            defaults.target,
+            CAPTCHA_POOL_MIN_TARGET,
+            CAPTCHA_POOL_MAX_TARGET,
+        ),
+        poll_ms: bounded_int_field(
+            map,
+            KEY_CAPTCHA_POOL_POLL_MS,
+            defaults.poll_ms,
+            CAPTCHA_POOL_MIN_POLL_MS,
+            CAPTCHA_POOL_MAX_POLL_MS,
+        ),
+        max_per_round: bounded_int_field(
+            map,
+            KEY_CAPTCHA_POOL_MAX_PER_ROUND,
+            defaults.max_per_round,
+            CAPTCHA_POOL_MIN_MAX_PER_ROUND,
+            CAPTCHA_POOL_MAX_MAX_PER_ROUND,
+        ),
+    }
+}
+
 // ─── 历史路由优先级（providerRoute，只读，供账号迁移）───────────
 
 // ─── 账号选路策略（routingStrategy：全局默认 + 逐家覆盖）────────────
@@ -346,7 +380,9 @@ pub(super) fn queue_from(map: &Map<String, Value>) -> QueueSettings {
 /// 由原始 JSON 解析选路策略设置。
 ///
 /// 口径与既有配置一致（**写坏回落、不报错、不影响启动**）：
-///   - 整个键缺失 / 不是对象 → 全默认（`default = priority`、逐家表为空）；
+///   - 整个键缺失 / 不是对象 / 不是字符串 → 全默认（`default = priority`、逐家表为空）；
+///   - 旧字符串形态（上游 v3.0.2）：`"order"`/`"rotate"`/`"usage"` 迁移成
+///     `{ default: <映射结果>, providers: {} }`（不丢数据）；
 ///   - `default` 缺失 / 非法 → `priority`；
 ///   - `providers` 缺失 / 不是对象 → 空表；
 ///   - 逐家项：id 空串跳过；值不是合法策略 → **回落到 `priority`**（而不是跳过 ——
@@ -358,24 +394,34 @@ pub(super) fn queue_from(map: &Map<String, Value>) -> QueueSettings {
 pub(super) fn routing_strategy_from(map: &Map<String, Value>) -> RoutingStrategySettings {
     use crate::server::core::routing::RoutingStrategy;
 
-    let Some(object) = map.get(KEY_ROUTING_STRATEGY).and_then(Value::as_object) else {
+    let Some(value) = map.get(KEY_ROUTING_STRATEGY) else {
+        return RoutingStrategySettings::default();
+    };
+    // ── 兼容上游 v3.0.2 的旧字符串形态（迁移，不丢数据）────────────
+    if let Some(text) = value.as_str() {
+        return RoutingStrategySettings {
+            default: RoutingStrategy::from_config(text),
+            providers: std::collections::BTreeMap::new(),
+        };
+    }
+    let Some(object) = value.as_object() else {
         return RoutingStrategySettings::default();
     };
     let default = object
         .get(KEY_ROUTING_STRATEGY_DEFAULT)
         .and_then(Value::as_str)
-        .and_then(RoutingStrategy::parse)
+        .map(RoutingStrategy::from_config)
         .unwrap_or_default();
     let mut providers = std::collections::BTreeMap::new();
     if let Some(entries) = object.get(KEY_ROUTING_STRATEGY_PROVIDERS).and_then(Value::as_object) {
-        for (id, value) in entries {
+        for (id, item) in entries {
             let id = id.trim();
             if id.is_empty() {
                 continue;
             }
-            let strategy = value
+            let strategy = item
                 .as_str()
-                .and_then(RoutingStrategy::parse)
+                .map(RoutingStrategy::from_config)
                 .unwrap_or_default();
             providers.insert(id.to_string(), strategy);
         }
@@ -441,12 +487,88 @@ mod routing_strategy_tests {
 
     #[test]
     fn wrong_shapes_fall_back_to_defaults() {
-        let settings = routing_strategy_from(&object(json!({ "routingStrategy": "priority" })));
+        let settings = routing_strategy_from(&object(json!({ "routingStrategy": 42 })));
         assert_eq!(settings.default, RoutingStrategy::Priority);
         assert!(settings.providers.is_empty());
         let settings = routing_strategy_from(&object(json!({
             "routingStrategy": { "providers": "round-robin" }
         })));
         assert!(settings.providers.is_empty());
+    }
+
+    // ── 上游 v3.0.2 旧字符串形态的迁移（任务要求：不丢数据）──────────
+
+    #[test]
+    fn legacy_rotate_string_loads_as_round_robin() {
+        let settings = routing_strategy_from(&object(json!({ "routingStrategy": "rotate" })));
+        assert_eq!(settings.default, RoutingStrategy::RoundRobin);
+        assert!(settings.providers.is_empty());
+    }
+
+    #[test]
+    fn legacy_order_string_loads_as_priority() {
+        let settings = routing_strategy_from(&object(json!({ "routingStrategy": "order" })));
+        assert_eq!(settings.default, RoutingStrategy::Priority);
+    }
+
+    #[test]
+    fn legacy_usage_string_loads_as_balance_weighted() {
+        let settings = routing_strategy_from(&object(json!({ "routingStrategy": "usage" })));
+        assert_eq!(settings.default, RoutingStrategy::BalanceWeighted);
+    }
+
+    #[test]
+    fn legacy_unknown_string_loads_as_priority() {
+        let settings = routing_strategy_from(&object(json!({ "routingStrategy": "whatever" })));
+        assert_eq!(settings.default, RoutingStrategy::Priority);
+        assert!(settings.providers.is_empty());
+    }
+}
+
+// ─── 账号路由的解析（粘性 / 退避 / 垫底 / 熔断）────────────────
+
+/// 由原始 JSON 解析路由设置（缺字段各自用默认值；非法取值回落默认）。
+///
+/// 与 `timeouts_from` 同一口径：范围校验在写侧（`routing_api`）是 400 报错，
+/// 在这里是回落默认 —— 手改库写进一个离谱值时，宁可回到默认行为也不要让
+/// 选路拿到一个必然坏事的值（例如阈值 0 会让熔断第一个失败就打开）。
+///
+/// 策略维度（`routingStrategy`）不在这里 —— 它是逐家的，见 `routing_strategy_from`。
+pub(super) fn routing_from(map: &Map<String, Value>) -> RoutingSettings {
+    let defaults = RoutingSettings::default();
+    let sticky = map
+        .get(KEY_ROUTING_STICKY)
+        .and_then(Value::as_str)
+        .map(StickyMode::from_id)
+        .unwrap_or(defaults.sticky);
+    let bool_field = |key: &str, default: bool| -> bool {
+        map.get(key).and_then(Value::as_bool).unwrap_or(default)
+    };
+    RoutingSettings {
+        sticky,
+        failover_backoff: bool_field(KEY_ROUTING_FAILOVER_BACKOFF, defaults.failover_backoff),
+        sink: bool_field(KEY_ROUTING_SINK, defaults.sink),
+        breaker_enabled: bool_field(KEY_ROUTING_BREAKER_ENABLED, defaults.breaker_enabled),
+        breaker_threshold: bounded_int_field(
+            map,
+            KEY_ROUTING_BREAKER_THRESHOLD,
+            defaults.breaker_threshold,
+            ROUTING_BREAKER_MIN_THRESHOLD,
+            ROUTING_BREAKER_MAX_THRESHOLD,
+        ),
+        breaker_timeout_seconds: bounded_int_field(
+            map,
+            KEY_ROUTING_BREAKER_TIMEOUT,
+            defaults.breaker_timeout_seconds,
+            ROUTING_BREAKER_MIN_TIMEOUT,
+            ROUTING_BREAKER_MAX_TIMEOUT,
+        ),
+        breaker_success_threshold: bounded_int_field(
+            map,
+            KEY_ROUTING_BREAKER_SUCCESS,
+            defaults.breaker_success_threshold,
+            ROUTING_BREAKER_MIN_SUCCESS,
+            ROUTING_BREAKER_MAX_SUCCESS,
+        ),
     }
 }

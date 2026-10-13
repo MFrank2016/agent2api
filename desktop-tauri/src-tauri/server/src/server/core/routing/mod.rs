@@ -493,3 +493,456 @@ fn js_number(value: &Value) -> Option<f64> {
         _ => None,
     }
 }
+
+// ─── 策略路由（plan_route）────────────────────────────────────
+//
+// 两种策略（顺序优先 / 负载均衡）与三种排序修饰
+// （垫底 / 休息 / 熔断）都落在这里：输入一张**快照**，输出一份**带原因的
+// 排序清单**。转发选路（rotate.rs）按清单从头往后找人；队列端点
+// （api::routing）把整张清单原样画给用户。两条路调的是同一个函数，
+// 「界面标的顺序」与「转发实际走的顺序」因此不可能分叉。
+
+use crate::server::config::{RoutingStrategySettings, StickyMode};
+
+/// 一条候选在计划里的样子（转发用 `account`，界面用其余字段）。
+#[derive(Clone, Debug)]
+pub struct PlanEntry {
+    pub account: Value,
+    pub id: String,
+    pub name: String,
+    pub provider: String,
+    /// 状态码：`usable` / `tried` / `disabled` / `cooldown` / `concurrency` /
+    /// `limiter` / `no-credentials`
+    pub state: &'static str,
+    /// 一句「为什么排这 / 为什么跳过」（队列面板与请求详情直接展示）
+    pub reason: String,
+    /// 限额恢复时刻（毫秒；0 = 未限流）
+    pub reset_at: i64,
+}
+
+/// 一份选路计划：可用候选（排好序）+ 被跳过的候选（各带原因）。
+pub struct RoutePlan {
+    pub ordered: Vec<PlanEntry>,
+    pub blocked: Vec<PlanEntry>,
+    /// 粘性命中的账号是否真的参与了排序（它可用且未被排除）
+    pub sticky_hit: bool,
+}
+
+/// 策略排序要读的**全部外部事实**（一次快照，纯函数不写任何状态）。
+///
+/// `strategies` / `state` / `balances` / `model` / `advance` 是**选路策略维度**
+/// （本实现的 6 档、逐家）；`sunk` / `resting` / `open` / `limiter_blocked` /
+/// `sticky_account` 是**上游引入的四个维度**（粘性 / 退避 / 垫底 / 熔断）。
+/// 两者在 [`base_order`] 与后续稳定修饰里合流。
+pub struct PlanMeta<'a> {
+    /// 逐家策略（全局默认 + 逐家覆盖）
+    pub strategies: &'a RoutingStrategySettings,
+    /// 选路策略的运行时状态（轮询游标 / LRU 时刻 / SWRR 权重）
+    pub state: &'a RoutingState,
+    /// 账号 id → 已知剩余余额（余额加权的权重来源；未知的账号不在表里）
+    pub balances: &'a HashMap<String, f64>,
+    /// 本请求的模型名（轮询游标按 `(provider, 模型)` 分键）
+    pub model: &'a str,
+    /// 是否推进有状态的策略（轮询游标 / LRU / SWRR）；预演（队列面板 / 429 顺延）传 `false`
+    pub advance: bool,
+    /// 沉底账号 → 沉底时刻（限流垫底）
+    pub sunk: &'a HashMap<String, i64>,
+    /// 休息中的账号 → 休息截止时刻（失败退避）
+    pub resting: &'a HashMap<String, i64>,
+    /// 熔断打开的账号
+    pub open: &'a std::collections::HashSet<String>,
+    /// 被限制器软跳过的账号（余额不足 / Token 限额，调用方判好传入）
+    pub limiter_blocked: &'a std::collections::HashSet<String>,
+    /// 粘性命中的账号 id（`None` = 无命中）
+    pub sticky_account: Option<&'a str>,
+}
+
+/// 时间戳 → 「HH:MM」短文案（原因句里用，按**操作者本机时区** —— 与请求
+/// 统计的切日同一口径：用户看的是「我这里几点恢复」）。跨天时补「明天」前缀。
+fn clock_text(reset_at: i64, now: i64) -> String {
+    use chrono::{TimeZone, Timelike};
+    let Some(secs) = reset_at.checked_div(1000) else {
+        return String::new();
+    };
+    let Some(time) = chrono::Local.timestamp_opt(secs, 0).single() else {
+        return String::new();
+    };
+    let days_ahead = (reset_at - now).max(0) / (24 * 3600 * 1000);
+    let prefix = match days_ahead {
+        0 => String::new(),
+        1 => "明天 ".to_string(),
+        _ => format!("{days_ahead} 天后 "),
+    };
+    format!("{prefix}{:02}:{:02}", time.hour(), time.minute())
+}
+
+/// 把可用候选按策略排出先后（不处理垫底 / 休息 / 熔断那三层修饰）。
+///
+/// 排序实现委托给 [`strategy::order_candidates`]：跨家分组序（全局优先级）+
+/// 组内策略序（逐家策略）。「界面画的顺序」与「转发实际走的顺序」因此共用
+/// 同一份实现。
+fn base_order(
+    candidates: &[Value],
+    counts: &HashMap<String, usize>,
+    now: i64,
+    meta: &PlanMeta<'_>,
+) -> Vec<Value> {
+    strategy::order_candidates(
+        candidates,
+        meta.model,
+        counts,
+        now,
+        meta.strategies,
+        meta.state,
+        meta.balances,
+        meta.advance,
+    )
+}
+
+/// 生成一份完整的选路计划（转发选路与队列端点共用的**唯一**排序实现）。
+///
+/// `excluded` 是本轮已试过的账号（429 降级 / 失败顺延），它们进 `blocked`
+/// （state = `tried`）——「这条请求不会再碰它」本来就是排障时要看的答案。
+pub fn plan_route(
+    accounts: &[Value],
+    keys: &CooldownKeys<'_>,
+    counts: &HashMap<String, usize>,
+    excluded: &[String],
+    now: i64,
+    meta: &PlanMeta<'_>,
+) -> RoutePlan {
+    let mut ordered: Vec<Value> = Vec::new();
+    let mut blocked: Vec<PlanEntry> = Vec::new();
+    for account in accounts {
+        let Some(id) = account_id(account) else { continue };
+        let id = id.to_string();
+        let name = account_name(account, &id);
+        let provider = provider_of(account).to_string();
+        let entry = |state: &'static str, reason: String| PlanEntry {
+            account: account.clone(),
+            id: id.clone(),
+            name: name.clone(),
+            provider: provider.clone(),
+            state,
+            reason,
+            reset_at: rate_limit_reset_at(account, keys, now),
+        };
+        if excluded.iter().any(|tried| tried == &id) {
+            blocked.push(entry("tried", "本轮已试过，不再回试".to_string()));
+            continue;
+        }
+        if matches!(account.get("enabled"), Some(Value::Bool(false))) {
+            blocked.push(entry("disabled", "已禁用，不参与转发".to_string()));
+            continue;
+        }
+        if meta.limiter_blocked.contains(&id) {
+            blocked.push(entry(
+                "limiter",
+                "被限制器拦下（余额不足或 Token 周期用量到顶），自动恢复后回来".to_string(),
+            ));
+            continue;
+        }
+        let reset_at = rate_limit_reset_at(account, keys, now);
+        if reset_at > 0 {
+            blocked.push(entry(
+                "cooldown",
+                format!(
+                    "对该模型限流冷却中，{} 恢复（恢复后自动回来）",
+                    clock_text(reset_at, now)
+                ),
+            ));
+            continue;
+        }
+        if at_concurrency_limit(account, &id, counts) {
+            blocked.push(entry(
+                "concurrency",
+                format!(
+                    "并发已满（{}/上限），等一个在途回落再参与",
+                    counts.get(&id).copied().unwrap_or(0)
+                ),
+            ));
+            continue;
+        }
+        if matches!(account.get("hasCredentials"), Some(Value::Bool(false))) {
+            blocked.push(entry("no-credentials", "没有可用凭证，登录后才能接请求".to_string()));
+            continue;
+        }
+        ordered.push(account.clone());
+    }
+
+    // 基础序（策略）→ 粘性 → 稳定修饰：没沉底的在前 → 没休息的在前 → 没熔断的在前
+    //
+    // 粘性放在**基础序之后**：策略排序会重排整张表，先插队会被它冲掉。
+    // 粘性命中的可用账号提到最前（它可用，请求就会走它 —— 排序必须如实反映）。
+    //
+    // 三个稳定修饰**跨策略**生效：垫底（Sink）解决的是「每次回到第 1 位再撞一次
+    // 429」，退避解决的是「反复失败反复撞」—— 它们在优先级策略下同样成立；
+    // 若只对轮询生效，默认策略下这两个开关就是摆设。稳定排序保证
+    // 同档内的先后仍由策略的基础序决定（优先级下 = 位次）。
+    let mut arranged = base_order(&ordered, counts, now, meta);
+    let mut sticky_hit = false;
+    if let Some(hit) = meta.sticky_account {
+        if let Some(index) = arranged
+            .iter()
+            .position(|account| account_id(account) == Some(hit))
+        {
+            let hit_account = arranged.remove(index);
+            arranged.insert(0, hit_account);
+            sticky_hit = true;
+        }
+    }
+    let rank_of = |account: &Value, table: &HashMap<String, i64>| -> bool {
+        account_id(account)
+            .and_then(|id| table.get(id))
+            .map(|until| *until > 0)
+            .unwrap_or(false)
+    };
+    arranged.sort_by_key(|account| rank_of(account, meta.sunk));
+    arranged.sort_by_key(|account| rank_of(account, meta.resting));
+    // 熔断的账号放在队尾（所有策略一致）：只有全场都打不开时才轮到它试一次
+    arranged.sort_by_key(|account| {
+        account_id(account)
+            .map(|id| meta.open.contains(id))
+            .unwrap_or(false)
+    });
+
+    let ordered_entries: Vec<PlanEntry> = arranged
+        .into_iter()
+        .enumerate()
+        .map(|(index, account)| {
+            let id = account_id(&account).unwrap_or("").to_string();
+            let position = index + 1;
+            let mut reason = if sticky_hit && Some(id.as_str()) == meta.sticky_account {
+                "会话粘住：这个会话上一轮是它答的，本轮继续用它".to_string()
+            } else {
+                match meta.strategies.resolve(provider_of(&account)) {
+                    RoutingStrategy::Priority => {
+                        if position == 1 {
+                            "队列第 1 位：优先级优先下它接走所有请求，直到不能答".to_string()
+                        } else {
+                            format!("队列第 {position} 位：前面的都可用时轮不到它")
+                        }
+                    }
+                    RoutingStrategy::RoundRobin => {
+                        if position == 1 {
+                            "本轮轮到它：轮询下每条请求换下一位".to_string()
+                        } else {
+                            format!("排在第 {position} 位：等前面的轮完或失败才到它")
+                        }
+                    }
+                    other => format!("按「{}」策略排在第 {position} 位", other.label()),
+                }
+            };
+            if meta.sunk.contains_key(&id) {
+                reason.push_str("；曾还有额度时被 429（垫底中，轮一圈才回来）");
+            }
+            if let Some(until) = meta.resting.get(&id) {
+                reason.push_str(&format!("；转发失败休息至 {}", clock_text(*until, now)));
+            }
+            if meta.open.contains(id.as_str()) {
+                reason.push_str("；熔断打开中（连续失败到阈值），到点放行试一次");
+            }
+            PlanEntry {
+                name: account_name(&account, &id),
+                provider: provider_of(&account).to_string(),
+                account,
+                id,
+                state: "usable",
+                reason,
+                reset_at: 0,
+            }
+        })
+        .collect();
+
+    RoutePlan {
+        ordered: ordered_entries,
+        blocked,
+        sticky_hit,
+    }
+}
+
+/// 粘性 TTL（毫秒）：转发选路与队列端点共用的换算（StickyMode → 时长）。
+pub fn sticky_ttl_ms(mode: StickyMode) -> i64 {
+    mode.ttl_ms().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod plan_tests {
+    //! `plan_route` 的统一选路用例：既证明**我的策略维度**（逐家 6 档）生效，
+    //! 也证明**上游的四个维度**（粘性 / 退避 / 垫底 / 熔断）生效，且 `priority`
+    //! 单一策略时与改造前的扁平优先级序逐字一致。
+
+    use super::*;
+    use crate::server::config::RoutingStrategySettings;
+    use crate::server::core::routing::RoutingStrategy;
+    use serde_json::json;
+    use std::collections::{BTreeMap, HashSet};
+
+    fn account(id: &str, provider: &str, priority: i64) -> Value {
+        json!({
+            "id": id,
+            "provider": provider,
+            "priority": priority,
+            "addedAt": priority,
+            "enabled": true,
+            "hasCredentials": true,
+        })
+    }
+
+    fn settings(default: RoutingStrategy, providers: &[(&str, RoutingStrategy)]) -> RoutingStrategySettings {
+        let mut table = BTreeMap::new();
+        for (id, strategy) in providers {
+            table.insert((*id).to_string(), *strategy);
+        }
+        RoutingStrategySettings { default, providers: table }
+    }
+
+    fn ids(plan: &RoutePlan) -> Vec<String> {
+        plan.ordered.iter().map(|entry| entry.id.clone()).collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan(
+        accounts: &[Value],
+        settings: &RoutingStrategySettings,
+        state: &RoutingState,
+        advance: bool,
+        sunk: &HashMap<String, i64>,
+        resting: &HashMap<String, i64>,
+        open: &HashSet<String>,
+        sticky: Option<&str>,
+    ) -> RoutePlan {
+        let keys = CooldownKeys::new("m");
+        let counts = HashMap::new();
+        let balances = HashMap::new();
+        let limiter = HashSet::new();
+        let meta = PlanMeta {
+            strategies: settings,
+            state,
+            balances: &balances,
+            model: "m",
+            advance,
+            sunk,
+            resting,
+            open,
+            limiter_blocked: &limiter,
+            sticky_account: sticky,
+        };
+        plan_route(accounts, &keys, &counts, &[], 1_000, &meta)
+    }
+
+    #[test]
+    fn priority_only_matches_flat_priority_order() {
+        let accounts = vec![
+            account("b", "p", 200),
+            account("a", "p", 100),
+            account("c", "q", 150),
+        ];
+        let settings = RoutingStrategySettings::default();
+        let state = RoutingState::new();
+        let empty_i = HashMap::new();
+        let empty_s = HashSet::new();
+        let result = plan(&accounts, &settings, &state, true, &empty_i, &empty_i, &empty_s, None);
+        // 与「全 priority 的扁平优先级序」逐字一致：100 < 150 < 200
+        assert_eq!(ids(&result), vec!["a", "c", "b"]);
+    }
+
+    #[test]
+    fn round_robin_rotates_within_top_group_only() {
+        // 队首组是 p（优先级更小）；q 优先级更高，不会抢到请求
+        let accounts = vec![
+            account("p1", "p", 100),
+            account("p2", "p", 101),
+            account("q1", "q", 200),
+        ];
+        let settings = settings(RoutingStrategy::RoundRobin, &[]);
+        let state = RoutingState::new();
+        let empty_i = HashMap::new();
+        let empty_s = HashSet::new();
+        let first = plan(&accounts, &settings, &state, true, &empty_i, &empty_i, &empty_s, None);
+        let second = plan(&accounts, &settings, &state, true, &empty_i, &empty_i, &empty_s, None);
+        // 队首组 p 内轮询：p1 → p2；q1 始终垫底（跨家优先级序）
+        assert_eq!(ids(&first), vec!["p1", "p2", "q1"]);
+        assert_eq!(ids(&second), vec!["p2", "p1", "q1"]);
+    }
+
+    #[test]
+    fn advance_false_does_not_rotate() {
+        let accounts = vec![account("p1", "p", 100), account("p2", "p", 101)];
+        let settings = settings(RoutingStrategy::RoundRobin, &[]);
+        let state = RoutingState::new();
+        let empty_i = HashMap::new();
+        let empty_s = HashSet::new();
+        // 预演（advance=false）不推进游标：两次都给优先级序
+        let a = plan(&accounts, &settings, &state, false, &empty_i, &empty_i, &empty_s, None);
+        let b = plan(&accounts, &settings, &state, false, &empty_i, &empty_i, &empty_s, None);
+        assert_eq!(ids(&a), vec!["p1", "p2"]);
+        assert_eq!(ids(&b), vec!["p1", "p2"]);
+    }
+
+    #[test]
+    fn sink_demotes_sunk_account() {
+        let accounts = vec![account("a", "p", 100), account("b", "p", 101), account("c", "p", 102)];
+        let settings = RoutingStrategySettings::default();
+        let state = RoutingState::new();
+        let empty_i = HashMap::new();
+        let empty_s = HashSet::new();
+        let mut sunk = HashMap::new();
+        sunk.insert("a".to_string(), 1_i64);
+        let result = plan(&accounts, &settings, &state, true, &sunk, &empty_i, &empty_s, None);
+        assert_eq!(ids(&result), vec!["b", "c", "a"]);
+    }
+
+    #[test]
+    fn resting_demotes_resting_account() {
+        let accounts = vec![account("a", "p", 100), account("b", "p", 101), account("c", "p", 102)];
+        let settings = RoutingStrategySettings::default();
+        let state = RoutingState::new();
+        let empty_i = HashMap::new();
+        let empty_s = HashSet::new();
+        let mut resting = HashMap::new();
+        resting.insert("b".to_string(), 10_000_i64);
+        let result = plan(&accounts, &settings, &state, true, &empty_i, &resting, &empty_s, None);
+        assert_eq!(ids(&result), vec!["a", "c", "b"]);
+    }
+
+    #[test]
+    fn breaker_demotes_open_account() {
+        let accounts = vec![account("a", "p", 100), account("b", "p", 101), account("c", "p", 102)];
+        let settings = RoutingStrategySettings::default();
+        let state = RoutingState::new();
+        let empty_i = HashMap::new();
+        let mut open = HashSet::new();
+        open.insert("a".to_string());
+        let result = plan(&accounts, &settings, &state, true, &empty_i, &empty_i, &open, None);
+        assert_eq!(ids(&result), vec!["b", "c", "a"]);
+    }
+
+    #[test]
+    fn sticky_hit_is_promoted_over_priority_order() {
+        let accounts = vec![account("a", "p", 100), account("b", "p", 101)];
+        let settings = RoutingStrategySettings::default();
+        let state = RoutingState::new();
+        let empty_i = HashMap::new();
+        let empty_s = HashSet::new();
+        let result = plan(&accounts, &settings, &state, false, &empty_i, &empty_i, &empty_s, Some("b"));
+        assert_eq!(ids(&result), vec!["b", "a"]);
+        assert!(result.sticky_hit);
+    }
+
+    #[test]
+    fn per_provider_strategy_overrides_global_default() {
+        // 全局 priority，但 p 家单独配 round-robin：p 组内轮询
+        let accounts = vec![account("p1", "p", 100), account("p2", "p", 101)];
+        let settings = settings(RoutingStrategy::Priority, &[("p", RoutingStrategy::RoundRobin)]);
+        let state = RoutingState::new();
+        let empty_i = HashMap::new();
+        let empty_s = HashSet::new();
+        let first = plan(&accounts, &settings, &state, true, &empty_i, &empty_i, &empty_s, None);
+        let second = plan(&accounts, &settings, &state, true, &empty_i, &empty_i, &empty_s, None);
+        assert_eq!(ids(&first), vec!["p1", "p2"]);
+        assert_eq!(ids(&second), vec!["p2", "p1"]);
+    }
+}
+
+

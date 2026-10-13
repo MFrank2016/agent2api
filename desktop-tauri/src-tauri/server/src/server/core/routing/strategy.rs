@@ -94,6 +94,20 @@ impl RoutingStrategy {
         Self::ALL.into_iter().find(|strategy| strategy.as_str() == normalized)
     }
 
+    /// 读侧口径的配置值 → 策略：在 [`Self::parse`] 之上兼容上游 v3.0.2 的旧字符串
+    /// 形态（`order` / `rotate` / `usage`），认不出（含空串）回落 [`Self::Priority`]。
+    ///
+    /// 与 `parse` 分开：写侧（`api::routing_strategy` 的 400 校验）只认新名字；
+    /// 读侧则要把旧配置无痛迁进来 —— 旧名字在这里有确定语义，不该报错也不该丢。
+    pub fn from_config(text: &str) -> Self {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "order" => Self::Priority,
+            "rotate" => Self::RoundRobin,
+            "usage" => Self::BalanceWeighted,
+            _ => Self::parse(text).unwrap_or_default(),
+        }
+    }
+
     /// 界面与日志用的中文短名
     pub fn label(self) -> &'static str {
         match self {
@@ -222,14 +236,8 @@ impl Default for RoutingState {
 
 /// 带**策略**的账号挑选：过滤 → 分组 → 组内按该家策略挑一个。
 ///
-/// ── 算法（与任务约定逐条对应）───────────────────────────────
-///   1. 用 [`usable_candidates`] 过滤出可用候选（与优先级路径**同一份**）；
-///   2. 候选按 provider 分组，组间按「组内最优先账号」的全局优先级排序
-///      —— 保持改造前的跨家顺序；
-///   3. 取**队首组**，组内按优先级排好，再按该家策略（配置默认 + 逐家覆盖）
-///      挑一个账号；
-///   4. 兼容性守卫：候选里**每一家**的策略都是 `priority` 时，直接走
-///      [`super::pick_account_by_priority`] —— 结果与改造前逐字相同。
+/// 它是 [`order_candidates`] 的「只取首位」形态 —— 两条路共用同一份排序，
+/// 「界面画的顺序」与「转发实际选的」因此不可能分叉。
 ///
 /// `state` 是跨请求的运行时状态（轮询游标 / LRU 时刻 / SWRR 权重）；
 /// `balances` 是「账号 id → 已知剩余余额」（未知的账号不在表里，用基线权重）。
@@ -249,50 +257,160 @@ pub fn pick_account(
     if candidates.is_empty() {
         return None;
     }
+    order_candidates(
+        &candidates,
+        keys.requested(),
+        counts,
+        now,
+        settings,
+        state,
+        balances,
+        true,
+    )
+    .into_iter()
+    .next()
+}
 
-    // ── 兼容性守卫：全 priority → 与改造前逐字一致的扁平路径 ──────────
+/// 按策略排出**完整的候选顺序**（跨家分组序 + 组内策略序）。
+///
+/// ── 算法（与任务约定逐条对应）───────────────────────────────
+///   1. 候选按 provider 分组，组间按「组内最优先账号」的全局优先级排序
+///      —— 保持改造前的跨家顺序；
+///   2. 组内按优先级排好，再按该家策略（配置默认 + 逐家覆盖）排成组内顺序；
+///   3. 组序拼接即为完整顺序；
+///   4. 兼容性守卫：候选里**每一家**的策略都是 `priority` 时，直接返回
+///      「全局扁平优先级序」—— 与改造前 [`super::pick_account_by_priority`] 的
+///      排序（以及上游 `order` 策略）逐字相同。
+///
+/// `advance` = 是否推进**有状态的策略**（轮询游标 / LRU 时刻 / SWRR 权重）：
+///   - 真：转发选路的「本请求第一次选路」（消耗一次轮询 / 记一次 LRU / 转一次
+///     加权轮询）；
+///   - 假：预演（队列面板只画不消耗、429 顺延沿用起点）—— 有状态策略退化成
+///     组内优先级序，不写任何运行时状态。
+///
+/// 跨家顺序用全局优先级、策略只在**一家之内**生效：workbuddy 的请求不会借到
+/// raccoon 的账号，而「先试哪一家」也没有因为引入策略而改变。
+#[allow(clippy::too_many_arguments)]
+pub fn order_candidates(
+    candidates: &[Value],
+    model: &str,
+    counts: &HashMap<String, usize>,
+    now: i64,
+    settings: &RoutingStrategySettings,
+    state: &RoutingState,
+    balances: &HashMap<String, f64>,
+    advance: bool,
+) -> Vec<Value> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    // ── 兼容性守卫：全 priority → 与改造前逐字一致的扁平优先级序 ──────
     let all_priority = candidates
         .iter()
         .all(|account| settings.resolve(provider_of(account)) == RoutingStrategy::Priority);
     if all_priority {
-        let mut sorted = candidates;
+        let mut sorted = candidates.to_vec();
         sorted.sort_by(compare_by_priority);
-        return sorted.into_iter().next();
+        return sorted;
     }
 
-    let model = keys.requested();
-    let mut groups = group_by_provider(candidates);
+    let mut groups = group_by_provider(candidates.to_vec());
     // 组间按「组内最优先账号」的全局优先级排 —— 队首组就是改造前会先用的那一家
     groups.sort_by(|left, right| {
         by_priority_order(best_priority_key(&left.1), best_priority_key(&right.1))
     });
-    let (provider, mut group) = groups.into_iter().next()?;
-    // 组内按优先级排好：所有策略的并列兜底与轮询顺序都基于它
-    group.sort_by(compare_by_priority);
+    let mut ordered: Vec<Value> = Vec::with_capacity(candidates.len());
+    for (index, (provider, mut group)) in groups.into_iter().enumerate() {
+        // 组内先按优先级排好：所有策略的并列兜底与轮询顺序都基于它
+        group.sort_by(compare_by_priority);
+        let strategy = settings.resolve(&provider);
+        // 只有**队首组**推进有状态策略（游标 / LRU / SWRR）：其余组排在后面
+        // 只是兜底顺序，不该消耗它们的运行时状态 —— 否则一条请求会把没用到的
+        // 那家的轮询游标也推一格，长期看会把轮询摊平打歪。
+        let group_advance = advance && index == 0;
+        ordered.extend(order_group(
+            group, strategy, &provider, model, counts, state, balances, now, group_advance,
+        ));
+    }
+    ordered
+}
 
-    let strategy = settings.resolve(&provider);
-    let index = match strategy {
-        // 组已按优先级排好，首位即答案
-        RoutingStrategy::Priority => 0,
-        RoutingStrategy::LeastConnections => least_connections_index(&group, counts),
-        RoutingStrategy::RoundRobin => state.next_round_robin(&provider, model, group.len()),
-        RoutingStrategy::LeastRecentlyUsed => least_recently_used_index(&group, state),
-        RoutingStrategy::BalanceWeighted => {
-            let (ids, weights) = balance_weights(&group, balances);
-            state.smooth_pick(&ids, &weights)
+/// 组内排序：按该家策略把一组（已按优先级排好）账号排成先后。
+///
+/// 有状态策略（轮询 / LRU / 加权轮询）在 `advance == false` 时退化为优先级序，
+/// 且不写任何运行时状态。
+#[allow(clippy::too_many_arguments)]
+fn order_group(
+    group: Vec<Value>,
+    strategy: RoutingStrategy,
+    provider: &str,
+    model: &str,
+    counts: &HashMap<String, usize>,
+    state: &RoutingState,
+    balances: &HashMap<String, f64>,
+    now: i64,
+    advance: bool,
+) -> Vec<Value> {
+    let len = group.len();
+    if len <= 1 {
+        return group;
+    }
+    match strategy {
+        // 组已按优先级排好，原样即答案
+        RoutingStrategy::Priority => group,
+        RoutingStrategy::LeastConnections => {
+            let mut group = group;
+            group.sort_by_key(|account| {
+                account_id(account)
+                    .and_then(|id| counts.get(id))
+                    .copied()
+                    .unwrap_or(0)
+            });
+            group
         }
-        RoutingStrategy::PriorityWeighted => {
-            let (ids, weights) = priority_weights(&group);
-            state.smooth_pick(&ids, &weights)
+        RoutingStrategy::RoundRobin => {
+            if !advance {
+                return group;
+            }
+            let start = state.next_round_robin(provider, model, len);
+            let mut rotated = group;
+            rotated.rotate_left(start % len);
+            rotated
         }
-    };
-    // LRU 的「更新上次选中时刻」放在挑中之后（挑不中就不该改记忆）
-    if matches!(strategy, RoutingStrategy::LeastRecentlyUsed) {
-        if let Some(id) = group.get(index).and_then(|account| account_id(account)) {
-            state.mark_selected(id, now);
+        RoutingStrategy::LeastRecentlyUsed => {
+            let mut group = group;
+            group.sort_by_key(|account| {
+                account_id(account)
+                    .and_then(|id| state.last_selected(id))
+                    .unwrap_or(i64::MIN)
+            });
+            if advance {
+                if let Some(id) = group.first().and_then(|account| account_id(account)) {
+                    state.mark_selected(id, now);
+                }
+            }
+            group
+        }
+        RoutingStrategy::BalanceWeighted | RoutingStrategy::PriorityWeighted => {
+            if !advance {
+                return group;
+            }
+            let (ids, weights) = match strategy {
+                RoutingStrategy::BalanceWeighted => balance_weights(&group, balances),
+                _ => priority_weights(&group),
+            };
+            let index = state.smooth_pick(&ids, &weights);
+            if index == 0 {
+                return group;
+            }
+            let mut group = group;
+            let picked = group.remove(index);
+            let mut ordered = Vec::with_capacity(len);
+            ordered.push(picked);
+            ordered.extend(group);
+            ordered
         }
     }
-    group.into_iter().nth(index)
 }
 
 /// 按 provider 分组，**保持候选第一次出现的组序**（后续再按优先级排组）。
@@ -318,39 +436,6 @@ fn best_priority_key(accounts: &[Value]) -> (i64, i64) {
             crate::server::core::account_store::priority::DEFAULT_PRIORITY,
             0,
         ))
-}
-
-/// 最少连接：`counts[id]` 最小者优先；并列取**先见者**（组已按优先级排好）
-fn least_connections_index(group: &[Value], counts: &HashMap<String, usize>) -> usize {
-    let mut best = 0usize;
-    let mut best_count = usize::MAX;
-    for (index, account) in group.iter().enumerate() {
-        let count = account_id(account)
-            .and_then(|id| counts.get(id))
-            .copied()
-            .unwrap_or(0);
-        if count < best_count {
-            best_count = count;
-            best = index;
-        }
-    }
-    best
-}
-
-/// 最近最少使用：上次选中时刻最小者优先（从未选中 = 最小）；并列取先见者
-fn least_recently_used_index(group: &[Value], state: &RoutingState) -> usize {
-    let mut best = 0usize;
-    let mut best_time = i64::MAX;
-    for (index, account) in group.iter().enumerate() {
-        let stamp = account_id(account)
-            .and_then(|id| state.last_selected(id))
-            .unwrap_or(i64::MIN);
-        if stamp < best_time {
-            best_time = stamp;
-            best = index;
-        }
-    }
-    best
 }
 
 /// 余额加权的权重表：`ids` 与 `weights` 一一对应（顺序 = 组内优先级序）。
