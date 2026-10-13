@@ -36,6 +36,7 @@ mod activity;
 pub mod commodity;
 pub mod keepalive;
 mod request;
+mod travel;
 mod usage;
 
 use serde_json::{json, Map, Value};
