@@ -24,6 +24,8 @@ services:
     user: "65532:65532"  # [安全巡检] 非 root 运行；./data 已 chown 65532
     security_opt:
       - no-new-privileges:true
+    # 运行时内存上限：网关是轻量 Rust 服务，1G 足够；防止异常请求/内存泄漏把宿主吃爆
+    mem_limit: 1g
     ports:
       # 只绑本机回环：公网入口统一走 Caddy（agent2api.061995.xyz），不直接暴露 3065
       - "127.0.0.1:3065:3065"

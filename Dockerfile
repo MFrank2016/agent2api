@@ -27,6 +27,12 @@ WORKDIR /build
 ARG HTTP_PROXY=""
 ARG HTTPS_PROXY=""
 
+# 构建并行度：默认 2 —— Rust 每个 codegen 单元峰值内存可达数百 MB～1GB，
+# 宿主内存紧张（本机 8G、无 swap、同时跑着若干容器）时 8 路并行会 OOM。
+# 需要更快可覆盖：docker build --build-arg CARGO_BUILD_JOBS=8 .
+ARG CARGO_BUILD_JOBS=2
+ENV CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS
+
 # TARGETARCH 由 buildx/BuildKit 自动注入：amd64 / arm64。注意它是预置 ARG，
 # 只在 FROM 行可用；阶段内的 RUN 要用必须在此重新声明，否则恒为空串 ——
 # arm64 分支永远不会命中，交叉编译退化成原生 amd64 编译，arm64 镜像里
