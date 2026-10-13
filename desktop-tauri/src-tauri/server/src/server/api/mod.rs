@@ -103,6 +103,9 @@ pub mod session;
 pub mod stats_api;
 pub mod storage_api;
 pub mod timeouts_api;
+// 派猫猫旅行（CN WorkBuddy 运营活动）：per-account 只读状态 + 手动跑一次，
+// 见该文件模块头
+pub mod travel;
 pub mod update;
 pub mod upgrade_api;
 // 活动套餐通道的人机验证令牌池（界面铸造 → 网关消费），见该文件模块头

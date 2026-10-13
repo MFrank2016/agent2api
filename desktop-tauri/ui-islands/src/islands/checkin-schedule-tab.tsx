@@ -3,7 +3,9 @@ import { Badge, Button, Checkbox, Input, Spinner, Switch } from '@ui'
 import { formatTime, shared, toast } from './accounts-shared'
 import { t } from '../i18n'
 import {
-  getCheckinStore, setKeepaliveDraft, submitKeepaliveModels, subscribeCheckinStore,
+  getCheckinStore, setKeepaliveDraft, setTravelClaimDraft, setTravelDepartDraft, setTravelEnabled,
+  setTravelLocationDraft, submitKeepaliveModels, submitTravelClaimTime, submitTravelDepartTime,
+  submitTravelLocation, subscribeCheckinStore,
   type CheckinStore,
 } from './checkin-state'
 import {
@@ -511,6 +513,99 @@ function KeepalivePanel({ models, defaultModels, dirty, saving }: {
   )
 }
 
+/**
+ * 派猫猫旅行设置面板（WorkBuddy 国内版）。
+ *
+ * 旅行**独立于多条目定时签到**：有自己的开关、派发时刻（departTime）与领取时刻
+ * （claimTime），不搭任何一条签到条目的时刻 —— 所以它和保活模型链一样独立成卡，
+ * 而不是塞进某条条目的编辑表单里。旅行卡片本身在「签到中心」的 WorkBuddy 账号行，
+ * 这里只放设置。
+ */
+function TravelPanel({ store }: { store: CheckinStore }) {
+  const travel = store.snapshot?.auto?.travel
+  const enabled = travel?.enabled === true
+  const locked = !store.snapshot || store.autoSaving
+  const departTime = store.travelDepartDraft ?? travel?.departTime ?? ''
+  const claimTime = store.travelClaimDraft ?? travel?.claimTime ?? ''
+  const location = store.travelLocationDraft ?? (travel?.locationId == null ? '' : String(travel.locationId))
+  return (
+    <section className='panel ck-travel-panel'>
+      <div className='panel-head'>
+        <h2>{t('派猫猫旅行')}</h2>
+        <span className='panel-sub'>{t('WorkBuddy 国内版：每天派猫猫出门旅行，到达后领积分')}</span>
+      </div>
+      <div className='p-4'>
+        <div className='ck-set-line'>
+          <span className='ck-set-k'>{t('开关')}</span>
+          <span className='ck-set-v flex items-center gap-2'>
+            <Switch
+              checked={enabled}
+              disabled={locked}
+              onCheckedChange={next => void setTravelEnabled(next)}
+            />
+            <span className='text-subtle text-xs'>{t('到点自动执行 · 错过会补签')}</span>
+          </span>
+        </div>
+        <div className='ck-set-line'>
+          <span className='ck-set-k'>{t('旅行派发时刻')}</span>
+          <span className='ck-set-v flex items-center gap-2'>
+            <Input
+              type='time'
+              className='w-[96px] max-w-[96px] font-mono tabular-nums'
+              value={departTime}
+              disabled={locked}
+              onChange={event => setTravelDepartDraft(event.currentTarget.value)}
+              onBlur={event => void submitTravelDepartTime(event.currentTarget.value)}
+              onKeyDown={event => {
+                if (event.key === 'Enter') event.currentTarget.blur()
+              }}
+            />
+            <span className='text-subtle text-xs'>{t('到点派猫猫出门（北京时间）')}</span>
+          </span>
+        </div>
+        <div className='ck-set-line'>
+          <span className='ck-set-k'>{t('旅行领取时刻')}</span>
+          <span className='ck-set-v flex items-center gap-2'>
+            <Input
+              type='time'
+              className='w-[96px] max-w-[96px] font-mono tabular-nums'
+              value={claimTime}
+              disabled={locked}
+              onChange={event => setTravelClaimDraft(event.currentTarget.value)}
+              onBlur={event => void submitTravelClaimTime(event.currentTarget.value)}
+              onKeyDown={event => {
+                if (event.key === 'Enter') event.currentTarget.blur()
+              }}
+            />
+            <span className='text-subtle text-xs'>{t('主轮派发后到达，届时自动领取积分（北京时间）')}</span>
+          </span>
+        </div>
+        <div className='ck-set-line'>
+          <span className='ck-set-k'>{t('旅行地点')}</span>
+          <span className='ck-set-v flex items-center gap-2'>
+            <Input
+              type='text'
+              className='w-[120px] max-w-[120px] font-mono tabular-nums'
+              placeholder={t('随机')}
+              value={location}
+              disabled={locked}
+              onChange={event => setTravelLocationDraft(event.currentTarget.value)}
+              onBlur={event => void submitTravelLocation(event.currentTarget.value)}
+              onKeyDown={event => {
+                if (event.key === 'Enter') event.currentTarget.blur()
+              }}
+            />
+            <span className='text-subtle text-xs'>{t('留空 = 每次随机；填地点 id 固定一处')}</span>
+          </span>
+        </div>
+        <div className='ck-note'>
+          {t('当天去重 + 幂等领取：重复执行只会拿到「已领取」，不会重复加分。 自动签到的设置以这里为准，「定时任务」页只保留间隔型任务。')}
+        </div>
+      </div>
+    </section>
+  )
+}
+
 /* ─── 页面 ─────────────────────────────────── */
 
 function ScheduleTab(): React.ReactElement {
@@ -595,6 +690,7 @@ function ScheduleTab(): React.ReactElement {
         dirty={chainDirty}
         saving={checkin.keepaliveSaving}
       />
+      <TravelPanel store={checkin} />
     </div>
   )
 }

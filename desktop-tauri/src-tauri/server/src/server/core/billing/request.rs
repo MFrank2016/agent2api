@@ -62,6 +62,17 @@ pub(super) struct CallOptions<'a> {
     /// 故障静默成成功。
     pub(super) tolerate_duplicate_claim: bool,
     pub(super) locale: Option<&'a str>,
+    /// 本次调用的 host 覆盖（只含 scheme+host，不含路径）。None = 用
+    /// `session.endpoint`（现状，所有既有调用都是 None）。
+    /// 只有「派猫猫旅行」用得到（它在另一个域名），见 billing::travel。
+    pub(super) base_url: Option<&'a str>,
+    /// 跨域调用要**不**带本机身份头（spec §3.2：旅行接口仅需 Bearer Token）。
+    /// true 时 `build_headers` 跳过 `X-User-Id` / `X-Enterprise-Id` /
+    /// `X-Tenant-Id` / `X-Domain`（Bearer 与 extra 头照旧）。
+    ///
+    /// 默认 false：既有计费调用（余额 / 签到 / 企业额度 / banner / 大使）
+    /// 的头集合逐字不变。只有「派猫猫旅行」在 billing::travel 里显式打开。
+    pub(super) suppress_identity_headers: bool,
 }
 
 impl Default for CallOptions<'_> {
@@ -75,6 +86,9 @@ impl Default for CallOptions<'_> {
             // 默认关：只有显式打开的那条调用点才容错
             tolerate_duplicate_claim: false,
             locale: None,
+            base_url: None,
+            // 默认关：既有计费调用逐字不变
+            suppress_identity_headers: false,
         }
     }
 }
@@ -166,7 +180,15 @@ pub(super) const ACTIVITY_AMBASSADOR: BillingSpec = BillingSpec {
 ///   - 计费版无 Authorization 时也会给 `Bearer `（转发版跳过）
 ///
 /// 这些差别是 Node 版两个 buildHeaders 各自的实现决定的，逐条保留。
-pub(super) fn build_headers(session: &Value, extra: &[(String, String)]) -> Vec<(String, String)> {
+///
+/// `suppress_identity_headers`（跨域旅行专用）为 true 时跳过全部身份头
+/// （`X-User-Id` / 条件 `X-Enterprise-Id`/`X-Tenant-Id`/`X-Domain`），只留
+/// Accept / Content-Type / Authorization 与 extra —— 见 spec §3.2。
+pub(super) fn build_headers(
+    session: &Value,
+    extra: &[(String, String)],
+    suppress_identity_headers: bool,
+) -> Vec<(String, String)> {
     let auth = session.get("auth").cloned().unwrap_or(Value::Null);
     let account = session.get("account").cloned().unwrap_or(Value::Null);
     let access_token = auth
@@ -178,30 +200,36 @@ pub(super) fn build_headers(session: &Value, extra: &[(String, String)]) -> Vec<
         ("Accept".to_string(), "application/json".to_string()),
         ("Content-Type".to_string(), "application/json".to_string()),
         ("Authorization".to_string(), format!("Bearer {access_token}")),
-        (
+    ];
+    // 身份头（X-User-Id + 条件 X-Enterprise-Id/X-Tenant-Id/X-Domain）只有计费
+    // 调用才带；跨域旅行调用按 spec §3.2 一律省略。
+    if !suppress_identity_headers {
+        headers.push((
             "X-User-Id".to_string(),
             account.get("uid").and_then(Value::as_str).unwrap_or("").to_string(),
-        ),
-    ];
+        ));
+    }
     // extra 在 Node 里是 `...extra` 插在 X-User-Id 之后的展开，
     // 因此同名的情况不存在（extra 只有 Accept-Language 与白名单头）
     for (key, value) in extra {
         headers.push((key.clone(), value.clone()));
     }
-    if let Some(enterprise_id) = account
-        .get("enterpriseId")
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
-    {
-        headers.push(("X-Enterprise-Id".to_string(), enterprise_id.to_string()));
-        headers.push(("X-Tenant-Id".to_string(), enterprise_id.to_string()));
-    }
-    if let Some(domain) = auth
-        .get("domain")
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
-    {
-        headers.push(("X-Domain".to_string(), domain.to_string()));
+    if !suppress_identity_headers {
+        if let Some(enterprise_id) = account
+            .get("enterpriseId")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            headers.push(("X-Enterprise-Id".to_string(), enterprise_id.to_string()));
+            headers.push(("X-Tenant-Id".to_string(), enterprise_id.to_string()));
+        }
+        if let Some(domain) = auth
+            .get("domain")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            headers.push(("X-Domain".to_string(), domain.to_string()));
+        }
     }
     headers
 }
@@ -439,4 +467,46 @@ pub(super) fn normalize_checkin(data: &Value) -> Value {
     }
     result.insert("raw".to_string(), data.clone());
     Value::Object(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn session() -> Value {
+        json!({
+            "auth": { "accessToken": "t", "domain": "corp.example" },
+            "account": { "uid": "u1", "enterpriseId": "ent1" }
+        })
+    }
+
+    fn header_names(headers: &[(String, String)]) -> Vec<&str> {
+        headers.iter().map(|(name, _)| name.as_str()).collect()
+    }
+
+    #[test]
+    fn build_headers_keeps_identity_by_default() {
+        let headers = build_headers(&session(), &[], false);
+        let names = header_names(&headers);
+        assert!(names.contains(&"X-User-Id"));
+        assert!(names.contains(&"X-Enterprise-Id"));
+        assert!(names.contains(&"X-Tenant-Id"));
+        assert!(names.contains(&"X-Domain"));
+        assert!(names.contains(&"Authorization"));
+    }
+
+    #[test]
+    fn build_headers_suppresses_identity_when_asked() {
+        let headers = build_headers(&session(), &[], true);
+        let names = header_names(&headers);
+        assert!(!names.contains(&"X-User-Id"), "抑制时必须去掉 X-User-Id");
+        assert!(!names.contains(&"X-Enterprise-Id"));
+        assert!(!names.contains(&"X-Tenant-Id"));
+        assert!(!names.contains(&"X-Domain"));
+        // Bearer 与固定头照旧
+        assert!(names.contains(&"Authorization"));
+        assert!(names.contains(&"Accept"));
+        assert!(names.contains(&"Content-Type"));
+    }
 }

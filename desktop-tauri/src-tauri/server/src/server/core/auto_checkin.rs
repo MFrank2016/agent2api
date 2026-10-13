@@ -388,6 +388,56 @@ pub(crate) fn raw_object() -> Map<String, Value> {
     }
 }
 
+/// 旅行配置的缺省派发时刻（北京时间）：与主签到同刻起步（00:01）。
+pub const DEFAULT_TRAVEL_DEPART_TIME: &str = "00:01";
+
+/// 旅行配置的缺省领取时刻（北京时间）：派发后 6 小时领取。
+pub const DEFAULT_TRAVEL_CLAIM_TIME: &str = "06:00";
+
+/// `autoCheckin.travel` 子对象（缺失 = 关闭，向后兼容）。
+///
+/// 旅行是**独立于多条目定时签到**的一条链路：它有自己的开关、派发时刻
+/// （`departTime`）与领取时刻（`claimTime`），不搭任何一条签到条目的时刻。
+#[derive(Clone, Debug, Default)]
+pub struct TravelState {
+    pub enabled: bool,
+    pub depart_time: String,
+    pub claim_time: String,
+    pub location_id: Option<i64>,
+    pub last_depart_date: Option<String>,
+    pub last_claim_date: Option<String>,
+}
+
+/// 从 `autoCheckin` 原始对象里读 travel 子对象。
+fn read_travel_state(raw: &Map<String, Value>) -> TravelState {
+    let Some(travel) = raw.get("travel").and_then(Value::as_object) else {
+        return TravelState {
+            enabled: false,
+            depart_time: DEFAULT_TRAVEL_DEPART_TIME.to_string(),
+            claim_time: DEFAULT_TRAVEL_CLAIM_TIME.to_string(),
+            location_id: None,
+            last_depart_date: None,
+            last_claim_date: None,
+        };
+    };
+    let depart_time = travel
+        .get("departTime")
+        .and_then(|value| normalize_time(Some(value)).ok())
+        .unwrap_or_else(|| DEFAULT_TRAVEL_DEPART_TIME.to_string());
+    let claim_time = travel
+        .get("claimTime")
+        .and_then(|value| normalize_time(Some(value)).ok())
+        .unwrap_or_else(|| DEFAULT_TRAVEL_CLAIM_TIME.to_string());
+    TravelState {
+        enabled: travel.get("enabled").and_then(Value::as_bool) == Some(true),
+        depart_time,
+        claim_time,
+        location_id: travel.get("locationId").and_then(Value::as_i64),
+        last_depart_date: travel.get("lastDepartDate").and_then(Value::as_str).map(str::to_string),
+        last_claim_date: travel.get("lastClaimDate").and_then(Value::as_str).map(str::to_string),
+    }
+}
+
 /// 总开关（`autoCheckin.enabled`）：关了所有条目都不跑。
 /// 条目自己的开关在 `checkin_schedules::Schedule::enabled`，两层都开着才跑。
 pub fn master_enabled() -> bool {
@@ -405,6 +455,63 @@ pub(crate) fn write_state(patch: Value) {
         }
     }
     config::update_raw_field(CONFIG_KEY, Value::Object(merged));
+}
+
+/// 纯合并：把 `patch` 的键并入现有 `travel` 子对象，保留 `travel` 里其它键与
+/// `autoCheckin` 顶层其它键（对应 spec 的 Review Focus 第 5 条）。
+///
+/// 抽成纯函数是为了能直接单测合并语义（不碰 config 全局）；
+/// `write_travel_state` 只是它 + 一次落盘。
+fn merge_travel(raw: &Map<String, Value>, patch: &Value) -> Map<String, Value> {
+    let mut merged = raw.clone();
+    let mut travel = merged
+        .get("travel")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Value::Object(entries) = patch {
+        for (key, value) in entries {
+            travel.insert(key.clone(), value.clone());
+        }
+    }
+    merged.insert("travel".to_string(), Value::Object(travel));
+    merged
+}
+
+/// 合并写回 `autoCheckin.travel`（不丢其它键，对应 spec 的 Review Focus 第 5 条）。
+fn write_travel_state(patch: Value) {
+    let merged = merge_travel(&raw_object(), &patch);
+    config::update_raw_field(CONFIG_KEY, Value::Object(merged));
+}
+
+/// 把 POST /api/auto-checkin 里的 `travel` 子对象归一成可合并的 patch。
+fn travel_patch_from_payload(value: &Value) -> Result<Value, AutoCheckinConfigError> {
+    let Some(object) = value.as_object() else {
+        return Err(AutoCheckinConfigError::new("travel 必须是对象"));
+    };
+    let mut patch = Map::new();
+    if let Some(enabled) = object.get("enabled") {
+        patch.insert("enabled".to_string(), Value::Bool(enabled == &Value::Bool(true)));
+    }
+    if let Some(depart_time) = object.get("departTime") {
+        patch.insert("departTime".to_string(), Value::String(normalize_time(Some(depart_time))?));
+    }
+    if let Some(claim_time) = object.get("claimTime") {
+        patch.insert("claimTime".to_string(), Value::String(normalize_time(Some(claim_time))?));
+    }
+    if let Some(location) = object.get("locationId") {
+        if location.is_null() {
+            patch.insert("locationId".to_string(), Value::Null);
+        } else if let Some(id) = location.as_i64() {
+            patch.insert("locationId".to_string(), Value::Number(id.into()));
+        } else {
+            return Err(AutoCheckinConfigError::new("locationId 必须是数字或 null"));
+        }
+    }
+    if patch.is_empty() {
+        return Err(AutoCheckinConfigError::new("travel 没有需要更新的字段"));
+    }
+    Ok(Value::Object(patch))
 }
 
 // ─── 服务句柄 ───────────────────────────────────────────────
@@ -445,6 +552,29 @@ impl Drop for RunningGuard {
             Err(poisoned) => poisoned.into_inner().running = false,
         }
     }
+}
+
+/// 旅行轮次的阶段（与去重键一一对应）。
+#[derive(Clone, Copy)]
+enum TravelPhase {
+    Depart,
+    Claim,
+}
+
+/// 一轮（主签到 / 旅行派发 / 旅行领取）是否应在本 tick 触发：
+/// 开关开 **且** 到点 **且** 今天该轮还没跑过。
+///
+/// 抽成纯函数是为了能直接单测「每日至多一次」与「两轮互不串台」的判定
+/// （tick 端到端要 config 全局 + 账号存储 + 调度循环，不适合做单测）。
+/// 主轮传 `state.time`/`lastFiredDate`；旅行派发同样绑 `state.time` 但用
+/// `lastDepartDate`；旅行领取传 `claimTime`/`lastClaimDate` —— 三轮各自独立去重。
+fn round_due(
+    enabled: bool,
+    time_text: &str,
+    last_date: Option<&str>,
+    now: DateTime<FixedOffset>,
+) -> bool {
+    enabled && due_now(time_text, now).is_some() && last_date != Some(date_key(now).as_str())
 }
 
 impl AutoCheckin {
@@ -490,6 +620,7 @@ impl AutoCheckin {
         let now = beijing::now();
         let today = date_key(now);
         let schedules = checkin_schedules::list();
+        let travel = read_travel_state(&raw_object());
         let entries: Vec<Value> = schedules
             .iter()
             .map(|schedule| {
@@ -553,6 +684,15 @@ impl AutoCheckin {
                 json!({ "id": id, "label": provider_label(id) })
             }).collect::<Vec<_>>(),
             "schedules": entries,
+            // 旅行设置（独立于多条目）：界面「签到中心」的旅行卡片读这里
+            "travel": {
+                "enabled": travel.enabled,
+                "departTime": travel.depart_time,
+                "claimTime": travel.claim_time,
+                "locationId": travel.location_id,
+                "lastDepartDate": travel.last_depart_date,
+                "lastClaimDate": travel.last_claim_date,
+            },
             "running": self.is_running(),
         })
     }
@@ -655,6 +795,58 @@ impl AutoCheckin {
         outcome
     }
 
+    /// 跑一轮旅行（对所有启用的 CN WorkBuddy 账号）。与 `fire` 共用 `running` 守卫。
+    async fn fire_travel(&self, phase: TravelPhase) -> Option<Value> {
+        let guard = {
+            let mut inner = self.lock();
+            if inner.running {
+                return None;
+            }
+            inner.running = true;
+            RunningGuard { inner: self.inner.clone() }
+        };
+        let today = today_key();
+        match phase {
+            TravelPhase::Depart => write_travel_state(json!({ "lastDepartDate": today })),
+            TravelPhase::Claim => write_travel_state(json!({ "lastClaimDate": today })),
+        }
+        let travel = read_travel_state(&raw_object());
+        if !travel.enabled {
+            drop(guard);
+            return None;
+        }
+        let opts = crate::server::core::billing::TravelOpts { location_id: travel.location_id };
+        let accounts = self
+            .store
+            .list_accounts()
+            .get("accounts")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut results = Vec::new();
+        for account in &accounts {
+            let provider = account.get("provider").and_then(Value::as_str).unwrap_or("");
+            let edition = account.get("edition").and_then(Value::as_str).unwrap_or("");
+            let enabled = account.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+            if provider != "workbuddy" || edition != "cn" || !enabled {
+                continue;
+            }
+            let Some(id) = account.get("id").and_then(Value::as_str) else { continue; };
+            let Some(entry) = self.store.get_session_by_id(id) else { continue; };
+            let result = self.billing.travel_auto(&entry.session, opts).await;
+            logging::log(
+                "[Travel]",
+                &format!("账号 {id}: {}", result.get("message").and_then(Value::as_str).unwrap_or("")),
+            );
+            results.push(json!({ "id": id, "travel": result }));
+        }
+        drop(guard);
+        Some(json!({
+            "phase": match phase { TravelPhase::Depart => "depart", TravelPhase::Claim => "claim" },
+            "results": results,
+        }))
+    }
+
     /// 本轮是否有「Qoder 国际版账号没领到且不算已签」的行 —— 有则今天保持
     /// 未落账状态，等窗口开了重试（见 tick 的说明）。
     fn qoder_intl_pending(result: &Value) -> bool {
@@ -751,7 +943,7 @@ impl AutoCheckin {
     // ─── 调度 ───────────────────────────────────────────────
 
     /// 轮询回调：每条启用的条目各自「到点 + 今天没跑过」就执行（对应 Node 版
-    /// tick 的多条目版）。
+    /// tick 的多条目版）；末尾另跑两轮**旅行**（派发 / 领取，独立开关与去重）。
     ///
     /// ── Qoder 国际版的窗口补领（2026-10，issue #140）────────────
     /// 国际版「每日 100 Credits」的官方窗口**每天 10:00（UTC+8）开启**，而
@@ -799,6 +991,16 @@ impl AutoCheckin {
                 // None = 已有轮次在跑或执行出错：照旧落账（fire 内部已写），行为不变
                 None => {}
             }
+        }
+
+        // ── 旅行两轮：独立于多条目（自己的开关 / 时刻 / 当天去重），
+        //    与签到共用 fire 的 running 守卫（同一时刻只跑一轮）──
+        let travel = read_travel_state(&raw_object());
+        if round_due(travel.enabled, &travel.depart_time, travel.last_depart_date.as_deref(), now) {
+            self.fire_travel(TravelPhase::Depart).await;
+        }
+        if round_due(travel.enabled, &travel.claim_time, travel.last_claim_date.as_deref(), now) {
+            self.fire_travel(TravelPhase::Claim).await;
         }
     }
 
@@ -902,9 +1104,15 @@ impl AutoCheckin {
         let has_enabled = payload.get("enabled").is_some();
         let has_time = payload.get("time").is_some();
         let has_providers = payload.get("providers").is_some();
-        if !has_enabled && !has_time && !has_providers {
+        let has_travel = payload.get("travel").is_some();
+        if !has_enabled && !has_time && !has_providers && !has_travel {
             return Err(AutoCheckinConfigError::new("没有需要更新的字段"));
         }
+        // 旅行 patch 先校验再落盘：校验失败时一个字段都不写
+        let travel_patch = match payload.get("travel") {
+            Some(value) => Some(travel_patch_from_payload(value)?),
+            None => None,
+        };
         if has_enabled {
             // Node: `enabled !== undefined` → `patch.enabled = enabled === true`，
             // 也就是说 null / 字符串 / 0 都会把开关置为 false（不是「忽略」）
@@ -953,6 +1161,10 @@ impl AutoCheckin {
             // 不带 enabled：条目自己的开关保持原样（这里只改时刻/范围）
             checkin_schedules::upsert(&Value::Object(entry))
                 .map_err(|error| AutoCheckinConfigError::new(error))?;
+        }
+        if let Some(travel) = travel_patch {
+            write_travel_state(travel);
+            logging::log("[Checkin]", "旅行设置已更新");
         }
         // 总开关开着就走一遍 start()：确保调度循环在跑（幂等），并且刚开启 /
         // 刚改完配置的今天还没跑过的条目立刻补签（模块头「补签」的实测行为）
@@ -1010,5 +1222,180 @@ pub fn init_global(service: AutoCheckin) -> AutoCheckin {
 pub fn stop_global() {
     if let Some(service) = GLOBAL.get() {
         service.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn travel_defaults_to_disabled() {
+        let travel = read_travel_state(&Map::new());
+        assert!(!travel.enabled);
+        assert_eq!(travel.claim_time, DEFAULT_TRAVEL_CLAIM_TIME);
+        assert_eq!(travel.location_id, None);
+    }
+
+    #[test]
+    fn travel_reads_and_normalizes_claim_time() {
+        let mut raw = Map::new();
+        raw.insert("travel".into(), json!({
+            "enabled": true, "claimTime": "6:5", "locationId": 2,
+            "lastDepartDate": "2026-10-12", "lastClaimDate": "2026-10-12"
+        }));
+        let travel = read_travel_state(&raw);
+        assert!(travel.enabled);
+        assert_eq!(travel.claim_time, "06:05", "HH:MM 应补零归一");
+        assert_eq!(travel.location_id, Some(2));
+        assert_eq!(travel.last_depart_date.as_deref(), Some("2026-10-12"));
+    }
+
+    #[test]
+    fn travel_invalid_claim_time_falls_back() {
+        let mut raw = Map::new();
+        raw.insert("travel".into(), json!({ "enabled": true, "claimTime": "99:99" }));
+        assert_eq!(read_travel_state(&raw).claim_time, DEFAULT_TRAVEL_CLAIM_TIME);
+    }
+
+    #[test]
+    fn travel_reads_and_normalizes_depart_time() {
+        let mut raw = Map::new();
+        raw.insert("travel".into(), json!({ "enabled": true, "departTime": "0:1" }));
+        assert_eq!(read_travel_state(&raw).depart_time, "00:01", "HH:MM 应补零归一");
+        // 缺失 departTime → 缺省 00:01（独立于主轮时刻）
+        raw.insert("travel".into(), json!({ "enabled": true }));
+        assert_eq!(read_travel_state(&raw).depart_time, DEFAULT_TRAVEL_DEPART_TIME);
+        assert_eq!(DEFAULT_TRAVEL_DEPART_TIME, "00:01");
+    }
+
+    #[test]
+    fn travel_patch_accepts_depart_time() {
+        let patch = travel_patch_from_payload(&json!({ "departTime": "6:5" })).unwrap();
+        assert_eq!(patch.get("departTime").and_then(Value::as_str), Some("06:05"));
+        assert!(travel_patch_from_payload(&json!({ "departTime": "99:99" })).is_err());
+    }
+
+    #[test]
+    fn travel_patch_accepts_valid_body() {
+        let patch = travel_patch_from_payload(&json!({
+            "enabled": true, "claimTime": "6:5", "locationId": 3
+        })).unwrap();
+        assert_eq!(patch.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(patch.get("claimTime").and_then(Value::as_str), Some("06:05"));
+        assert_eq!(patch.get("locationId").and_then(Value::as_i64), Some(3));
+    }
+
+    #[test]
+    fn travel_patch_rejects_bad_location() {
+        assert!(travel_patch_from_payload(&json!({ "locationId": "x" })).is_err());
+    }
+
+    #[test]
+    fn travel_patch_null_location_clears_it() {
+        let patch = travel_patch_from_payload(&json!({ "locationId": null })).unwrap();
+        assert!(patch.get("locationId").unwrap().is_null());
+    }
+
+    // ── (a) write_travel_state 的合并语义（Review Focus 第 5 条）──
+
+    #[test]
+    fn merge_travel_preserves_other_travel_and_autocheckin_keys() {
+        let mut raw = Map::new();
+        raw.insert("enabled".into(), json!(true));
+        raw.insert("time".into(), json!("00:01"));
+        raw.insert("providers".into(), json!(["workbuddy", "raccoon"]));
+        raw.insert("travel".into(), json!({
+            "enabled": true, "claimTime": "06:00", "locationId": 3,
+            "lastDepartDate": "2026-10-12", "lastClaimDate": "2026-10-12"
+        }));
+        // 只写 lastDepartDate（tick 的派发轮落账路径）
+        let merged = merge_travel(&raw, &json!({ "lastDepartDate": "2026-10-13" }));
+        let travel = merged.get("travel").and_then(Value::as_object).unwrap();
+        // travel 的其它键一个不少
+        assert_eq!(travel.get("enabled"), Some(&json!(true)));
+        assert_eq!(travel.get("claimTime"), Some(&json!("06:00")));
+        assert_eq!(travel.get("locationId"), Some(&json!(3)));
+        assert_eq!(travel.get("lastClaimDate"), Some(&json!("2026-10-12")));
+        assert_eq!(travel.get("lastDepartDate"), Some(&json!("2026-10-13")));
+        // autoCheckin 顶层其它键一个不少
+        assert_eq!(merged.get("enabled"), Some(&json!(true)));
+        assert_eq!(merged.get("time"), Some(&json!("00:01")));
+        assert_eq!(merged.get("providers"), Some(&json!(["workbuddy", "raccoon"])));
+    }
+
+    #[test]
+    fn merge_travel_creates_travel_when_absent() {
+        let mut raw = Map::new();
+        raw.insert("enabled".into(), json!(false));
+        let merged = merge_travel(&raw, &json!({ "lastClaimDate": "2026-10-13" }));
+        assert_eq!(merged.get("travel"), Some(&json!({ "lastClaimDate": "2026-10-13" })));
+        assert_eq!(merged.get("enabled"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn merge_travel_overwrites_same_key_only() {
+        let mut raw = Map::new();
+        raw.insert("travel".into(), json!({ "enabled": true, "claimTime": "06:00" }));
+        let merged = merge_travel(&raw, &json!({ "enabled": false }));
+        let travel = merged.get("travel").and_then(Value::as_object).unwrap();
+        assert_eq!(travel.get("enabled"), Some(&json!(false)));
+        assert_eq!(travel.get("claimTime"), Some(&json!("06:00")));
+    }
+
+    // ── (b) tick 的轮次判定（每日至多一次 / 两轮互不串台）──
+
+    /// 构造北京时间的确定时刻（用于轮次判定的单测）。
+    fn beijing_at(hour: u32, minute: u32) -> DateTime<FixedOffset> {
+        beijing::offset()
+            .with_ymd_and_hms(2026, 10, 13, hour, minute, 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn round_due_is_daily_and_off_aware() {
+        let now = beijing_at(0, 5);
+        // 到点 + 今天没跑过 → 触发
+        assert!(round_due(true, "00:01", None, now));
+        // 今天已跑过 → 不再触发（每日至多一次）
+        assert!(!round_due(true, "00:01", Some("2026-10-13"), now));
+        // 开关关着 → 不触发
+        assert!(!round_due(false, "00:01", None, now));
+        // 没到点 → 不触发
+        assert!(!round_due(true, "06:00", None, now));
+    }
+
+    /// 旅行两轮各自去重、互不串台：派发绑主轮时刻、领取绑 claimTime。
+    #[test]
+    fn travel_rounds_do_not_cross_fire() {
+        let depart_time = "00:01";
+        let claim_time = "06:00";
+
+        // 00:05：派发到点（主轮时刻已过），领取还没到点
+        let early = beijing_at(0, 5);
+        assert!(round_due(true, depart_time, None, early), "00:05 应触发派发");
+        assert!(!round_due(true, claim_time, None, early), "00:05 不该触发领取");
+
+        // 06:05：派发今天已落账（lastDepartDate=今天）→ 不再触发；领取到点 → 触发
+        let late = beijing_at(6, 5);
+        assert!(!round_due(true, depart_time, Some("2026-10-13"), late), "派发今天已跑过不再触发");
+        assert!(round_due(true, claim_time, None, late), "06:05 应触发领取");
+        // 领取落账后不再触发
+        assert!(!round_due(true, claim_time, Some("2026-10-13"), late), "领取今天已跑过不再触发");
+
+        // 旅行关着时两轮都不触发
+        assert!(!round_due(false, depart_time, None, late));
+        assert!(!round_due(false, claim_time, None, late));
+    }
+
+    /// 旅行轮次的去重键与主轮 lastFiredDate 相互独立（Review Focus：「独立去重」）。
+    #[test]
+    fn travel_rounds_are_independent_of_main_last_fired() {
+        let now = beijing_at(0, 5);
+        // 主轮今天已跑过 → 主轮不触发
+        assert!(!round_due(true, "00:01", Some("2026-10-13"), now));
+        // 同一 tick 里，旅行派发用 lastDepartDate（None）→ 仍触发
+        assert!(round_due(true, "00:01", None, now));
     }
 }

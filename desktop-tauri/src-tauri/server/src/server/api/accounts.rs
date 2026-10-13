@@ -309,6 +309,18 @@ pub async fn dispatch(
                 return super::onboarding::claim(&state, &id).await;
             }
         }
+        // 派猫猫旅行：手动跑一次 travel_auto（先领后派）。CN WorkBuddy 专有，
+        // 见 `api::travel`。body 形如 `{"locationId": N}`，可为空。
+        if let Some(id) = rest.strip_suffix("/travel") {
+            let id = decode_segment(id);
+            if !id.is_empty() {
+                let payload = match parse_json_body(body, "请求内容不是有效 JSON") {
+                    Ok(payload) => payload,
+                    Err(response) => return response,
+                };
+                return super::travel::run(&state, &id, &payload).await;
+            }
+        }
     }
 
     // ③' GET + /onboarding 结尾 → 新手任务状态（只读，签到后弹窗的查询口）。
@@ -321,6 +333,13 @@ pub async fn dispatch(
             if !id.is_empty() {
                 let refresh = query_param(query, "refresh").as_deref() == Some("1");
                 return super::onboarding::status(&state, &id, refresh).await;
+            }
+        }
+        // 派猫猫旅行状态（卡片惰性查询，零写）。CN WorkBuddy 专有，见 `api::travel`。
+        if let Some(id) = rest.strip_suffix("/travel") {
+            let id = decode_segment(id);
+            if !id.is_empty() {
+                return super::travel::status(&state, &id).await;
             }
         }
     }

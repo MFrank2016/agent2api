@@ -72,6 +72,21 @@ export type AutoCheckinState = {
   nextRunAt?: number | null
   lastResult?: CheckinHistoryEntry | null
   running?: boolean
+  /** 派猫猫旅行的配置 + 去重键（后端 `autoCheckin.travel` 原样透传） */
+  travel?: TravelConfig
+}
+
+/** `autoCheckin.travel` 子对象（缺失 = 关闭） */
+export type TravelConfig = {
+  enabled?: boolean
+  /** 第一轮派发时刻（北京时间 HH:MM） */
+  departTime?: string
+  /** 第二轮领取时刻（北京时间 HH:MM） */
+  claimTime?: string
+  /** 固定地点 id；null = 每次随机 */
+  locationId?: number | null
+  lastDepartDate?: string | null
+  lastClaimDate?: string | null
 }
 
 /**
@@ -171,6 +186,31 @@ export type OnboardingCache = {
   settled?: boolean
   /** 结算时刻（后端记忆里的 `at`；仅 `settled` 时有） */
   settledAt?: number
+}
+
+/* ─── 派猫猫旅行（WorkBuddy 国内版；惰性查询 + 手动派发 / 领取）─── */
+
+/** `GET /api/accounts/{id}/travel` 的 `status` 块（字段可能缺，读时逐个兜底） */
+export type TravelStatus = {
+  available: boolean
+  /** idle | traveling | arrived（无活动时为空串） */
+  state: string
+  rewardCredit: number
+  dailyLimitReached: boolean
+  location: { name?: string } | null
+  /** 到达时刻（秒）；traveling 时 `arriveAt - serverNow` 即剩余秒数 */
+  arriveAt: number
+  /** 上游的当前时刻（秒）—— 倒计时的基准，不拿本机时钟直接减 arriveAt */
+  serverNow: number
+  letter: { text?: string } | null
+  useDeeplink: string
+}
+
+/** 一个账号的旅行缓存：status 来自 GET，auto 是同响应里的 travel 配置 */
+export type TravelCache = {
+  loading: boolean
+  status: TravelStatus | null
+  auto: { enabled?: boolean; departTime?: string; claimTime?: string; locationId?: number | null } | null
 }
 
 /* ─── 本岛用到的桥（在 accounts-shared 的 AccountsBridge 之上补签到两组）─── */
@@ -292,10 +332,18 @@ export type CheckinStore = {
   keepaliveSaving: boolean
   /** 保活模型链的编辑草稿：null = 跟随后端值；数组 = 用户正在编辑的清单 */
   keepaliveDraft: string[] | null
+  /** 旅行派发时刻的编辑草稿：null = 跟随后端值 */
+  travelDepartDraft: string | null
+  /** 旅行领取时刻的编辑草稿：null = 跟随后端值 */
+  travelClaimDraft: string | null
+  /** 旅行地点的编辑草稿：null = 跟随后端值（空串 = 随机） */
+  travelLocationDraft: string | null
   /** 单账号签到在途（行内按钮的去重闸） */
   signing: ReadonlySet<string>
   /** 新手任务的按账号缓存（Loomy / 小浣熊） */
   onboarding: ReadonlyMap<string, OnboardingCache>
+  /** 派猫猫旅行的按账号缓存（WorkBuddy 国内版） */
+  travel: Record<string, TravelCache>
 }
 
 let store: CheckinStore = {
@@ -310,8 +358,12 @@ let store: CheckinStore = {
   autoTimeDraft: null,
   keepaliveSaving: false,
   keepaliveDraft: null,
+  travelDepartDraft: null,
+  travelClaimDraft: null,
+  travelLocationDraft: null,
   signing: new Set<string>(),
   onboarding: new Map<string, OnboardingCache>(),
+  travel: {},
 }
 
 const subscribers = new Set<() => void>()
@@ -599,6 +651,65 @@ export async function toggleAutoProvider(optionId: string, checked: boolean): Pr
   await saveAutoCheckin({ providers }, t('签到提供商'))
 }
 
+/* ─── 派猫猫旅行设置（WorkBuddy 国内版）─── */
+
+/** 旅行总开关（提交 `travel.enabled`） */
+export async function setTravelEnabled(enabled: boolean): Promise<void> {
+  await saveAutoCheckin({ travel: { enabled } }, t('派猫猫旅行开关'))
+}
+
+/** 旅行派发时刻的编辑草稿（输入过程；提交在 blur / 回车时走 submitTravelDepartTime） */
+export function setTravelDepartDraft(value: string): void {
+  patch({ travelDepartDraft: value })
+}
+
+/** 旅行派发时刻提交（失焦 / 回车）：格式由后端校验，错误原样吐回 */
+export async function submitTravelDepartTime(value: string): Promise<void> {
+  const time = value.trim()
+  if (!time || getCheckinStore().autoSaving) return
+  await saveAutoCheckin({ travel: { departTime: time } }, t('旅行派发时刻'))
+  patch({ travelDepartDraft: null })
+}
+
+/** 旅行领取时刻的编辑草稿（输入过程；提交在 blur / 回车时走 submitTravelClaimTime） */
+export function setTravelClaimDraft(value: string): void {
+  patch({ travelClaimDraft: value })
+}
+
+/** 旅行领取时刻提交（失焦 / 回车）：格式由后端校验，错误原样吐回 */
+export async function submitTravelClaimTime(value: string): Promise<void> {
+  const time = value.trim()
+  if (!time || getCheckinStore().autoSaving) return
+  await saveAutoCheckin({ travel: { claimTime: time } }, t('旅行领取时刻'))
+  patch({ travelClaimDraft: null })
+}
+
+/** 旅行地点的编辑草稿（输入过程；提交在 blur / 回车时走 submitTravelLocation） */
+export function setTravelLocationDraft(value: string): void {
+  patch({ travelLocationDraft: value })
+}
+
+/**
+ * 旅行地点提交（失焦 / 回车）：空 = 随机（null），否则必须是正整数 id。
+ * 后端只接受数字或 null（`travel_patch_from_payload`），非数字在这里先拦。
+ */
+export async function submitTravelLocation(value: string): Promise<void> {
+  const draft = value.trim()
+  if (getCheckinStore().autoSaving) return
+  if (!draft) {
+    await saveAutoCheckin({ travel: { locationId: null } }, t('旅行地点'))
+    patch({ travelLocationDraft: null })
+    return
+  }
+  const id = Number(draft)
+  if (!Number.isInteger(id) || id < 1) {
+    toast(t('地点 id 必须是正整数，留空表示随机'), 'err')
+    return
+  }
+  await saveAutoCheckin({ travel: { locationId: id } }, t('旅行地点'))
+  patch({ travelLocationDraft: null })
+}
+
 /** 快照里只换 auto 段（保存响应是新状态，其余快照原样保留） */
 function mergeAuto(next: AutoCheckinState): CheckinCenterSnapshot | null {
   const current = getCheckinStore().snapshot
@@ -807,6 +918,48 @@ export async function claimOnboarding(id: string): Promise<void> {
     toast(t('领取失败：{error}', { error: message }), 'err')
   } finally {
     await loadCheckinCenter()
+  }
+}
+
+/* ─── 派猫猫旅行 ───────────────────────────── */
+
+/**
+ * 一个账号的旅行缓存（没拉过时给一份只读空壳）。
+ *
+ * `auto.enabled` 是旅行总开关：关着时卡片只展示只读状态、不给按钮
+ * （见设计 §6「关=调度与卡片按钮都不启用，卡片仍可显示只读状态」）。
+ */
+export function travelOf(id: string): TravelCache {
+  return getCheckinStore().travel[id] ?? { loading: false, status: null, auto: null }
+}
+
+function patchTravel(id: string, next: Partial<TravelCache>): void {
+  patch({ travel: { ...store.travel, [id]: { ...travelOf(id), ...next } } })
+}
+
+/** 拉一次旅行状态（卡片挂载时惰性调用；只读，零写） */
+export async function fetchTravel(id: string): Promise<void> {
+  patchTravel(id, { loading: true })
+  try {
+    const response = await fetch(`/api/accounts/${encodeURIComponent(id)}/travel`)
+    const payload = await response.json().catch(() => null)
+    patchTravel(id, {
+      loading: false,
+      status: payload?.status ?? null,
+      auto: payload?.auto ?? null,
+    })
+  } catch {
+    patchTravel(id, { loading: false })
+  }
+}
+
+/** 手动跑一次 travel_auto（派发 / 领取二合一，上游幂等），跑完重拉状态 */
+export async function runTravel(id: string): Promise<void> {
+  patchTravel(id, { loading: true })
+  try {
+    await fetch(`/api/accounts/${encodeURIComponent(id)}/travel`, { method: 'POST' })
+  } finally {
+    await fetchTravel(id)
   }
 }
 
