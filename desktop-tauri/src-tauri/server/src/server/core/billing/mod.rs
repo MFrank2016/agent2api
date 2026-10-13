@@ -37,6 +37,7 @@ pub mod commodity;
 pub mod keepalive;
 mod request;
 mod travel;
+pub use travel::TravelOpts;
 mod usage;
 
 use serde_json::{json, Map, Value};

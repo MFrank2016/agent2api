@@ -422,6 +422,33 @@ fn write_travel_state(patch: Value) {
     config::update_raw_field(CONFIG_KEY, Value::Object(raw));
 }
 
+/// 把 POST /api/auto-checkin 里的 `travel` 子对象归一成可合并的 patch。
+fn travel_patch_from_payload(value: &Value) -> Result<Value, AutoCheckinConfigError> {
+    let Some(object) = value.as_object() else {
+        return Err(AutoCheckinConfigError::new("travel 必须是对象"));
+    };
+    let mut patch = Map::new();
+    if let Some(enabled) = object.get("enabled") {
+        patch.insert("enabled".to_string(), Value::Bool(enabled == &Value::Bool(true)));
+    }
+    if let Some(claim_time) = object.get("claimTime") {
+        patch.insert("claimTime".to_string(), Value::String(normalize_time(Some(claim_time))?));
+    }
+    if let Some(location) = object.get("locationId") {
+        if location.is_null() {
+            patch.insert("locationId".to_string(), Value::Null);
+        } else if let Some(id) = location.as_i64() {
+            patch.insert("locationId".to_string(), Value::Number(id.into()));
+        } else {
+            return Err(AutoCheckinConfigError::new("locationId 必须是数字或 null"));
+        }
+    }
+    if patch.is_empty() {
+        return Err(AutoCheckinConfigError::new("travel 没有需要更新的字段"));
+    }
+    Ok(Value::Object(patch))
+}
+
 // ─── 服务句柄 ───────────────────────────────────────────────
 
 /// 句柄内部状态：下载/签到这类长任务只在这里留「是否在跑」与调度任务句柄。
@@ -460,6 +487,13 @@ impl Drop for RunningGuard {
             Err(poisoned) => poisoned.into_inner().running = false,
         }
     }
+}
+
+/// 旅行轮次的阶段（与去重键一一对应）。
+#[derive(Clone, Copy)]
+enum TravelPhase {
+    Depart,
+    Claim,
 }
 
 impl AutoCheckin {
@@ -581,6 +615,58 @@ impl AutoCheckin {
         outcome
     }
 
+    /// 跑一轮旅行（对所有启用的 CN WorkBuddy 账号）。与 `fire` 共用 `running` 守卫。
+    async fn fire_travel(&self, phase: TravelPhase) -> Option<Value> {
+        let guard = {
+            let mut inner = self.lock();
+            if inner.running {
+                return None;
+            }
+            inner.running = true;
+            RunningGuard { inner: self.inner.clone() }
+        };
+        let today = today_key();
+        match phase {
+            TravelPhase::Depart => write_travel_state(json!({ "lastDepartDate": today })),
+            TravelPhase::Claim => write_travel_state(json!({ "lastClaimDate": today })),
+        }
+        let state = read_state();
+        if !state.travel.enabled {
+            drop(guard);
+            return None;
+        }
+        let opts = crate::server::core::billing::TravelOpts { location_id: state.travel.location_id };
+        let accounts = self
+            .store
+            .list_accounts()
+            .get("accounts")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut results = Vec::new();
+        for account in &accounts {
+            let provider = account.get("provider").and_then(Value::as_str).unwrap_or("");
+            let edition = account.get("edition").and_then(Value::as_str).unwrap_or("");
+            let enabled = account.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+            if provider != "workbuddy" || edition != "cn" || !enabled {
+                continue;
+            }
+            let Some(id) = account.get("id").and_then(Value::as_str) else { continue; };
+            let Some(entry) = self.store.get_session_by_id(id) else { continue; };
+            let result = self.billing.travel_auto(&entry.session, opts).await;
+            logging::log(
+                "[Travel]",
+                &format!("账号 {id}: {}", result.get("message").and_then(Value::as_str).unwrap_or("")),
+            );
+            results.push(json!({ "id": id, "travel": result }));
+        }
+        drop(guard);
+        Some(json!({
+            "phase": match phase { TravelPhase::Depart => "depart", TravelPhase::Claim => "claim" },
+            "results": results,
+        }))
+    }
+
     /// 本轮是否有「Qoder 国际版账号没领到且不算已签」的行 —— 有则今天保持
     /// 未落账状态，等窗口开了重试（见 tick 的说明）。
     fn qoder_intl_pending(result: &Value) -> bool {
@@ -694,27 +780,38 @@ impl AutoCheckin {
             return;
         }
         let now = beijing::now();
-        // 未到点（含 time 非法）直接返回
-        if due_now(&state.time, now).is_none() {
-            return;
-        }
-        if state.last_fired_date.as_deref() == Some(date_key(now).as_str()) {
-            return;
-        }
-        match self.fire("到点触发").await {
-            Some(result) => {
-                // 领取轮次完成，但里面有「Qoder 国际版无活动」的行 → 不落账，
-                // 今天窗口开了之后由后续 tick 重试
-                if result.get("qoderIntlPending").and_then(Value::as_bool) == Some(true) {
-                    write_state(json!({ "lastFiredDate": Value::Null }));
-                    logging::log(
-                        "[Checkin]",
-                        "⏳ Qoder 国际版的活动窗口未开（官方每日 10:00 UTC+8），今天会自动重试到领到为止",
-                    );
+        let today = date_key(now);
+
+        // 主轮次：签到
+        if due_now(&state.time, now).is_some()
+            && state.last_fired_date.as_deref() != Some(today.as_str())
+        {
+            match self.fire("到点触发").await {
+                Some(result) => {
+                    if result.get("qoderIntlPending").and_then(Value::as_bool) == Some(true) {
+                        write_state(json!({ "lastFiredDate": Value::Null }));
+                        logging::log(
+                            "[Checkin]",
+                            "⏳ Qoder 国际版的活动窗口未开（官方每日 10:00 UTC+8），今天会自动重试到领到为止",
+                        );
+                    }
                 }
+                None => {}
             }
-            // None = 已有轮次在跑或执行出错：照旧落账（fire 内部已写），行为不变
-            None => {}
+        }
+
+        // 旅行轮次（独立去重，不受主轮 lastFiredDate 影响）
+        if state.travel.enabled {
+            if due_now(&state.time, now).is_some()
+                && state.travel.last_depart_date.as_deref() != Some(today.as_str())
+            {
+                self.fire_travel(TravelPhase::Depart).await;
+            }
+            if due_now(&state.travel.claim_time, now).is_some()
+                && state.travel.last_claim_date.as_deref() != Some(today.as_str())
+            {
+                self.fire_travel(TravelPhase::Claim).await;
+            }
         }
     }
 
@@ -828,12 +925,20 @@ impl AutoCheckin {
             }
             patch.insert("providers".to_string(), Value::Array(picked));
         }
-        if patch.is_empty() {
+        let mut travel_patch: Option<Value> = None;
+        if let Some(value) = payload.get("travel") {
+            travel_patch = Some(travel_patch_from_payload(value)?);
+        }
+        if patch.is_empty() && travel_patch.is_none() {
             return Err(AutoCheckinConfigError::new("没有需要更新的字段"));
         }
 
         let before = read_state();
         write_state(Value::Object(patch));
+        if let Some(travel) = travel_patch {
+            write_travel_state(travel);
+            logging::log("[Checkin]", "旅行设置已更新");
+        }
         let after = read_state();
         if before.enabled != after.enabled {
             logging::log(
@@ -933,5 +1038,26 @@ mod tests {
         let mut raw = Map::new();
         raw.insert("travel".into(), json!({ "enabled": true, "claimTime": "99:99" }));
         assert_eq!(read_travel_state(&raw).claim_time, DEFAULT_TRAVEL_CLAIM_TIME);
+    }
+
+    #[test]
+    fn travel_patch_accepts_valid_body() {
+        let patch = travel_patch_from_payload(&json!({
+            "enabled": true, "claimTime": "6:5", "locationId": 3
+        })).unwrap();
+        assert_eq!(patch.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(patch.get("claimTime").and_then(Value::as_str), Some("06:05"));
+        assert_eq!(patch.get("locationId").and_then(Value::as_i64), Some(3));
+    }
+
+    #[test]
+    fn travel_patch_rejects_bad_location() {
+        assert!(travel_patch_from_payload(&json!({ "locationId": "x" })).is_err());
+    }
+
+    #[test]
+    fn travel_patch_null_location_clears_it() {
+        let patch = travel_patch_from_payload(&json!({ "locationId": null })).unwrap();
+        assert!(patch.get("locationId").unwrap().is_null());
     }
 }
