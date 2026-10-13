@@ -313,6 +313,43 @@ fn today_at(time_text: &str, now: DateTime<FixedOffset>) -> Option<DateTime<Fixe
 
 // ─── 状态读写 ───────────────────────────────────────────────
 
+/// 旅行配置的缺省领取时刻（北京时间）：主轮 00:01 派发后，6 小时后领取。
+pub const DEFAULT_TRAVEL_CLAIM_TIME: &str = "06:00";
+
+/// `autoCheckin.travel` 子对象（缺失 = 关闭，向后兼容）。
+#[derive(Clone, Debug, Default)]
+pub struct TravelState {
+    pub enabled: bool,
+    pub claim_time: String,
+    pub location_id: Option<i64>,
+    pub last_depart_date: Option<String>,
+    pub last_claim_date: Option<String>,
+}
+
+/// 从 `autoCheckin` 原始对象里读 travel 子对象。
+fn read_travel_state(raw: &Map<String, Value>) -> TravelState {
+    let Some(travel) = raw.get("travel").and_then(Value::as_object) else {
+        return TravelState {
+            enabled: false,
+            claim_time: DEFAULT_TRAVEL_CLAIM_TIME.to_string(),
+            location_id: None,
+            last_depart_date: None,
+            last_claim_date: None,
+        };
+    };
+    let claim_time = travel
+        .get("claimTime")
+        .and_then(|value| normalize_time(Some(value)).ok())
+        .unwrap_or_else(|| DEFAULT_TRAVEL_CLAIM_TIME.to_string());
+    TravelState {
+        enabled: travel.get("enabled").and_then(Value::as_bool) == Some(true),
+        claim_time,
+        location_id: travel.get("locationId").and_then(Value::as_i64),
+        last_depart_date: travel.get("lastDepartDate").and_then(Value::as_str).map(str::to_string),
+        last_claim_date: travel.get("lastClaimDate").and_then(Value::as_str).map(str::to_string),
+    }
+}
+
 /// 从 config.json 读出的调度状态（对应 Node 版 readState 的返回）
 struct CheckinState {
     enabled: bool,
@@ -321,6 +358,7 @@ struct CheckinState {
     providers: Vec<String>,
     last_fired_date: Option<String>,
     last_result: Option<Value>,
+    pub travel: TravelState,
 }
 
 /// `autoCheckin` 字段的原始对象（非对象/缺失都给空对象）
@@ -351,6 +389,7 @@ fn read_state() -> CheckinState {
         providers: normalize_providers(raw.get("providers")),
         last_fired_date,
         last_result,
+        travel: read_travel_state(&raw),
     }
 }
 
@@ -364,6 +403,23 @@ fn write_state(patch: Value) {
         }
     }
     config::update_raw_field(CONFIG_KEY, Value::Object(merged));
+}
+
+/// 合并写回 `autoCheckin.travel`（不丢其它键，对应 spec 的 Review Focus 第 5 条）。
+fn write_travel_state(patch: Value) {
+    let mut raw = raw_object();
+    let mut travel = raw
+        .get("travel")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Value::Object(entries) = patch {
+        for (key, value) in entries {
+            travel.insert(key, value);
+        }
+    }
+    raw.insert("travel".to_string(), Value::Object(travel));
+    config::update_raw_field(CONFIG_KEY, Value::Object(raw));
 }
 
 // ─── 服务句柄 ───────────────────────────────────────────────
@@ -457,6 +513,13 @@ impl AutoCheckin {
             "lastFiredToday": state.last_fired_date.as_deref() == Some(date_key(now).as_str()),
             "nextRunAt": next_run_at,
             "lastResult": state.last_result,
+            "travel": {
+                "enabled": state.travel.enabled,
+                "claimTime": state.travel.claim_time,
+                "locationId": state.travel.location_id,
+                "lastDepartDate": state.travel.last_depart_date,
+                "lastClaimDate": state.travel.last_claim_date,
+            },
             "running": self.is_running(),
         })
     }
@@ -835,5 +898,40 @@ pub fn init_global(service: AutoCheckin) -> AutoCheckin {
 pub fn stop_global() {
     if let Some(service) = GLOBAL.get() {
         service.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn travel_defaults_to_disabled() {
+        let travel = read_travel_state(&Map::new());
+        assert!(!travel.enabled);
+        assert_eq!(travel.claim_time, DEFAULT_TRAVEL_CLAIM_TIME);
+        assert_eq!(travel.location_id, None);
+    }
+
+    #[test]
+    fn travel_reads_and_normalizes_claim_time() {
+        let mut raw = Map::new();
+        raw.insert("travel".into(), json!({
+            "enabled": true, "claimTime": "6:5", "locationId": 2,
+            "lastDepartDate": "2026-10-12", "lastClaimDate": "2026-10-12"
+        }));
+        let travel = read_travel_state(&raw);
+        assert!(travel.enabled);
+        assert_eq!(travel.claim_time, "06:05", "HH:MM 应补零归一");
+        assert_eq!(travel.location_id, Some(2));
+        assert_eq!(travel.last_depart_date.as_deref(), Some("2026-10-12"));
+    }
+
+    #[test]
+    fn travel_invalid_claim_time_falls_back() {
+        let mut raw = Map::new();
+        raw.insert("travel".into(), json!({ "enabled": true, "claimTime": "99:99" }));
+        assert_eq!(read_travel_state(&raw).claim_time, DEFAULT_TRAVEL_CLAIM_TIME);
     }
 }
