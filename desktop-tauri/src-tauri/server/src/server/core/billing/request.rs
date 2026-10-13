@@ -62,6 +62,10 @@ pub(super) struct CallOptions<'a> {
     /// 故障静默成成功。
     pub(super) tolerate_duplicate_claim: bool,
     pub(super) locale: Option<&'a str>,
+    /// 本次调用的 host 覆盖（只含 scheme+host，不含路径）。None = 用
+    /// `session.endpoint`（现状，所有既有调用都是 None）。
+    /// 只有「派猫猫旅行」用得到（它在另一个域名），见 billing::travel。
+    pub(super) base_url: Option<&'a str>,
 }
 
 impl Default for CallOptions<'_> {
@@ -75,6 +79,7 @@ impl Default for CallOptions<'_> {
             // 默认关：只有显式打开的那条调用点才容错
             tolerate_duplicate_claim: false,
             locale: None,
+            base_url: None,
         }
     }
 }

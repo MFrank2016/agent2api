@@ -205,12 +205,17 @@ impl BillingService {
         // 账户级端点：国内版/国际版账号各走自己的站点。
         // 会话缺 endpoint 时回落到 auth 的默认 baseUrl（Node 的
         // `normalizeEndpoint(activeSession.endpoint || baseUrl)`）
-        let endpoint = session
-            .get("endpoint")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(normalize_endpoint)
-            .unwrap_or_else(|| normalize_endpoint(self.auth.default_context().base_url.as_str()));
+        let endpoint = match options.base_url {
+            Some(base) => normalize_endpoint(base),
+            None => session
+                .get("endpoint")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(normalize_endpoint)
+                .unwrap_or_else(|| {
+                    normalize_endpoint(self.auth.default_context().base_url.as_str())
+                }),
+        };
         let url = format!("{endpoint}{}{}", spec.path, options.query.unwrap_or(""));
 
         let mut extra: Vec<(String, String)> = Vec::new();
@@ -624,5 +629,72 @@ mod tests {
         // 含「已签到」但并非「今天已领过」：会被误放行（已知弱点）
         assert!(is_duplicate_claim(400, "该活动已签到结束"));
         assert!(is_duplicate_claim(400, "签到功能已领取完毕待下期"));
+    }
+
+    // ── base_url 覆盖（Task 1：派猫猫旅行跨域接口铺路）─────────────────
+    use super::*;
+    use serde_json::json;
+
+    async fn mock_get() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>, tokio::task::JoinHandle<()>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let count = hits.clone();
+        let app = axum::Router::new().route(
+            "/probe",
+            axum::routing::get(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    (axum::http::StatusCode::OK,
+                     [(axum::http::header::CONTENT_TYPE, "application/json")],
+                     "{\"code\":0,\"data\":{\"ok\":true}}")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, hits, task)
+    }
+
+    fn empty_body() -> Value { json!({}) }
+
+    fn probe_spec() -> request::BillingSpec {
+        request::BillingSpec { method: "GET", path: "/probe", body: empty_body, whitelist_headers: false }
+    }
+
+    fn service(label: &str) -> (BillingService, crate::server::db::test_temp::TempDb) {
+        use crate::server::core::account_store::AccountStore;
+        let (db, guard) = crate::server::db::test_temp::TempDb::open(label);
+        let store = AccountStore::with_db(Some(db));
+        (BillingService::new(crate::server::core::auth::AuthService::for_store(store)), guard)
+    }
+
+    fn session(endpoint: &str) -> Value {
+        json!({ "endpoint": endpoint, "edition": "cn",
+                "auth": { "accessToken": "t" }, "account": { "uid": "u1" } })
+    }
+
+    #[tokio::test]
+    async fn base_url_override_retargets_the_call() {
+        let (billing, _guard) = service("billing-base-url-override");
+        let (base, hits, _task) = mock_get().await;
+        let session = session("http://127.0.0.1:1");
+        billing.call_billing(probe_spec(), request::CallOptions {
+            session: Some(&session), base_url: Some(&base),
+            expect_code_ok: true, ..Default::default()
+        }).await.expect("base_url 覆盖后应打到 mock");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn without_base_url_the_session_endpoint_is_used() {
+        let (billing, _guard) = service("billing-base-url-none");
+        let (base, hits, _task) = mock_get().await;
+        let session = session(&base);
+        billing.call_billing(probe_spec(), request::CallOptions {
+            session: Some(&session), expect_code_ok: true, ..Default::default()
+        }).await.expect("不传 base_url 时用 session.endpoint");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
