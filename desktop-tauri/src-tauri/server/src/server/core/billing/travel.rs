@@ -330,4 +330,46 @@ mod tests {
         assert_eq!(claims.load(Ordering::SeqCst), 0);
         assert_eq!(departs.load(Ordering::SeqCst), 0);
     }
+
+    /// 领取端点返回 HTTP 500（非 2xx）—— `travel_claim` 在 `expect_code_ok: false`
+    /// 下只有非 2xx 才会得到 `Err`，用于覆盖「到达但领取失败」的早退分支。
+    async fn mock_script_claim_fails(status_json: &'static str)
+        -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let claims = Arc::new(AtomicUsize::new(0));
+        let departs = Arc::new(AtomicUsize::new(0));
+        let c = claims.clone();
+        let d = departs.clone();
+        let app = axum::Router::new()
+            .route(TRAVEL_STATUS_PATH, axum::routing::get(move || async move {
+                (axum::http::StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")], status_json) }))
+            .route(TRAVEL_CONFIG_PATH, axum::routing::get(move || async move {
+                (axum::http::StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")],
+                 r#"{"code":0,"data":{"locations":[{"id":1}]}}"#) }))
+            .route(TRAVEL_CLAIM_PATH, axum::routing::post(move || { let c = c.clone(); async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, [(axum::http::header::CONTENT_TYPE, "application/json")],
+                 r#"{"code":500,"msg":"领取失败"}"#) } }))
+            .route(TRAVEL_DEPART_PATH, axum::routing::post(move || { let d = d.clone(); async move {
+                d.fetch_add(1, Ordering::SeqCst);
+                (axum::http::StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")],
+                 r#"{"code":0,"data":{"location":{"id":1}}}"#) } }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, claims, departs, task)
+    }
+
+    #[tokio::test]
+    async fn arrived_but_claim_failure_reports_claim_error_not_traveling() {
+        let (billing, _g) = service("travel-auto-claim-fail");
+        let (base, claims, departs, _t) = mock_script_claim_fails(
+            r#"{"code":0,"data":{"state":"arrived","reward_credit":8,"daily_limit_reached":false,"location":{"id":4}}}"#).await;
+        let out = billing.travel_auto(&cn_session(&base), TravelOpts::default()).await;
+        assert_eq!(out.get("claimed").and_then(Value::as_bool), Some(false));
+        assert_eq!(claims.load(Ordering::SeqCst), 1, "领取失败仍应记一次领取调用");
+        assert_eq!(departs.load(Ordering::SeqCst), 0, "领取失败后不得继续派发");
+        let message = out.get("message").and_then(Value::as_str).unwrap_or("");
+        assert!(message.contains("领取失败"), "应报告领取失败，实际: {message}");
+        assert!(!message.contains("旅行中"), "不得误报「旅行中」，实际: {message}");
+    }
 }
