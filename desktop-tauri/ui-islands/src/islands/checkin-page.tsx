@@ -7,11 +7,11 @@ import { PROVIDER_ICONS } from './add-provider-pick'
 import { formatTime, shared, type OnboardingTask } from './accounts-shared'
 import { claimedPlanIdsToday, welfareDoneTitle, welfareStateOf, welfareTodoTitle } from './accounts-domain'
 import {
-  claimOnboarding, getCheckinStore, groupTone, historyLine, loadCheckinCenter,
-  nextRunText, onboardingExpanded, queryOnboarding, runAllCheckin, saveAutoCheckin,
+  claimOnboarding, fetchTravel, getCheckinStore, groupTone, historyLine, loadCheckinCenter,
+  nextRunText, onboardingExpanded, queryOnboarding, runAllCheckin, runTravel, saveAutoCheckin,
   setAutoTimeDraft, setKeepaliveDraft, signSingleAccount, submitAutoTime,
   submitKeepaliveModels, subscribeCheckinStore, toggleAutoProvider,
-  toggleOnboardingExpand, toggleProviderExpand,
+  toggleOnboardingExpand, toggleProviderExpand, travelOf,
   type AutoCheckinState, type CheckinProviderGroup, type CheckinStore,
 } from './checkin-state'
 import { openZcodePlans } from './accounts-data'
@@ -145,11 +145,91 @@ function ProviderLogo({ id, label }: { id: string; label: string }) {
   )
 }
 
+/**
+ * 派猫猫旅行卡片（WorkBuddy 国内版账号行展开区）。
+ *
+ * ── 惰性加载 ──────────────────────────────────────────────
+ * 账号行（也就是本卡片）只在提供商分组展开时才挂载，挂载即 `fetchTravel` 拉一次
+ * `GET /api/accounts/{id}/travel` —— 保持签到中心「打开页面零上游」的既有口径
+ * （旅行状态刻意不进 checkin_center 快照，见设计 §5.5）。
+ *
+ * ── 只读 vs 可操作 ────────────────────────────────────────
+ * 旅行总开关 `auto.enabled` 关着时卡片**只读**（不给派发 / 领取按钮），开着才给
+ * 动作按钮（见设计 §6）。倒计时按 `arriveAt - serverNow` 换算成本地绝对时刻后
+ * 用本地时钟每秒推进 —— 上游时钟与本机不一定同步，直接拿本机时间减 arriveAt 会偏。
+ */
+function TravelCard({ accountId }: { accountId: string }) {
+  useCheckinStore()
+  const cache = travelOf(accountId)
+  const status = cache.status
+  const enabled = cache.auto?.enabled === true
+  const [deadline, setDeadline] = React.useState<number | null>(null)
+  const [now, setNow] = React.useState(() => Date.now())
+
+  React.useEffect(() => { void fetchTravel(accountId) }, [accountId])
+
+  // 拿到 traveling 状态那一刻，把「剩余秒数」锚成本地绝对时刻
+  React.useEffect(() => {
+    if (status?.state === 'traveling' && status.arriveAt > 0) {
+      setDeadline(Date.now() + Math.max(0, status.arriveAt - status.serverNow) * 1000)
+    } else {
+      setDeadline(null)
+    }
+  }, [status])
+
+  // 仅在旅行中每秒推进本地时钟
+  React.useEffect(() => {
+    if (deadline === null) return
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [deadline])
+
+  const remaining = deadline === null ? 0 : Math.max(0, Math.round((deadline - now) / 1000))
+  const countdown = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')}`
+
+  return (
+    <div className='flex flex-wrap items-center gap-2 px-[2px] py-1 text-[12px] text-muted-foreground'>
+      <span>{t('旅行')}</span>
+      {!status ? (
+        <Spinner className='size-3.5' />
+      ) : !status.available ? (
+        <Badge variant='outline' shape='tag'>{t('暂无旅行活动')}</Badge>
+      ) : status.state === 'traveling' ? (
+        <>
+          <Badge variant='brand' shape='tag'>{t('旅行中')}</Badge>
+          <span className='font-mono tabular-nums'>{countdown}</span>
+        </>
+      ) : status.state === 'arrived' ? (
+        <>
+          <Badge variant='success' shape='tag'>{t('可领 {n} 积分', { n: status.rewardCredit })}</Badge>
+          {enabled ? (
+            <Button size='sm' variant='default' disabled={cache.loading} onClick={() => void runTravel(accountId)}>
+              {t('领取')}
+            </Button>
+          ) : null}
+        </>
+      ) : (
+        <>
+          <Badge variant='outline' shape='tag'>{t('空闲')}</Badge>
+          {enabled ? (
+            <Button size='sm' variant='outline' disabled={cache.loading} onClick={() => void runTravel(accountId)}>
+              {t('派发')}
+            </Button>
+          ) : null}
+        </>
+      )}
+      {status?.dailyLimitReached ? <span>{t('今日派遣已用完')}</span> : null}
+    </div>
+  )
+}
+
 /** 展开区里的账号明细行（每日签到） */
 function AccountRows({ group }: { group: CheckinProviderGroup }) {
   const signing = getCheckinStore().signing
-  // 在途判定按 `${id}:${mode}`：三颗按钮各自的转圈互不牵连
-  const busy = (id: string, mode: string) => signing.has(`${id}:${mode}`)
+  // 在途判定按 `${id}:${mode}`：三颗按钮各自的转圈互不牵连；
+  // travel 是另一处在途源（旅行缓存自己的 loading），单列一条判据
+  const busy = (id: string, mode: string) =>
+    mode === 'travel' ? travelOf(id).loading : signing.has(`${id}:${mode}`)
   return (
     <table className='ck-table'>
       <thead>
@@ -171,56 +251,74 @@ function AccountRows({ group }: { group: CheckinProviderGroup }) {
           // 账号」）。只有 `workbuddy-intl` 这一组执行日活链。
           const dailyActivity = group.id === 'workbuddy-intl'
           return (
-            <tr key={account.id}>
-              <td>{account.name || account.id}</td>
-              <td>
-                {account.checkedInToday
-                  ? <Badge variant='success' shape='tag'>{t('已签')}</Badge>
-                  : <Badge variant='brand' shape='tag'>{t('待签')}</Badge>}
-              </td>
-              <td className='text-subtle'>{account.checkinAt ? formatTime(account.checkinAt) : '—'}</td>
-              <td className='text-right'>
-                {dailyActivity ? (
-                  <span className='inline-flex items-center gap-1'>
+            <React.Fragment key={account.id}>
+              <tr>
+                <td>{account.name || account.id}</td>
+                <td>
+                  {account.checkedInToday
+                    ? <Badge variant='success' shape='tag'>{t('已签')}</Badge>
+                    : <Badge variant='brand' shape='tag'>{t('待签')}</Badge>}
+                </td>
+                <td className='text-subtle'>{account.checkinAt ? formatTime(account.checkinAt) : '—'}</td>
+                <td className='text-right'>
+                  {dailyActivity ? (
+                    <span className='inline-flex items-center gap-1'>
+                      <Button
+                        size='sm' variant='ghost'
+                        disabled={busy(account.id, 'keepalive')}
+                        title={t('用免费模型维持账号活跃 · 不领取奖励')}
+                        onClick={() => void signSingleAccount(account.id, 'keepalive')}
+                      >
+                        {busy(account.id, 'keepalive') ? t('保活中…') : t('保活')}
+                      </Button>
+                      <Button
+                        size='sm' variant='ghost'
+                        disabled={busy(account.id, 'claim')}
+                        title={t('探测活动并领取日活奖励 · 不做保活')}
+                        onClick={() => void signSingleAccount(account.id, 'claim')}
+                      >
+                        {busy(account.id, 'claim') ? t('领取中…') : t('领取')}
+                      </Button>
+                      <Button
+                        size='sm' variant='ghost'
+                        disabled={busy(account.id, 'full')}
+                        title={t('探测 + 领取 + 保活 · 与定时签到同一套组合')}
+                        onClick={() => void signSingleAccount(account.id, 'full')}
+                      >
+                        {busy(account.id, 'full') ? t('执行中…') : t('保活+领取')}
+                      </Button>
+                    </span>
+                  ) : (
                     <Button
-                      size='sm' variant='ghost'
-                      disabled={busy(account.id, 'keepalive')}
-                      title={t('用免费模型维持账号活跃 · 不领取奖励')}
-                      onClick={() => void signSingleAccount(account.id, 'keepalive')}
+                      size='sm'
+                      variant='ghost'
+                      disabled={busy(account.id, 'checkin')}
+                      onClick={() => void signSingleAccount(account.id)}
                     >
-                      {busy(account.id, 'keepalive') ? t('保活中…') : t('保活')}
+                      {busy(account.id, 'checkin')
+                        ? t('签到中…')
+                        : account.checkedInToday ? t('重签') : t('签到')}
                     </Button>
+                  )}
+                  {group.id === 'workbuddy' ? (
                     <Button
-                      size='sm' variant='ghost'
-                      disabled={busy(account.id, 'claim')}
-                      title={t('探测活动并领取日活奖励 · 不做保活')}
-                      onClick={() => void signSingleAccount(account.id, 'claim')}
+                      size='sm'
+                      variant='outline'
+                      className='ml-1'
+                      disabled={busy(account.id, 'travel')}
+                      onClick={() => { void fetchTravel(account.id); void runTravel(account.id) }}
                     >
-                      {busy(account.id, 'claim') ? t('领取中…') : t('领取')}
+                      {t('旅行')}
                     </Button>
-                    <Button
-                      size='sm' variant='ghost'
-                      disabled={busy(account.id, 'full')}
-                      title={t('探测 + 领取 + 保活 · 与定时签到同一套组合')}
-                      onClick={() => void signSingleAccount(account.id, 'full')}
-                    >
-                      {busy(account.id, 'full') ? t('执行中…') : t('保活+领取')}
-                    </Button>
-                  </span>
-                ) : (
-                  <Button
-                    size='sm'
-                    variant='ghost'
-                    disabled={busy(account.id, 'checkin')}
-                    onClick={() => void signSingleAccount(account.id)}
-                  >
-                    {busy(account.id, 'checkin')
-                      ? t('签到中…')
-                      : account.checkedInToday ? t('重签') : t('签到')}
-                  </Button>
-                )}
-              </td>
-            </tr>
+                  ) : null}
+                </td>
+              </tr>
+              {group.id === 'workbuddy' ? (
+                <tr className='ck-travel-row'>
+                  <td colSpan={4}><TravelCard accountId={account.id} /></td>
+                </tr>
+              ) : null}
+            </React.Fragment>
           )
         })}
       </tbody>

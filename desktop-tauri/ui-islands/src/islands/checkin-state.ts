@@ -127,6 +127,31 @@ export type OnboardingCache = {
   settledAt?: number
 }
 
+/* ─── 派猫猫旅行（WorkBuddy 国内版；惰性查询 + 手动派发 / 领取）─── */
+
+/** `GET /api/accounts/{id}/travel` 的 `status` 块（字段可能缺，读时逐个兜底） */
+export type TravelStatus = {
+  available: boolean
+  /** idle | traveling | arrived（无活动时为空串） */
+  state: string
+  rewardCredit: number
+  dailyLimitReached: boolean
+  location: { name?: string } | null
+  /** 到达时刻（秒）；traveling 时 `arriveAt - serverNow` 即剩余秒数 */
+  arriveAt: number
+  /** 上游的当前时刻（秒）—— 倒计时的基准，不拿本机时钟直接减 arriveAt */
+  serverNow: number
+  letter: { text?: string } | null
+  useDeeplink: string
+}
+
+/** 一个账号的旅行缓存：status 来自 GET，auto 是同响应里的 travel 配置 */
+export type TravelCache = {
+  loading: boolean
+  status: TravelStatus | null
+  auto: { enabled?: boolean; claimTime?: string; locationId?: number | null } | null
+}
+
 /* ─── 本岛用到的桥（在 accounts-shared 的 AccountsBridge 之上补签到两组）─── */
 
 type CheckinBridge = {
@@ -202,6 +227,8 @@ export type CheckinStore = {
   signing: ReadonlySet<string>
   /** 新手任务的按账号缓存（Loomy / 小浣熊） */
   onboarding: ReadonlyMap<string, OnboardingCache>
+  /** 派猫猫旅行的按账号缓存（WorkBuddy 国内版） */
+  travel: Record<string, TravelCache>
 }
 
 let store: CheckinStore = {
@@ -217,6 +244,7 @@ let store: CheckinStore = {
   keepaliveDraft: null,
   signing: new Set<string>(),
   onboarding: new Map<string, OnboardingCache>(),
+  travel: {},
 }
 
 const subscribers = new Set<() => void>()
@@ -708,6 +736,48 @@ export async function claimOnboarding(id: string): Promise<void> {
     toast(t('领取失败：{error}', { error: message }), 'err')
   } finally {
     await loadCheckinCenter()
+  }
+}
+
+/* ─── 派猫猫旅行 ───────────────────────────── */
+
+/**
+ * 一个账号的旅行缓存（没拉过时给一份只读空壳）。
+ *
+ * `auto.enabled` 是旅行总开关：关着时卡片只展示只读状态、不给按钮
+ * （见设计 §6「关=调度与卡片按钮都不启用，卡片仍可显示只读状态」）。
+ */
+export function travelOf(id: string): TravelCache {
+  return getCheckinStore().travel[id] ?? { loading: false, status: null, auto: null }
+}
+
+function patchTravel(id: string, next: Partial<TravelCache>): void {
+  patch({ travel: { ...store.travel, [id]: { ...travelOf(id), ...next } } })
+}
+
+/** 拉一次旅行状态（卡片挂载时惰性调用；只读，零写） */
+export async function fetchTravel(id: string): Promise<void> {
+  patchTravel(id, { loading: true })
+  try {
+    const response = await fetch(`/api/accounts/${encodeURIComponent(id)}/travel`)
+    const payload = await response.json().catch(() => null)
+    patchTravel(id, {
+      loading: false,
+      status: payload?.status ?? null,
+      auto: payload?.auto ?? null,
+    })
+  } catch {
+    patchTravel(id, { loading: false })
+  }
+}
+
+/** 手动跑一次 travel_auto（派发 / 领取二合一，上游幂等），跑完重拉状态 */
+export async function runTravel(id: string): Promise<void> {
+  patchTravel(id, { loading: true })
+  try {
+    await fetch(`/api/accounts/${encodeURIComponent(id)}/travel`, { method: 'POST' })
+  } finally {
+    await fetchTravel(id)
   }
 }
 
