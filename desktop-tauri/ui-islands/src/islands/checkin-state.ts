@@ -72,6 +72,19 @@ export type AutoCheckinState = {
   nextRunAt?: number | null
   lastResult?: CheckinHistoryEntry | null
   running?: boolean
+  /** 派猫猫旅行的配置 + 去重键（后端 `autoCheckin.travel` 原样透传） */
+  travel?: TravelConfig
+}
+
+/** `autoCheckin.travel` 子对象（缺失 = 关闭） */
+export type TravelConfig = {
+  enabled?: boolean
+  /** 第二轮领取时刻（北京时间 HH:MM） */
+  claimTime?: string
+  /** 固定地点 id；null = 每次随机 */
+  locationId?: number | null
+  lastDepartDate?: string | null
+  lastClaimDate?: string | null
 }
 
 export type CheckinCenterSnapshot = {
@@ -223,6 +236,10 @@ export type CheckinStore = {
   keepaliveSaving: boolean
   /** 保活模型链的编辑草稿：null = 跟随后端值（逗号分隔的一行文本） */
   keepaliveDraft: string | null
+  /** 旅行领取时刻的编辑草稿：null = 跟随后端值 */
+  travelClaimDraft: string | null
+  /** 旅行地点的编辑草稿：null = 跟随后端值（空串 = 随机） */
+  travelLocationDraft: string | null
   /** 单账号签到在途（行内按钮的去重闸） */
   signing: ReadonlySet<string>
   /** 新手任务的按账号缓存（Loomy / 小浣熊） */
@@ -242,6 +259,8 @@ let store: CheckinStore = {
   autoTimeDraft: null,
   keepaliveSaving: false,
   keepaliveDraft: null,
+  travelClaimDraft: null,
+  travelLocationDraft: null,
   signing: new Set<string>(),
   onboarding: new Map<string, OnboardingCache>(),
   travel: {},
@@ -530,6 +549,52 @@ export async function toggleAutoProvider(optionId: string, checked: boolean): Pr
   // 顺序取 providerOptions 的注册顺序（与后端落盘口径一致）
   const providers = options.map(option => option.id).filter(id => picked.has(id))
   await saveAutoCheckin({ providers }, t('签到提供商'))
+}
+
+/* ─── 派猫猫旅行设置（WorkBuddy 国内版）─── */
+
+/** 旅行总开关（提交 `travel.enabled`） */
+export async function setTravelEnabled(enabled: boolean): Promise<void> {
+  await saveAutoCheckin({ travel: { enabled } }, t('派猫猫旅行开关'))
+}
+
+/** 旅行领取时刻的编辑草稿（输入过程；提交在 blur / 回车时走 submitTravelClaimTime） */
+export function setTravelClaimDraft(value: string): void {
+  patch({ travelClaimDraft: value })
+}
+
+/** 旅行领取时刻提交（失焦 / 回车）：格式由后端校验，错误原样吐回 */
+export async function submitTravelClaimTime(value: string): Promise<void> {
+  const time = value.trim()
+  if (!time || getCheckinStore().autoSaving) return
+  await saveAutoCheckin({ travel: { claimTime: time } }, t('旅行领取时刻'))
+  patch({ travelClaimDraft: null })
+}
+
+/** 旅行地点的编辑草稿（输入过程；提交在 blur / 回车时走 submitTravelLocation） */
+export function setTravelLocationDraft(value: string): void {
+  patch({ travelLocationDraft: value })
+}
+
+/**
+ * 旅行地点提交（失焦 / 回车）：空 = 随机（null），否则必须是正整数 id。
+ * 后端只接受数字或 null（`travel_patch_from_payload`），非数字在这里先拦。
+ */
+export async function submitTravelLocation(value: string): Promise<void> {
+  const draft = value.trim()
+  if (getCheckinStore().autoSaving) return
+  if (!draft) {
+    await saveAutoCheckin({ travel: { locationId: null } }, t('旅行地点'))
+    patch({ travelLocationDraft: null })
+    return
+  }
+  const id = Number(draft)
+  if (!Number.isInteger(id) || id < 1) {
+    toast(t('地点 id 必须是正整数，留空表示随机'), 'err')
+    return
+  }
+  await saveAutoCheckin({ travel: { locationId: id } }, t('旅行地点'))
+  patch({ travelLocationDraft: null })
 }
 
 /** 快照里只换 auto 段（保存响应是新状态，其余快照原样保留） */

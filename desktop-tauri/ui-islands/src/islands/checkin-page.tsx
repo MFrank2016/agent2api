@@ -9,7 +9,8 @@ import { claimedPlanIdsToday, welfareDoneTitle, welfareStateOf, welfareTodoTitle
 import {
   claimOnboarding, fetchTravel, getCheckinStore, groupTone, historyLine, loadCheckinCenter,
   nextRunText, onboardingExpanded, queryOnboarding, runAllCheckin, runTravel, saveAutoCheckin,
-  setAutoTimeDraft, setKeepaliveDraft, signSingleAccount, submitAutoTime,
+  setAutoTimeDraft, setKeepaliveDraft, setTravelClaimDraft, setTravelEnabled, setTravelLocationDraft,
+  signSingleAccount, submitAutoTime, submitTravelClaimTime, submitTravelLocation,
   submitKeepaliveModels, subscribeCheckinStore, toggleAutoProvider,
   toggleOnboardingExpand, toggleProviderExpand, travelOf,
   type AutoCheckinState, type CheckinProviderGroup, type CheckinStore,
@@ -599,6 +600,11 @@ function AutoCheckinCard({ store }: { store: CheckinStore }) {
   const keepaliveModels = Array.isArray(keepalive?.models) ? keepalive!.models : []
   const defaultModels = Array.isArray(keepalive?.defaultModels) ? keepalive!.defaultModels : []
   const keepaliveText = store.keepaliveDraft ?? keepaliveModels.join(t('、'))
+  // 派猫猫旅行（WorkBuddy 国内版）：总开关 / 领取时刻 / 地点（空 = 随机）
+  const travel = auto?.travel
+  const travelEnabled = travel?.enabled === true
+  const travelClaimTime = store.travelClaimDraft ?? travel?.claimTime ?? ''
+  const travelLocation = store.travelLocationDraft ?? (travel?.locationId == null ? '' : String(travel.locationId))
   return (
     <section className='panel'>
       <div className='panel-head'>
@@ -680,6 +686,56 @@ function AutoCheckinCard({ store }: { store: CheckinStore }) {
             />
           </span>
         </div>
+        <div className='ck-set-line'>
+          <span className='ck-set-k'>{t('派猫猫旅行')}</span>
+          <span className='ck-set-v flex items-center gap-2'>
+            <Switch
+              checked={travelEnabled}
+              disabled={locked}
+              onCheckedChange={next => void setTravelEnabled(next)}
+            />
+            <span className='text-subtle text-xs'>{t('WorkBuddy 国内版：每天派猫猫出门旅行，到达后领积分')}</span>
+          </span>
+        </div>
+        {travelEnabled ? (
+          <>
+            <div className='ck-set-line'>
+              <span className='ck-set-k'>{t('旅行领取时刻')}</span>
+              <span className='ck-set-v flex items-center gap-2'>
+                <Input
+                  type='time'
+                  className='w-[96px] max-w-[96px] font-mono tabular-nums'
+                  value={travelClaimTime}
+                  disabled={locked}
+                  onChange={event => setTravelClaimDraft(event.currentTarget.value)}
+                  onBlur={event => void submitTravelClaimTime(event.currentTarget.value)}
+                  onKeyDown={event => {
+                    if (event.key === 'Enter') event.currentTarget.blur()
+                  }}
+                />
+                <span className='text-subtle text-xs'>{t('主轮派发后到达，届时自动领取积分（北京时间）')}</span>
+              </span>
+            </div>
+            <div className='ck-set-line'>
+              <span className='ck-set-k'>{t('旅行地点')}</span>
+              <span className='ck-set-v flex items-center gap-2'>
+                <Input
+                  type='text'
+                  className='w-[120px] max-w-[120px] font-mono tabular-nums'
+                  placeholder={t('随机')}
+                  value={travelLocation}
+                  disabled={locked}
+                  onChange={event => setTravelLocationDraft(event.currentTarget.value)}
+                  onBlur={event => void submitTravelLocation(event.currentTarget.value)}
+                  onKeyDown={event => {
+                    if (event.key === 'Enter') event.currentTarget.blur()
+                  }}
+                />
+                <span className='text-subtle text-xs'>{t('留空 = 每次随机；填地点 id 固定一处')}</span>
+              </span>
+            </div>
+          </>
+        ) : null}
         <div className='ck-note'>
           {t('「保活模型链」是 WorkBuddy 国际版领日活时用来保活的免费模型，按顺序逐个尝试、 第一个成功即止；清空提交恢复缺省（{defaults}）。 当天去重 + 幂等领取：重复执行只会拿到「已领取」，不会重复加分。 自动签到的设置以这里为准，「定时任务」页只保留间隔型任务。', {
             defaults: defaultModels.join(t('、')),
