@@ -375,6 +375,128 @@ function WebLoginSection({
   )
 }
 
+/* ─── 纯浏览器面板的「粘贴回调地址」网页登录（LobsterAI）─── */
+
+/**
+ * 手工回调登录：面板跑在**普通浏览器**里 —— 既没有壳侧桥
+ * （`window.workbuddyDesktop.startLogin`），远端浏览器也访问不到网关自己的
+ * loopback `http://127.0.0.1:<port>/auth/callback`（那指的是用户自己的机器），
+ * 于是登录任务永远停在 pending。这里改成「打开授权页 → 浏览器里完成短信 +
+ * 滑块 → 把跳转后的完整地址粘回来 → 完成登录」。
+ *
+ * 与 WebLoginSection 的差别：那条链把发起与等待交给壳侧引擎（web-login.js +
+ * `startLogin`），浏览器面板里不存在；这条链**只用同源 fetch** 直连
+ * `/api/session/login/{start,callback}`，凭证靠浏览器自带的同源会话 cookie
+ * （与 checkin-state / sms-login 的直连同款）。
+ *
+ * 只在配置了 `webLogin.manualCallback` 的家渲染（当前只有 LobsterAI）。
+ */
+function ManualCallbackSection({
+  config,
+  visible,
+}: {
+  config: ProviderConfig
+  visible: boolean
+}): React.ReactElement | null {
+  const web = config.webLogin
+  const prefix = config.provider
+  const inputId = `${prefix}-callback-url-input`
+  const [opening, setOpening] = React.useState(false)
+  const [submitting, setSubmitting] = React.useState(false)
+  const [hint, setHint] = React.useState('')
+  // 发起登录时后端给的 state：提交回调时原样带回（后端据此找到这次的登录任务）
+  const stateRef = React.useRef('')
+
+  if (!web) return null
+
+  /** 同源 POST：面板会话靠 `credentials: 'same-origin'` 的 cookie 带上 */
+  async function postJson(path: string, payload: unknown): Promise<Record<string, unknown>> {
+    const response = await fetch(path, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    const body = (await response.json().catch(() => null)) as
+      | { success?: boolean; data?: unknown; error?: string }
+      | null
+    if (!response.ok || !body?.success) {
+      throw new Error(body?.error || t('请求失败（HTTP {status}）', { status: response.status }))
+    }
+    return (body.data ?? {}) as Record<string, unknown>
+  }
+
+  async function openAuthPage(): Promise<void> {
+    if (opening) return
+    setOpening(true)
+    setHint('')
+    try {
+      const data = await postJson('/api/session/login/start', { provider: prefix, mode: 'external' })
+      const authUrl = typeof data.authUrl === 'string' ? data.authUrl : ''
+      stateRef.current = typeof data.state === 'string' ? data.state : ''
+      if (!authUrl) throw new Error(t('后端未返回授权地址，请重试'))
+      window.open(authUrl, '_blank')
+      setHint(t('已在新标签页打开授权页；登录后把跳转到的完整地址粘贴到下方'))
+    } catch (error) {
+      toast(t('打开授权页失败：{reason}', { reason: describeError(error) }), 'err')
+    } finally {
+      setOpening(false)
+    }
+  }
+
+  async function finish(): Promise<void> {
+    if (submitting) return
+    const callbackUrl = readField(inputId)
+    if (!callbackUrl) {
+      toast(t('请先粘贴浏览器跳转后的完整地址'), 'err')
+      return
+    }
+    // 客户端先挡一次：粘错（没带 code）时不打后端，直接给一句人话提示
+    if (!callbackUrl.includes('code=')) {
+      toast(t('粘贴的地址里没有 code 参数，请确认复制的是授权完成后的回调地址'), 'err')
+      return
+    }
+    setSubmitting(true)
+    setHint('')
+    try {
+      await postJson('/api/session/login/callback', { state: stateRef.current, callbackUrl })
+      clearFields([inputId])
+      await afterAdd('', config.label)
+    } catch (error) {
+      toast(t('登录失败：{reason}', { reason: describeError(error) }), 'err')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <DialogSection hidden={!visible}>
+      <h3>{t('网页登录')}</h3>
+      <Note html={web.noteHtml} text={web.hint} />
+      <div className='field-row'>
+        <Button id={`${prefix}-web-open`} onClick={() => { void openAuthPage() }} disabled={opening}>
+          {web.button}
+        </Button>
+      </div>
+      <div className='field-row stack'>
+        <label htmlFor={inputId}>{t('把浏览器跳转后的完整地址粘贴到这里')}</label>
+        <Textarea
+          id={inputId}
+          rows={3}
+          placeholder='http://127.0.0.1:3065/auth/callback?code=…&state=…'
+          {...draftProps(inputId)}
+        />
+      </div>
+      <div className='field-row'>
+        <Button id={`${prefix}-web-finish`} onClick={() => { void finish() }} disabled={submitting}>
+          {submitting ? web.busyText || t('登录中…') : t('完成登录')}
+        </Button>
+        <span className='detail' id={`${prefix}-web-hint`}>{hint}</span>
+      </div>
+    </DialogSection>
+  )
+}
+
 /* ─── 手机验证码登录（sms-login.js）─────────────── */
 
 /**
@@ -613,13 +735,17 @@ export function ProviderBlock({
         visible={effective === 'oauth'}
       />
       <SmsSection config={config} visible={effective === 'sms'} />
-      <WebLoginSection
-        config={config}
-        mode={webMode}
-        onModeChange={setWebMode}
-        region={region}
-        visible={effective === 'web'}
-      />
+      {config.webLogin?.manualCallback ? (
+        <ManualCallbackSection config={config} visible={effective === 'web'} />
+      ) : (
+        <WebLoginSection
+          config={config}
+          mode={webMode}
+          onModeChange={setWebMode}
+          region={region}
+          visible={effective === 'web'}
+        />
+      )}
       <ManualSection config={config} region={region} visible={effective === 'manual'} />
       <DesktopSection config={config} visible={effective === 'desktop'} />
     </div>

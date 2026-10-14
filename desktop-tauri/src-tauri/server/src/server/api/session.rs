@@ -345,6 +345,10 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
     // 的 `/auth/callback`（见 `core::login::lobsterai`）。响应形状与另外几条登录链
     // 一致（`{state, authUrl, edition, provider}`），前端不需要新分支。
     if kind == crate::server::core::providers::ProviderKind::LobsterAi {
+        // redirect_uri 用进程级 loopback（`http://127.0.0.1:<port>/auth/callback`）：
+        // 面板在普通浏览器里跑，远端用户访问不到这个 loopback —— 浏览器完成授权后跳到
+        // 它、页面打不开是**预期**的，但地址栏里带着 code/state，用户把它粘回面板的
+        // 「完成登录」即可（前端 ManualCallbackSection，见 add-provider-blocks.tsx）。
         let handle = match state.login().start_lobsterai_login() {
             Ok(handle) => handle,
             Err(error) => return management_error(400, error),
@@ -527,7 +531,7 @@ pub async fn login_cancel(State(state): State<ServerState>, body: Bytes) -> Resp
 /// 而用户其实早就该看到「state 校验失败，请重新发起」。
 pub async fn login_callback(State(state): State<ServerState>, body: Bytes) -> Response {
     let payload = parse_body(&body).unwrap_or(Value::Null);
-    let task_state = payload
+    let mut task_state = payload
         .get("state")
         .and_then(Value::as_str)
         .unwrap_or("")
@@ -541,6 +545,24 @@ pub async fn login_callback(State(state): State<ServerState>, body: Bytes) -> Re
         .to_string();
     if callback_url.is_empty() {
         return management_error(400, "缺少 callbackUrl（登录回调地址）");
+    }
+    // 远程面板只 POST 粘来的整条回调地址（body 不带 state）：从 callbackUrl 的查询串里
+    // 取 `state`，省得前端自己解析。带了 state 时仍以 body 为准（桌面壳那条链原样不变）；
+    // 取不到就留给 submit_login_callback 报「缺少 state」。
+    if task_state.is_empty() {
+        let query = callback_url
+            .split_once('?')
+            .map(|(_, rest)| rest)
+            .unwrap_or("")
+            .split('#')
+            .next()
+            .unwrap_or("");
+        let params: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        if let Some(value) = params.get("state") {
+            task_state = value.clone();
+        }
     }
     match state
         .login()

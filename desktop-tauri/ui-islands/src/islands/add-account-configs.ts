@@ -49,6 +49,15 @@ export type WebLoginConfig = {
   region?: string
   /** 写死的变体选择器（传给壳侧 start_login 的第一个参数） */
   edition?: string
+  /**
+   * 纯浏览器面板专用的「粘贴回调地址」模式（当前只有 LobsterAI）。
+   *
+   * 置 true 时这一家的「网页登录」段不再走壳侧登录窗口（`window.workbuddyDesktop`
+   * 在浏览器面板里根本不存在），而是渲染 ManualCallbackSection：打开授权页 →
+   * 浏览器里完成短信 / 滑块 → 把跳转后的完整地址粘回来 → 完成登录。见
+   * add-provider-blocks.tsx。
+   */
+  manualCallback?: boolean
 }
 
 export type SmsLoginConfig = { noteHtml?: string }
@@ -762,9 +771,11 @@ const NOUS: ProviderConfig = {
  * ── 两条登录来源（与后端 `add_lobsterai_account` 对齐）────────
  * ① **粘贴 accessToken / refreshToken**（常用路径）：这两枚令牌取自桌面端
  *    本机的登录态（本机 sqlite）；refreshToken 可选，填了到期可自动续期。
- * ② **浏览器网页登录**：打开官方登录页，用户在浏览器里完成短信 + 滑块验证，
- *    网关的 loopback 回调完成登录并落账号 —— 与 CatPaw / Accio 同一种
- *    「回调落本机」的形态（内嵌窗口与系统浏览器两种打开方式都走得通）。
+ * ② **浏览器网页登录（手工粘贴回调地址）**：打开官方登录页，用户在浏览器里完成
+ *    短信 + 滑块验证后，浏览器会跳到网关自己的 loopback 回调（远端用户打不开，
+ *    但地址栏带着 code/state）—— 把那条地址粘回面板的「完成登录」即可。走这条路
+ *    是因为面板跑在普通浏览器里、没有壳侧桥，也够不到 loopback（见下面 webLogin
+ *    里的说明与前端 ManualCallbackSection）。
  *
  * ── 没有「导入桌面端登录态」────────────────────────────────
  * 登录态在桌面端自己的 sqlite 里，没有 `auth.json` 那种稳定可读的文件形态
@@ -776,13 +787,17 @@ const LOBSTERAI: ProviderConfig = {
   label: 'LobsterAI',
   desktop: false,
   webLogin: {
-    noteHtml: t('打开官方登录页并用你的 LobsterAI 账号登录：在浏览器里完成短信与滑块验证后，网关的 loopback 回调会自动把账号加入列表。'),
-    button: t('打开 LobsterAI 网页登录'),
+    // ── 为什么是「粘贴回调地址」而不是壳侧登录窗口 ──────────────
+    // 面板跑在**普通浏览器**里：既没有 `window.workbuddyDesktop` 这套壳侧桥
+    // （web-login.js 的 startLogin 在这里不存在），远端浏览器也访问不到网关
+    // 自己的 `http://127.0.0.1:<port>/auth/callback`（那指的是用户自己的机器）。
+    // 因此走「打开授权页 → 浏览器里完成短信 + 滑块 → 把跳转后的完整地址粘回来」
+    // 这条路（前端 ManualCallbackSection，只用同源 fetch）。
+    manualCallback: true,
+    noteHtml: t('点「打开 LobsterAI 授权页」会在新标签页打开官方登录页：在浏览器里完成<b>短信 + 滑块</b>验证后，页面会跳到本机地址（<code>http://127.0.0.1:…</code>，打不开是正常的）——把<b>地址栏里的完整地址</b>复制回来，粘贴到下方再点「完成登录」即可。'),
+    button: t('打开 LobsterAI 授权页'),
+    hint: t('浏览器里完成登录后，把跳转后的完整地址粘贴到下方输入框'),
     busyText: t('等待 LobsterAI 登录完成…'),
-    modes: [
-      { value: 'embedded', label: t('内嵌窗口（推荐）'), hint: t('内嵌窗口打开；完成后自动加入列表，关窗即取消等待') },
-      { value: 'external', label: t('系统浏览器'), hint: t('系统浏览器打开（复用已登录账号）；完成后自动加入列表') },
-    ],
   },
   manualTitle: t('粘贴 accessToken / refreshToken'),
   manualNote: t('accessToken 必填，refreshToken 可选（填了到期可自动续期）。两者都能从桌面端本机登录态里取到；也可以直接用上方的「网页登录」。'),
