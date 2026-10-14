@@ -58,6 +58,9 @@ pub mod checkin_schedules;
 pub mod cline_headers;
 pub mod codearts_welfare;
 pub mod config_api;
+// WorkBuddy 成长任务（查询 / 执行 / 开学季 / 猫猫旅行）：从参考项目
+// workbuddy2api 的 task_runner.py 移植，见该文件模块头
+pub mod growth;
 // 网关面（`/v1/*`）跨域访问开关：`GET/PUT /api/cors`（与 `/api/sanitize`
 // 同形的单开关端点，见该文件模块头）
 pub mod cors;
@@ -74,11 +77,16 @@ pub mod health;
 // `core::import_ccswitch`）
 pub mod import_sources;
 // 流式请求「首字节等待」的 SSE 保活（转发超过宽限期仍没就绪时先回保活流，
-// 见该文件模块头）—— 与 disconnect_guard 同属 handler 生命周期上的兜底件
+// 见该文件模块头）—— 与 disconnect_guard 同属 handler 生命周期上的兜底件；
+// 同一文件还承载「保活换行丢弃开关」（`/api/keepalive-strip`，与 `/api/sanitize`、
+// `/api/debug` 同形的单开关端点，理由见该模块头）。
 pub mod keepalive;
 pub mod keys_api;
 pub mod logs_api;
 pub mod model_manage;
+// models.dev 模型元数据（开关 / 状态 / 立即刷新）：与「逐家上游目录」的
+// /api/models/refresh 分开，理由见该文件模块头
+pub mod model_meta;
 // 模型测试（模型管理页操作列的「测试」）：挂管理面、走真实转发链路，
 // 只把候选收窄到「这一家 × 这一个账号」并把流量标成测试，见该文件模块头
 pub mod model_test;
@@ -102,6 +110,7 @@ pub mod scheduled_tasks;
 pub mod session;
 pub mod stats_api;
 pub mod storage_api;
+pub mod subscriptions;
 pub mod timeouts_api;
 // 派猫猫旅行（CN WorkBuddy 运营活动）：per-account 只读状态 + 手动跑一次，
 // 见该文件模块头
