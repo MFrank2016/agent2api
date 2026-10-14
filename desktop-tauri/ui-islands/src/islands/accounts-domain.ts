@@ -208,6 +208,14 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   //   由网关基址 + app key 派生），不是任何凭据本身：面板上显示 `modelAppKey`
   //   会把网关 key 露在界面上（`identifierOf` 读的是字段**值**，不只是标签）。
   officeace: { usage: true, edition: false, identifier: 'id', expiry: 'expiresAt' },
+  // Nous（Nous Research Portal）。各位各有出处：
+  // `usage: false` —— 本家没有余额 / 积分查询（后端不暴露余额读数），因此不渲染
+  //   余额按钮、也不参与批量查询（`supportsUsage` 直接返回 false）。
+  // `edition: false` —— 单一入口（OAuth 设备码登录），没有国际版 / 地区概念。
+  // `identifier: 'userId'` —— 账号标识落在 userId（与 Qoder / ZCode / Cline 等
+  //   设备码家同一口径）。
+  // `expiry: 'expiresAt'` —— 设备码换回的 OAuth 访问令牌带过期时间。
+  nous: { usage: false, edition: false, identifier: 'userId', expiry: 'expiresAt' },
 }
 
 /**

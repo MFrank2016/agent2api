@@ -316,6 +316,30 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
         return ok_json(json!({ "state": task_state, "authUrl": auth_url,
             "edition": task_edition, "provider": "officeace" }));
     }
+    // Nous Research Portal：**服务端中介的设备码登录**（与 ZCode / OfficeAce
+    // 同一形态，见 `core::login::nous` 的模块头）—— 同步向 Portal 申请设备码拿到
+    // 授权地址，用户在浏览器里确认，后台任务**轮询令牌端点**换令牌（再铸 agent key）。
+    // **不需要壳侧开回调监听**。响应形状与另外几条登录链一致
+    // （`{state, authUrl, edition, provider}`），前端不需要新分支。
+    if kind == crate::server::core::providers::ProviderKind::Nous {
+        let handle = match state.login().start_nous_login() {
+            Ok(handle) => handle,
+            Err(error) => return management_error(400, error),
+        };
+        let (task_state, auth_url, task_edition) = match state
+            .login()
+            .wait_for_auth_url(&handle, Duration::from_millis(AUTH_URL_WAIT_MS))
+            .await
+        {
+            Ok(values) => values,
+            Err(error) => {
+                logging::log("[Login]", &format!("❌ 发起 Nous 登录失败: {error}"));
+                return management_error(502, error);
+            }
+        };
+        return ok_json(json!({ "state": task_state, "authUrl": auth_url,
+            "edition": task_edition, "provider": "nous" }));
+    }
     // Cline：**设备授权登录**（WorkOS RFC 8628）。形态上介于「网页登录」与
     // 「Qoder 设备授权」之间：同步问上游要 user_code 与授权页地址（一次 POST），
     // 把地址交给界面打开；用户确认后由后台任务轮询换令牌。

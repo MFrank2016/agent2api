@@ -136,6 +136,11 @@ pub mod loomy;
 /// 含工具自动批准与提问自动应答）全部已接通；`is_stateful` 为 true，
 /// 见 `monkeycode/mod.rs` 的模块头。
 pub mod monkeycode;
+/// Nous Research Portal（`portal.nousresearch.com`）：无状态 OpenAI 兼容转发
+/// ＋ Portal OAuth 设备码登录 ＋ **匿名免费档**（无账号时透明使用，
+/// `allows_anonymous_default_session`）。账号用 agent key 打付费推理面、
+/// 匿名用 JWT 打免费面（只认 `nous/welcome`），见 `nous/mod.rs` 的模块头。
+pub mod nous;
 pub mod officeace;
 pub mod onboarding_memory;
 /// **本地就绪闸门**：一条通道在「还没出本机就注定发不出去」时，让选路绕开它
@@ -458,6 +463,24 @@ pub enum ProviderKind {
     /// 不需要 CodeArts 那种会话闸门。凭据两层：网关 Basic（不过期，转发用）
     /// 与控制面临时 AK/SK（2 小时，额度/签到用）。
     OfficeAce,
+    /// Nous Research Portal（`portal.nousresearch.com`）。适配实现在 `nous/`：
+    /// 账号管理（**Portal OAuth 设备码登录**）＋ 推理转发 ＋ **匿名免费档**。
+    ///
+    /// ── 上游长什么样（规格见 `nous/mod.rs` 的模块头）───────────
+    /// 一条身份链（Portal OAuth：设备码 → access/refresh token → 铸 agent key）
+    /// 与两个推理面：账号用 agent key 打付费面 `inference-api.nousresearch.com`，
+    /// **无账号时透明地**用匿名 JWT 打免费面 `welcome-api.nousresearch.com`
+    /// （只认 `nous/welcome`）—— 与官方 `hermes-agent` 一致。
+    ///
+    /// ── 为什么是**一家**（没有地区伴生）───────────────────
+    /// 上游没有地区参数，付费 / 免费是**两个推理面**而不是两个地区。
+    ///
+    /// ── 转发路线（无状态）─────────────────────────────
+    /// 推理面就是 OpenAI `chat/completions`，一次请求一次回答：
+    /// `build_chat_request` 一条路、`is_stateful` 恒 false，账号轮换 / 冷却 /
+    /// 重试 / usage / 取消全部由编排层承担。匿名旁路由
+    /// [`ProviderAdapter::allows_anonymous_default_session`] 打开（见适配器）。
+    Nous,
 }
 
 /// 一个提供商的静态元数据。
@@ -549,6 +572,9 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // glm-5.3 / deepseek-v4-flash-0731 / kimi-k2.6 …），注册表顺序决定目录
     // 合并时同名模型先归谁家 —— 放在末尾即「同名时优先已有各家」。
     ProviderMeta { id: "officeace", label: "OfficeAce 果办" },
+    // Nous Research Portal：单一入口（Portal OAuth 设备码登录），没有地区伴生
+    // （付费 / 免费是两个推理面而不是两个地区）。排末尾（新家按约定追加在末尾）。
+    ProviderMeta { id: "nous", label: "Nous" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -632,6 +658,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "commandcode" => Some(ProviderKind::CommandCode),
         "antigravity" => Some(ProviderKind::Antigravity),
         "officeace" => Some(ProviderKind::OfficeAce),
+        "nous" => Some(ProviderKind::Nous),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -673,6 +700,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::CommandCode => "commandcode",
         ProviderKind::Antigravity => "antigravity",
         ProviderKind::OfficeAce => "officeace",
+        ProviderKind::Nous => "nous",
     }
 }
 

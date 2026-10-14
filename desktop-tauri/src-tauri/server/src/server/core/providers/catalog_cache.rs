@@ -106,6 +106,9 @@ pub const SCOPE_ANTIGRAVITY: &str = "antigravity";
 /// OfficeAce（华为云果办 / OfficeClaw）的模型目录缓存槽
 pub const SCOPE_OFFICEACE: &str = "officeace";
 
+/// Nous（`GET {base}/models`；单一推理面、无地区之分，单格即可）
+pub const SCOPE_NOUS: &str = "nous";
+
 /// 全部 scope（事实来源：`cached_scopes` 按它遍历；新增一家时加在这里）。
 pub const ALL_SCOPES: &[&str] = &[
     SCOPE_WORKBUDDY,
@@ -126,6 +129,7 @@ pub const ALL_SCOPES: &[&str] = &[
     SCOPE_MONKEYCODE_INTL,
     SCOPE_COMMANDCODE,
     SCOPE_ANTIGRAVITY,
+    SCOPE_NOUS,
 ];
 
 /// 一份清单缓存

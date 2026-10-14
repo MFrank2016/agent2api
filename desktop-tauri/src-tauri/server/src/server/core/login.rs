@@ -31,6 +31,7 @@ mod accio;
 mod autoclaw;
 mod catpaw;
 pub mod codearts;
+mod nous;
 mod qoder;
 mod officeace;
 mod trae;

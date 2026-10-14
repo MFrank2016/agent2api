@@ -722,6 +722,40 @@ const OFFICEACE: ProviderConfig = {
   ],
 }
 
+/**
+ * Nous（Nous Research Portal）：一家一个 provider，没有地区之分。
+ *
+ * ── 登录方式（OAuth 设备码）─────────────────────────────────
+ * 服务端发起设备授权，返回 user_code 与 verification_uri：用户在浏览器里打开
+ * 授权地址、输入码确认，网关在后台轮询直到取回凭证 —— 与 Qoder / ZCode / Cline
+ * 同一种交互形态（授权结果由服务端记录、没有回调落到本机，因此内嵌窗口与系统
+ * 浏览器两种打开方式都走得通）。
+ *
+ * ── 后端另有一条匿名免费档，界面不做 ────────────────────────
+ * 匿名免费档不需要账号，因此这里只给「账号登录」这一张卡。
+ *
+ * ── 没有「导入桌面端登录态」────────────────────────────────
+ * 本家没有可读的客户端登录态文件（与 Accio / ZCode / Loomy 同一处境），
+ * 显式 `desktop: false`，免得桌面壳里多出一个选了之后什么都没有的分段。
+ */
+const NOUS: ProviderConfig = {
+  provider: 'nous',
+  label: 'Nous',
+  desktop: false,
+  webLogin: {
+    noteHtml: t('打开官方授权页完成设备码授权：在浏览器里用你的 Nous 账号登录并确认授权码，网关在后台自动轮询取回凭证并加入账号列表。'),
+    button: t('打开 Nous 授权页'),
+    busyText: t('等待 Nous 授权完成…'),
+    modes: [
+      { value: 'embedded', label: t('内嵌窗口（推荐）'), hint: t('内嵌窗口打开；完成后自动加入列表，关窗即取消等待') },
+      { value: 'external', label: t('系统浏览器'), hint: t('系统浏览器打开（复用已登录账号）；完成后自动加入列表') },
+    ],
+  },
+  // 只有设备码登录这一条入口，没有手填凭证的段落 —— 空数组让「填写凭证」整段
+  // 收起（判据见 methodsOf），不是「有手填段但没有字段」。
+  fields: [],
+}
+
 /** 内置家的表单块，顺序与旧 ADD_FORMS 一致（只影响 DOM 里的块顺序，不影响界面） */
 export const BUILTIN_CONFIGS: ProviderConfig[] = [
   RACCOON,
@@ -763,6 +797,9 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   // OfficeAce（华为云果办 / OfficeClaw）：浏览器登录（自助 OAuth）或粘贴网关
   //凭据，排在末尾（与后端注册表 PROVIDERS 的排列一致，2026-10 接入）
   OFFICEACE,
+  // Nous（Nous Research Portal）：OAuth 设备码登录，排在末尾（与后端注册表
+  // PROVIDERS 的追加顺序一致 —— 后到居后，新增的家加在表尾）。
+  NOUS,
 ]
 
 /** WorkBuddy 的块 id（结构特殊，单独一个组件） */
@@ -845,6 +882,9 @@ export function methodsOf(config: ProviderConfig, region: string): MethodId[] {
     if (method.id === 'sms') return Boolean(config.smsLogin)
     if (method.id === 'web') return Boolean(config.webLogin) && (!config.webLogin?.region || region === config.webLogin.region)
     if (method.id === 'desktop') return desktopImportAvailable(config)
+    // 手填段只在有字段时露出：nous 这类「只有设备码登录」的家没有手填入口，
+    // 给它一个空表单（点了必然失败）不如整段收起。
+    if (method.id === 'manual') return config.fields.length > 0
     return true
   }).map(method => method.id)
 }

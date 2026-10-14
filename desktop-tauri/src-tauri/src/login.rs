@@ -661,9 +661,12 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // 见 `providers::officeace::oauth` 的模块头），所以这里没有 CodeArts 那种
         // loopback 回调要放行；但「不设限」仍是必须显式写出的选择（落进默认分支
         // 会拿到 WorkBuddy 的白名单 → 窗口白屏）。
+        // Nous（Nous Research Portal）同样不设限：OAuth 设备码流程把用户带到官方
+        // 的 verification_uri，主机由上游给、不可穷举（与 Qoder / ZCode / Cline 同一
+        // 情形）；落进默认分支会拿到 WorkBuddy 的白名单 → 授权窗口白屏。
         "catpaw" | "qoder" | "qoder-intl" | "cline-free" | "cline-pass" | "autoclaw"
         | "autoclaw-intl" | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae"
-        | "kuku" | "antigravity" | "officeace" => None,
+        | "kuku" | "antigravity" | "officeace" | "nous" => None,
         // WorkBuddy 的两个地区共用这一张表（表里 `workbuddy.ai` 那一行就是国际站
         // 的登录域）。**显式列出**而不是靠下面的默认分支：上面那条警告要求
         // 「新 provider 落到默认分支」必须是有意的选择，写出来才看得出是选过的
@@ -871,6 +874,10 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // 与轮询 —— 与 ZCode / CodeArts 同一条路。它的授权码由网关**轮询云端**
         // 取回（云端回调页不往本机跳），所以窗口最后停在云端页上也不影响登录判定。
         "officeace" => Ok("officeace"),
+        // Nous（Nous Research Portal）：OAuth 设备码 —— 授权地址（verification_uri）
+        // 由**后端适配器**问上游拿，壳侧只负责开窗口与轮询，与 Qoder / ZCode / Cline
+        // 的设备授权同一条路（授权结果由服务端记录，不依赖窗口捕获回调）。
+        "nous" => Ok("nous"),
         other => Err(format!("不支持网页登录的提供商：{other}")),
     }
 }
@@ -1184,6 +1191,8 @@ pub async fn start(
         // OfficeAce 只有一家（自助 OAuth 一条链，没有地区/版本概念），品牌名里
         // 不需要地区
         "officeace" => "OfficeAce 果办",
+        // Nous 只有一家（OAuth 设备码一条链，没有地区/版本概念），品牌名里不需要地区
+        "nous" => "Nous",
         _ => "WorkBuddy",
     };
     // 窗口标题：Cline 两家的池、ZCode 两家的地区、CodeArts / Trae / OfficeAce
@@ -1192,7 +1201,7 @@ pub async fn start(
     let title = if matches!(
         provider,
         "cline-free" | "cline-pass" | "zcode" | "zcode-intl" | "codearts" | "trae" | "qoder"
-        | "qoder-intl" | "antigravity" | "officeace"
+        | "qoder-intl" | "antigravity" | "officeace" | "nous"
     ) {
         format!("登录 {provider_label} 账号")
     } else {

@@ -95,6 +95,10 @@ export const PROVIDER_ICONS: Record<string, string> = {
   // （`res-static.hc-cdn.cn/.../OfficeAce/新图标.png`，176×176 RGBA，
   // 归一成 256×256 入库 —— 与系统里显示的应用图标为同一形象）
   officeace: 'assets/providers/officeace.png',
+  // Nous（Nous Research Portal）：暂无专用 logo 资产，**复用**一张现成的中性图标
+  // （opencode-go.png —— 只是一个描边圆角方块，没有字形/吉祥物，最不误导），
+  // 等官方 logo 入库后换成 assets/providers/nous.png。
+  nous: 'assets/providers/opencode-go.png',
 }
 
 /**
@@ -103,7 +107,7 @@ export const PROVIDER_ICONS: Record<string, string> = {
  * 账号表徽章、模型管理页都不跟着变；判据是「转发通道刚上线」，
  * 观察期结束后从这张表里删掉即可。
  */
-const BETA_PROVIDERS = new Set(['monkeycode', 'monkeycode-intl', 'commandcode', 'antigravity'])
+const BETA_PROVIDERS = new Set(['monkeycode', 'monkeycode-intl', 'commandcode', 'antigravity', 'nous'])
 
 type CardItem = {
   id: string

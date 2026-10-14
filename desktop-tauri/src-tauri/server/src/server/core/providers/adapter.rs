@@ -1143,6 +1143,9 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // （Basic 网关凭据；账号管理走手工导入 / 自助 OAuth，见
         // `officeace/mod.rs` 的模块头）
         ProviderKind::OfficeAce => &super::officeace::adapter::OFFICEACE_ADAPTER,
+        // Nous Research Portal：无状态 OpenAI 兼容转发 + Portal 设备码登录 +
+        // 匿名免费档（无账号时用匿名 JWT 打免费面，见 `nous/mod.rs` 的模块头）
+        ProviderKind::Nous => &super::nous::NOUS_ADAPTER,
     }
 }
 
@@ -1238,6 +1241,9 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // OfficeAce：远程目录（`GET {网关}/v1/models`）+ 有转发能力，
         // 进本列表才会被后台目录刷新调度
         ProviderKind::OfficeAce,
+        // Nous：有转发能力（含匿名免费档）与远程目录（`GET {base}/models`），
+        // 进本列表才会被后台目录刷新调度
+        ProviderKind::Nous,
     ]
 }
 

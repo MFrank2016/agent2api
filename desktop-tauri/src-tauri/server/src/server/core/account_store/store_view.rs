@@ -303,6 +303,12 @@ impl AccountStore {
             // 之类与它无关的空字段，而「刷新 Token」按钮靠的 hasRefreshToken
             // 只是**恰好**在兜底形状里也算得出来 —— 那不是设计，是巧合。
             self.to_officeace_public_account(record)
+        } else if record.provider() == super::NOUS_PROVIDER_ID {
+            // Nous Research Portal：单一入口（Portal OAuth 设备码登录），公开形态
+            // 去掉令牌 / agent key 本体、只留尾号与三个存在性标记（见
+            // `nous_accounts.rs`）。漏这一支会掉进 workbuddy 兜底形状，多出一批
+            // 与本家无关的空字段。
+            self.to_nous_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)

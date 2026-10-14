@@ -614,6 +614,35 @@ impl AccountStore {
                 }
             }
         }
+        // ── Nous 的会话附加键（`nous::adapter` / `nous::credentials` 用）───
+        // 它的转发凭证是**记录顶层的 agent key**（不是 `auth.accessToken` 那个
+        // Portal 令牌），推理基址也随账号记录走（付费面）。会话是转发链交给适配器
+        // 的唯一形态（`build_chat_request` 的 `account` 参数），所以这些字段必须
+        // 随会话出来 —— 否则 `nous::credentials::from_record` 读不到 agentKey，
+        // 会把账号误判成匿名免费档、把付费请求打到免费面。
+        //
+        // `nousAccount: true` 是**账号 / 匿名**的判别标记：匿名最小会话
+        // （`provider_loop` 现造的 `{auth:{accessToken}}`）没有它，因此本家只在
+        // 账号会话上注入。与 ZCode / OfficeAce 那两支同一形态（本家才注入，
+        // 别家逐字不变）；空值不写。
+        if record.provider() == super::NOUS_PROVIDER_ID {
+            if let Some(object) = session.as_object_mut() {
+                object.insert("nousAccount".to_string(), Value::Bool(true));
+                for key in ["agentKey", "inferenceBaseUrl"] {
+                    let value = record.get(key).and_then(Value::as_str).unwrap_or("");
+                    if !value.trim().is_empty() {
+                        object.insert(key.to_string(), Value::String(value.to_string()));
+                    }
+                }
+                if let Some(expires) = record
+                    .get("agentKeyExpiresAt")
+                    .and_then(Value::as_i64)
+                    .filter(|value| *value > 0)
+                {
+                    object.insert("agentKeyExpiresAt".to_string(), Value::from(expires));
+                }
+            }
+        }
         session
     }
 

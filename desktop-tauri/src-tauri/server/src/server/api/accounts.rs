@@ -823,6 +823,23 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
             // 面板传来的名字是用户自己打的 ⇒ 标 custom（此后续期/重登不改它）
             store.add_officeace_account(&payload, import_name, true)
         }
+        // Nous Research Portal：**Portal OAuth 设备码登录**（见 `core::login::nous`）
+        // 是主入口；这里处理「填写凭证」——用户可直接粘贴 Portal 的
+        // accessToken / refreshToken（agent key 缺了转发时按需铸）。不调上游
+        // （与 OfficeAce 同口径）：凭据是登录换来的，添加时没有可交换的授权码；
+        // 目录与连通性由刷新链路验。
+        //
+        // `importDesktop` 不提供：本家的登录态是 Portal OAuth 令牌，没有客户端
+        // 「auth.json」那种可读登录态（与 Loomy / MonkeyCode 同一处境）。
+        Some(crate::server::core::providers::ProviderKind::Nous) => {
+            if import_desktop {
+                return management_error(
+                    400,
+                    "Nous 不支持导入桌面端登录态，请用「Nous Portal 登录」或粘贴 Portal 令牌添加账号",
+                );
+            }
+            store.add_nous_account(&payload, import_name, "manual")
+        }
         // WorkBuddy 系的两家（国内版 / 国际版）：同一套凭证形态与落账号路径，
         // 差别只有归属 —— provider id 自己就是归属（拆家后不再从 payload 里的
         // `edition` 反推：那是账号的属性，而落哪一家是身份问题）。
@@ -1179,6 +1196,13 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
     // （`refresh_account` 的文档里把这条列为「加带 refreshToken 的家时必须一起加」）。
     if state.store().antigravity_account_record(&id).is_some() {
         return refresh_provider_account(state, &id, ProviderKind::Antigravity).await;
+    }
+    // Nous：**有**可刷新的 refreshToken（Portal OAuth），走自家适配器的强制刷新
+    // （`grant_type=refresh_token` 打 Portal token 端点 + 重铸 agent key）。
+    // 这条分派不能省：漏了就落到下面的 workbuddy 兜底链路，用户点「刷新 Token」
+    // 收到的是腾讯鉴权端点的错 —— 与 Antigravity / Command Code 漏登记时同一性质。
+    if state.store().nous_account_record(&id).is_some() {
+        return refresh_provider_account(state, &id, ProviderKind::Nous).await;
     }
     // WorkBuddy 系（国内版 / 国际版）的兜底：两条链路都按**账号自己的**
     // endpoint / prefixPath / platform / edition 续期

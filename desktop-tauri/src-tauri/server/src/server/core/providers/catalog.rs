@@ -186,6 +186,12 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             super::officeace::models::remote_refreshed(),
             super::officeace::models::last_refreshed_at(),
         ),
+        // Nous 的清单来自 `GET {base}/models`（Bearer，OpenAI 格式）；单一推理面，
+        // 单格缓存。「有远程内容」才算远程来源（拉不到时是内置兜底清单）。
+        ProviderKind::Nous => (
+            super::nous::models::remote_refreshed(),
+            super::nous::models::last_refreshed_at(),
+        ),
     }
 }
 
