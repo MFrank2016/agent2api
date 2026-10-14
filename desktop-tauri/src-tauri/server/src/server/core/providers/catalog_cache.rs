@@ -109,6 +109,9 @@ pub const SCOPE_OFFICEACE: &str = "officeace";
 /// Nous（`GET {base}/models`；单一推理面、无地区之分，单格即可）
 pub const SCOPE_NOUS: &str = "nous";
 
+/// LobsterAI（有道龙虾；`GET {base}/api/models/available`，单一入口、无地区之分，单格即可）
+pub const SCOPE_LOBSTERAI: &str = "lobsterai";
+
 /// 全部 scope（事实来源：`cached_scopes` 按它遍历；新增一家时加在这里）。
 pub const ALL_SCOPES: &[&str] = &[
     SCOPE_WORKBUDDY,
@@ -130,6 +133,7 @@ pub const ALL_SCOPES: &[&str] = &[
     SCOPE_COMMANDCODE,
     SCOPE_ANTIGRAVITY,
     SCOPE_NOUS,
+    SCOPE_LOBSTERAI,
 ];
 
 /// 一份清单缓存

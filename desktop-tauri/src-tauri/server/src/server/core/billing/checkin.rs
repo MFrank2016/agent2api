@@ -347,6 +347,16 @@ pub async fn checkin_for(
                     .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
         }
+        "lobsterai" => {
+            // LobsterAI（有道龙虾）：三步时序（slot → context → check_in → 回读确认），
+            // 已领取（claimedToday）是幂等成功（`alreadyCompleted`），见
+            // `lobsterai::checkin` 的模块头。
+            let claim =
+                crate::server::core::providers::lobsterai::checkin::claim_daily_checkin(store, &id)
+                    .await
+                    .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
         "codearts" => {
             // CodeArts：当日 ops 福利（每日登录送积分那一组，`Rewards::DailyLogin`
             // ——一次性注册礼归新手福利，不在这里领，见 welfare 的模块头）。

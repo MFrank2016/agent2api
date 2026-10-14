@@ -340,6 +340,22 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
         return ok_json(json!({ "state": task_state, "authUrl": auth_url,
             "edition": task_edition, "provider": "nous" }));
     }
+    // LobsterAI（有道龙虾）：**浏览器 OAuth 授权码 + loopback 回调**（与 Antigravity
+    // 同一形态）—— 授权地址由适配器本地拼（`build_login_url`），回调落在本网关自己
+    // 的 `/auth/callback`（见 `core::login::lobsterai`）。响应形状与另外几条登录链
+    // 一致（`{state, authUrl, edition, provider}`），前端不需要新分支。
+    if kind == crate::server::core::providers::ProviderKind::LobsterAi {
+        let handle = match state.login().start_lobsterai_login() {
+            Ok(handle) => handle,
+            Err(error) => return management_error(400, error),
+        };
+        let task = handle.snapshot();
+        let (Some(task_state), Some(auth_url)) = (task.state, task.auth_url) else {
+            return management_error(500, "LobsterAI 网页登录未能生成 state/授权地址，请重试");
+        };
+        return ok_json(json!({ "state": task_state, "authUrl": auth_url,
+            "edition": task.edition, "provider": "lobsterai" }));
+    }
     // Cline：**设备授权登录**（WorkOS RFC 8628）。形态上介于「网页登录」与
     // 「Qoder 设备授权」之间：同步问上游要 user_code 与授权页地址（一次 POST），
     // 把地址交给界面打开；用户确认后由后台任务轮询换令牌。
@@ -1350,6 +1366,51 @@ fn antigravity_callback_url(code: &str, state: &str) -> String {
     query.append_pair("code", code);
     query.append_pair("state", state);
     format!("http://localhost/oauth-callback?{}", query.finish())
+}
+
+// ─── GET /auth/callback（LobsterAI 浏览器 OAuth 回调）───────
+
+/// LobsterAI 网页登录的 loopback 回调：**浏览器 302 到这里**（门户登录完成后顶层
+/// 导航回我们发起时登记的 redirect_uri，查询串带 code / state）。
+///
+/// 与 Antigravity 那条同款：免鉴权（调用方是用户的浏览器，没有 API Key；安全性由
+/// 本次登录任务生成的一次性 state 承担），收尾转交 `submit_login_callback`。
+pub async fn login_lobsterai_callback(
+    State(state): State<ServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let code = params.get("code").cloned().unwrap_or_default();
+    let task_state = params.get("state").cloned().unwrap_or_default();
+    if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
+        return oauth_callback_page(400, &format!("登录失败：授权被拒绝（{error}）"));
+    }
+    if task_state.trim().is_empty() || code.trim().is_empty() {
+        return oauth_callback_page(400, "登录失败：回调缺少 state 或授权码，请重新发起网页登录。");
+    }
+    let callback_url = lobsterai_callback_url(&code, &task_state);
+    match state
+        .login()
+        .submit_login_callback(&task_state, &callback_url)
+        .await
+    {
+        Ok(crate::server::core::login::LoginCallbackSubmission::Completed(_)) => {
+            oauth_callback_page(200, "登录成功，已返回网关，可以关闭此页面。")
+        }
+        Ok(crate::server::core::login::LoginCallbackSubmission::ContinueTo(_)) => {
+            oauth_callback_page(400, "登录回调仍需继续，请重新发起网页登录。")
+        }
+        Err(error) => {
+            oauth_callback_page(error.status_code, &format!("登录失败：{}", error.message))
+        }
+    }
+}
+
+/// 把 `code` / `state` 还原成标准回调 URL（走 `submit_login_callback` 的解析路径）。
+fn lobsterai_callback_url(code: &str, state: &str) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("code", code);
+    query.append_pair("state", state);
+    format!("http://127.0.0.1/auth/callback?{}", query.finish())
 }
 
 // ─── POST /api/session/refresh ──────────────────────────────

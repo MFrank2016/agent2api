@@ -1146,6 +1146,9 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // Nous Research Portal：无状态 OpenAI 兼容转发 + Portal 设备码登录 +
         // 匿名免费档（无账号时用匿名 JWT 打免费面，见 `nous/mod.rs` 的模块头）
         ProviderKind::Nous => &super::nous::NOUS_ADAPTER,
+        // LobsterAI（有道龙虾）：无状态 SSE 转发 + 令牌续期 + 目录 + 签到 + 余额
+        // + 浏览器 OAuth 登录（见 `lobsterai/mod.rs` 的模块头）
+        ProviderKind::LobsterAi => &super::lobsterai::LOBSTERAI_ADAPTER,
     }
 }
 
@@ -1244,6 +1247,9 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // Nous：有转发能力（含匿名免费档）与远程目录（`GET {base}/models`），
         // 进本列表才会被后台目录刷新调度
         ProviderKind::Nous,
+        // LobsterAI：无状态 SSE 转发 + 远程目录（`GET /api/models/available`），
+        // 进本列表才会被后台目录刷新调度
+        ProviderKind::LobsterAi,
     ]
 }
 

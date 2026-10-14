@@ -756,6 +756,43 @@ const NOUS: ProviderConfig = {
   fields: [],
 }
 
+/**
+ * LobsterAI（有道龙虾，NetEase Youdao）：一家一个 provider，没有地区之分。
+ *
+ * ── 两条登录来源（与后端 `add_lobsterai_account` 对齐）────────
+ * ① **粘贴 accessToken / refreshToken**（常用路径）：这两枚令牌取自桌面端
+ *    本机的登录态（本机 sqlite）；refreshToken 可选，填了到期可自动续期。
+ * ② **浏览器网页登录**：打开官方登录页，用户在浏览器里完成短信 + 滑块验证，
+ *    网关的 loopback 回调完成登录并落账号 —— 与 CatPaw / Accio 同一种
+ *    「回调落本机」的形态（内嵌窗口与系统浏览器两种打开方式都走得通）。
+ *
+ * ── 没有「导入桌面端登录态」────────────────────────────────
+ * 登录态在桌面端自己的 sqlite 里，没有 `auth.json` 那种稳定可读的文件形态
+ * （与 Accio / ZCode / Loomy 同一处境），显式 `desktop: false`，免得桌面壳里
+ * 多出一个选了之后什么都没有的分段。
+ */
+const LOBSTERAI: ProviderConfig = {
+  provider: 'lobsterai',
+  label: 'LobsterAI',
+  desktop: false,
+  webLogin: {
+    noteHtml: t('打开官方登录页并用你的 LobsterAI 账号登录：在浏览器里完成短信与滑块验证后，网关的 loopback 回调会自动把账号加入列表。'),
+    button: t('打开 LobsterAI 网页登录'),
+    busyText: t('等待 LobsterAI 登录完成…'),
+    modes: [
+      { value: 'embedded', label: t('内嵌窗口（推荐）'), hint: t('内嵌窗口打开；完成后自动加入列表，关窗即取消等待') },
+      { value: 'external', label: t('系统浏览器'), hint: t('系统浏览器打开（复用已登录账号）；完成后自动加入列表') },
+    ],
+  },
+  manualTitle: t('粘贴 accessToken / refreshToken'),
+  manualNote: t('accessToken 必填，refreshToken 可选（填了到期可自动续期）。两者都能从桌面端本机登录态里取到；也可以直接用上方的「网页登录」。'),
+  fields: [
+    { key: 'accessToken', label: 'accessToken', rows: 3, placeholder: t('粘贴 LobsterAI 的 accessToken') },
+    { key: 'refreshToken', label: 'refreshToken', rows: 2, optional: true, placeholder: t('可选，没有则无法自动续期') },
+    { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空则用上游返回的账号名') },
+  ],
+}
+
 /** 内置家的表单块，顺序与旧 ADD_FORMS 一致（只影响 DOM 里的块顺序，不影响界面） */
 export const BUILTIN_CONFIGS: ProviderConfig[] = [
   RACCOON,
@@ -800,6 +837,9 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   // Nous（Nous Research Portal）：OAuth 设备码登录，排在末尾（与后端注册表
   // PROVIDERS 的追加顺序一致 —— 后到居后，新增的家加在表尾）。
   NOUS,
+  // LobsterAI（有道龙虾，NetEase Youdao）：粘贴 accessToken / refreshToken 或
+  // 浏览器网页登录，排在末尾（与后端注册表 PROVIDERS 的追加顺序一致 —— 后到居后）。
+  LOBSTERAI,
 ]
 
 /** WorkBuddy 的块 id（结构特殊，单独一个组件） */

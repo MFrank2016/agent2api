@@ -192,6 +192,12 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             super::nous::models::remote_refreshed(),
             super::nous::models::last_refreshed_at(),
         ),
+        // LobsterAI 的清单来自 `GET {base}/api/models/available`（Bearer + 能力头）；
+        // 单一入口，单格缓存。「有远程内容」才算远程来源（无内置兜底清单）。
+        ProviderKind::LobsterAi => (
+            super::lobsterai::models::remote_refreshed(),
+            super::lobsterai::models::last_refreshed_at(),
+        ),
     }
 }
 

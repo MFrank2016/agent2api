@@ -265,6 +265,24 @@ pub(super) fn identity_of_item(provider: &str, item: &Map<String, Value>) -> Res
         }
         return Err("缺少 accessToken 与 id（无法标识 Command Code 账号）".to_string());
     }
+    // LobsterAI：账号标识是 `userId`（上游 user.userId）；粘贴路径可能没有它，
+    // 退到设备 id（账号级稳定）再退到账号 id —— 与 Command Code「凭证即身份、
+    // 缺则用 id」同口径。没有这一支会落进兜底按 `userId` 取，粘贴账号
+    // （无 userId）导入时会报「缺少 userId」整条失败。
+    if provider == kind_id(ProviderKind::LobsterAi) {
+        if !user_id.is_empty() {
+            return Ok(user_id);
+        }
+        let device_id = text("deviceId");
+        if !device_id.is_empty() {
+            return Ok(device_id);
+        }
+        let id = text("id");
+        if !id.is_empty() {
+            return Ok(id);
+        }
+        return Err("缺少 userId / deviceId / id（无法标识 LobsterAI 账号）".to_string());
+    }
     if user_id.is_empty() {
         return Err(format!("缺少 userId（无法标识 {provider} 账号）"));
     }

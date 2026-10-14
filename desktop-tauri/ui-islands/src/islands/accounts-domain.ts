@@ -216,6 +216,13 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   //   设备码家同一口径）。
   // `expiry: 'expiresAt'` —— 设备码换回的 OAuth 访问令牌带过期时间。
   nous: { usage: false, edition: false, identifier: 'userId', expiry: 'expiresAt' },
+  // LobsterAI（有道龙虾，NetEase Youdao）。各位各有出处：
+  // `usage: true` —— 余额 / 积分查询（余额以积分类读数展示）。
+  // `edition: false` —— 单一入口（粘贴 accessToken / refreshToken 或网页登录），
+  //   没有国际版 / 地区概念。
+  // `identifier: 'userId'` —— 账号标识落在 userId。
+  // `expiry: 'expiresAt'` —— 访问令牌带过期时间（refreshToken 可续期）。
+  lobsterai: { usage: true, edition: false, identifier: 'userId', expiry: 'expiresAt' },
 }
 
 /**

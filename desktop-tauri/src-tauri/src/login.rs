@@ -664,9 +664,13 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // Nous（Nous Research Portal）同样不设限：OAuth 设备码流程把用户带到官方
         // 的 verification_uri，主机由上游给、不可穷举（与 Qoder / ZCode / Cline 同一
         // 情形）；落进默认分支会拿到 WorkBuddy 的白名单 → 授权窗口白屏。
+        // LobsterAI（有道龙虾，NetEase Youdao）同样不设限：网页登录打开官方登录页，
+        // 用户在浏览器里完成短信 + 滑块验证，回调落**网关自己的** loopback 端口；
+        // 主机不可穷举（短信 / 滑块链路），落进默认分支会拿到 WorkBuddy 的白名单
+        // → 登录窗口白屏。
         "catpaw" | "qoder" | "qoder-intl" | "cline-free" | "cline-pass" | "autoclaw"
         | "autoclaw-intl" | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae"
-        | "kuku" | "antigravity" | "officeace" | "nous" => None,
+        | "kuku" | "antigravity" | "officeace" | "nous" | "lobsterai" => None,
         // WorkBuddy 的两个地区共用这一张表（表里 `workbuddy.ai` 那一行就是国际站
         // 的登录域）。**显式列出**而不是靠下面的默认分支：上面那条警告要求
         // 「新 provider 落到默认分支」必须是有意的选择，写出来才看得出是选过的
@@ -878,6 +882,10 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // 由**后端适配器**问上游拿，壳侧只负责开窗口与轮询，与 Qoder / ZCode / Cline
         // 的设备授权同一条路（授权结果由服务端记录，不依赖窗口捕获回调）。
         "nous" => Ok("nous"),
+        // LobsterAI（有道龙虾，NetEase Youdao）：网页登录的授权地址由**后端适配器**
+        // 现拼（官方登录页 + loopback 回调），壳侧只负责开窗口与轮询 —— 与 CatPaw /
+        // Accio 同一条路。粘贴 accessToken / refreshToken 不走这里（走 POST /api/accounts）。
+        "lobsterai" => Ok("lobsterai"),
         other => Err(format!("不支持网页登录的提供商：{other}")),
     }
 }
@@ -1193,6 +1201,9 @@ pub async fn start(
         "officeace" => "OfficeAce 果办",
         // Nous 只有一家（OAuth 设备码一条链，没有地区/版本概念），品牌名里不需要地区
         "nous" => "Nous",
+        // LobsterAI 只有一家（粘贴令牌 + 网页登录两条来源，没有地区/版本概念），
+        // 品牌名里不需要地区
+        "lobsterai" => "LobsterAI",
         _ => "WorkBuddy",
     };
     // 窗口标题：Cline 两家的池、ZCode 两家的地区、CodeArts / Trae / OfficeAce
@@ -1201,7 +1212,7 @@ pub async fn start(
     let title = if matches!(
         provider,
         "cline-free" | "cline-pass" | "zcode" | "zcode-intl" | "codearts" | "trae" | "qoder"
-        | "qoder-intl" | "antigravity" | "officeace" | "nous"
+        | "qoder-intl" | "antigravity" | "officeace" | "nous" | "lobsterai"
     ) {
         format!("登录 {provider_label} 账号")
     } else {

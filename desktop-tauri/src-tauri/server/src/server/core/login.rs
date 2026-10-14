@@ -32,6 +32,7 @@ mod autoclaw;
 mod catpaw;
 pub mod codearts;
 mod nous;
+mod lobsterai;
 mod qoder;
 mod officeace;
 mod trae;
@@ -829,6 +830,50 @@ impl LoginService {
                     logging::log(
                         "[Login]",
                         &format!("❌ Antigravity 网页登录换取凭证失败: {}", error.message),
+                    );
+                    Err(error)
+                }
+            };
+        }
+        // LobsterAI 的浏览器 OAuth 回调同样是标准 `code` / `state` 查询串（授权码
+        // + loopback）。与 Antigravity 同款：public 回调路由把 URL 转交进来，
+        // 这里 state 与任务逐字比对 → 适配器换码落账号。
+        if kind == ProviderKind::LobsterAi {
+            let parsed = url::Url::parse(callback_url).map_err(|_| {
+                GatewayError::with_status(400, "LobsterAI 登录回调地址无效")
+            })?;
+            let params: std::collections::HashMap<String, String> = parsed
+                .query_pairs()
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
+                return Err(GatewayError::with_status(400, format!("授权被拒绝（{error}）")));
+            }
+            let callback_state = params.get("state").map(String::as_str).unwrap_or("");
+            let code = params.get("code").map(String::as_str).unwrap_or("");
+            if callback_state.trim() != state {
+                return Err(GatewayError::with_status(400, "回调地址与当前 LobsterAI 登录任务不匹配"));
+            }
+            return match adapter_for(kind).exchange_login_code(&self.store, code, state).await {
+                Ok(account_id) => {
+                    let session = json!({
+                        "accountUid": account_id,
+                        "nickname": Value::Null,
+                        "edition": task.edition,
+                        "provider": task.provider,
+                    });
+                    handle.update(|task| {
+                        task.done = true;
+                        task.session = Some(session);
+                        task.finished_at = Some(logging::now_ms());
+                    });
+                    Ok(LoginCallbackSubmission::Completed(account_id))
+                }
+                Err(error) => {
+                    finish_task_error(&handle, &error.message);
+                    logging::log(
+                        "[Login]",
+                        &format!("❌ LobsterAI 网页登录换取凭证失败: {}", error.message),
                     );
                     Err(error)
                 }

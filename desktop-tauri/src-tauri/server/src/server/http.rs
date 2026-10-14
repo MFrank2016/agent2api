@@ -168,6 +168,14 @@ pub fn panel_router(state: ServerState) -> Router {
         .route(
             "/oauth-callback",
             get(api::session::login_antigravity_callback),
+        )
+        // LobsterAI 网页登录的 loopback 回调：**浏览器 302 到这里**（门户登录完成后
+        // 顶层导航回我们发起时登记的 redirect_uri，查询串带 code / state）。
+        // 路径是我们自己定的（redirect_uri 由发起方给）。免鉴权的理由与 Antigravity
+        // 那条同一句：调用方是用户的浏览器，安全性由本次登录任务的一次性 state 承担。
+        .route(
+            "/auth/callback",
+            get(api::session::login_lobsterai_callback),
         );
 
     // 需鉴权：Node 版对这些路径都调用了 checkApiKey

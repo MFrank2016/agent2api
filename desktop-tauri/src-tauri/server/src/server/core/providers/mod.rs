@@ -130,6 +130,10 @@ pub mod content_block;
 pub mod custom;
 pub mod kuku;
 pub mod loomy;
+/// LobsterAI（有道龙虾 / NetEase Youdao）：无状态 SSE 转发 + 令牌续期 + 远程
+/// 模型目录 + 每日签到 + 积分余额 + 浏览器 OAuth 登录（适配实现在 `lobsterai/`，
+/// 见其模块头）。单一入口（无地区伴生），排在末尾（新家按约定追加在末尾）。
+pub mod lobsterai;
 /// MonkeyCode（长亭科技的开源 AI 开发平台）。适配实现在 `monkeycode/`：
 /// 账号管理（粘贴 session）+ 模型目录（`GET /api/v1/users/models`）+
 /// **会话转发**（上游是「建任务 → WebSocket 任务流」，ACP 事件翻译为 chat 帧，
@@ -481,6 +485,20 @@ pub enum ProviderKind {
     /// 重试 / usage / 取消全部由编排层承担。匿名旁路由
     /// [`ProviderAdapter::allows_anonymous_default_session`] 打开（见适配器）。
     Nous,
+    /// LobsterAI（有道龙虾，NetEase Youdao）。适配实现在 `lobsterai/`：账号管理
+    /// （粘贴令牌 / 浏览器 OAuth 登录）、令牌续期、模型目录、每日签到、积分余额与
+    /// **无状态** SSE 转发全部已接通（上游是 OpenAI 兼容的
+    /// `/api/proxy/v1/chat/completions`，SSE-only，因此 `build_chat_request` 恒
+    /// 强制 `stream=true`）。
+    ///
+    /// ── 为什么是**一家**（没有地区伴生）─────────────────────────
+    /// 上游只有一套域名（`lobsterai-server.youdao.com`）、一套协议，没有地区参数。
+    ///
+    /// ── 与别家不同的一处：真实版本伪装 ─────────────────────────
+    /// 上游按「像不像官方客户端」做风控，`User-Agent` / `X-LobsterAI-Client-Version`
+    /// 用从有道 Overmind 拿的真实版本（`lobsterai::endpoints`），过时的 `"0.1.0"`
+    /// 会让签到 slot 被判成 empty。
+    LobsterAi,
 }
 
 /// 一个提供商的静态元数据。
@@ -575,6 +593,9 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // Nous Research Portal：单一入口（Portal OAuth 设备码登录），没有地区伴生
     // （付费 / 免费是两个推理面而不是两个地区）。排末尾（新家按约定追加在末尾）。
     ProviderMeta { id: "nous", label: "Nous" },
+    // LobsterAI（有道龙虾）：单一入口（粘贴令牌 / 浏览器 OAuth 登录），没有地区
+    // 伴生。排末尾（新家按约定追加在末尾）。
+    ProviderMeta { id: "lobsterai", label: "LobsterAI" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -659,6 +680,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "antigravity" => Some(ProviderKind::Antigravity),
         "officeace" => Some(ProviderKind::OfficeAce),
         "nous" => Some(ProviderKind::Nous),
+        "lobsterai" => Some(ProviderKind::LobsterAi),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -701,6 +723,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::Antigravity => "antigravity",
         ProviderKind::OfficeAce => "officeace",
         ProviderKind::Nous => "nous",
+        ProviderKind::LobsterAi => "lobsterai",
     }
 }
 

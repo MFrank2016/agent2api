@@ -309,6 +309,11 @@ impl AccountStore {
             // `nous_accounts.rs`）。漏这一支会掉进 workbuddy 兜底形状，多出一批
             // 与本家无关的空字段。
             self.to_nous_public_account(record)
+        } else if record.provider() == super::LOBSTERAI_PROVIDER_ID {
+            // LobsterAI（有道龙虾）：单一入口（粘贴令牌 / 浏览器 OAuth 登录），
+            // 公开形态去掉令牌本体、只留尾号与两个存在性标记（见
+            // `lobsterai_accounts.rs`）。
+            self.to_lobsterai_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)
