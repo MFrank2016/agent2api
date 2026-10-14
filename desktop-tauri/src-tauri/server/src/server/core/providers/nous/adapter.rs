@@ -55,7 +55,7 @@ impl ProviderAdapter for NousAdapter {
 
     /// 构造 `POST {base}/chat/completions`。
     ///
-    /// `base` 与 Bearer 凭证都取自会话：账号形态是 agent key + 付费面；
+    /// `base` 与 Bearer 凭证都取自会话：账号形态是 OAuth access_token + 付费面；
     /// 匿名形态是匿名 JWT + 免费面（见 `credentials::from_record`）。
     fn build_chat_request(
         &self,
@@ -74,7 +74,7 @@ impl ProviderAdapter for NousAdapter {
 
     /// 上游错误分类（四档口径）：
     ///   - 400 → 内容拦截判定（`content_block`，命中则换中性提示词补救）；
-    ///   - 401 / 403 / 404 → `TokenExpired`（刷新一次再重试：账号换新 agent key，
+    ///   - 401 / 403 / 404 → `TokenExpired`（刷新一次再重试：账号换新 access token，
     ///     匿名重换 JWT；404 也归这一档，因为匿名身份失效时免费面回 404）；
     ///   - 402 → `QuotaLimited`（下游按 429：额度不足换账号更有用）；
     ///   - 429 → `QuotaLimited`（含免费面对非 `nous/welcome` 模型的 `model_not_free`）；
@@ -118,7 +118,7 @@ impl ProviderAdapter for NousAdapter {
 
     /// 取可用凭证：
     ///   - 空 `account_id`（无账号）→ 匿名免费档 JWT；
-    ///   - 非空 → 账号的 agent key（临期或缺失时自动续期 / 重铸并回写）。
+    ///   - 非空 → 账号的 OAuth access_token（临期或缺失时自动续期并回写）。
     fn ensure_access_token<'a>(
         &'a self,
         store: &'a AccountStore,
@@ -133,14 +133,14 @@ impl ProviderAdapter for NousAdapter {
             if credentials.token.trim().is_empty() {
                 return Err(GatewayError::with_status(
                     401,
-                    "Nous 账号没有可用的推理凭证（agent key），请重新登录",
+                    "Nous 账号没有可用的推理凭证（access token），请重新登录",
                 ));
             }
             Ok(credentials.token)
         })
     }
 
-    /// 401 后的**强制**刷新：账号重铸 agent key，匿名重换 JWT。
+    /// 401 后的**强制**刷新：账号换新 access token，匿名重换 JWT。
     fn refresh_access_token<'a>(
         &'a self,
         store: &'a AccountStore,
@@ -156,12 +156,12 @@ impl ProviderAdapter for NousAdapter {
         })
     }
 
-    /// 有续期手段（Portal refresh token + agent key 重铸）。
+    /// 有续期手段（Portal refresh token）。
     fn supports_refresh(&self) -> bool {
         true
     }
 
-    /// 该账号的凭证是否临期（Portal access token 或 agent key 任一临期）。
+    /// 该账号的凭证是否临期（Portal access token 临期即算）。
     ///
     /// 没有 refresh token 的账号返回 false：它连续期手段都没有，交给维护只会
     /// 变成每轮一条稳定失败的记录（与 Antigravity / Trae 同一处置）。

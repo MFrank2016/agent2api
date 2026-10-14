@@ -1,11 +1,11 @@
-//! Nous 凭证：Portal 令牌（accessToken / refreshToken）＋ 推理用 agent key，
-//! 以及匿名免费档的 JWT（无账号时）。
+//! Nous 凭证：Portal 令牌（accessToken / refreshToken）——access_token 即推理
+//! Bearer——以及匿名免费档的 JWT（无账号时）。
 //!
 //! ── 两种凭证形态（会话里怎么区分）────────────────────────────
 //! 适配器只拿到会话（`account_store::store::session_from_record` 或
 //! `provider_loop` 现造的匿名最小会话），因此判别只依赖会话里的字段：
 //!   - **账号形态**：记录属于本家（`provider == "nous"`）或会话带
-//!     `nousAccount` 标记 / 顶层有 `agentKey`。转发用 **agent key**，
+//!   `nousAccount` 标记 / 顶层有 `agentKey`。转发用 **OAuth access_token**（存于 `agentKey` 字段），
 //!     基址取 `inferenceBaseUrl`（缺省 `DEFAULT_INFERENCE_BASE_URL`）；
 //!   - **匿名形态**：`provider_loop` 在「一个账号都没有」时现造的最小会话
 //!     （只有 `auth.accessToken`），token 就是匿名 JWT，基址恒为免费面
@@ -16,12 +16,13 @@
 //!   accessToken    Portal access token（通用键：`has_token()` / 续期框架都认它）
 //!   refreshToken   Portal refresh token（通用键）
 //!   expiresAt      Portal access token 过期时刻（毫秒）
-//!   agentKey       推理用 API Key（**本家专属键**，chat 的 Bearer）
-//!   agentKeyExpiresAt  agent key 过期时刻（毫秒）
+//!   agentKey       推理用 Bearer（**本家专属键**）= OAuth access token
+//!   agentKeyExpiresAt  Bearer 过期时刻（毫秒，= access token 过期）
 //!   inferenceBaseUrl   上游给的付费推理基址（可选）
 //! ```
 //! `accessToken` 用通用键名，是为了让通用的「有没有凭证」判定与维护任务
-//! 原样可用；chat 真正发出的 Bearer 是 `agentKey`（见 `from_record`）。
+//! 原样可用；chat 真正发出的 Bearer 是 `agentKey`（见 `from_record`），它现在
+//! 就是同一枚 OAuth access_token（官方 hermes：`agent_key = access_token`）。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
@@ -44,10 +45,9 @@ pub struct NousCredentials {
     pub name: String,
     /// 是否匿名免费档（true 时 `token` 是匿名 JWT、`base_url` 是免费面）
     pub anonymous: bool,
-    /// 用于 `Authorization: Bearer` 的凭证（账号 = agent key；匿名 = 匿名 JWT）
-    /// 用于 `Authorization: Bearer` 的凭证（账号 = agent key；匿名 = 匿名 JWT）
+    /// 用于 `Authorization: Bearer` 的凭证（账号 = OAuth access_token；匿名 = 匿名 JWT）
     pub token: String,
-    /// Portal access token（账号形态专用；续期 / 铸 key 时用它，匿名为空串）
+    /// Portal access token（账号形态专用；续期时用它，匿名为空串）
     pub portal_access_token: String,
     /// 推理基址（账号 = 付费面；匿名 = 免费面）
     pub base_url: String,
@@ -55,16 +55,16 @@ pub struct NousCredentials {
     pub refresh_token: String,
     /// Portal access token 过期时刻（毫秒；未知为 0）
     pub expires_at: i64,
-    /// agent key 过期时刻（毫秒；未知为 0）
+    /// Bearer 过期时刻（毫秒；未知为 0）= access token 过期
     pub agent_key_expires_at: i64,
 }
 
 impl NousCredentials {
     /// 这份凭证此刻是否临期（需要主动刷新）。
     ///
-    /// 判据取**两者更早的那一个**：Portal access token 过期就铸不出新 key，
-    /// agent key 过期就发不出请求 —— 任一临期都该刷。没有过期信息（0）的那
-    /// 一半不参与判定（与各家「判不出来就不判」的口径一致）。
+    /// 判据取**两者更早的那一个**：Portal access token 过期就发不出请求，
+    /// `agentKey`（= access token）过期同理 —— 任一临期都该刷。没有过期信息
+    /// （0）的那一半不参与判定（与各家「判不出来就不判」的口径一致）。
     pub fn expiring(&self) -> bool {
         if self.anonymous {
             return false;
@@ -121,7 +121,7 @@ fn is_account(record: &Value) -> bool {
 
 /// 从账号记录 / 会话解析凭证（`record` 为 None 时报「没有可用账号」）。
 ///
-/// 账号形态读 `agentKey` + `inferenceBaseUrl`；匿名形态读 `auth.accessToken`
+/// 账号形态读 `agentKey`（= OAuth access_token）+ `inferenceBaseUrl`；匿名形态读 `auth.accessToken`
 /// 并强制走免费面（见模块头）。
 pub fn from_record(record: Option<&Value>) -> Result<NousCredentials, GatewayError> {
     let Some(record) = record else {
@@ -135,7 +135,7 @@ pub fn from_record(record: Option<&Value>) -> Result<NousCredentials, GatewayErr
         if agent_key.is_empty() {
             return Err(GatewayError::with_status(
                 401,
-                "Nous 账号缺少推理凭证（agent key）：请点「刷新 Token」重新铸一把，或重新登录",
+                "Nous 账号缺少推理凭证（access token）：请点「刷新 Token」或重新登录",
             ));
         }
         let base = pick(record, &["inferenceBaseUrl"]);

@@ -2,10 +2,10 @@
 //! 兼容转发 + Portal OAuth 设备码登录 + 匿名免费档。
 //!
 //! ── 这条通道长什么样（规格 A/B/C）────────────────────────────
-//! 一条身份链（Portal OAuth 设备码 → access/refresh token → 铸 agent key），
+//! 一条身份链（Portal OAuth 设备码 → access/refresh token；access_token 即推理 Bearer），
 //! 两个推理面：
 //! ```text
-//!   账号：Bearer <agent key> 打 https://inference-api.nousresearch.com/v1
+//!   账号：Bearer <OAuth access_token> 打 https://inference-api.nousresearch.com/v1
 //!   匿名：Bearer <匿名 JWT>  打 https://welcome-api.nousresearch.com/v1（只认 nous/welcome）
 //! ```
 //! 与官方 `hermes-agent` 的行为一致：**没有账号时透明地走匿名免费档**。
@@ -20,7 +20,7 @@
 //!   endpoints.rs    地址 / 路径 / 客户端常量 / UA 伪装 / 头集合
 //!   credentials.rs  账号记录 / 会话 → 凭证快照（账号形态 vs 匿名形态）
 //!   models.rs       GET {base}/models（10 分钟缓存 + 内置兜底清单）
-//!   oauth.rs        设备码登录 + 令牌续期 + agent key 铸造 + 单飞刷新
+//!   oauth.rs        设备码登录 + 令牌续期 + 单飞刷新
 //!   anonymous.rs    匿名身份创建 / JWT 换取 + 进程级缓存
 //!   adapter.rs      ProviderAdapter 实现（装配层）
 //! ```

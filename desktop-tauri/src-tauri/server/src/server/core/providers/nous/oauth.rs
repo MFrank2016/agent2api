@@ -1,10 +1,10 @@
-//! Nous Portal OAuth：设备码登录（RFC 8628）+ 令牌续期 + agent key 铸造
-//! + 单飞刷新与比较再写。
+//! Nous Portal OAuth：设备码登录（RFC 8628）+ 令牌续期 + 单飞刷新与比较再写。
+//! OAuth access_token 本身即推理 Bearer（官方 hermes：`agent_key = access_token`）。
 //!
 //! ── 身份链（规格 A）──────────────────────────────────────────
 //! ```text
 //!   ① POST {portal}/api/oauth/device/code   (form) client_id=hermes-cli
-//!        scope=inference:mint_agent_key
+//!        scope=inference:invoke
 //!      → { device_code, user_code, verification_uri, verification_uri_complete,
 //!          expires_in, interval }
 //!   ② 用户在浏览器打开 verification_uri_complete 完成授权
@@ -13,11 +13,9 @@
 //!      → authorization_pending | slow_down（interval+5，上限 30）|
 //!        { access_token, refresh_token, token_type, expires_in, scope,
 //!          inference_base_url? }
-//!   ④ POST {portal}/api/oauth/agent-key  (Bearer access_token)
-//!        json {"min_ttl_seconds":1800}
-//!      → { api_key, key_id, expires_at, expires_in, reused, inference_base_url? }
 //! ```
-//! `reused = true` 也是**有效**结果（上游复用了同一把未过期的 key）。
+//! `access_token`（`scope` 含 `inference:invoke`）就是推理 Bearer —— 上游已退役
+//! `/api/oauth/agent-key` 铸 key 端点，不再单独铸 key。
 //!
 //! ── 续期（规格 A.3）─────────────────────────────────────────
 //! `grant_type=refresh_token` 打同一个 token 端点，换新的 access_token
@@ -34,7 +32,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::server::core::account_store::{AccountStore, CredentialWrite};
 use crate::server::core::proxies::{ProxyResolution, ResolvedProxy};
@@ -222,66 +220,6 @@ pub async fn refresh_token(
     parse_token_set(&payload)
 }
 
-// ─── agent key 铸造 ─────────────────────────────────────────
-
-/// 铸一把推理用 agent key（`reused = true` 也是有效结果）。
-pub async fn mint_agent_key(
-    access_token: &str,
-    proxy: Option<&ResolvedProxy>,
-) -> Result<AgentKey, GatewayError> {
-    let client = client_for(proxy);
-    let response = client
-        .post(endpoints::portal_url(endpoints::AGENT_KEY_PATH))
-        .header("Accept", "application/json")
-        .header("Authorization", format!("Bearer {}", access_token.trim()))
-        .timeout(Duration::from_millis(REQUEST_TIMEOUT_MS))
-        .json(&json!({ "min_ttl_seconds": endpoints::AGENT_KEY_MIN_TTL_SECONDS }))
-        .send()
-        .await
-        .map_err(|error| {
-            GatewayError::with_status(
-                502,
-                format!("Nous agent key 铸造请求失败：{}", crate::server::core::egress::describe_error_detail(&error)),
-            )
-        })?;
-    let status = response.status().as_u16();
-    let ok = response.status().is_success();
-    let text = response.text().await.unwrap_or_default();
-    let payload: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-    if !ok {
-        return Err(device_error(status, &payload, "Nous agent key 铸造被拒"));
-    }
-    let api_key = payload
-        .get("api_key")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| GatewayError::with_status(502, "Nous agent key 响应缺少 api_key"))?
-        .to_string();
-    let expires_at = payload
-        .get("expires_at")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    // `expires_at` 上游可能给秒；规范成毫秒（> 1e12 视为已经是毫秒）
-    let expires_at_ms = if expires_at <= 0 {
-        0
-    } else if expires_at > 1_000_000_000_000 {
-        expires_at
-    } else {
-        expires_at.saturating_mul(1000)
-    };
-    Ok(AgentKey {
-        api_key,
-        expires_at_ms,
-        inference_base_url: payload
-            .get("inference_base_url")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-    })
-}
-
 // ─── 单飞刷新（ensure_fresh）────────────────────────────────
 
 /// 取可用账号凭证（`force = true` 时不看临期窗口，401 之后强制刷一次）。
@@ -354,20 +292,11 @@ async fn refresh_and_save(
         expires_at = now + token_set.expires_in.saturating_mul(1000);
         inference_base_url = token_set.inference_base_url;
     }
-    // ② agent key：强制刷、或已临期（或还没有）时重铸一把
-    let agent_stale = credentials.token.trim().is_empty()
-        || credentials.agent_key_expires_at == 0
-        || credentials.agent_key_expires_at - now < credentials::REFRESH_WINDOW_MS;
-    let mut agent_key = credentials.token.clone();
-    let mut agent_key_expires_at = credentials.agent_key_expires_at;
-    if force || agent_stale || inference_base_url.is_some() {
-        let minted = mint_agent_key(&portal_access_token, proxy.as_ref()).await?;
-        agent_key = minted.api_key;
-        agent_key_expires_at = minted.expires_at_ms;
-        if inference_base_url.is_none() {
-            inference_base_url = minted.inference_base_url;
-        }
-    }
+    // ② 运行时凭证 = OAuth access token 本身（官方 hermes：agent_key = access_token）。
+    //    上游已退役 /api/oauth/agent-key，不再铸 key —— access token 换了就用新的，
+    //    没换（仅临期判定触发）就沿用记录里那份。
+    let agent_key = portal_access_token.clone();
+    let agent_key_expires_at = expires_at;
     let write = store.update_nous_credentials_if_current(
         &credentials.id,
         &credentials.refresh_token,
@@ -391,7 +320,7 @@ async fn refresh_and_save(
     logging::verbose(
         "[Nous]",
         &format!(
-            "凭证刷新成功（agent key {}，有效期至 {}）",
+            "凭证刷新成功（access token {}，有效期至 {}）",
             credentials::masked(&agent_key),
             agent_key_expires_at
         ),
@@ -438,14 +367,6 @@ pub struct TokenSet {
     pub token_type: String,
     pub expires_in: i64,
     pub scope: String,
-    pub inference_base_url: Option<String>,
-}
-
-/// 一次 agent key 读取
-#[derive(Clone, Debug)]
-pub struct AgentKey {
-    pub api_key: String,
-    pub expires_at_ms: i64,
     pub inference_base_url: Option<String>,
 }
 

@@ -7,11 +7,10 @@
 //!   · 与 ZCode / OfficeAce 同款：确认是在浏览器里发生的，网关只能**轮询**
 //!     令牌端点，因此 spawn 一个后台任务轮询，结果写回任务句柄供 `/wait` 取。
 //!
-//! ── 拿到令牌后还差一步：铸 agent key ────────────────────────
-//! 设备码换到的 `access_token` 是 Portal 令牌，**不能直接推理**：要再
-//! `POST /api/oauth/agent-key` 铸一把 agent key（chat 的 Bearer）。这一步是
-//! 网络动作，因此放在**拿任务锁之前**（与 ZCode 换取推理凭证同一处置）。
-//! 铸不到就整条登录失败 —— 不落半条「能登录但发不出请求」的账号。
+//! ── 拿到令牌即可推理：access_token 就是 Bearer ──────────────
+//! 设备码换到的 `access_token` 即推理 Bearer（scope `inference:invoke`；官方
+//! hermes：`agent_key = access_token`）。上游已退役 `/api/oauth/agent-key`，
+//! 因此不再铸 key —— 直接把 access_token 落成凭证（`agentKey` 字段）。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
@@ -21,7 +20,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::server::core::endpoints::resolve_edition;
-use crate::server::core::providers::nous::oauth::{self, DeviceLogin};
+use crate::server::core::providers::nous::oauth::DeviceLogin;
 use crate::server::core::providers::{kind_id, ProviderKind};
 use crate::server::logging;
 
@@ -99,35 +98,22 @@ impl LoginService {
                 // 还没授权完 —— 继续等
                 Ok(None) => continue,
                 Ok(Some(tokens)) => {
-                    // ② 铸 agent key（网络动作，放在拿任务锁之前）
-                    let agent = match oauth::mint_agent_key(&tokens.access_token, None).await {
-                        Ok(agent) => agent,
-                        Err(error) => {
-                            logging::log(
-                                "[Login]",
-                                &format!("❌ Nous 登录换取 agent key 失败: {}", error.message),
-                            );
-                            finish_task_error(&handle, &error.message);
-                            return;
-                        }
-                    };
                     // 与取消共用任务锁：取消先发生就绝不落账号，落盘先发生则视为已完成
                     let mut task = handle.lock();
                     if task.done || task.canceled {
                         return;
                     }
+                    // access_token 即推理 Bearer（不再铸 agent key）；`agentKey` 字段
+                    // 存同一枚 access_token，续期时会被新的 access_token 覆盖。
                     let expires_at = logging::now_ms() + tokens.expires_in.saturating_mul(1000);
-                    let inference_base_url = agent
-                        .inference_base_url
-                        .clone()
-                        .or_else(|| tokens.inference_base_url.clone());
+                    let access_token = tokens.access_token.clone();
                     let payload = json!({
                         "accessToken": tokens.access_token,
                         "refreshToken": tokens.refresh_token,
                         "expiresAt": expires_at,
-                        "agentKey": agent.api_key,
-                        "agentKeyExpiresAt": agent.expires_at_ms,
-                        "inferenceBaseUrl": inference_base_url,
+                        "agentKey": access_token,
+                        "agentKeyExpiresAt": expires_at,
+                        "inferenceBaseUrl": tokens.inference_base_url,
                     });
                     match self.store.add_nous_account(&payload, None, "web") {
                         Ok(account) => {

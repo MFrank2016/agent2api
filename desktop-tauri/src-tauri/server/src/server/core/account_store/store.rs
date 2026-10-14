@@ -615,11 +615,12 @@ impl AccountStore {
             }
         }
         // ── Nous 的会话附加键（`nous::adapter` / `nous::credentials` 用）───
-        // 它的转发凭证是**记录顶层的 agent key**（不是 `auth.accessToken` 那个
-        // Portal 令牌），推理基址也随账号记录走（付费面）。会话是转发链交给适配器
-        // 的唯一形态（`build_chat_request` 的 `account` 参数），所以这些字段必须
-        // 随会话出来 —— 否则 `nous::credentials::from_record` 读不到 agentKey，
-        // 会把账号误判成匿名免费档、把付费请求打到免费面。
+        // 它的转发凭证是**记录顶层的 `agentKey`**（= OAuth access_token，官方
+        // hermes：`agent_key = access_token`；不是 `auth.accessToken` 那份副本），
+        // 推理基址也随账号记录走（付费面）。会话是转发链交给适配器的唯一形态
+        // （`build_chat_request` 的 `account` 参数），所以这些字段必须随会话出来 ——
+        // 否则 `nous::credentials::from_record` 读不到 agentKey，会把账号误判成
+        // 匿名免费档、把付费请求打到免费面。
         //
         // `nousAccount: true` 是**账号 / 匿名**的判别标记：匿名最小会话
         // （`provider_loop` 现造的 `{auth:{accessToken}}`）没有它，因此本家只在

@@ -8,8 +8,8 @@
 //!   accessToken       Portal access token（通用键；续期框架 / has_token 认它）
 //!   refreshToken      Portal refresh token（通用键；续期主凭证）
 //!   expiresAt         Portal access token 过期时刻（毫秒）
-//!   agentKey          推理用 API Key（**本家专属键**，chat 的 Bearer）
-//!   agentKeyExpiresAt agent key 过期时刻（毫秒）
+//!   agentKey          推理用 Bearer（**本家专属键**）= OAuth access token
+//!   agentKeyExpiresAt Bearer 过期时刻（毫秒，= access token 过期）
 //!   inferenceBaseUrl  上游给的付费推理基址（可选；缺省用默认付费面）
 //!   userId            身份键（可选；见下）
 //!   tokenTail         refresh token 尾 4 位（展示用；**凭证本体不进公开形态**）
@@ -111,7 +111,7 @@ impl AccountStore {
     ///   - `accessToken` / `access_token`：Portal access token（至少要有它或 refreshToken）；
     ///   - `refreshToken` / `refresh_token`：Portal refresh token（续期主凭证）；
     ///   - `expiresAt`：access token 过期时刻（毫秒，可选）；
-    ///   - `agentKey` / `apiKey`：推理用 agent key（可选；缺了转发时按需铸）；
+    ///   - `agentKey` / `apiKey`：推理用 Bearer（= OAuth access token；登录写入）；
     ///   - `agentKeyExpiresAt`：agent key 过期时刻（毫秒，可选）；
     ///   - `inferenceBaseUrl`：付费推理基址（可选）；
     ///   - `userId` / `email` / `orgId`：身份（可选）。

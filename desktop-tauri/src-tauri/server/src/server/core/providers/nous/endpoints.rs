@@ -4,21 +4,20 @@
 //! 一条身份链（Portal OAuth 设备码）＋ 两个推理面（付费 / 免费）：
 //! ```text
 //!   POST {portal}/api/oauth/device/code   设备码（form）→ user_code / verification_uri
-//!   POST {portal}/api/oauth/token         轮询 / 续期（form）
-//!   POST {portal}/api/oauth/agent-key     用 access_token 铸推理用的 agent key（Bearer）
+//!   POST {portal}/api/oauth/token         轮询 / 续期（form）→ access_token（即推理 Bearer）
 //!   POST {portal}/api/anonymous/create    匿名身份（**UA 必须是 hermes-agent 形态**）
 //!   POST {portal}/api/anonymous/token     匿名身份 → 免费档 JWT（~900s）
-//!   POST {inference_base}/chat/completions  付费面（Bearer agent key）
+//!   POST {inference_base}/chat/completions  付费面（Bearer = OAuth access_token）
 //!   POST {welcome_base}/chat/completions    免费面（Bearer 匿名 JWT，**只认 nous/welcome**）
 //!   GET  {inference_base}/models          模型目录（Bearer）
 //! ```
 //!
 //! ── 两个推理面（别混）────────────────────────────────────────
-//!   - **付费面** `https://inference-api.nousresearch.com/v1`：账号（agent key）用；
+//!   - **付费面** `https://inference-api.nousresearch.com/v1`：账号（OAuth access_token）用；
 //!     匿名 JWT 打这里会回 400「Anonymous accounts must use …welcome-api…」；
 //!   - **免费面** `https://welcome-api.nousresearch.com/v1`：匿名 JWT 专用，
 //!     只认 `nous/welcome`（其它模型 429 `model_not_free`）。
-//! 账号的 `inference_base_url` 若上游给了（token / agent-key 响应里的同名字段），
+//! 账号的 `inference_base_url` 若上游给了（token 响应里的同名字段），
 //! 以它为准（见 `DEFAULT_INFERENCE_BASE_URL` 的说明）。
 //!
 //! ── 匿名创建为什么必须伪装成官方 CLI（硬事实，别省）──────────
@@ -29,7 +28,7 @@
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
 
-/// Portal 基址（身份链：设备码 / 令牌 / agent key）
+/// Portal 基址（身份链：设备码 / 令牌）
 pub const PORTAL_BASE_URL: &str = "https://portal.nousresearch.com";
 
 /// 付费推理面默认基址（账号用；上游给了 `inference_base_url` 时以它为准）
@@ -44,16 +43,13 @@ pub const WELCOME_MODEL: &str = "nous/welcome";
 /// OAuth 客户端 id（官方 hermes-cli 用的那个）
 pub const CLIENT_ID: &str = "hermes-cli";
 
-/// 设备码授权申请的 scope
-pub const SCOPE: &str = "inference:mint_agent_key";
+/// 设备码授权申请的 scope（官方 hermes：`inference:invoke`；access_token 即推理 Bearer）
+pub const SCOPE: &str = "inference:invoke";
 
 /// 设备码授权类型（RFC 8628）
 pub const GRANT_TYPE_DEVICE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 /// 续期授权类型
 pub const GRANT_TYPE_REFRESH: &str = "refresh_token";
-
-/// 铸 agent key 时要求的最小 TTL（秒）——上游给 ≥ 这个值的 key
-pub const AGENT_KEY_MIN_TTL_SECONDS: i64 = 1800;
 
 // ─── 路径 ────────────────────────────────────────────────────
 
@@ -61,8 +57,6 @@ pub const AGENT_KEY_MIN_TTL_SECONDS: i64 = 1800;
 pub const DEVICE_CODE_PATH: &str = "/api/oauth/device/code";
 /// 令牌端点（轮询与续期共用）
 pub const TOKEN_PATH: &str = "/api/oauth/token";
-/// agent key 铸造
-pub const AGENT_KEY_PATH: &str = "/api/oauth/agent-key";
 /// 匿名身份创建
 pub const ANONYMOUS_CREATE_PATH: &str = "/api/anonymous/create";
 /// 匿名令牌换取
