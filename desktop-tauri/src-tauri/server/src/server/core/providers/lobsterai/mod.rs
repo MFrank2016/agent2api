@@ -16,6 +16,7 @@
 //! ── 子模块分工 ──────────────────────────────────────────────
 //! ```text
 //!   endpoints.rs    地址 / 路径 / 协议版本 / 真实客户端版本（缓存）/ 逐字请求头
+//!   envelope.rs     有道统一信封（`{code,message,data}`）的解包与业务错误判定
 //!   credentials.rs  账号记录 → 凭证快照（accessToken / refreshToken / keyfrom / 设备 id）
 //!   refresh.rs      令牌续期（单飞 + 比较再写）
 //!   models.rs       GET /api/models/available（5 分钟缓存 + 落盘缓存）
@@ -33,6 +34,7 @@ pub mod balance;
 pub mod checkin;
 pub mod credentials;
 pub mod endpoints;
+pub mod envelope;
 pub mod login;
 pub mod models;
 pub mod refresh;

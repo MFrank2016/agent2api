@@ -30,7 +30,7 @@ use crate::server::core::upstream::request::new_request_id;
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 
-use super::{credentials, endpoints};
+use super::{credentials, endpoints, envelope};
 
 /// 签到请求超时
 const REQUEST_TIMEOUT_MS: u64 = 20_000;
@@ -59,7 +59,9 @@ async fn call(
             format!("LobsterAI 签到接口返回 HTTP {}", response.status),
         ));
     }
-    Ok(response.payload.unwrap_or(Value::Null))
+    // 上游统一信封 `{code, message, data}`：真实数据在 `data` 里，这里统一解包
+    let payload = response.payload.unwrap_or(Value::Null);
+    Ok(envelope::data(&payload))
 }
 
 /// 从 `activity` 里取 `activityCode` / `configRevision`（数字或字符串都收）。

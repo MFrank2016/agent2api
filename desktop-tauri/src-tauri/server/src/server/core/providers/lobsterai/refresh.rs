@@ -26,7 +26,7 @@ use crate::server::core::providers::refresh_flight::{self, Join, Table};
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 
-use super::{credentials, endpoints};
+use super::{credentials, endpoints, envelope};
 
 /// 单次请求超时
 const REQUEST_TIMEOUT_MS: u64 = 30_000;
@@ -74,21 +74,29 @@ pub async fn refresh_tokens(
         ));
     }
     let payload = response.payload.unwrap_or(Value::Null);
-    let access_token = payload
+    // 上游统一信封 `{code, message, data}`：业务失败看 `code != 0`，成功数据在 `data`
+    if let Some(message) = envelope::business_error(&payload) {
+        return Err(GatewayError::with_status(
+            502,
+            format!("LobsterAI 令牌续期被拒：{message}"),
+        ));
+    }
+    let data = envelope::data(&payload);
+    let access_token = data
         .get("accessToken")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| GatewayError::with_status(502, "LobsterAI 续期响应缺少 accessToken"))?
         .to_string();
-    let expires_in = payload
+    let expires_in = data
         .get("expiresIn")
         .and_then(Value::as_i64)
         .filter(|value| *value > 0)
         .unwrap_or(30 * 24 * 3600);
     Ok(RefreshedTokens {
         access_token,
-        refresh_token: payload
+        refresh_token: data
             .get("refreshToken")
             .and_then(Value::as_str)
             .map(str::trim)

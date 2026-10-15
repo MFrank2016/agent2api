@@ -36,7 +36,7 @@ use crate::server::core::upstream::request::new_request_id;
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 
-use super::endpoints;
+use super::{endpoints, envelope};
 
 /// exchange 请求超时
 const REQUEST_TIMEOUT_MS: u64 = 30_000;
@@ -128,25 +128,33 @@ pub async fn exchange(
         ));
     }
     let payload = response.payload.unwrap_or(Value::Null);
-    let access_token = payload
+    // 上游统一信封 `{code, message, data}`：业务失败看 `code != 0`，成功数据在 `data`
+    if let Some(message) = envelope::business_error(&payload) {
+        return Err(GatewayError::with_status(
+            502,
+            format!("LobsterAI 授权码交换被拒：{message}"),
+        ));
+    }
+    let data = envelope::data(&payload);
+    let access_token = data
         .get("accessToken")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| GatewayError::with_status(502, "LobsterAI 交换响应缺少 accessToken"))?
         .to_string();
-    let refresh_token = payload
+    let refresh_token = data
         .get("refreshToken")
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or("")
         .to_string();
-    let expires_in = payload
+    let expires_in = data
         .get("expiresIn")
         .and_then(Value::as_i64)
         .filter(|value| *value > 0)
         .unwrap_or(30 * 24 * 3600);
-    let user = payload.get("user").cloned().unwrap_or(Value::Null);
+    let user = data.get("user").cloned().unwrap_or(Value::Null);
     let user_id = user
         .get("userId")
         .and_then(Value::as_str)
