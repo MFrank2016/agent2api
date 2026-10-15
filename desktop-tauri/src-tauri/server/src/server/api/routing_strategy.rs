@@ -2,16 +2,17 @@
 //!
 //! ── 这条端点管什么 ──────────────────────────────────────────
 //! 它把两套路由设置合成一份配置：
-//!   · **选路策略**（`core::routing::strategy` 的 6 档，**逐家**）：全局默认
+//!   · **选路策略**（`core::routing::strategy` 的 7 档，**逐家**）：全局默认
 //!     `default` + 逐家覆盖 `providers`。取值 `priority`（默认，行为与改造前
-//!     逐字相同）/ `least-connections` / `round-robin` / `least-recently-used`
+//!     逐字相同）/ `least-connections` / `round-robin`（家内轮询）/
+//!     `global-round-robin`（整表轮询，上游 `rotate`）/ `least-recently-used`
 //!     / `balance-weighted` / `priority-weighted`。
 //!   · **上游 v3.0.2 引入的四个维度**：会话粘性（`routingSticky`）、失败退避
 //!     （`routingFailoverBackoff`）、限流垫底（`routingSink`）、熔断
 //!     （`routingBreaker*`）。语义与默认值原样保留。
 //!
 //! `/api/routing`（`api::routing_api`）是本端点的**兼容别名**：读写同一份配置，
-//! 额外认一个旧的字符串字段 `routingStrategy`（`order` / `rotate` / `usage`）。
+//! 额外认一个旧的字符串字段 `routingStrategy`（`order` / `rotate` / `provider` / `usage`）。
 //!
 //! ── 为什么与 /api/prompt 分成两条端点 ───────────────────────
 //! 两者读写的是不同的配置键、不同的语义；形状也不同（这条是「枚举 + 一张
@@ -409,10 +410,10 @@ mod tests {
     }
 
     #[test]
-    fn strategies_list_has_all_six_with_labels() {
+    fn strategies_list_has_all_values_with_labels() {
         let value = strategies_json();
         let items = value.as_array().cloned().unwrap_or_default();
-        assert_eq!(items.len(), 6);
+        assert_eq!(items.len(), 7);
         for item in items {
             assert!(item.get("id").and_then(Value::as_str).is_some_and(|id| !id.is_empty()));
             assert!(item.get("label").and_then(Value::as_str).is_some_and(|label| !label.is_empty()));

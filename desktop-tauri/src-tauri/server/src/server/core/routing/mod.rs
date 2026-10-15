@@ -730,6 +730,13 @@ pub fn plan_route(
                             format!("排在第 {position} 位：等前面的轮完或失败才到它")
                         }
                     }
+                    RoutingStrategy::GlobalRoundRobin => {
+                        if position == 1 {
+                            "本轮轮到它：全局轮询下整条队列依次轮流（跨提供商）".to_string()
+                        } else {
+                            format!("排在第 {position} 位：全局轮询每轮整体前移一位")
+                        }
+                    }
                     other => format!("按「{}」策略排在第 {position} 位", other.label()),
                 }
             };

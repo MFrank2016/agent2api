@@ -872,9 +872,10 @@ pub struct QueuePatch {
 ///
 /// ── 兼容上游 v3.0.2 的旧字符串形态 ─────────────────────────
 /// 旧版本把 `routingStrategy` 直接写成字符串（`"order"` / `"rotate"` /
-/// `"usage"`）。读侧（`config::parse::routing_strategy_from`）在读取时把它
-/// 迁移成上面的对象形态（`order`→`priority`、`rotate`→`round-robin`、
-/// `usage`→`balance-weighted`、认不出→`priority`），**不丢数据**。
+/// `"provider"` / `"usage"`）。读侧（`config::parse::routing_strategy_from`）在读取
+/// 时把它迁移成上面的对象形态（`order`→`priority`、`rotate`→`global-round-robin`、
+/// `provider`→`round-robin`、`usage`→`balance-weighted`、认不出→`priority`），
+/// **不丢数据**。迁移表本体在 `core::routing::RoutingStrategy::from_config`（唯一一处）。
 pub const KEY_ROUTING_STRATEGY: &str = "routingStrategy";
 /// `routingStrategy` 里的全局默认子键（值 = 策略字符串）
 pub const KEY_ROUTING_STRATEGY_DEFAULT: &str = "default";
@@ -1022,14 +1023,6 @@ pub const KEY_ROUTING_BREAKER_TIMEOUT: &str = "routingBreakerTimeoutSeconds";
 /// 恢复阈值：熔断放行后要连续成功几次才算恢复（`routingBreakerSuccessThreshold`）
 pub const KEY_ROUTING_BREAKER_SUCCESS: &str = "routingBreakerSuccessThreshold";
 
-pub const ROUTING_STRATEGY_ORDER: &str = "order";
-pub const ROUTING_STRATEGY_ROTATE: &str = "rotate";
-/// 家内轮询（`provider`）：家之间按优先级，同一家内部轮流用各账号。
-///
-/// 与「负载均衡」的差别在**轮转的边界**：这里家的先后固定（由优先级定），
-/// 只有家内换人 —— 适合「想优先用某几家、又不愿把某一家的某个账号焊死」。
-pub const ROUTING_STRATEGY_PROVIDER: &str = "provider";
-
 pub const STICKY_OFF: &str = "off";
 pub const STICKY_TURN: &str = "turn";
 pub const STICKY_SESSION: &str = "session";
@@ -1044,42 +1037,6 @@ pub const ROUTING_BREAKER_MAX_TIMEOUT: i64 = 600;
 /// 恢复阈值合法范围：1~10 次
 pub const ROUTING_BREAKER_MIN_SUCCESS: i64 = 1;
 pub const ROUTING_BREAKER_MAX_SUCCESS: i64 = 10;
-
-/// 路由策略（`RouteStrategy` 的 Rust 形态；配置里存 `as_str`）
-///
-/// 三档：顺序优先（队列第 1 位接走所有请求）、负载均衡（逐请求轮换）、
-/// 家内轮询（家之间按优先级、同一家内部轮流用各账号）。
-/// 「余额优先（usage）」已下线（2026-10，按用户要求移除）—— 见 `from_id` 的兜底说明。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RouteStrategy {
-    Order,
-    Rotate,
-    /// 家内轮询（本仓新增，上游没有）：轮转的边界收在「家」里面
-    Provider,
-}
-
-impl RouteStrategy {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Order => ROUTING_STRATEGY_ORDER,
-            Self::Rotate => ROUTING_STRATEGY_ROTATE,
-            Self::Provider => ROUTING_STRATEGY_PROVIDER,
-        }
-    }
-
-    /// 配置值 → 策略。**未知值一律回落顺序优先**（与旧行为一致）。
-    ///
-    /// 已下线的 `"usage"`（余额优先）单独归到**负载均衡**而不是默认档：那种配置是
-    /// 用户当初显式选的「谁空谁上」，语义上最接近的是「把负载摊开」（rotate），
-    /// 静默退回「排第 1 的接走所有请求」会与他的本意相反。
-    pub fn from_id(value: &str) -> Self {
-        match value {
-            ROUTING_STRATEGY_PROVIDER => Self::Provider,
-            ROUTING_STRATEGY_ROTATE | "usage" => Self::Rotate,
-            _ => Self::Order,
-        }
-    }
-}
 
 /// 会话粘性档位（`StickyMode`）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

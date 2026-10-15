@@ -3,7 +3,7 @@
 //!
 //! ── /api/routing（统一端点 `/api/routing-strategy` 的别名）─────────
 //! 读写的是同一份配置（`api::routing_strategy::apply_object`）。GET 返回统一的
-//! JSON，额外附一个旧字符串字段 `routingStrategy`（`order` / `rotate` / `usage`）
+//! JSON，额外附一个旧字符串字段 `routingStrategy`（`order` / `rotate` / `provider` / `usage`）
 //! 供旧读取方；PUT 接受统一的 patch，也接受旧形态的 `routingStrategy` 字符串
 //! （翻成统一的 `default`）。**新界面一律走 `/api/routing-strategy`**，这条别名
 //! 只为兼容而保留。
@@ -77,22 +77,29 @@ pub async fn put_routing(State(_state): State<ServerState>, body: Bytes) -> Resp
 }
 
 /// 旧字符串 → 策略（写侧口径：未知给 `None`，由调用方报 400）。
+///
+/// 迁移表与读侧（`RoutingStrategy::from_config`）**同一份**：`rotate` 是上游的
+/// 「整表轮转」→ `global-round-robin`，`provider` 是「家内轮询」→ `round-robin`
+/// —— 两个轮询边界必须分开，早先 `rotate`→`round-robin` 把全局轮转降级成了家内轮转。
 fn legacy_strategy(text: &str) -> Option<RoutingStrategy> {
     match text.trim().to_ascii_lowercase().as_str() {
         "order" => Some(RoutingStrategy::Priority),
-        "rotate" => Some(RoutingStrategy::RoundRobin),
+        "rotate" => Some(RoutingStrategy::GlobalRoundRobin),
+        "provider" => Some(RoutingStrategy::RoundRobin),
         "usage" => Some(RoutingStrategy::BalanceWeighted),
         _ => RoutingStrategy::parse(text),
     }
 }
 
 /// 在统一 JSON 上补一个旧字符串字段 `routingStrategy`（旧界面 / 旧脚本读它）。
-/// 只映射 `priority` → `order`、`round-robin` → `rotate`，其余给新档位 id。
+/// 只映射 `priority` → `order`、`round-robin` → `provider`、`global-round-robin`
+/// → `rotate`，其余给新档位 id（与 `legacy_strategy` 对称）。
 fn with_legacy_strategy(mut value: Value) -> Value {
     let default = config::routing_strategy_settings().default;
     let legacy = match default {
         RoutingStrategy::Priority => "order",
-        RoutingStrategy::RoundRobin => "rotate",
+        RoutingStrategy::RoundRobin => "provider",
+        RoutingStrategy::GlobalRoundRobin => "rotate",
         other => other.as_str(),
     };
     if let Some(object) = value.as_object_mut() {

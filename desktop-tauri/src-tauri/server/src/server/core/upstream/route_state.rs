@@ -87,9 +87,10 @@ pub(super) struct RouteState {
     sink: Mutex<HashMap<String, i64>>,
     /// 熔断：账号 id → 状态
     breaker: Mutex<HashMap<String, BreakerEntry>>,
-    /// 轮转游标：模型键 → 单调计数（上游 `RouteStrategy::Rotate` / `Provider`
-    /// 两种轮转策略用；取模由调用方做，见 `rotate_take`）。本仓的选路引擎改由
-    /// `routing::strategy` 的逐家策略承担轮转，这里保留以兼容上游的轮转实现。
+    /// 轮转游标：模型键 → 单调计数（上游的 `rotate` / `provider` 两种轮转策略用；
+    /// 取模由调用方做，见 `rotate_take`）。本仓的选路引擎改由 `routing::strategy`
+    /// 的逐家策略（`round-robin` / `global-round-robin`）承担轮转，这里保留以兼容
+    /// 上游的轮转实现。
     #[allow(dead_code)]
     cursors: Mutex<HashMap<String, usize>>,
 }

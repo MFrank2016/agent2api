@@ -464,8 +464,10 @@ pub(super) fn captcha_pool_from(map: &Map<String, Value>) -> CaptchaPoolSettings
 ///
 /// 口径与既有配置一致（**写坏回落、不报错、不影响启动**）：
 ///   - 整个键缺失 / 不是对象 / 不是字符串 → 全默认（`default = priority`、逐家表为空）；
-///   - 旧字符串形态（上游 v3.0.2）：`"order"`/`"rotate"`/`"usage"` 迁移成
-///     `{ default: <映射结果>, providers: {} }`（不丢数据）；
+///   - 旧字符串形态（上游 v3.0.2）：`"order"`/`"rotate"`/`"provider"`/`"usage"`
+///     迁移成 `{ default: <映射结果>, providers: {} }`（不丢数据）；映射表在
+///     `RoutingStrategy::from_config`（`rotate`→`global-round-robin`、
+///     `provider`→`round-robin`，两个轮询边界分开）；
 ///   - `default` 缺失 / 非法 → `priority`；
 ///   - `providers` 缺失 / 不是对象 → 空表；
 ///   - 逐家项：id 空串跳过；值不是合法策略 → **回落到 `priority`**（而不是跳过 ——
@@ -582,8 +584,15 @@ mod routing_strategy_tests {
     // ── 上游 v3.0.2 旧字符串形态的迁移（任务要求：不丢数据）──────────
 
     #[test]
-    fn legacy_rotate_string_loads_as_round_robin() {
+    fn legacy_rotate_string_loads_as_global_round_robin() {
         let settings = routing_strategy_from(&object(json!({ "routingStrategy": "rotate" })));
+        assert_eq!(settings.default, RoutingStrategy::GlobalRoundRobin);
+        assert!(settings.providers.is_empty());
+    }
+
+    #[test]
+    fn legacy_provider_string_loads_as_round_robin() {
+        let settings = routing_strategy_from(&object(json!({ "routingStrategy": "provider" })));
         assert_eq!(settings.default, RoutingStrategy::RoundRobin);
         assert!(settings.providers.is_empty());
     }

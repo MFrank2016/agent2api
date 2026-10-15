@@ -18,9 +18,13 @@
 //! 挑一个。于是「workbuddy 的请求不会借到 raccoon 的账号」这条仍然成立，
 //! 而「先试哪一家」也没有因为引入策略而改变。
 //!
+//! **唯一例外**是 `global-round-robin`（全局轮询）：它是**池级**策略，轮转的
+//! 边界是整条候选队列（跨家）—— 见 [`order_candidates`] 与枚举里那一档的说明。
+//!
 //! ── 运行时状态（[`RoutingState`]）───────────────────────────
-//! 三种策略需要**跨请求记忆**（进程内、重启即清零）：
-//!   - 轮询：`(provider, 请求名) → 游标`；
+//! 四种策略需要**跨请求记忆**（进程内、重启即清零）：
+//!   - 轮询（家内）：`(provider, 请求名) → 游标`；
+//!   - 全局轮询：`请求名 → 游标`（整条候选队列一条环，跨家）；
 //!   - 最近最少使用：`账号 id → 上次被选中的时刻`；
 //!   - 平滑加权轮询（SWRR）：`账号 id → 当前权重`。
 //! 全挂在一个 `Arc<Mutex<..>>` 上（与 `upstream::connections` 同一形态），
@@ -54,8 +58,10 @@ pub enum RoutingStrategy {
     Priority,
     /// 最少连接：在途请求数最少者优先，并列按优先级
     LeastConnections,
-    /// 轮询：在可用账号之间依次轮流
+    /// 轮询（家内轮询）：在同一家的可用账号之间依次轮流
     RoundRobin,
+    /// 全局轮询：整条候选队列（跨提供商）依次轮流 —— 上游 `rotate` 的等价物
+    GlobalRoundRobin,
     /// 最近最少使用：上次被选中最早者优先，并列按优先级
     LeastRecentlyUsed,
     /// 余额加权：平滑加权轮询，权重 = 账号剩余余额
@@ -66,10 +72,11 @@ pub enum RoutingStrategy {
 
 impl RoutingStrategy {
     /// 全部合法值（界面下拉与 400 文案共用一份，避免两处各写一遍）
-    pub const ALL: [RoutingStrategy; 6] = [
+    pub const ALL: [RoutingStrategy; 7] = [
         RoutingStrategy::Priority,
         RoutingStrategy::LeastConnections,
         RoutingStrategy::RoundRobin,
+        RoutingStrategy::GlobalRoundRobin,
         RoutingStrategy::LeastRecentlyUsed,
         RoutingStrategy::BalanceWeighted,
         RoutingStrategy::PriorityWeighted,
@@ -81,6 +88,7 @@ impl RoutingStrategy {
             RoutingStrategy::Priority => "priority",
             RoutingStrategy::LeastConnections => "least-connections",
             RoutingStrategy::RoundRobin => "round-robin",
+            RoutingStrategy::GlobalRoundRobin => "global-round-robin",
             RoutingStrategy::LeastRecentlyUsed => "least-recently-used",
             RoutingStrategy::BalanceWeighted => "balance-weighted",
             RoutingStrategy::PriorityWeighted => "priority-weighted",
@@ -95,14 +103,25 @@ impl RoutingStrategy {
     }
 
     /// 读侧口径的配置值 → 策略：在 [`Self::parse`] 之上兼容上游 v3.0.2 的旧字符串
-    /// 形态（`order` / `rotate` / `usage`），认不出（含空串）回落 [`Self::Priority`]。
+    /// 形态（`order` / `rotate` / `provider` / `usage`），认不出（含空串）回落
+    /// [`Self::Priority`]。
+    ///
+    /// ── 迁移表（上游 → 本仓，2026-10 统一）─────────────────────
+    ///   - `order`    → `priority`（严格优先级）
+    ///   - `rotate`   → `global-round-robin`（**整条队列**轮转，上游的「负载均衡」）
+    ///   - `provider` → `round-robin`（**家内**轮询）
+    ///   - `usage`    → `balance-weighted`（余额加权）
+    ///   - 认不出     → `priority`
+    /// `rotate` 与 `provider` 是**两个不同**的轮询边界（整表 vs 家内），必须分开
+    /// 映射 —— 早先把两者都归到 `round-robin`，等于把上游的全局轮转降级成了家内轮转。
     ///
     /// 与 `parse` 分开：写侧（`api::routing_strategy` 的 400 校验）只认新名字；
     /// 读侧则要把旧配置无痛迁进来 —— 旧名字在这里有确定语义，不该报错也不该丢。
     pub fn from_config(text: &str) -> Self {
         match text.trim().to_ascii_lowercase().as_str() {
             "order" => Self::Priority,
-            "rotate" => Self::RoundRobin,
+            "rotate" => Self::GlobalRoundRobin,
+            "provider" => Self::RoundRobin,
             "usage" => Self::BalanceWeighted,
             _ => Self::parse(text).unwrap_or_default(),
         }
@@ -114,6 +133,7 @@ impl RoutingStrategy {
             RoutingStrategy::Priority => "优先级优先",
             RoutingStrategy::LeastConnections => "最少连接",
             RoutingStrategy::RoundRobin => "轮询",
+            RoutingStrategy::GlobalRoundRobin => "全局轮询",
             RoutingStrategy::LeastRecentlyUsed => "最近最少使用",
             RoutingStrategy::BalanceWeighted => "余额加权",
             RoutingStrategy::PriorityWeighted => "优先级加权",
@@ -125,7 +145,8 @@ impl RoutingStrategy {
         match self {
             RoutingStrategy::Priority => "按账号页的全局优先级从小到大取第一个可用的（默认，行为与改造前完全一致）",
             RoutingStrategy::LeastConnections => "优先挑当前在途请求数最少的账号，把并发摊平",
-            RoutingStrategy::RoundRobin => "在可用账号之间依次轮流，均衡且可预期",
+            RoutingStrategy::RoundRobin => "在同一家的可用账号之间依次轮流（家内轮询），均衡且可预期",
+            RoutingStrategy::GlobalRoundRobin => "整条候选队列（跨提供商）依次轮流：每条请求换下一位，适合把手里所有号都摊开用（上游「负载均衡 / rotate」的等价物）",
             RoutingStrategy::LeastRecentlyUsed => "优先挑最久没有被选中的账号",
             RoutingStrategy::BalanceWeighted => "按账号余额加权轮询：余额越多分到的请求越多（平滑加权轮询）",
             RoutingStrategy::PriorityWeighted => "按优先级加权轮询：优先级数字越小权重越高（同级等权）",
@@ -136,7 +157,7 @@ impl RoutingStrategy {
 /// 选路策略的**运行时状态**（进程内、重启即清零）。
 ///
 /// `Clone` 是浅拷贝（内部 `Arc`）：`ServerState` 的 handler 克隆后拿到的仍是
-/// 同一份状态（与 `Connections` 同一形态）。三张表各自的键见模块头。
+/// 同一份状态（与 `Connections` 同一形态）。四张表各自的键见模块头。
 #[derive(Clone)]
 pub struct RoutingState {
     inner: Arc<Mutex<RoutingInner>>,
@@ -146,6 +167,8 @@ pub struct RoutingState {
 struct RoutingInner {
     /// `(provider, 请求名) → 轮询游标`（下一次从哪个下标开始）
     rr_cursor: HashMap<(String, String), usize>,
+    /// `请求名 → 全局轮询游标`（整条候选队列一条环，跨家；见 `next_global_round_robin`）
+    global_rr_cursor: HashMap<String, usize>,
     /// `账号 id → 上次被选中的毫秒时刻`
     last_selected: HashMap<String, i64>,
     /// `账号 id → 平滑加权轮询的当前权重`
@@ -178,6 +201,22 @@ impl RoutingState {
             .rr_cursor
             .entry((provider.to_string(), model.to_string()))
             .or_insert(0);
+        let index = *cursor % len;
+        *cursor = cursor.wrapping_add(1);
+        index
+    }
+
+    /// 全局轮询游标前进一格：返回本次应取的**整表下标**（`0..len`）。
+    ///
+    /// 游标按**请求名**记忆（键里没有 provider）—— 全局轮询跨家轮转，整条候选
+    /// 队列共用一条环，与家内轮询的 `(provider, 请求名)` 二维键刻意分开。
+    /// `len == 0` 是防御（调用点不会用空表），返回 0。
+    pub fn next_global_round_robin(&self, model: &str, len: usize) -> usize {
+        if len == 0 {
+            return 0;
+        }
+        let mut inner = self.lock();
+        let cursor = inner.global_rr_cursor.entry(model.to_string()).or_insert(0);
         let index = *cursor % len;
         *cursor = cursor.wrapping_add(1);
         index
@@ -278,18 +317,22 @@ pub fn pick_account(
 ///      —— 保持改造前的跨家顺序；
 ///   2. 组内按优先级排好，再按该家策略（配置默认 + 逐家覆盖）排成组内顺序；
 ///   3. 组序拼接即为完整顺序；
-///   4. 兼容性守卫：候选里**每一家**的策略都是 `priority` 时，直接返回
+///   4. **全局轮询**（`global-round-robin`）：只要有任一家的有效策略是它，
+///      就把整条顺序当成一条环**跨家轮转**（`advance` 为真时消耗一次全局游标）
+///      —— 上游 `rotate` 的等价物；组内退化为优先级序（轮转在整表层做）；
+///   5. 兼容性守卫：候选里**每一家**的策略都是 `priority` 时，直接返回
 ///      「全局扁平优先级序」—— 与改造前 [`super::pick_account_by_priority`] 的
 ///      排序（以及上游 `order` 策略）逐字相同。
 ///
-/// `advance` = 是否推进**有状态的策略**（轮询游标 / LRU 时刻 / SWRR 权重）：
+/// `advance` = 是否推进**有状态的策略**（轮询游标 / 全局游标 / LRU 时刻 / SWRR 权重）：
 ///   - 真：转发选路的「本请求第一次选路」（消耗一次轮询 / 记一次 LRU / 转一次
 ///     加权轮询）；
 ///   - 假：预演（队列面板只画不消耗、429 顺延沿用起点）—— 有状态策略退化成
 ///     组内优先级序，不写任何运行时状态。
 ///
-/// 跨家顺序用全局优先级、策略只在**一家之内**生效：workbuddy 的请求不会借到
-/// raccoon 的账号，而「先试哪一家」也没有因为引入策略而改变。
+/// 跨家顺序用全局优先级、策略默认只在**一家之内**生效：workbuddy 的请求不会借到
+/// raccoon 的账号，而「先试哪一家」也没有因为引入策略而改变。**唯一例外**是
+/// `global-round-robin` —— 它是**池级**策略，轮转的边界是整条队列（跨家），见上面第 4 条。
 #[allow(clippy::too_many_arguments)]
 pub fn order_candidates(
     candidates: &[Value],
@@ -319,18 +362,40 @@ pub fn order_candidates(
     groups.sort_by(|left, right| {
         by_priority_order(best_priority_key(&left.1), best_priority_key(&right.1))
     });
+    // ── 全局轮询：整条候选队列（跨家）整体轮转 ──────────────────────
+    // 只要有**任一家的有效策略**是 `global-round-robin`，就把整表当成一条环
+    // 轮转（上游 `rotate` 的语义），而不是只在组内轮转。它是**池级**策略：
+    //   · 作为全局 `default`：所有未覆盖的家都用它 —— 整条队列跨家轮流；
+    //   · 作为逐家覆盖：那一家「要求整表轮转」，于是整表照样轮转（该家的账号也
+    //     参与其中）—— 覆盖表达的是「这一家要参与全局轮转」，轮转的边界仍是整条
+    //     队列（跨家），不会退回成「只在家内轮」。
+    // 组内一律退化为优先级序（轮转在下面统一做），其余有状态策略仍只在队首组推进。
+    let whole_rotate = advance
+        && groups
+            .iter()
+            .any(|(provider, _)| settings.resolve(provider) == RoutingStrategy::GlobalRoundRobin);
     let mut ordered: Vec<Value> = Vec::with_capacity(candidates.len());
     for (index, (provider, mut group)) in groups.into_iter().enumerate() {
         // 组内先按优先级排好：所有策略的并列兜底与轮询顺序都基于它
         group.sort_by(compare_by_priority);
         let strategy = settings.resolve(&provider);
-        // 只有**队首组**推进有状态策略（游标 / LRU / SWRR）：其余组排在后面
-        // 只是兜底顺序，不该消耗它们的运行时状态 —— 否则一条请求会把没用到的
-        // 那家的轮询游标也推一格，长期看会把轮询摊平打歪。
+        // `global-round-robin` 的轮转发生在**整表**层面（见上），组内退化成优先级序；
+        // 其余有状态策略（游标 / LRU / SWRR）只在**队首组**推进：后面的组只是兜底顺序，
+        // 不该消耗它们的运行时状态 —— 否则一条请求会把没用到的那家的轮询游标也推一格。
+        let group_strategy = if strategy == RoutingStrategy::GlobalRoundRobin {
+            RoutingStrategy::Priority
+        } else {
+            strategy
+        };
         let group_advance = advance && index == 0;
         ordered.extend(order_group(
-            group, strategy, &provider, model, counts, state, balances, now, group_advance,
+            group, group_strategy, &provider, model, counts, state, balances, now, group_advance,
         ));
+    }
+    if whole_rotate && !ordered.is_empty() {
+        let len = ordered.len();
+        let start = state.next_global_round_robin(model, len);
+        ordered.rotate_left(start % len);
     }
     ordered
 }
@@ -358,6 +423,9 @@ fn order_group(
     match strategy {
         // 组已按优先级排好，原样即答案
         RoutingStrategy::Priority => group,
+        // `global-round-robin` 的轮转在**整表**层做（见 `order_candidates`），组内
+        // 走优先级序 —— 这个分支只在被直接调用时兜底，正常路径不会到这里。
+        RoutingStrategy::GlobalRoundRobin => group,
         RoutingStrategy::LeastConnections => {
             let mut group = group;
             group.sort_by_key(|account| {
@@ -821,4 +889,52 @@ mod tests {
         assert_eq!(account_id(&p_first.unwrap_or(Value::Null)), Some("p1"));
         assert_eq!(account_id(&p_second.unwrap_or(Value::Null)), Some("p2"));
     }
+
+    #[test]
+    fn global_round_robin_rotates_the_whole_candidate_list() {
+        // 两家：p 优先、q 次之；全局轮询下**整条队列**跨家轮转（p1 → p2 → q1 → …）
+        let accounts = vec![
+            account("p1", "p", 100, 1),
+            account("p2", "p", 101, 2),
+            account("q1", "q", 200, 3),
+        ];
+        let state = RoutingState::new();
+        let config = settings(RoutingStrategy::GlobalRoundRobin, &[]);
+        let keys = CooldownKeys::new("m");
+        let counts = HashMap::new();
+        let balances = HashMap::new();
+        let seq: Vec<Option<String>> = (0..3)
+            .map(|_| {
+                pick_account(&accounts, &keys, &counts, &[], 1_000, &config, &state, &balances)
+                    .and_then(|value| account_id(&value).map(str::to_string))
+            })
+            .collect();
+        assert_eq!(seq, vec![Some("p1".into()), Some("p2".into()), Some("q1".into())]);
+    }
+
+    #[test]
+    fn global_round_robin_as_provider_override_rotates_the_whole_list() {
+        // 全局 priority，但 p 家覆盖成 global-round-robin → 仍是**整表**轮转
+        let accounts = vec![
+            account("p1", "p", 100, 1),
+            account("p2", "p", 101, 2),
+            account("q1", "q", 200, 3),
+        ];
+        let state = RoutingState::new();
+        let config = settings(
+            RoutingStrategy::Priority,
+            &[("p", RoutingStrategy::GlobalRoundRobin)],
+        );
+        let keys = CooldownKeys::new("m");
+        let counts = HashMap::new();
+        let balances = HashMap::new();
+        let seq: Vec<Option<String>> = (0..3)
+            .map(|_| {
+                pick_account(&accounts, &keys, &counts, &[], 1_000, &config, &state, &balances)
+                    .and_then(|value| account_id(&value).map(str::to_string))
+            })
+            .collect();
+        assert_eq!(seq, vec![Some("p1".into()), Some("p2".into()), Some("q1".into())]);
+    }
+
 }
