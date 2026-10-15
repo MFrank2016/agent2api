@@ -323,6 +323,20 @@ impl AccountStore {
             .flatten()
     }
 
+    /// 该账号是否带着「因余额不足被自动禁用」标记（原始记录字段，见
+    /// [`crate::server::core::account_store::state::LOW_BALANCE_DISABLED_KEY`]）。
+    ///
+    /// 公开形态（`store_view::public_account`）**刻意不透出**这个内部标记：它只服务
+    /// 「签到后余额回升自动解冻」这一条链路（见 `billing::checkin`），是区分
+    /// 「自动禁用」与「用户手动禁用」的唯一判据 —— 手动禁用的账号没有它，因此
+    /// 永远不允许被自动启用。库不可用 / 账号不存在时按 false 处理（不解冻）。
+    pub fn low_balance_disabled(&self, id: &str) -> bool {
+        let _guard = self.guard();
+        self.record_by_id(&_guard, id)
+            .map(|record| record.low_balance_disabled())
+            .unwrap_or(false)
+    }
+
     /// 取某个 provider 的全部账号（**只读这一家**）。
     ///
     /// `current_entry_for_provider` / `accounts_for_provider` 用它：两者的语义

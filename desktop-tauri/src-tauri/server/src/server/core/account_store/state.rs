@@ -37,6 +37,15 @@ pub struct AccountState {
 /// `priority_scope` 的当前取值：全局一条队列
 pub const PRIORITY_SCOPE_GLOBAL: &str = "global";
 
+/// 记录字段：`true` 表示这条账号是**被自动禁用**的（当前只有
+/// `usage_query::enforce_low_balance_disable` 的「余额不足」档会写入）。
+///
+/// 它是「自动禁用」与「用户手动禁用」之间**唯一**的可判别据：自动解冻
+/// （签到后余额回升，见 `billing::checkin` 的 `refresh_usage_after_checkin`）
+/// 只认带这个标记的禁用；手动禁用的账号没有它，永远不会被自动启用。用户手动
+/// 动过启用开关时由 `apply_patch` 清掉（见那里的说明）。
+pub const LOW_BALANCE_DISABLED_KEY: &str = "lowBalanceDisabled";
+
 /// 一条账号记录：原样持有的 JSON 对象 + 容错访问器。
 #[derive(Clone, Debug)]
 pub struct StoredAccount {
@@ -235,6 +244,24 @@ impl StoredAccount {
     pub fn set_enabled(&mut self, enabled: bool) {
         self.fields
             .insert("enabled".to_string(), Value::Bool(enabled));
+    }
+
+    /// 是否带着「因余额不足被自动禁用」标记（缺省 false）。
+    ///
+    /// 语义与写入侧见 [`LOW_BALANCE_DISABLED_KEY`]。这是自动解冻链路
+    /// （`billing::checkin`）区分「自动禁用」与「手动禁用」的唯一判据。
+    pub fn low_balance_disabled(&self) -> bool {
+        matches!(self.fields.get(LOW_BALANCE_DISABLED_KEY), Some(Value::Bool(true)))
+    }
+
+    /// 打上 / 清掉「因余额不足被自动禁用」标记（`true` 写显式 `true`，`false` 删键）。
+    pub fn set_low_balance_disabled(&mut self, disabled: bool) {
+        if disabled {
+            self.fields
+                .insert(LOW_BALANCE_DISABLED_KEY.to_string(), Value::Bool(true));
+        } else {
+            self.fields.remove(LOW_BALANCE_DISABLED_KEY);
+        }
     }
 
     pub fn added_at(&self) -> i64 {

@@ -6,9 +6,11 @@
 //!     header: Authorization: Bearer <accessToken>（+ 能力头）
 //!   → { code, data: [ { modelId, modelName, provider, apiFormat } ] }
 //! ```
-//! 目录**没有内置兜底清单**（上游清单就是唯一事实来源）：拉不到时保持现有清单
-//! （内存 → 落盘缓存 → 空）。清单为空的家不进 `/v1/models`（见 `catalog` 的
-//! 可用性判据）—— 这与 Loomy「上游没有内置兜底」的处境一致。
+//! 目录**有内置兜底清单**（`FALLBACK_MODELS`，上游 `/api/models/available` 实测
+//! 19 支）：远程拉不到时用它 —— 否则在首次成功刷新之前 LobsterAI 会在模型管理
+//! 与 `/v1/models` 里**整家缺席**（0 行）。这与 Nous 的兜底同一手法（见
+//! `providers::nous::models`）：拉不到时保持现有清单（内存 → 落盘缓存 → 内置
+//! 兜底），远程刷新成功后由真实目录覆盖。
 //!
 //! ── 缓存 ────────────────────────────────────────────────────
 //! 与各家同款：内存缓存 + `providers::catalog_cache` 落盘（进程重启后读回，
@@ -35,6 +37,51 @@ const TTL_MS: i64 = 5 * 60 * 1000;
 
 /// 目录查询超时
 const REQUEST_TIMEOUT_MS: u64 = 15_000;
+
+/// 内置兜底清单（远程目录拉不到时用；上游 `/api/models/available` 实测 19 支）。
+///
+/// 为什么需要它：`list()` 在首次成功刷新之前本来是空的，而空清单的家在
+/// `/v1/models` 与模型管理里会**整家缺席**（`catalog` 的可用性判据按清单非空）。
+/// 有了兜底，账号一加就能看到模型，远程刷新成功后再被真实目录覆盖。展示名直接
+/// 用 id（上游目录只回 `modelName`，兜底没有更权威的名字可用）。
+const FALLBACK_MODELS: &[&str] = &[
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "MiniMax-M3",
+    "MiniMax-M2.7",
+    "qwen3.7-max",
+    "qwen3.7-plus",
+    "qwen3.6-plus",
+    "qwen3.5-plus-2026-04-20",
+    "kimi-k2.7-code",
+    "kimi-k2.7-code-highspeed",
+    "kimi-k2.6",
+    "kimi-k2.5",
+    "doubao-seed-2-1-pro-260628",
+    "doubao-seed-2-1-turbo-260628",
+    "doubao-seed-2-0-code-preview-260215",
+    "glm-5.2",
+    "glm-5.1",
+    "glm-5v-turbo",
+    "glm-5",
+];
+
+/// 内置兜底清单的聚合层形态（能力位与 `map_entry` 同款：工具 / 思考恒 true，
+/// 图片位保守 false —— 没有目录依据时不报「支持」）。
+fn fallback_models() -> Vec<Value> {
+    FALLBACK_MODELS
+        .iter()
+        .map(|id| {
+            json!({
+                "id": id,
+                "name": id,
+                "supportsToolCall": true,
+                "supportsReasoning": true,
+                "supportsImages": false,
+            })
+        })
+        .collect()
+}
 
 /// 进程内缓存（首次访问时从落盘缓存读回）
 struct CatalogState {
@@ -107,12 +154,13 @@ pub fn parse_models(payload: &Value) -> Vec<Value> {
     rows.iter().filter_map(map_entry).collect()
 }
 
-/// 当前模型清单（内存 → 落盘缓存；可能为空）
+/// 当前模型清单（内存 → 落盘缓存 → 内置兜底；永远非空）
 pub fn list() -> Vec<Value> {
     with_state(|slot| {
         slot.as_ref()
             .map(|state| state.models.clone())
-            .unwrap_or_default()
+            .filter(|models| !models.is_empty())
+            .unwrap_or_else(fallback_models)
     })
 }
 

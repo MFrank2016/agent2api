@@ -41,7 +41,9 @@ use crate::server::core::account_store::priority::{
     QueueEntry, DEFAULT_PRIORITY,
 };
 use crate::server::core::account_store::sql;
-use crate::server::core::account_store::state::{mark_name_custom, StoredAccount};
+use crate::server::core::account_store::state::{
+    mark_name_custom, StoredAccount, LOW_BALANCE_DISABLED_KEY,
+};
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
 use crate::server::core::account_store::store_util::{
     js_string, js_truthy, number_or, object_or_empty, optional_text, pick_token, token_tail_of,
@@ -722,7 +724,21 @@ impl AccountStore {
             if next != current {
                 record.set_enabled(next);
                 changes.push(if next { "已启用".to_string() } else { "已禁用".to_string() });
+                // 用户手动改动启用状态：清掉「余额不足自动禁用」标记（只有
+                // **真的变化**时才清，设置弹窗把当前 enabled 原样回传不算手动
+                // 启停）。自动禁用 / 自动解冻走同一条写路径，但它们在 patch 里
+                // **显式**带上 `lowBalanceDisabled`，所以用「patch 是否显式携带该键」
+                // 区分手动与自动 —— 用户动过开关的账号不该再被自动解冻逻辑认领。
+                if !patch.contains_key(LOW_BALANCE_DISABLED_KEY) {
+                    record.set_low_balance_disabled(false);
+                }
             }
+        }
+
+        // 「余额不足自动禁用」标记的显式读写（只有自动禁用 / 自动解冻会带这个键）。
+        // 它**不进 `changes`**：标记是内部状态，不该出现在「账号已更新」的变更提示里。
+        if let Some(value) = patch.get(LOW_BALANCE_DISABLED_KEY) {
+            record.set_low_balance_disabled(matches!(value, Value::Bool(true)));
         }
 
         if let Some(value) = patch.get("proxy") {

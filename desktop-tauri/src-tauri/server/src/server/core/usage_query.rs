@@ -21,8 +21,11 @@
 //!   - skip（软跳过）：不改任何状态，转发选路按 `usage_records::balance_facts`
 //!     的内存事实实时剔除（见 `upstream::rotate`），余额回升自动恢复参与；
 //!   - disable（硬禁用）：查询成功落记录后由 `enforce_low_balance_disable`
-//!     判定，低于阈值就把账号 `enabled` 置 false —— 不自动恢复，需手动启用；
-//!     自动查询**继续**跑（禁用只表示不参与转发，余额保持新鲜供用户判断）。
+//!     判定，低于阈值就把账号 `enabled` 置 false 并打上 `lowBalanceDisabled`
+//!     标记 —— **本函数不自动恢复**（自动查询继续跑：禁用只表示不参与转发，余额
+//!     保持新鲜供用户判断）。唯一的例外是签到链路：LobsterAI 签到成功后重查余额，
+//!     带标记且余额回到阈值之上时由 `billing::checkin` 自动解冻（见那里）；
+//!     手动禁用不带标记，永远不会被解冻。
 //! 判定口径与余额列同一数字（`usage_records::extract_remaining`）。
 //!
 //! ── 限制器（余额 / Token 规则列表）与 Token 周期消耗 ─────────
@@ -318,9 +321,12 @@ fn write_row_record(row: &Value) {
 ///   3. 账号当前是启用状态（幂等：已禁用的账号不再执行、不再重复打日志）。
 ///
 /// 禁用走 `update_account` 既有写路径（与手动禁用同一入口，「已禁用」的变更
-/// 日志照常出现），再补一条说明原因的日志 —— 「为什么被禁」必须可复看。
-/// **不自动恢复**：余额回升后需手动启用；自动查询继续跑（禁用只表示不参与
-/// 转发），余额列保持新鲜，用户看着读数决定何时恢复。
+/// 日志照常出现），并在**同一个 patch** 里打上 `lowBalanceDisabled` 标记 —— 只有
+/// 带标记的禁用才允许被签到链路的自动解冻认领（见 `billing::checkin`）。再补一条
+/// 说明原因的日志 —— 「为什么被禁」必须可复看。
+/// **本函数只禁用、不恢复**：余额回升后由签到链路（带标记时）或用户手动启用；
+/// 自动查询继续跑（禁用只表示不参与转发），余额列保持新鲜，用户看着读数决定
+/// 何时恢复。
 fn enforce_low_balance_disable(store: &AccountStore, account: &Value, row: &Value) {
     if matches!(account.get("enabled"), Some(Value::Bool(false))) {
         return;
@@ -344,7 +350,9 @@ fn enforce_low_balance_disable(store: &AccountStore, account: &Value, row: &Valu
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .unwrap_or(id);
-    match store.update_account(id, &json!({ "enabled": false })) {
+    // 自动禁用同时打上标记：只有带这个标记的禁用才允许在余额回升后被自动解冻
+    // （见 `billing::checkin` 的签到后重估）；用户手动禁用不带标记。
+    match store.update_account(id, &json!({ "enabled": false, "lowBalanceDisabled": true })) {
         Ok(_) => logging::log_with_level(
             "[Usage]",
             &format!(

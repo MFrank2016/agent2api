@@ -355,6 +355,13 @@ pub async fn checkin_for(
                 crate::server::core::providers::lobsterai::checkin::claim_daily_checkin(store, &id)
                     .await
                     .map_err(|error| error.message);
+            // 签到成功后立即刷新该账号积分并重估「余额不足」闸（对照参考实现
+            // `RunCheckinNow` 的「签到 → 余额查询 → 解冻」）：+100 要立刻反映到
+            // 余额列，低余额判定也要拿新读数重估一次。范围只限本家（就在这个
+            // 分派臂里），别家行为不变。
+            if claim.as_ref().map(checkin_completed_today).unwrap_or(false) {
+                refresh_usage_after_checkin(store, &id).await;
+            }
             claim_result(id, name, &display, true, claim)
         }
         "codearts" => {
@@ -467,6 +474,111 @@ fn claim_result(
                 "error": message,
             })
         }
+    }
+}
+
+/// 签到成功后立即刷新该账号的积分并重估「余额不足」闸（LobsterAI 专用）。
+///
+/// ── 为什么签到后要立刻查一次余额 ─────────────────────────────
+/// 参考实现 `RunCheckinNow` 的顺序是「签到 → 余额查询 → 解冻」：签到发的
+/// +100 要立刻出现在余额列，而低余额自动禁用要在新读数上重估一次。这里复用
+/// `usage_query::query_all`（账号页单查「余额」走的就是它）：它查询、落记录、
+/// 并跑 `enforce_low_balance_disable` —— 与手动查询同一段编排，判定不会出现
+/// 两套口径。
+///
+/// 失败只记 verbose：签到本身已经成功，一次余额查询失败不该把成功的签到报成
+/// 失败（余额列下一次自动查询会补上）；余额查询失败时也**不解冻**（拿不到新鲜
+/// 读数，不能用记录表里上次成功的旧值做硬动作）。
+///
+/// ── 自动解冻的安全边界（本功能的核心）────────────────────────
+/// 解冻只认带 `lowBalanceDisabled` 标记的禁用（见 [`maybe_unfreeze_low_balance`]），
+/// 用户手动禁用的账号没有这个标记、永远不会被自动启用。
+///
+/// 范围只限 LobsterAI：调用点在本家的分派臂里，别家账号不会走到这里。
+async fn refresh_usage_after_checkin(store: &AccountStore, account_id: &str) {
+    let result = match crate::server::core::usage_query::query_all(store, Some(account_id)).await {
+        Ok(value) => value,
+        Err(error) => {
+            logging::verbose(
+                "[Checkin]",
+                &format!("账号 {account_id} 签到后余额刷新失败：{}", error.message),
+            );
+            return;
+        }
+    };
+    // 只有本次查询**成功**（结果行带 usage）才重估解冻：失败行的 usage 为 null，
+    // 而记录表里还留着上一次成功的旧读数（`usage_records` 的「失败保留数值」）——
+    // 拿旧读数去解冻等于用过期结论做硬动作。
+    let fresh = result
+        .get("results")
+        .and_then(Value::as_array)
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row.get("id").and_then(Value::as_str) == Some(account_id))
+        })
+        .and_then(|row| row.get("usage"))
+        .filter(|usage| !usage.is_null())
+        .cloned();
+    let Some(usage) = fresh else { return };
+    maybe_unfreeze_low_balance(store, account_id, &usage);
+}
+
+/// 签到后余额回升的**自动解冻**（LobsterAI 专用，只在签到成功后调用）。
+///
+/// ── 安全边界（本功能的核心）────────────────────────────────
+/// 只有**带 `lowBalanceDisabled` 标记**的禁用才可能被解冻：该标记由
+/// `usage_query::enforce_low_balance_disable` 在「余额不足自动禁用」时打上，
+/// 用户手动禁用**不带**标记（且手动动过启用开关会由 `account_store::apply_patch`
+/// 清掉标记）。因此手动禁用的账号永远不会被这里自动启用 —— 解冻只认自动禁用。
+///
+/// 命中条件（三条全要）：
+///   1. 账号当前 `enabled:false`；
+///   2. 带 `lowBalanceDisabled` 标记；
+///   3. 本次签到后的新读数判得出数字且 **≥** 该账号的余额禁用阈值（严格小于才
+///      禁用，等于阈值视为回升，与禁用判定同一口径）。
+///
+/// 解冻走 `update_account` 既有写路径，同一个 patch 里清掉标记 —— `enabled:true`
+/// 与标记必须一起落，否则会留下「已启用但仍带标记」的脏状态。
+fn maybe_unfreeze_low_balance(store: &AccountStore, account_id: &str, usage: &Value) {
+    if !store.low_balance_disabled(account_id) {
+        return;
+    }
+    // 回读账号（公开形态）：拿 enabled / 阈值 / 展示名
+    let account = store
+        .list_accounts()
+        .get("accounts")
+        .and_then(Value::as_array)
+        .and_then(|accounts| {
+            accounts
+                .iter()
+                .find(|item| item.get("id").and_then(Value::as_str) == Some(account_id))
+        })
+        .cloned();
+    let Some(account) = account else { return };
+    if account.get("enabled").and_then(Value::as_bool) != Some(false) {
+        return;
+    }
+    let Some(threshold) =
+        crate::server::core::usage_records::low_balance_disable_threshold(&account)
+    else {
+        return;
+    };
+    let (remaining, _unlimited) = crate::server::core::usage_records::extract_remaining(usage);
+    let Some(remaining) = remaining else { return };
+    if remaining < threshold {
+        return;
+    }
+    let display = account
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(account_id);
+    match store.update_account(account_id, &json!({ "enabled": true, "lowBalanceDisabled": false })) {
+        Ok(_) => logging::log("[Usage]", &format!("账号「{display}」余额回升，已自动解冻")),
+        Err(error) => logging::verbose(
+            "[Usage]",
+            &format!("账号 {account_id} 自动解冻失败：{}", error.message),
+        ),
     }
 }
 
