@@ -1,5 +1,5 @@
 //! LobsterAI（有道龙虾 / NetEase Youdao）接入：**无状态** SSE 转发 + 令牌续期 +
-//! 远程模型目录 + 每日签到 + 积分余额 + 浏览器 OAuth 登录。
+//! 远程模型目录 + 每日签到 + 积分余额 + 令牌保活 + 浏览器 OAuth 登录。
 //!
 //! ── 这条通道长什么样（逆向契约）────────────────────────────────
 //! ```text
@@ -19,6 +19,7 @@
 //!   envelope.rs     有道统一信封（`{code,message,data}`）的解包与业务错误判定
 //!   credentials.rs  账号记录 → 凭证快照（accessToken / refreshToken / keyfrom / 设备 id）
 //!   refresh.rs      令牌续期（单飞 + 比较再写）
+//!   keepalive.rs    全部账号令牌保活（定时任务调用；会话死亡 → 禁用）
 //!   models.rs       GET /api/models/available（5 分钟缓存 + 落盘缓存）
 //!   balance.rs      GET /api/user/profile-summary（归一成统一积分形状）
 //!   checkin.rs      每日签到三步时序（slot → context → check_in → 回读确认）
@@ -35,6 +36,7 @@ pub mod checkin;
 pub mod credentials;
 pub mod endpoints;
 pub mod envelope;
+pub mod keepalive;
 pub mod login;
 pub mod models;
 pub mod refresh;

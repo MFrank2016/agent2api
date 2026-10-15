@@ -74,6 +74,8 @@ export type AutoCheckinState = {
   running?: boolean
   /** 派猫猫旅行的配置 + 去重键（后端 `autoCheckin.travel` 原样透传） */
   travel?: TravelConfig
+  /** LobsterAI 令牌保活的配置 + 去重键（后端 `autoCheckin.lobsteraiKeepalive` 原样透传） */
+  lobsteraiKeepalive?: LobsteraiKeepaliveConfig
 }
 
 /** `autoCheckin.travel` 子对象（缺失 = 关闭） */
@@ -87,6 +89,15 @@ export type TravelConfig = {
   locationId?: number | null
   lastDepartDate?: string | null
   lastClaimDate?: string | null
+}
+
+/** `autoCheckin.lobsteraiKeepalive` 子对象（缺失 = 缺省开启，默认 22:00） */
+export type LobsteraiKeepaliveConfig = {
+  enabled?: boolean
+  /** 每天触发时刻（北京时间 HH:MM，默认 22:00） */
+  time?: string
+  lastFiredDate?: string | null
+  lastResult?: CheckinHistoryEntry | null
 }
 
 /**
@@ -437,6 +448,8 @@ export type CheckinStore = {
   travelClaimDraft: string | null
   /** 旅行地点的编辑草稿：null = 跟随后端值（空串 = 随机） */
   travelLocationDraft: string | null
+  /** LobsterAI 保活时刻的编辑草稿：null = 跟随后端值 */
+  lobsteraiTimeDraft: string | null
   /** 单账号签到在途（行内按钮的去重闸） */
   signing: ReadonlySet<string>
   /** 新手任务的按账号缓存（Loomy / 小浣熊） */
@@ -462,6 +475,7 @@ let store: CheckinStore = {
   travelDepartDraft: null,
   travelClaimDraft: null,
   travelLocationDraft: null,
+  lobsteraiTimeDraft: null,
   signing: new Set<string>(),
   onboarding: new Map<string, OnboardingCache>(),
   travel: {},
@@ -704,6 +718,71 @@ export async function signSingleAccount(id: string, mode: 'checkin' | 'full' | '
   }
 }
 
+/**
+ * 分组手动签到（每日签到卡某一行右上角的「立即签到」）。
+ *
+ * ── 为什么是逐个账号串行 ────────────────────────────────────
+ * 既有端点只有「单账号签到」（`POST /api/accounts/checkin {id}`）与「全部账号
+ * 签到」（同端点不带 id，走全部提供商）两档，没有「按提供商」这一档。这里按
+ * 分组把账号逐个串行打单签端点：串行与批量签到是同一条防风控口径（多账号同时
+ * 打上游会触发 11-128），且**结果按账号粒度聚合**，一次点击只播报一句
+ * （逐账号各弹一条 toast 会把屏幕刷满）。
+ *
+ * 在途键是 `group:${id}`：与 `signSingleAccount` 的 `${id}:${mode}` 共用同一份
+ * `signing` 集合，前缀区分、互不牵连（账号 id 与 `group:` 不会撞）。
+ */
+export async function signProviderGroup(group: CheckinProviderGroup): Promise<void> {
+  const busyKey = `group:${group.id}`
+  if (store.signing.has(busyKey) || group.accounts.length === 0) return
+  const next = new Set(store.signing)
+  next.add(busyKey)
+  patch({ signing: next })
+  const total = group.accounts.length
+  let done = 0
+  let failed = 0
+  try {
+    for (const account of group.accounts) {
+      try {
+        const result = await bridge().checkinAllAccounts?.(account.id)
+        const row = result?.results?.[0]
+        const claim = row?.claim as
+          | { success?: boolean; msg?: string; alreadyCompleted?: boolean }
+          | undefined
+        // 结果口径与后端 run_checkin 一致：真领取与「今日已领取」都算今天已完成
+        if (!row?.error && (claim?.success === true || claim?.alreadyCompleted === true)) done += 1
+        else failed += 1
+      } catch {
+        failed += 1
+      }
+    }
+    if (failed > 0) {
+      toast(t('{label} 签到完成：{done}/{total} 个账号已签到，{failed} 个失败', {
+        label: group.label, done, total, failed,
+      }), 'err')
+    } else {
+      toast(t('✅ {label} 签到完成：{done}/{total} 个账号已签到', {
+        label: group.label, done, total,
+      }))
+    }
+    // 余额读数是账号页自己缓存里的，不查它还是签到前的旧值（与批量签到同款）
+    accountsView().wbAccountsView?.refreshUsageAfterCheckin?.(null)
+  } catch (error) {
+    toast(t('签到失败：{error}', { error: errorMessage(error) }), 'err')
+  } finally {
+    const rest = new Set(getCheckinStore().signing)
+    rest.delete(busyKey)
+    patch({ signing: rest })
+    await loadCheckinCenter()
+    // 快照到位后自动处理新手任务（只处理本组账号；本组通常不在新手福利清单里，
+    // 过滤后为空数组，与单账号签到同一手法）
+    const ids = new Set(group.accounts.map(account => account.id))
+    const onboardingRows = (getCheckinStore().snapshot?.extras.onboarding ?? [])
+      .filter(row => ids.has(row.id))
+    void autoProcessOnboarding(onboardingRows)
+    shared().wbApp?.refresh?.()
+  }
+}
+
 /* ─── 自动签到设置（自 tasks-panel 迁入，提交语义保持一致）─── */
 
 /**
@@ -810,6 +889,26 @@ export async function submitTravelLocation(value: string): Promise<void> {
   }
   await saveAutoCheckin({ travel: { locationId: id } }, t('旅行地点'))
   patch({ travelLocationDraft: null })
+}
+
+/* ─── LobsterAI 令牌保活设置（有道龙虾）─── */
+
+/** LobsterAI 保活总开关（提交 `lobsteraiKeepalive.enabled`） */
+export async function setLobsteraiKeepaliveEnabled(enabled: boolean): Promise<void> {
+  await saveAutoCheckin({ lobsteraiKeepalive: { enabled } }, t('LobsterAI 令牌保活开关'))
+}
+
+/** LobsterAI 保活时刻的编辑草稿（输入过程；提交在 blur / 回车时走 submitLobsteraiKeepaliveTime） */
+export function setLobsteraiTimeDraft(value: string): void {
+  patch({ lobsteraiTimeDraft: value })
+}
+
+/** LobsterAI 保活时刻提交（失焦 / 回车）：格式由后端校验，错误原样吐回 */
+export async function submitLobsteraiKeepaliveTime(value: string): Promise<void> {
+  const time = value.trim()
+  if (!time || getCheckinStore().autoSaving) return
+  await saveAutoCheckin({ lobsteraiKeepalive: { time } }, t('LobsterAI 保活时刻'))
+  patch({ lobsteraiTimeDraft: null })
 }
 
 /** 快照里只换 auto 段（保存响应是新状态，其余快照原样保留） */

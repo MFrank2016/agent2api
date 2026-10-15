@@ -3,8 +3,9 @@ import { Badge, Button, Checkbox, Input, Spinner, Switch } from '@ui'
 import { formatTime, shared, toast } from './accounts-shared'
 import { t } from '../i18n'
 import {
-  getCheckinStore, setKeepaliveDraft, setTravelClaimDraft, setTravelDepartDraft, setTravelEnabled,
-  setTravelLocationDraft, submitKeepaliveModels, submitTravelClaimTime, submitTravelDepartTime,
+  getCheckinStore, setKeepaliveDraft, setLobsteraiKeepaliveEnabled, setLobsteraiTimeDraft,
+  setTravelClaimDraft, setTravelDepartDraft, setTravelEnabled, setTravelLocationDraft,
+  submitKeepaliveModels, submitLobsteraiKeepaliveTime, submitTravelClaimTime, submitTravelDepartTime,
   submitTravelLocation, subscribeCheckinStore,
   type CheckinStore,
 } from './checkin-state'
@@ -606,6 +607,62 @@ function TravelPanel({ store }: { store: CheckinStore }) {
   )
 }
 
+/**
+ * LobsterAI 令牌保活设置面板（有道龙虾）。
+ *
+ * 与旅行同构：**独立于多条目定时签到**的一条链路，有自己的开关与触发时刻
+ * （time），到点替全部 LobsterAI 账号主动续期一次 access token —— 所以同样
+ * 独立成卡，而不是塞进某条条目的编辑表单里。
+ */
+function LobsteraiKeepalivePanel({ store }: { store: CheckinStore }) {
+  const keepalive = store.snapshot?.auto?.lobsteraiKeepalive
+  // 缺省开启（与改造前的间隔型任务一致）：后端没给该字段时按「开」渲染
+  const enabled = keepalive?.enabled !== false
+  const locked = !store.snapshot || store.autoSaving
+  const time = store.lobsteraiTimeDraft ?? keepalive?.time ?? ''
+  return (
+    <section className='panel ck-keepalive-panel'>
+      <div className='panel-head'>
+        <h2>{t('LobsterAI 令牌保活')}</h2>
+        <span className='panel-sub'>{t('LobsterAI（有道龙虾）：每天替全部账号主动续期一次令牌')}</span>
+      </div>
+      <div className='p-4'>
+        <div className='ck-set-line'>
+          <span className='ck-set-k'>{t('开关')}</span>
+          <span className='ck-set-v flex items-center gap-2'>
+            <Switch
+              checked={enabled}
+              disabled={locked}
+              onCheckedChange={next => void setLobsteraiKeepaliveEnabled(next)}
+            />
+            <span className='text-subtle text-xs'>{t('到点自动执行 · 错过会补跑')}</span>
+          </span>
+        </div>
+        <div className='ck-set-line'>
+          <span className='ck-set-k'>{t('保活时刻')}</span>
+          <span className='ck-set-v flex items-center gap-2'>
+            <Input
+              type='time'
+              className='w-[96px] max-w-[96px] font-mono tabular-nums'
+              value={time}
+              disabled={locked}
+              onChange={event => setLobsteraiTimeDraft(event.currentTarget.value)}
+              onBlur={event => void submitLobsteraiKeepaliveTime(event.currentTarget.value)}
+              onKeyDown={event => {
+                if (event.key === 'Enter') event.currentTarget.blur()
+              }}
+            />
+            <span className='text-subtle text-xs'>{t('每天到点主动续期一次令牌（北京时间）')}</span>
+          </span>
+        </div>
+        <div className='ck-note'>
+          {t('与「凭证自动维护」的区别：后者只碰已过期或临期的账号，保活是无条件地把每个账号的令牌刷一遍，保证长期不开桌面端时账号也不会因令牌到期而显得不可用。续期被上游拒绝（登录态失效）的账号会自动禁用，需重新登录。')}
+        </div>
+      </div>
+    </section>
+  )
+}
+
 /* ─── 页面 ─────────────────────────────────── */
 
 function ScheduleTab(): React.ReactElement {
@@ -691,6 +748,7 @@ function ScheduleTab(): React.ReactElement {
         saving={checkin.keepaliveSaving}
       />
       <TravelPanel store={checkin} />
+      <LobsteraiKeepalivePanel store={checkin} />
     </div>
   )
 }

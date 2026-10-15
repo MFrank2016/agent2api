@@ -7,7 +7,7 @@ import { claimedPlanIdsToday } from './accounts-domain'
 import {
   claimOnboarding, fetchTravel, getCheckinStore, groupTone, loadCheckinCenter, nextScheduleRun,
   onboardingExpanded, queryOnboarding, runAllCheckin, runTravel, setCheckinTab, showCheckinTab,
-  signSingleAccount, subscribeCheckinStore, toggleOnboardingExpand, toggleProviderExpand, travelOf,
+  signProviderGroup, signSingleAccount, subscribeCheckinStore, toggleOnboardingExpand, toggleProviderExpand, travelOf,
   growthExpanded, queryGrowth, runGrowth, runGrowthSchool, runGrowthTravel, toggleGrowthExpand,
   type CheckinProviderGroup, type CheckinStore, type CheckinTab,
 } from './checkin-state'
@@ -285,6 +285,8 @@ function AccountRows({ group }: { group: CheckinProviderGroup }) {
 /** 每日签到卡的一行（可展开看账号明细） */
 function ProviderRow({ group, expanded }: { group: CheckinProviderGroup; expanded: boolean }) {
   const hasAccounts = group.totalCount > 0
+  // 分组手动签到的在途判定（键与 checkin-state 的 signProviderGroup 成对）
+  const busy = getCheckinStore().signing.has(`group:${group.id}`)
   return (
     <div className={expanded ? 'ck-prov-row open' : 'ck-prov-row'}>
       <div
@@ -310,6 +312,21 @@ function ProviderRow({ group, expanded }: { group: CheckinProviderGroup; expande
             {hasAccounts ? t('{total} 账号 · {done} 已签', { total: group.totalCount, done: group.doneCount }) : '—'}
           </span>
           <GroupBadge group={group} />
+          {/* 分组手动签到（LobsterAI 等）：逐个账号串行打单签端点，一次点击只播报一句。
+              外层 span 拦下冒泡 —— 这颗按钮不该顺手展开 / 收起这一行（行体本身可点） */}
+          {hasAccounts ? (
+            <span onClick={event => event.stopPropagation()} onKeyDown={event => event.stopPropagation()}>
+              <Button
+                size='sm'
+                variant='default'
+                disabled={busy}
+                title={t('对该分组的全部账号逐个签到')}
+                onClick={() => void signProviderGroup(group)}
+              >
+                {busy ? t('签到中…') : t('立即签到')}
+              </Button>
+            </span>
+          ) : null}
           {hasAccounts ? <span className='ck-chev' aria-hidden>›</span> : null}
         </div>
       </div>

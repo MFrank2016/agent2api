@@ -398,6 +398,12 @@ pub const DEFAULT_TRAVEL_DEPART_TIME: &str = "00:01";
 /// 旅行配置的缺省领取时刻（北京时间）：派发后 6 小时领取。
 pub const DEFAULT_TRAVEL_CLAIM_TIME: &str = "06:00";
 
+/// LobsterAI 令牌保活的缺省触发时刻（北京时间）：每天 22:00 主动续期一次。
+///
+/// 与旅行同构：这是 `autoCheckin.lobsteraiKeepalive` 的默认时刻，改这块前先读
+/// `read_lobsterai_keepalive_state`。
+pub const DEFAULT_LOBSTERAI_KEEPALIVE_TIME: &str = "22:00";
+
 /// `autoCheckin.travel` 子对象（缺失 = 关闭，向后兼容）。
 ///
 /// 旅行是**独立于多条目定时签到**的一条链路：它有自己的开关、派发时刻
@@ -440,6 +446,90 @@ fn read_travel_state(raw: &Map<String, Value>) -> TravelState {
         last_depart_date: travel.get("lastDepartDate").and_then(Value::as_str).map(str::to_string),
         last_claim_date: travel.get("lastClaimDate").and_then(Value::as_str).map(str::to_string),
     }
+}
+
+/// `autoCheckin.lobsteraiKeepalive` 子对象（缺失 = 缺省开启，向后兼容）。
+///
+/// LobsterAI 令牌保活与旅行同构：**独立于多条目定时签到**的一条链路，
+/// 有自己的开关与触发时刻（`time`，北京时间），到点替全部 LobsterAI 账号
+/// 主动续期一次 access token（`lobsterai::keepalive::refresh_all_tokens`）。
+/// 与改造前的间隔型任务一样**缺省开启**（默认 22:00），长期不开桌面端时
+/// 账号也不会因 token 到期而显得不可用。
+#[derive(Clone, Debug)]
+pub struct LobsteraiKeepaliveState {
+    pub enabled: bool,
+    pub time: String,
+    pub last_fired_date: Option<String>,
+    pub last_result: Option<Value>,
+}
+
+/// 从 `autoCheckin` 原始对象里读 lobsteraiKeepalive 子对象。
+///
+/// 子对象缺失时 `enabled` 取 **true**（缺省开启，与改造前的间隔型任务一致）；
+/// `time` 非法 / 缺失回落 `DEFAULT_LOBSTERAI_KEEPALIVE_TIME`。
+fn read_lobsterai_keepalive_state(raw: &Map<String, Value>) -> LobsteraiKeepaliveState {
+    let node = raw.get("lobsteraiKeepalive").and_then(Value::as_object);
+    let time = node
+        .and_then(|node| node.get("time"))
+        .and_then(|value| normalize_time(Some(value)).ok())
+        .unwrap_or_else(|| DEFAULT_LOBSTERAI_KEEPALIVE_TIME.to_string());
+    LobsteraiKeepaliveState {
+        enabled: node
+            .and_then(|node| node.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        time,
+        last_fired_date: node
+            .and_then(|node| node.get("lastFiredDate"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        last_result: node
+            .and_then(|node| node.get("lastResult"))
+            .filter(|value| value.is_object())
+            .cloned(),
+    }
+}
+
+/// 纯合并：把 `patch` 的键并入现有 `lobsteraiKeepalive` 子对象，保留该子对象里
+/// 其它键与 `autoCheckin` 顶层其它键（与 `merge_travel` 同一语义）。
+fn merge_lobsterai_keepalive(raw: &Map<String, Value>, patch: &Value) -> Map<String, Value> {
+    let mut merged = raw.clone();
+    let mut node = merged
+        .get("lobsteraiKeepalive")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Value::Object(entries) = patch {
+        for (key, value) in entries {
+            node.insert(key.clone(), value.clone());
+        }
+    }
+    merged.insert("lobsteraiKeepalive".to_string(), Value::Object(node));
+    merged
+}
+
+/// 合并写回 `autoCheckin.lobsteraiKeepalive`（不丢其它键，与 `write_travel_state` 同构）。
+fn write_lobsterai_keepalive_state(patch: Value) {
+    let merged = merge_lobsterai_keepalive(&raw_object(), &patch);
+    config::update_raw_field(CONFIG_KEY, Value::Object(merged));
+}
+
+/// 把 POST /api/auto-checkin 里的 `lobsteraiKeepalive` 子对象归一成可合并的 patch。
+fn lobsterai_keepalive_patch_from_payload(value: &Value) -> Result<Value, AutoCheckinConfigError> {
+    let Some(object) = value.as_object() else {
+        return Err(AutoCheckinConfigError::new("lobsteraiKeepalive 必须是对象"));
+    };
+    let mut patch = Map::new();
+    if let Some(enabled) = object.get("enabled") {
+        patch.insert("enabled".to_string(), Value::Bool(enabled == &Value::Bool(true)));
+    }
+    if let Some(time) = object.get("time") {
+        patch.insert("time".to_string(), Value::String(normalize_time(Some(time))?));
+    }
+    if patch.is_empty() {
+        return Err(AutoCheckinConfigError::new("lobsteraiKeepalive 没有需要更新的字段"));
+    }
+    Ok(Value::Object(patch))
 }
 
 /// 总开关（`autoCheckin.enabled`）：关了所有条目都不跑。
@@ -625,6 +715,7 @@ impl AutoCheckin {
         let today = date_key(now);
         let schedules = checkin_schedules::list();
         let travel = read_travel_state(&raw_object());
+        let lobsterai = read_lobsterai_keepalive_state(&raw_object());
         let entries: Vec<Value> = schedules
             .iter()
             .map(|schedule| {
@@ -696,6 +787,13 @@ impl AutoCheckin {
                 "locationId": travel.location_id,
                 "lastDepartDate": travel.last_depart_date,
                 "lastClaimDate": travel.last_claim_date,
+            },
+            // LobsterAI 令牌保活设置（独立于多条目）：界面「定时签到」页的保活卡片读这里
+            "lobsteraiKeepalive": {
+                "enabled": lobsterai.enabled,
+                "time": lobsterai.time,
+                "lastFiredDate": lobsterai.last_fired_date,
+                "lastResult": lobsterai.last_result,
             },
             "running": self.is_running(),
         })
@@ -849,6 +947,61 @@ impl AutoCheckin {
             "phase": match phase { TravelPhase::Depart => "depart", TravelPhase::Claim => "claim" },
             "results": results,
         }))
+    }
+
+    /// 跑一轮 LobsterAI 令牌保活（对所有 LobsterAI 账号主动续期一次）。
+    /// 与 `fire` / `fire_travel` 共用 `running` 守卫（同一时刻只跑一轮）。
+    async fn fire_lobsterai_keepalive(&self) -> Option<Value> {
+        let guard = {
+            let mut inner = self.lock();
+            if inner.running {
+                return None;
+            }
+            inner.running = true;
+            RunningGuard { inner: self.inner.clone() }
+        };
+        let today = today_key();
+        // 先落日期再执行：即便中途进程被杀，也不会在重启后反复补跑
+        write_lobsterai_keepalive_state(json!({ "lastFiredDate": today }));
+        let state = read_lobsterai_keepalive_state(&raw_object());
+        if !state.enabled {
+            drop(guard);
+            return None;
+        }
+        use crate::server::core::providers::lobsterai::keepalive;
+        let results = keepalive::refresh_all_tokens(&self.store).await;
+        let count = |status: &str| {
+            results.iter().filter(|item| item["status"] == status).count()
+        };
+        let (refreshed, skipped, failed) = (
+            count(keepalive::STATUS_REFRESHED),
+            count(keepalive::STATUS_SKIPPED),
+            count(keepalive::STATUS_FAILED),
+        );
+        // 没有 LobsterAI 账号是常态（大多数部署）：单独一句说清「本轮无事可做」
+        let summary = if refreshed == 0 && skipped == 0 && failed == 0 {
+            "没有 LobsterAI 账号可保活".to_string()
+        } else {
+            format!("刷新 {refreshed} 个，跳过 {skipped} 个，失败 {failed} 个")
+        };
+        let result = json!({
+            "at": logging::now_ms(),
+            "date": today,
+            "refreshed": refreshed,
+            "skipped": skipped,
+            "failedCount": failed,
+            "message": summary.clone(),
+        });
+        write_lobsterai_keepalive_state(json!({ "lastResult": result.clone() }));
+        if refreshed > 0 || failed > 0 {
+            logging::log_with_level(
+                "[LobsterAI]",
+                &format!("令牌保活：{summary}"),
+                if failed > 0 { "error" } else { "info" },
+            );
+        }
+        drop(guard);
+        Some(result)
     }
 
     /// 本轮是否有「Qoder 国际版账号没领到且不算已签」的行 —— 有则今天保持
@@ -1006,6 +1159,13 @@ impl AutoCheckin {
         if round_due(travel.enabled, &travel.claim_time, travel.last_claim_date.as_deref(), now) {
             self.fire_travel(TravelPhase::Claim).await;
         }
+
+        // ── LobsterAI 令牌保活：与旅行同构（自己的开关 / 时刻 / 当天去重），
+        //    与签到共用 fire 的 running 守卫（同一时刻只跑一轮）──
+        let lobsterai = read_lobsterai_keepalive_state(&raw_object());
+        if round_due(lobsterai.enabled, &lobsterai.time, lobsterai.last_fired_date.as_deref(), now) {
+            self.fire_lobsterai_keepalive().await;
+        }
     }
 
     /// 起调度循环（对应 Node 版 schedule 的 `if (timer) return`）：
@@ -1109,12 +1269,18 @@ impl AutoCheckin {
         let has_time = payload.get("time").is_some();
         let has_providers = payload.get("providers").is_some();
         let has_travel = payload.get("travel").is_some();
-        if !has_enabled && !has_time && !has_providers && !has_travel {
+        let has_lobsterai = payload.get("lobsteraiKeepalive").is_some();
+        if !has_enabled && !has_time && !has_providers && !has_travel && !has_lobsterai {
             return Err(AutoCheckinConfigError::new("没有需要更新的字段"));
         }
         // 旅行 patch 先校验再落盘：校验失败时一个字段都不写
         let travel_patch = match payload.get("travel") {
             Some(value) => Some(travel_patch_from_payload(value)?),
+            None => None,
+        };
+        // LobsterAI 保活 patch 同样先校验再落盘（校验失败一个字段都不写）
+        let lobsterai_patch = match payload.get("lobsteraiKeepalive") {
+            Some(value) => Some(lobsterai_keepalive_patch_from_payload(value)?),
             None => None,
         };
         if has_enabled {
@@ -1169,6 +1335,10 @@ impl AutoCheckin {
         if let Some(travel) = travel_patch {
             write_travel_state(travel);
             logging::log("[Checkin]", "旅行设置已更新");
+        }
+        if let Some(keepalive) = lobsterai_patch {
+            write_lobsterai_keepalive_state(keepalive);
+            logging::log("[Checkin]", "LobsterAI 令牌保活设置已更新");
         }
         // 总开关开着就走一遍 start()：确保调度循环在跑（幂等），并且刚开启 /
         // 刚改完配置的今天还没跑过的条目立刻补签（模块头「补签」的实测行为）
