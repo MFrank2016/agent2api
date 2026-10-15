@@ -74,6 +74,16 @@ export type DatabaseImportResult = {
   tables?: DatabaseTableStat[]
   /** 替换前自动建的安全备份文件名（{config_dir}/backups/ 下） */
   safetyBackup?: string
+  /**
+   * 密钥指纹不匹配的警告（**只在有问题的恢复里出现**，文案由后端 `db::backup` 的
+   * `account_key_warning` 生成并给全）。
+   *
+   * 它**不是失败**：导入照常完成，但这份备份是用另一把加密密钥做的（或备份时本机
+   * 还没生成过密钥），导入后的账号数据解不开、账号列表会是空的。所以界面**必须**
+   * 把它常驻显示出来（面板内的警告框）—— 只塞进几秒即逝的 toast 等于没提示，
+   * 用户错过后只会对着空账号列表发懵。
+   */
+  warning?: string
 }
 
 /**

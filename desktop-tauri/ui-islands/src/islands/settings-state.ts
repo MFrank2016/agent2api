@@ -293,6 +293,15 @@ export type SettingsSnapshot = {
    */
   dbIncludeLogs: boolean
   dbBackupConfirm: { includeLogs: boolean } | null
+  /**
+   * 整库恢复返回的密钥警告原文（`DatabaseImportResult.warning`；null = 没有警告）。
+   *
+   * 存进快照而不是只弹 toast：这条警告决定导入后的账号能不能解开（密钥不匹配时
+   * 账号列表是空的），必须**常驻**在面板里等用户看到 —— toast 只亮 3.5 秒（app.js），
+   * 错过就再没有第二次提示。生命周期与 ioFailure 同约定：只反映最近一次恢复，
+   * 下一次恢复开始时清掉。
+   */
+  dbWarning: string | null
   /** 局域网访问的确认框（非空即开着）；确认 / 取消都收口到 resolveLanConfirm */
   lanConfirm: LanConfirm
   /** 局域网开启流程的注册步（非空 = 弹窗切到注册表单） */
@@ -377,6 +386,7 @@ const INITIAL: SettingsSnapshot = {
   // 整库备份：默认包含日志与调试报文（完整备份）；恢复确认弹窗默认关闭
   dbIncludeLogs: true,
   dbBackupConfirm: null,
+  dbWarning: null,
   lanConfirm: null,
   lanRegister: null,
   panelLogin: false,
@@ -857,6 +867,8 @@ async function proceedDbRestore(): Promise<void> {
     return
   }
   beginBusy('dbImport')
+  // 结果区只反映最近一次操作：上一次恢复留下的密钥警告先清掉（与 ioFailure 同一约定）
+  publish({ dbWarning: null })
   try {
     const result = await api.importDatabase()
     const tables = Array.isArray(result?.tables) ? result.tables.length : 0
@@ -864,6 +876,11 @@ async function proceedDbRestore(): Promise<void> {
       ? t('，替换前的数据已备份为 {name}', { name: result.safetyBackup })
       : ''
     toast(t('✅ 已恢复 {n} 张表{note}', { n: tables, note }))
+    // 密钥指纹不匹配的警告（账号将无法解密）：后端把文案给全了，这里只负责让它
+    // 在面板里**常驻**显示 —— 光靠上面那条 3.5 秒的 toast，用户错过后只会对着
+    // 空账号列表发懵，不知道「为什么账号都没了」
+    const warning = typeof result?.warning === 'string' ? result.warning.trim() : ''
+    if (warning) publish({ dbWarning: warning })
     // 重拉整页（含启动/托盘设置、保留期、提示词、存储概况等全部面板）
     await load()
     await shared().wbApp?.refresh?.()
@@ -874,7 +891,7 @@ async function proceedDbRestore(): Promise<void> {
   }
 }
 
-/* ─── 数据保留（三项保留天数） ─────────────── */
+/* ─── 数据保留（事件日志保留天数） ─────────────── */
 
 export function renderRetention(data?: unknown): void {
   if (data === undefined) return
@@ -913,7 +930,7 @@ function askRetentionShrink(head: string): Promise<boolean> {
   })
 }
 
-/** 改小保留期会立即删数据，文案必须点名「删的是哪一档」 */
+/** 改小保留期会立即删数据，文案必须点名「删的是哪一档」（泛化：选项来自 RETENTION_FIELDS） */
 function shrinkPromptHead(field: NumberField, previous: number | null, days: number): string {
   return previous === null
     ? t('没能读到「{label}」的当前值，改为 {days} 天可能会删除超出的历史数据。', {
