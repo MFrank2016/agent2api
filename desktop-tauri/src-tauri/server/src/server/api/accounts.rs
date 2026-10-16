@@ -882,6 +882,7 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
                 Err(error) => return management_error(error.status_code, error.message),
             };
             store.add_lobsterai_account(&normalized, import_name, "manual")
+        }
         // OrcaTerm（腾讯云遨驰终端桌面客户端）：**粘贴 accessToken**（OAuth JWT）
         // → 本地归一化（剥 `Bearer ` / `ot_session=` 前缀；整段 data.bin JSON
         // 直接粘也行）→ 打一次 `GetUserInfo` 做**真实校验**（顺带补 userId 与

@@ -136,21 +136,14 @@ pub fn build_web_conversation_request(
         ("Authorization".to_string(), format!("Bearer {token}")),
         ("X-User-Id".to_string(), uid.to_string()),
     ];
-    let proxy = match ResolvedProxy::from_json(session.get("proxy").unwrap_or(&Value::Null)) {
-        Ok(proxy) => proxy,
-        Err(reason) => {
-            crate::server::logging::log(
-                "[Upstream]",
-                &format!("⚠️ 账号代理不可用（{reason}），网页会话请求回退直连"),
-            );
-            None
-        }
-    };
+    let egress = crate::server::core::proxies::AccountEgress::from_json(
+        session.get("egress").or_else(|| session.get("proxy")).unwrap_or(&Value::Null),
+    );
     Ok(TransportRequest {
         url: web_conversations_url(session, Region::Intl),
         headers,
         payload,
-        proxy,
+        egress,
         // 与桌面端保活同一口径：转发链路的旁支，workbuddy 不覆写能力位 = 直连
         system_proxy_when_unset: false,
     })
