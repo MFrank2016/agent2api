@@ -610,14 +610,14 @@ mod tests {
     //! 不认识任何协议）；这里测的是 chat 专属的 `materialize_chat`。
     use super::*;
     use crate::server::core::upstream::usage::RequestTelemetry;
-    use crate::server::request_stats::RequestStats;
+    use crate::server::request_stats::{RequestStats, Retention};
     use futures::StreamExt;
     use std::sync::Arc;
 
     /// 记账降级为空操作的收尾上下文（库句柄给 None，只关心字节形状）
     fn noop_context() -> RecordContext {
         RecordContext {
-            stats: Arc::new(RequestStats::with_db(None)),
+            stats: Arc::new(RequestStats::with_db(None, Retention::default)),
             telemetry: Arc::new(RequestTelemetry::new()),
             started_at: 0,
             model: "test-model".to_string(),

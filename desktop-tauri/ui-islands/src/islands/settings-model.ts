@@ -165,6 +165,10 @@ export type RoutingStrategyPatch = {
   default?: string
   providers?: Record<string, string>
   sticky?: string
+  /** 三个自愈开关（后端 `RoutingStrategyPatch` 的对应键，见 api::routing_strategy） */
+  routingFailoverBackoff?: boolean
+  routingSink?: boolean
+  routingBreakerEnabled?: boolean
 }
 
 /** models.dev 模型元数据的当前状态（GET / PUT `/api/models/metadata` 同形）。 */
@@ -524,8 +528,21 @@ export type NumberField = {
 
 /** 与后端 RETENTION_MIN_DAYS / RETENTION_MAX_DAYS 同源（非法值后端会 400） */
 export const RETENTION_MIN = 1
-export const RETENTION_MAX = 3650
+export const RETENTION_MAX = 99999
 
+/**
+ * 保留期字段（「数据保留」面板）。
+ *
+ * 三项的 key 与后端 `/api/retention` 的 JSON 键逐字同源。请求日志与按天聚合
+ * 用的是恢复这项设置时**新起**的键名（`requestLogRetentionDays` /
+ * `dailyAggregateRetentionDays`）：旧的 `requestRetentionDays` /
+ * `dailyRetentionDays` 在「全量保留」时期退役过，老配置里残留的是当时的旧默认
+ * （30 / 365 天）—— 沿用旧键会让那些残留值悄悄生效，升级后的第一次记账就把
+ * 老数据裁掉；换新键让它从新默认（99999 天）起步，旧键残留不被读取、也无害。
+ *
+ * 两档的**默认 99999 天来自后端**（`GET /api/retention` 返回，约 274 年，
+ * 效果上等于全量保留）；用户改小保存后后端立即裁剪。
+ */
 export const RETENTION_FIELDS: NumberField[] = [
   {
     key: 'logRetentionDays',
@@ -534,25 +551,25 @@ export const RETENTION_FIELDS: NumberField[] = [
     unit: t('天'),
     min: RETENTION_MIN,
     max: RETENTION_MAX,
-    hint: t('登录 / 账号切换 / 429 切换等系统事件，可填 1–3650 天。'),
+    hint: t('登录 / 账号切换 / 429 切换等系统事件，可填 1–99999 天。'),
   },
   {
-    key: 'requestRetentionDays',
+    key: 'requestLogRetentionDays',
     id: 'settings-retention-request',
     label: t('请求日志保留天数'),
     unit: t('天'),
     min: RETENTION_MIN,
     max: RETENTION_MAX,
-    hint: t('「请求日志」页的逐条请求记录，可填 1–3650 天。'),
+    hint: t('「请求日志」页的逐条请求记录，默认 99999 天（近似全量保留），可填 1–99999 天。'),
   },
   {
-    key: 'dailyRetentionDays',
+    key: 'dailyAggregateRetentionDays',
     id: 'settings-retention-daily',
     label: t('按天聚合保留天数'),
     unit: t('天'),
     min: RETENTION_MIN,
     max: RETENTION_MAX,
-    hint: t('报表页的热力图与按天趋势，可填 1–3650 天。'),
+    hint: t('报表页的热力图与按天趋势，默认 99999 天（近似全量保留），可填 1–99999 天。'),
   },
 ]
 
@@ -807,7 +824,7 @@ export const TIPS = {
   debug: t('开启后，网关会把每次转发**发给上游的请求**（请求头 + 请求体）与**上游返回的响应**（状态码 + 响应头 + 响应体）完整保存到本地，供请求日志页的「详情」查看。请求头里的 Authorization、Cookie、API Key 等凭据字段一律替换成 [redacted]，不会明文落盘；请求体与响应体按原样保存（可能包含你的对话内容）。报文只保留最近 500 条，超出后丢弃最旧的。这是排障用的临时开关，不需要时建议关闭。'),
   io: t('导出会把全部账号与自定义提供商定义写入一个 JSON 文件，可以拷到另一台机器上导入后继续使用。导入采用合并策略：同提供商下按业务身份（UID / userId / apiKey 等）去重 —— 已存在的账号只更新凭证，保留本机原有的优先级顺序；新账号追加到转发顺序末尾，不会抢占当前正在使用的账号；自定义提供商定义按 id 合并，本机缺失时自动补建。'),
   backup: t('把整份数据库（账号、网关配置、事件日志、请求统计、调试报文与桌面设置）导出成一个 SQL 文件，恢复时整体替换本机全部数据 —— 与上面「账号导入 / 导出」的逐条合并是两种语义：恢复会连配置、日志与当前启用状态一起换成备份那台机器的状态。导出默认包含日志与调试报文（文件可能很大），不需要时可以取消勾选只备业务数据。恢复前会自动把当前数据备份到配置目录的 backups/ 下，恢复后需要重新登录管理面板。'),
-  retention: t('三类数据各自独立计时，超出保留天数的部分会被删除：事件日志是登录、账号切换、429 切换这类系统事件；请求日志是网关每次转发到上游的逐条记录；按天聚合供报表页的热力图与按天趋势使用。把某一档改小（例如 30 天改成 7 天）保存后会立即删除超出的历史数据，此操作不可恢复；改大或保持不变不会删除任何数据。三项的可填范围均为 1–3650 天。'),
+  retention: t('三档数据各自独立计时，超出保留天数的部分会被删除：事件日志是登录、账号切换、429 切换这类系统事件；请求日志是网关每次转发到上游的逐条记录；按天聚合供报表页的热力图与按天趋势使用。请求日志与按天聚合默认 99999 天（约 274 年，效果上等于全量保留），事件日志默认 30 天。把某一档改小（例如 30 天改成 7 天）保存后会立即删除超出的历史数据，此操作不可恢复；改大或保持不变不会删除任何数据。三档的可填范围均为 1–99999 天。'),
   storage: t('全部数据（账号、事件日志、请求记录、调试报文、设置）统一保存在配置目录下的 agent2api.db 这一个 SQLite 数据库里。备份时只需拷贝这个文件；更换保存位置请设置环境变量 AGENT2API_PROXY_HOME 后重启程序。'),
   modelsDev: t('models.dev 是一个开源的模型资料库（社区维护），这里用它补齐「上游没告诉我们」的模型能力：上下文窗口、最大输出、工具调用、图片、视频、是否支持思考，以及这个模型认识哪些思考档位。优先级是：你在「模型能力」里手工改的值 > 上游清单自己声明的值 > models.dev 的值 —— 它只填上游没声明的空位，从不推翻上游已声明的。网关随包内嵌了一份快照，所以离线、首次启动、访问不通时也有数据；开启时会按「模型目录刷新」任务的间隔联网更新（同一轮里一并刷新，也可在这里立即刷新）。关闭只停联网刷新，已经拿到的数据继续用。'),
 } as const
@@ -878,3 +895,27 @@ export const STATES = {
   languageHint: t('界面语言只保存在本机（localStorage）。切换后整页立即刷新，不影响账号、密钥与转发。'),
   routingUnavailable: t('未能读取选路策略设置，请稍后重试'),
 } as const
+
+// ── 自愈开关（上游 v3.0.6「找回路由分类」的一部分；策略与会话粘性走本仓数据驱动那份）──
+export const ROUTE_PROTECTION_SWITCHES = [
+  {
+    key: 'routingFailoverBackoff',
+    label: t('失败退避'),
+    defaultOn: true,
+    tip: t('转发失败的账号休息一会儿再回来：15 分钟起步，连续失败翻倍，封顶 1 小时；成功一次立即恢复。目的是「让这次失败先凉一会儿」，免得一条条地反复撞同一个坏账号。'),
+  },
+  {
+    key: 'routingSink',
+    label: t('限流垫底'),
+    defaultOn: true,
+    tip: t('还有额度时被 429 的账号排到队尾，30 分钟后自动回到队列（成功转发一次也会立即回来）。它标记的是「疑似共享池被别人抢」，不是「这个账号本身有问题」。⚠️ 注意它与路由策略的配合：在「家内轮询」下，队尾意味着这一家整体被往后排 —— 如果某个提供商的账号被批量限流，它们会集体沉到队尾，那个家可能长时间轮不到。这时可以关掉本项，让 429 过的账号只受冷却约束（冷却到点自动回来）。'),
+  },
+  {
+    key: 'routingBreakerEnabled',
+    label: t('熔断'),
+    defaultOn: false,
+    tip: t('连续失败到阈值后把这个账号整个打开（默认关）。与失败退避的分工：退避管「单次失败先凉一会儿」，惩罚轻、自动恢复；熔断管「这个账号现在整体不对劲，别再一条条地试」，要连续成功若干次才关。打开期间该账号被跳过，除非全场只剩它 —— 那时仍放行试一次。'),
+  },
+] as const
+
+export type RouteProtectionKey = (typeof ROUTE_PROTECTION_SWITCHES)[number]['key']

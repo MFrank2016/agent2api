@@ -161,6 +161,12 @@ export type CorsState = { status: LoadStatus; on: boolean }
   providers: Record<string, string>
   strategies: RoutingStrategyOption[]
   sticky: string
+  /** 自愈开关：失败退避（转发失败的账号休息一会儿再回来） */
+  failoverBackoff: boolean
+  /** 限流垫底（还有额度时被 429 的账号排到队尾） */
+  sink: boolean
+  /** 熔断（连续失败到阈值后把这个账号整个打开） */
+  breakerEnabled: boolean
   }
 
  /**
@@ -351,7 +357,7 @@ const INITIAL: SettingsSnapshot = {
   sanitize: { status: 'loading', on: false },
   clineHeaders: { status: 'loading', defaults: {}, overrides: {}, effective: {} },
   cors: { status: 'loading', on: false },
-  routing: { status: 'loading', default: '', providers: {}, strategies: [], sticky: 'auto' },
+  routing: { status: 'loading', default: '', providers: {}, strategies: [], sticky: 'auto', failoverBackoff: true, sink: true, breakerEnabled: false },
   prompt: {
     status: 'loading',
     mode: 'passthrough',
@@ -1475,6 +1481,11 @@ export function renderRouting(data?: unknown): void {
       providers: routingProviders(record.providers),
       strategies: routingStrategies(record.strategies),
       sticky: routingSticky(record[ROUTING_STICKY_KEY]),
+      // 自愈开关：后端与前端字段名不同（见 settings-page 的 PROTECTION_STATE_FIELD），
+      // 只认布尔，缺字段 / 脏值回落各自的默认值（与 ROUTE_PROTECTION_SWITCHES.defaultOn 一致）
+      failoverBackoff: typeof record.routingFailoverBackoff === 'boolean' ? record.routingFailoverBackoff : true,
+      sink: typeof record.routingSink === 'boolean' ? record.routingSink : true,
+      breakerEnabled: typeof record.routingBreakerEnabled === 'boolean' ? record.routingBreakerEnabled : false,
     },
   })
 }
@@ -1529,8 +1540,8 @@ export async function saveRoutingProvider(id: string, strategy: string): Promise
   await commitRouting(snapshot.routing.default, providers)
 }
 
-/** 改单个附加维度（目前只有会话粘性；供「路由」分类的面板用） */
-export async function saveRoutingField(patch: { default?: string; providers?: Record<string, string>; sticky?: string }): Promise<void> {
+/** 改单个附加维度（会话粘性 + 三个自愈开关；供「路由」分类的面板用） */
+export async function saveRoutingField(patch: RoutingStrategyPatch): Promise<void> {
   await commitRoutingPatch(patch)
 }
 

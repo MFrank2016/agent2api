@@ -329,13 +329,13 @@ mod tests {
     use serde_json::json;
 
     use crate::server::core::upstream::usage::RequestTelemetry;
-    use crate::server::request_stats::RequestStats;
+    use crate::server::request_stats::{RequestStats, Retention};
 
     /// 一个「记账降级为空操作」的收尾上下文：本模块的用例只关心字节形状，
     /// 不关心是否真的落库（库句柄给 None，`record_entry` 静默跳过写入）。
     fn noop_context() -> RecordContext {
         RecordContext {
-            stats: Arc::new(RequestStats::with_db(None)),
+            stats: Arc::new(RequestStats::with_db(None, Retention::default)),
             telemetry: Arc::new(RequestTelemetry::new()),
             started_at: 0,
             model: "test-model".to_string(),
