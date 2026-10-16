@@ -43,7 +43,7 @@ import { t } from '../i18n'
  */
 const PROVIDER_DESC: Record<string, string> = {
   workbuddy: t('腾讯每日签到接口 · 仅国内版'),
-  'workbuddy-intl': t('每日活跃任务 · 领取才加积分，保活只维持活跃 · 两者可分开执行'),
+  'workbuddy-intl': t('每日活跃任务 · 网页会话保活点亮日活，领取才加积分 · 两者可分开执行'),
   raccoon: t('桌面端每日积分链路'),
   autoclaw: t('官方客户端的每日签到任务'),
   'autoclaw-intl': t('与国内版同一套任务接口 · 站点不同'),
