@@ -25,10 +25,10 @@ pub const TRAVEL_DEPART_PATH: &str = "/activity/growth/buddy/travel/depart";
 
 fn empty_body() -> Value { json!({}) }
 
-const TRAVEL_STATUS_SPEC: BillingSpec = BillingSpec { method: "GET", path: TRAVEL_STATUS_PATH, body: empty_body, whitelist_headers: false };
-const TRAVEL_CONFIG_SPEC: BillingSpec = BillingSpec { method: "GET", path: TRAVEL_CONFIG_PATH, body: empty_body, whitelist_headers: false };
-const TRAVEL_CLAIM_SPEC: BillingSpec = BillingSpec { method: "POST", path: TRAVEL_CLAIM_PATH, body: empty_body, whitelist_headers: false };
-const TRAVEL_DEPART_SPEC: BillingSpec = BillingSpec { method: "POST", path: TRAVEL_DEPART_PATH, body: empty_body, whitelist_headers: false };
+const TRAVEL_STATUS_SPEC: BillingSpec = BillingSpec { method: "GET", path: TRAVEL_STATUS_PATH, body: empty_body, whitelist_headers: false, base: None };
+const TRAVEL_CONFIG_SPEC: BillingSpec = BillingSpec { method: "GET", path: TRAVEL_CONFIG_PATH, body: empty_body, whitelist_headers: false, base: None };
+const TRAVEL_CLAIM_SPEC: BillingSpec = BillingSpec { method: "POST", path: TRAVEL_CLAIM_PATH, body: empty_body, whitelist_headers: false, base: None };
+const TRAVEL_DEPART_SPEC: BillingSpec = BillingSpec { method: "POST", path: TRAVEL_DEPART_PATH, body: empty_body, whitelist_headers: false, base: None };
 
 /// 旅行 host（按 edition 派生）。测试可经 session.travelBaseOverride 注入 mock 地址。
 fn travel_base(session: &Value) -> &'static str {
