@@ -740,7 +740,7 @@ mod tests {
     fn empty_body() -> Value { json!({}) }
 
     fn probe_spec() -> request::BillingSpec {
-        request::BillingSpec { method: "GET", path: "/probe", body: empty_body, whitelist_headers: false }
+        request::BillingSpec { method: "GET", path: "/probe", body: empty_body, whitelist_headers: false, base: None }
     }
 
     fn service(label: &str) -> (BillingService, crate::server::db::test_temp::TempDb) {
