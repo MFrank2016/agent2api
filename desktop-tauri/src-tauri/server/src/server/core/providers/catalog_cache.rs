@@ -111,6 +111,8 @@ pub const SCOPE_NOUS: &str = "nous";
 
 /// LobsterAI（有道龙虾；`GET {base}/api/models/available`，单一入口、无地区之分，单格即可）
 pub const SCOPE_LOBSTERAI: &str = "lobsterai";
+/// 智谱清言（`chatglm.cn`）的模型目录缓存槽
+pub const SCOPE_CHATGLM: &str = "chatglm";
 
 /// 全部 scope（事实来源：`cached_scopes` 按它遍历；新增一家时加在这里）。
 pub const ALL_SCOPES: &[&str] = &[
@@ -134,6 +136,8 @@ pub const ALL_SCOPES: &[&str] = &[
     SCOPE_ANTIGRAVITY,
     SCOPE_NOUS,
     SCOPE_LOBSTERAI,
+    SCOPE_OFFICEACE,
+    SCOPE_CHATGLM,
 ];
 
 /// 一份清单缓存

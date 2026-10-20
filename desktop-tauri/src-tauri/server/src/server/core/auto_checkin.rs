@@ -125,7 +125,7 @@ pub fn default_time() -> String {
 /// 这是「有签到或每日活跃任务」的清单，不是「有积分概念」的清单：CatPaw 有积分
 /// 查询但没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
 /// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
-pub const CHECKIN_PROVIDERS: [&str; 13] = [
+pub const CHECKIN_PROVIDERS: [&str; 14] = [
     "workbuddy",
     "workbuddy-intl",
     "raccoon",
@@ -143,6 +143,9 @@ pub const CHECKIN_PROVIDERS: [&str; 13] = [
     // LobsterAI（有道龙虾）：每日签到 +100 积分（`lobsterai::checkin`），追加在
     // 末尾（顺序即界面顺序，不动存量）。
     "lobsterai",
+    // 智谱清言：「每日登录积分」即本家的签到（`chatglm::checkin`）。
+    // 访客账号会被实现判成中性未领取（没有积分体系），不算失败。
+    "chatglm",
 ];
 
 /// 缺省的签到提供商集合（全选）
@@ -165,8 +168,8 @@ pub const PROVIDERS_VERSION: i64 = 3;
 /// 「哪一版加入的家」——条目清单的版本低于它 = 这家还没被提供过 ⇒ 补进去。
 /// 版本 1 = 多条目改造上线时的形态（9 家；`qoder-intl` 由 `normalize_providers`
 /// 的存量兼容规则跟着 `qoder` 带上，不在这里重复登记）。
-const PROVIDERS_ADDED_IN: [(&str, i64); 3] =
-    [("officeace", 2), ("codearts", 2), ("lobsterai", 3)];
+const PROVIDERS_ADDED_IN: [(&str, i64); 4] =
+    [("officeace", 2), ("codearts", 2), ("lobsterai", 3), ("chatglm", 3)];
 
 /// 版本 `version` 之后才加入清单的家（按注册顺序）。空数组 = 这一版没有新家，
 /// 或配置比代码还新（装过更新的版本又退回来）——两种情况都只记账、不动清单。

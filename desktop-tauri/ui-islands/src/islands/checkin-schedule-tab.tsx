@@ -4,10 +4,9 @@ import { formatTime, shared, toast } from './accounts-shared'
 import { t } from '../i18n'
 import {
   getCheckinStore, setKeepaliveDraft, setLobsteraiKeepaliveEnabled, setLobsteraiTimeDraft,
-  setTravelClaimDraft, setTravelDepartDraft, setTravelEnabled, setTravelLocationDraft,
-  submitKeepaliveModels, submitLobsteraiKeepaliveTime, submitTravelClaimTime, submitTravelDepartTime,
-  submitTravelLocation, subscribeCheckinStore,
-  type CheckinStore,
+  submitKeepaliveModels, submitLobsteraiKeepaliveTime, subscribeCheckinStore,
+  runTravelScheduleNow, saveTravelSchedule,
+  type CheckinStore, type TravelScheduleState,
 } from './checkin-state'
 import {
   deleteSchedule, getSchedulesStore, loadSchedules, runScheduleNow, saveSchedule,
@@ -514,98 +513,6 @@ function KeepalivePanel({ models, defaultModels, dirty, saving }: {
   )
 }
 
-/**
- * 派猫猫旅行设置面板（WorkBuddy 国内版）。
- *
- * 旅行**独立于多条目定时签到**：有自己的开关、派发时刻（departTime）与领取时刻
- * （claimTime），不搭任何一条签到条目的时刻 —— 所以它和保活模型链一样独立成卡，
- * 而不是塞进某条条目的编辑表单里。旅行卡片本身在「签到中心」的 WorkBuddy 账号行，
- * 这里只放设置。
- */
-function TravelPanel({ store }: { store: CheckinStore }) {
-  const travel = store.snapshot?.auto?.travel
-  const enabled = travel?.enabled === true
-  const locked = !store.snapshot || store.autoSaving
-  const departTime = store.travelDepartDraft ?? travel?.departTime ?? ''
-  const claimTime = store.travelClaimDraft ?? travel?.claimTime ?? ''
-  const location = store.travelLocationDraft ?? (travel?.locationId == null ? '' : String(travel.locationId))
-  return (
-    <section className='panel ck-travel-panel'>
-      <div className='panel-head'>
-        <h2>{t('派猫猫旅行')}</h2>
-        <span className='panel-sub'>{t('WorkBuddy 国内版：每天派猫猫出门旅行，到达后领积分')}</span>
-      </div>
-      <div className='p-4'>
-        <div className='ck-set-line'>
-          <span className='ck-set-k'>{t('开关')}</span>
-          <span className='ck-set-v flex items-center gap-2'>
-            <Switch
-              checked={enabled}
-              disabled={locked}
-              onCheckedChange={next => void setTravelEnabled(next)}
-            />
-            <span className='text-subtle text-xs'>{t('到点自动执行 · 错过会补签')}</span>
-          </span>
-        </div>
-        <div className='ck-set-line'>
-          <span className='ck-set-k'>{t('旅行派发时刻')}</span>
-          <span className='ck-set-v flex items-center gap-2'>
-            <Input
-              type='time'
-              className='w-[96px] max-w-[96px] font-mono tabular-nums'
-              value={departTime}
-              disabled={locked}
-              onChange={event => setTravelDepartDraft(event.currentTarget.value)}
-              onBlur={event => void submitTravelDepartTime(event.currentTarget.value)}
-              onKeyDown={event => {
-                if (event.key === 'Enter') event.currentTarget.blur()
-              }}
-            />
-            <span className='text-subtle text-xs'>{t('到点派猫猫出门（北京时间）')}</span>
-          </span>
-        </div>
-        <div className='ck-set-line'>
-          <span className='ck-set-k'>{t('旅行领取时刻')}</span>
-          <span className='ck-set-v flex items-center gap-2'>
-            <Input
-              type='time'
-              className='w-[96px] max-w-[96px] font-mono tabular-nums'
-              value={claimTime}
-              disabled={locked}
-              onChange={event => setTravelClaimDraft(event.currentTarget.value)}
-              onBlur={event => void submitTravelClaimTime(event.currentTarget.value)}
-              onKeyDown={event => {
-                if (event.key === 'Enter') event.currentTarget.blur()
-              }}
-            />
-            <span className='text-subtle text-xs'>{t('主轮派发后到达，届时自动领取积分（北京时间）')}</span>
-          </span>
-        </div>
-        <div className='ck-set-line'>
-          <span className='ck-set-k'>{t('旅行地点')}</span>
-          <span className='ck-set-v flex items-center gap-2'>
-            <Input
-              type='text'
-              className='w-[120px] max-w-[120px] font-mono tabular-nums'
-              placeholder={t('随机')}
-              value={location}
-              disabled={locked}
-              onChange={event => setTravelLocationDraft(event.currentTarget.value)}
-              onBlur={event => void submitTravelLocation(event.currentTarget.value)}
-              onKeyDown={event => {
-                if (event.key === 'Enter') event.currentTarget.blur()
-              }}
-            />
-            <span className='text-subtle text-xs'>{t('留空 = 每次随机；填地点 id 固定一处')}</span>
-          </span>
-        </div>
-        <div className='ck-note'>
-          {t('当天去重 + 幂等领取：重复执行只会拿到「已领取」，不会重复加分。 自动签到的设置以这里为准，「定时任务」页只保留间隔型任务。')}
-        </div>
-      </div>
-    </section>
-  )
-}
 
 /**
  * LobsterAI 令牌保活设置面板（有道龙虾）。
@@ -747,9 +654,125 @@ function ScheduleTab(): React.ReactElement {
         dirty={chainDirty}
         saving={checkin.keepaliveSaving}
       />
-      <TravelPanel store={checkin} />
+
+      <TravelPanel
+        travel={checkin.snapshot?.travel}
+        saving={checkin.travelSaving}
+        running={checkin.travelRunning}
+      />
       <LobsteraiKeepalivePanel store={checkin} />
     </div>
+  )
+}
+
+/* ─── 猫猫旅行定时排程 ─────────────────────── */
+
+/**
+ * 猫猫旅行定时排程面板（国内版）。
+ *
+ * ── 为什么与「定时签到」分卡 ────────────────────────────────
+ * 两个排程完全独立（`autoCheckin` vs `growthSchedule`）：用户可能只想自动
+ * 签到、不想自动派猫，或反过来。合成一张卡会让「关掉旅行」变成「关掉签到」
+ * 的副作用（参考项目也是两套开关与时刻）。
+ *
+ * ── 时刻怎么编 ──────────────────────────────────────────────
+ * 用逗号分隔的 `HH:MM` 列表（缺省 `09:00, 21:00`）：早上派出、晚上领奖。
+ * 保存时后端归一化（排序去重、校验范围），界面以后端返回为准。
+ */
+function TravelPanel({
+  travel,
+  saving,
+  running,
+}: {
+  travel?: TravelScheduleState
+  saving: boolean
+  running: boolean
+}): React.ReactElement {
+  const enabled = travel?.enabled === true
+  const times = Array.isArray(travel?.times) ? travel!.times : []
+  const fired = new Set(Array.isArray(travel?.firedToday) ? travel!.firedToday : [])
+  const [draft, setDraft] = React.useState<string | null>(null)
+  const text = draft ?? times.join(', ')
+  const dirty = draft !== null && draft.replace(/\s+/g, '') !== times.join(',')
+  const last = travel?.lastResult
+  const actions = Array.isArray(last?.actions) ? last!.actions! : []
+  const submit = (): void => {
+    const list = text
+      .split(/[,，\s]+/)
+      .map(item => item.trim())
+      .filter(Boolean)
+    void saveTravelSchedule({ times: list }).then(() => setDraft(null))
+  }
+  return (
+    <section className='panel'>
+      <div className='panel-head'>
+        <h2>{t('猫猫旅行定时排程')}</h2>
+        <span
+          className='tip-q'
+          data-tip={t(
+            '每天按这里的时刻自动巡检一遍 WorkBuddy 国内版账号：没有猫就领养、在家就派出、到站就领奖。一趟只推进一步，所以建议留两个时刻（早上派出、晚上领奖）。企业版与国际版账号自动跳过。',
+          )}
+        ></span>
+        <span className='panel-sub'>{t('每天定点巡检 · 一趟推进一步 · 与签到排程互相独立')}</span>
+        <Button
+          size='sm'
+          variant='outline'
+          className='ml-auto flex-none'
+          disabled={running}
+          onClick={() => void runTravelScheduleNow()}
+        >
+          {running ? t('巡检中…') : t('立即巡检全部')}
+        </Button>
+      </div>
+      <div className='p-4'>
+        <div className='ck-set-line'>
+          <span className='ck-set-k'>{t('开关')}</span>
+          <span className='ck-set-v flex items-center gap-2'>
+            <Switch
+              checked={enabled}
+              disabled={saving}
+              onCheckedChange={next => void saveTravelSchedule({ enabled: next === true })}
+            />
+            <span className='text-subtle text-xs'>
+              {enabled ? t('开着：按下面的时刻自动巡检') : t('关着：不自动巡检（仍可手动巡检）')}
+            </span>
+          </span>
+        </div>
+        <div className='ck-set-line'>
+          <span className='ck-set-k'>{t('时刻')}</span>
+          <span className='ck-set-v flex items-center gap-2'>
+            <Input
+              value={text}
+              disabled={saving}
+              placeholder='09:00, 21:00'
+              onChange={event => setDraft(event.target.value)}
+            />
+            <Button size='sm' variant='outline' disabled={!dirty || saving} onClick={submit}>
+              {t('保存')}
+            </Button>
+          </span>
+        </div>
+        <div className='ck-fold-note'>
+          {t('北京时间 · 逗号分隔 · 最多 6 条 · 到点后最多晚 30 秒执行；错过时点开机后会补跑一轮。')}
+          {fired.size > 0
+            ? ` ${t('今天已执行：{list}', { list: Array.from(fired).join(' / ') })}`
+            : ''}
+        </div>
+        {last && actions.length > 0 ? (
+          <div className='ck-fold-note'>
+            {t('上一轮（{time}）：{n} 个动作，+{credit} 积分', {
+              time: last.at ? formatTime(Number(last.at)) : '',
+              n: actions.length,
+              credit: Number(last.credit) || 0,
+            })}
+            {actions
+              .slice(0, 6)
+              .map(action => ` · ${action.name ?? action.accountId ?? ''}: ${action.message ?? action.outcome ?? ''}`)
+              .join('')}
+          </div>
+        ) : null}
+      </div>
+    </section>
   )
 }
 
