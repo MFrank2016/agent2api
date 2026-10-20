@@ -474,11 +474,19 @@ pub fn record_early_failure(
     model: &str,
     client_reasoning: &str,
     client: &str,
+    key_id: &str,
+    key_name: &str,
     error: &GatewayError,
 ) {
+    let telemetry = Arc::new(RequestTelemetry::new());
+    // 早失败同样是某把 Key 发起的（请求体非法、缺 messages 等）：身份要记下来，
+    // 否则 Key 页的请求数会偏低。与正常路径同一处旁路（见 `set_key`）。
+    if !key_id.is_empty() {
+        telemetry.set_key(key_id, key_name);
+    }
     let context = RecordContext {
         stats: state.request_stats(),
-        telemetry: Arc::new(RequestTelemetry::new()),
+        telemetry,
         started_at,
         client_model: model.to_string(),
         client_reasoning: client_reasoning.to_string(),
@@ -623,6 +631,10 @@ pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
     // 存储契约里这两个字段是 String（不是 Option），空串就是「没有账号」的表示
     entry.account_id = snapshot.account_id;
     entry.account_name = snapshot.account_name;
+    // Key 身份（schema v17）：入口在鉴权命中时挂进 telemetry 旁路，这里只搬运。
+    // 空串 = 免鉴权 / 环境变量 Key / 助手 / 模型测试（见 `RequestEntry::key_id`）
+    entry.key_id = snapshot.key_id;
+    entry.key_name = snapshot.key_name;
     entry.provider = snapshot.provider;
     // 下游名 / 上游名分记：下游名是客户端原值（context 带入），上游名是
     // 实际发出的名字（telemetry 采集，空串 = 一次都没发出去）。两者都空时

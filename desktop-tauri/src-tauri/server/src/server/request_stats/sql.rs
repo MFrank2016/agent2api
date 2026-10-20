@@ -71,7 +71,8 @@ use super::report::{normalize_status_filter, SummaryRow};
 const REQUEST_COLUMNS: &str = "id, ts, model, account_id, account_name, status, duration_ms, \
      first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
      cache_read_tokens, provider, client_model, upstream_model, attempt_details, sensitive_hits, \
-     client_reasoning, upstream_reasoning, phase, phase_started_at, is_test, route, client";
+     client_reasoning, upstream_reasoning, phase, phase_started_at, is_test, route, client, \
+     key_id, key_name";
 
 /// 报表窄列查询的列顺序 —— **与 `db::schema` 的 `idx_requests_summary` 列序一致**
 /// （索引是 `ts, is_test` 前缀 + 这里的后 5 列），改任一侧都要回来对一眼。
@@ -151,6 +152,11 @@ fn decode_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestEntry> {
         // 末列是 schema v12 加的（请求来源客户端）；旧行的 DEFAULT '' 原样
         // 读出 —— 空串 = 没有记录（前端显示占位符），与无 UA 的请求同一形态
         client: row.get(25)?,
+        // 末两列是 schema v17 加的（网关 Key 身份）；旧行 DEFAULT '' 原样读出
+        // —— 空串 = 没有可归属的 Key（v17 之前的历史无从回填，见 schema 的
+        // v17 段）
+        key_id: row.get(26)?,
+        key_name: row.get(27)?,
     })
 }
 
@@ -604,6 +610,8 @@ pub(super) fn insert_started_request(
     client_model: &str,
     client_reasoning: &str,
     client: &str,
+    key_id: &str,
+    key_name: &str,
     is_test: bool,
 ) -> rusqlite::Result<bool> {
     let existing: i64 = conn.query_row(
@@ -622,9 +630,19 @@ pub(super) fn insert_started_request(
     // 进行中行也应带上 —— 等收尾再补会让列表里「客户端」列在转发期间空一格
     conn.execute(
         "INSERT INTO requests (id, ts, model, client_model, client_reasoning, status, \
-         phase, phase_started_at, is_test, client) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, 'connecting', ?2, ?6, ?7)",
-        params![id, ts, model, client_model, client_reasoning, is_test as i64, client],
+         phase, phase_started_at, is_test, client, key_id, key_name) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, 'connecting', ?2, ?6, ?7, ?8, ?9)",
+        params![
+            id,
+            ts,
+            model,
+            client_model,
+            client_reasoning,
+            is_test as i64,
+            client,
+            key_id,
+            key_name,
+        ],
     )?;
     Ok(true)
 }
@@ -755,7 +773,7 @@ pub(super) fn update_running_request(
          completion_tokens = ?12, total_tokens = ?13, cache_read_tokens = ?14, provider = ?15, \
          client_model = ?16, upstream_model = ?17, attempt_details = ?18, sensitive_hits = ?19, \
          client_reasoning = ?20, upstream_reasoning = ?21, phase = '', phase_started_at = NULL, \
-         is_test = ?22, route = ?23, client = ?24 \
+         is_test = ?22, route = ?23, client = ?24, key_id = ?25, key_name = ?26 \
          WHERE id = ?1 AND status = 0",
         params![
             entry.id,
@@ -786,6 +804,9 @@ pub(super) fn update_running_request(
             // 客户端同 is_test：首发已写过一次，收尾再写一次保证
             // 「有进行中行」与「直接插入」两条路径落库的值同源
             entry.client,
+            // Key 身份同一口径：首发时若没有进行中行就没写，收尾这次补上
+            entry.key_id,
+            entry.key_name,
         ],
     )
 }
@@ -803,9 +824,10 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
         "INSERT INTO requests (id, ts, model, account_id, account_name, status, duration_ms, \
          first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
          cache_read_tokens, provider, client_model, upstream_model, attempt_details, \
-         sensitive_hits, client_reasoning, upstream_reasoning, is_test, route, client) \
+         sensitive_hits, client_reasoning, upstream_reasoning, is_test, route, client, \
+         key_id, key_name) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-         ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+         ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
         params![
             entry.id,
             entry.ts,
@@ -831,6 +853,8 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
             entry.is_test as i64,
             encode_optional_json(&entry.route),
             entry.client,
+            entry.key_id,
+            entry.key_name,
         ],
     )?;
     Ok(())

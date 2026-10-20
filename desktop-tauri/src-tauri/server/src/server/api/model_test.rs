@@ -599,7 +599,8 @@ pub async fn run_model_test(State(state): State<ServerState>, body: Bytes) -> Re
     // 那件事已经由 `is_test` 表达（见 `request_stats::RequestEntry::client`）
     state
         .request_stats()
-        .record_started(&test_id, started_at, &model, &model, &reasoning, "", true);
+        // 模型测试没有网关 Key 身份（面板内部发起，key_id / key_name 空串）
+        .record_started(&test_id, started_at, &model, &model, &reasoning, "", "", "", true);
     if let Some(token) = cancellation::register(&test_id) {
         telemetry.set_cancel_token(token);
     }

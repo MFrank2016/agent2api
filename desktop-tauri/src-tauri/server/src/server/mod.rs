@@ -390,6 +390,10 @@ impl ServerState {
         // 聚合读同一个库（schema v9 的聚合索引），装句柄即可 —— 事实表的刷新
         // 由 usage_query 的心跳循环驱动（见 limiter 模块头）。
         core::limiter::install(db.clone());
+        // 网关 Key 的配额判定与用量查询（schema v17）：与 limiter 同一形态装
+        // 同一个库句柄。**没有心跳**——用量缓存按需懒加载（见 key_quota 模块头），
+        // 所以这里只是把句柄放进去，位置只要求早于第一次鉴权请求。
+        core::key_quota::install(db.clone());
         // 出网代理池（「网络代理」页维护的命名代理；账号按 id 引用它们）：
         // 与任务状态同为「kv 固定键 + 整份读写」的形态，把同一个 `Db` 传进去。
         // 它不参与启动预热，位置只要求早于任何一次 `/api/proxies/pool*` 请求。

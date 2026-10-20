@@ -238,11 +238,40 @@
 .models-table .c-caps { width: 11.5%; }
 .models-table .c-alias { width: 33%; }
 .models-table .c-act { width: 11%; }
-.keys-table .k-name { width: 22%; }
-.keys-table .k-key { width: 44%; }
-.keys-table .k-time { width: 16%; }
-.keys-table .k-state { width: 8%; }
+.keys-table .k-name { width: 18%; }
+.keys-table .k-key { width: 32%; }
+.keys-table .k-quota { width: 14%; }
+.keys-table .k-usage { width: 16%; }
+.keys-table .k-time { width: 10%; }
+.keys-table .k-state { width: 6%; }
 .keys-table .k-act { width: 10%; }
+
+/* 配额列：一行文字 + 一条进度条（见 islands/keys-page.tsx 的 quota 单元格）。
+   进度条用百分比宽度而不是 grid 份额：它表达的是「已用 / 上限」这个比例，
+   与列宽无关；无限配额的 Key 不画条（`quotaPercent` 返回 null）。 */
+.keys-table .quotacell { display: flex; flex-direction: column; gap: 3px; }
+.keys-table .quotacell .qtext { font-size: 12px; font-variant-numeric: tabular-nums; }
+.keys-table .quotacell .qtext.over { color: var(--danger, #d9534f); font-weight: 600; }
+.keys-table .quotacell .qbar {
+  display: block;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border, rgba(0, 0, 0, .12));
+  overflow: hidden;
+}
+.keys-table .quotacell .qfill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent, #4a90d9);
+  transition: width .2s ease;
+}
+.keys-table .quotacell .qfill.over { background: var(--danger, #d9534f); }
+
+/* 用量列：Token 数在上、请求数与最近使用在下 */
+.keys-table .usagecell { display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
+.keys-table .usagecell > span:first-child { font-variant-numeric: tabular-nums; }
+.keys-table .usagecell .muted { font-size: 11px; }
 
 /* 代理池表（islands/proxies-page.tsx）的默认列宽。
    与上面两组同一条口径：默认宽度写在**普通类**上、由 colgroup 的 <col> 带上，

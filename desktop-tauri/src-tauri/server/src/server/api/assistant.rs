@@ -257,6 +257,9 @@ pub async fn chat(State(state): State<ServerState>, body: Bytes) -> Response {
         &requested_model,
         &model,
         "",
+        // 助手是面板内部发起的，没有网关 Key 身份（key_id / key_name 空串）
+        "",
+        "",
         "",
         true,
     );

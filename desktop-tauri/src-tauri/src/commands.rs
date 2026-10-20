@@ -301,7 +301,16 @@ pub fn change_lan_access(app: AppHandle, enabled: bool, panel: bool) -> Result<V
 
     let mut created_key = None;
     if enabled && crate::server::config::current().active_api_keys().is_empty() {
-        let entry = crate::server::core::api_keys::add("默认", None, Vec::new(), Vec::new())
+        // 自动补的这把 Key 不配配额（`None` = 无限）：它只是让壳的管理通道
+        // 有凭证可用，给运维兜底用的 Key 设限反而会把用户锁在门外
+        let entry = crate::server::core::api_keys::add(
+            "默认",
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            crate::server::core::api_keys::QuotaReset::Daily,
+        )
             .map_err(|message| format!("自动创建网关 Key 失败: {message}"))?;
         crate::server::logging::log(
             "[Config]",

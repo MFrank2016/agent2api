@@ -59,11 +59,13 @@ fn parse_object(
     path: &str,
     body: &Bytes,
     client: &str,
+    key_id: &str,
+    key_name: &str,
 ) -> Result<Value, Response> {
     let parsed = serde_json::from_slice::<Value>(body).ok();
     let Some(payload) = parsed.filter(Value::is_object) else {
         let error = GatewayError::bad_request("请求体必须是 JSON 对象");
-        record_early_failure(state, started_at, "", "", client, &error);
+        record_early_failure(state, started_at, "", "", client, key_id, key_name, &error);
         logging::verbose("[Model]", &format!("← POST {path} 请求体不是 JSON 对象"));
         return Err(error.payload_response());
     };
@@ -152,7 +154,15 @@ pub async fn responses_endpoint(
     // 请求来源客户端（UA 识别，见 `core::client`）：早失败路径与收尾记账共用
     let client = crate::server::core::client::classify(&pipeline::user_agent_of(&headers));
     let path = "/v1/responses";
-    let raw = match parse_object(&state, started_at, path, &body, &client) {
+    let raw = match parse_object(
+        &state,
+        started_at,
+        path,
+        &body,
+        &client,
+        scope.as_ref().map_or("", |s| s.key_id()),
+        scope.as_ref().map_or("", |s| s.key_name()),
+    ) {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -170,7 +180,16 @@ pub async fn responses_endpoint(
         Ok(body) => body,
         Err(message) => {
             let error = GatewayError::bad_request(message);
-            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &client, &error);
+            record_early_failure(
+                &state,
+                started_at,
+                &pipeline::model_field_text(&raw),
+                &client_reasoning,
+                &client,
+                scope.as_ref().map_or("", |scope| scope.key_id()),
+                scope.as_ref().map_or("", |scope| scope.key_name()),
+                &error,
+            );
             return error.payload_response();
         }
     };
@@ -180,7 +199,16 @@ pub async fn responses_endpoint(
         .unwrap_or(false)
     {
         let error = GatewayError::bad_request("input 必须能转换成对话消息");
-        record_early_failure(&state, started_at, "", &client_reasoning, &client, &error);
+        record_early_failure(
+            &state,
+            started_at,
+            "",
+            &client_reasoning,
+            &client,
+            scope.as_ref().map_or("", |scope| scope.key_id()),
+            scope.as_ref().map_or("", |scope| scope.key_name()),
+            &error,
+        );
         return error.payload_response();
     }
 
@@ -189,7 +217,16 @@ pub async fn responses_endpoint(
     let requested_model = match pipeline::resolve_model(&state, &mut chat_body, scope.as_ref()) {
         Ok(model) => model,
         Err(error) => {
-            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &client, &error);
+            record_early_failure(
+                &state,
+                started_at,
+                &pipeline::model_field_text(&raw),
+                &client_reasoning,
+                &client,
+                scope.as_ref().map_or("", |scope| scope.key_id()),
+                scope.as_ref().map_or("", |scope| scope.key_name()),
+                &error,
+            );
             return error.payload_response();
         }
     };
@@ -210,6 +247,10 @@ pub async fn responses_endpoint(
     // telemetry 在这里创建（不再由 forward_chat 代建）：进行中行要在
     // 转发开始前插入，见下方 record_started。
     let telemetry = Arc::new(RequestTelemetry::with_id());
+    // 命中的网关 Key 身份（schema v17）：挂到 telemetry 旁路，记账点从快照里读
+    if let Some(scope) = scope.as_ref() {
+        telemetry.set_key(scope.key_id(), scope.key_name());
+    }
     let client_model = pipeline::model_field_text(&raw);
     // 「进行中」行（与 /v1/chat/completions 同一处时点：模型解析成功、
     // 转发开始前；生命周期见 `RequestStats::record_started`）
@@ -221,6 +262,8 @@ pub async fn responses_endpoint(
         &client_model,
         &client_reasoning,
         &client,
+        scope.as_ref().map_or("", |scope| scope.key_id()),
+        scope.as_ref().map_or("", |scope| scope.key_name()),
         // 真实流量：不是模型测试（见 `RecordContext::is_test`）
         false,
     );
@@ -349,7 +392,15 @@ pub async fn messages_endpoint(
     // 请求来源客户端（UA 识别，见 `core::client`）：早失败路径与收尾记账共用
     let client = crate::server::core::client::classify(&pipeline::user_agent_of(&headers));
     let path = "/v1/messages";
-    let raw = match parse_object(&state, started_at, path, &body, &client) {
+    let raw = match parse_object(
+        &state,
+        started_at,
+        path,
+        &body,
+        &client,
+        scope.as_ref().map_or("", |s| s.key_id()),
+        scope.as_ref().map_or("", |s| s.key_name()),
+    ) {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -360,7 +411,16 @@ pub async fn messages_endpoint(
         Ok(body) => body,
         Err(message) => {
             let error = GatewayError::bad_request(message);
-            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), "", &client, &error);
+            record_early_failure(
+                &state,
+                started_at,
+                &pipeline::model_field_text(&raw),
+                "",
+                &client,
+                scope.as_ref().map_or("", |scope| scope.key_id()),
+                scope.as_ref().map_or("", |scope| scope.key_name()),
+                &error,
+            );
             return anthropic_error_response(&error);
         }
     };
@@ -371,7 +431,16 @@ pub async fn messages_endpoint(
     let requested_model = match pipeline::resolve_model(&state, &mut chat_body, scope.as_ref()) {
         Ok(model) => model,
         Err(error) => {
-            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &client, &error);
+            record_early_failure(
+                &state,
+                started_at,
+                &pipeline::model_field_text(&raw),
+                &client_reasoning,
+                &client,
+                scope.as_ref().map_or("", |scope| scope.key_id()),
+                scope.as_ref().map_or("", |scope| scope.key_name()),
+                &error,
+            );
             return anthropic_error_response(&error);
         }
     };
@@ -391,6 +460,10 @@ pub async fn messages_endpoint(
     // telemetry 在这里创建（与 responses_endpoint 同理：进行中行要在
     // 转发开始前插入）
     let telemetry = Arc::new(RequestTelemetry::with_id());
+    // 命中的网关 Key 身份（schema v17）：挂到 telemetry 旁路，记账点从快照里读
+    if let Some(scope) = scope.as_ref() {
+        telemetry.set_key(scope.key_id(), scope.key_name());
+    }
     let client_model = pipeline::model_field_text(&raw);
     // 「进行中」行（与 /v1/chat/completions 同一处时点：模型解析成功、
     // 转发开始前；生命周期见 `RequestStats::record_started`）
@@ -402,6 +475,8 @@ pub async fn messages_endpoint(
         &client_model,
         &client_reasoning,
         &client,
+        scope.as_ref().map_or("", |scope| scope.key_id()),
+        scope.as_ref().map_or("", |scope| scope.key_name()),
         // 真实流量：不是模型测试（见 `RecordContext::is_test`）
         false,
     );

@@ -89,6 +89,7 @@ pub mod endpoints;
 pub mod growth_scheduler;
 pub mod import_ccswitch;
 pub mod key_scope;
+pub mod key_quota;
 pub mod legacy_api_key;
 pub mod limiter;
 pub mod login;

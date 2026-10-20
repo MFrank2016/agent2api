@@ -70,6 +70,29 @@ type KeyEntry = {
   /** 白名单，**空数组 = 不限制** */
   allowedProviders?: string[]
   allowedModels?: string[]
+  /** 配额上限（Token）；`null` = 无限（默认） */
+  quotaTokens?: number | null
+  /** 配额重置方式：`"daily"` 或 `{"fixed": 秒数}` */
+  quotaReset?: string | { fixed: number }
+  /** 近 7 天用量（后端 `key_quota::usage_summary` 算好） */
+  usage?: KeyUsage
+  /** 当前窗口的配额快照（后端 `key_quota::quota_json` 算好） */
+  quota?: QuotaSnapshot
+}
+
+type KeyUsage = {
+  requests?: number
+  tokens?: number
+  successful?: number
+  lastUsedAt?: number
+}
+
+type QuotaSnapshot = {
+  limit?: number | null
+  used?: number
+  windowStart?: number | null
+  reset?: string | { fixed: number }
+  exceeded?: boolean
 }
 
 /**
@@ -97,10 +120,21 @@ type KeysBridge = {
     key?: string
     allowedProviders: string[]
     allowedModels: string[]
+    /** 配额上限；null / 缺省 = 不限量 */
+    quotaTokens?: number | null
+    /** 重置方式；缺省 = 后端默认（每天 0 点） */
+    quotaReset?: string | { fixed: number }
   }): Promise<KeysPayload | null | undefined>
   updateKey(
     id: string,
-    patch: { enabled?: boolean; allowedProviders?: string[]; allowedModels?: string[] },
+    patch: {
+      enabled?: boolean
+      allowedProviders?: string[]
+      allowedModels?: string[]
+      /** 三态：缺省 = 不动，null = 改成不限量，数字 = 设成它 */
+      quotaTokens?: number | null
+      quotaReset?: string | { fixed: number }
+    },
   ): Promise<KeysPayload | null | undefined>
   deleteKey(id: string): Promise<KeysPayload | null | undefined>
 }
@@ -179,6 +213,9 @@ const COLUMNS: readonly ColumnDecl[] = [
   { key: 'name', label: t('名称') },
   // 「Key」是产品固定叫法（无中文），不进词典
   { key: 'key', label: 'Key' },
+  // 配额与用量：放在创建时间之前 —— 这两列是用户看这张表的主要目的
+  { key: 'quota', label: t('配额') },
+  { key: 'usage', label: t('用量（7天）') },
   { key: 'time', label: t('创建时间') },
   { key: 'state', label: t('启用') },
   { key: 'act', label: t('操作'), align: 'right' },
@@ -188,6 +225,8 @@ const COLUMNS: readonly ColumnDecl[] = [
 const CELL_CLASS: Record<string, string> = {
   name: 'cell-name',
   key: 'cell-key',
+  quota: 'cell-quota',
+  usage: 'cell-usage',
   time: 'cell-time',
   state: 'cell-state state',
   act: 'cell-act r',
@@ -323,6 +362,56 @@ function restrictionTitle(k: KeyEntry): string {
   return lines.join('\n')
 }
 
+/* ─── 配额与用量的展示换算 ───────────────────── */
+
+/** Token 数 → 紧凑可读（`1.2M` / `345K` / `678`） */
+function compactTokens(value: number | undefined): string {
+  const n = Number(value) || 0
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(n >= 100_000 ? 0 : 1)}K`
+  return String(n)
+}
+
+/** 配额重置方式 → 中文说明 */
+function resetText(reset: string | { fixed: number } | undefined): string {
+  if (reset === 'daily') return t('每天 0 点重置')
+  if (reset && typeof reset === 'object' && typeof reset.fixed === 'number') {
+    const hours = Math.max(1, Math.round(reset.fixed / 3600))
+    return t('每 {n} 小时重置', { n: hours })
+  }
+  return t('每天 0 点重置')
+}
+
+/** 配额列的一行文字（无限 / 已用上限） */
+function quotaText(k: KeyEntry): string {
+  const limit = k.quota?.limit
+  if (limit == null) return t('无限')
+  const used = Number(k.quota?.used) || 0
+  return `${compactTokens(used)} / ${compactTokens(limit)}`
+}
+
+/** 配额进度条（0~100；无限时返回 null，由调用方决定不画） */
+function quotaPercent(k: KeyEntry): number | null {
+  const limit = k.quota?.limit
+  if (limit == null || limit <= 0) return null
+  const used = Number(k.quota?.used) || 0
+  return Math.min(100, Math.round((used / limit) * 100))
+}
+
+/** 配额列的悬停说明 */
+function quotaTitle(k: KeyEntry): string {
+  const limit = k.quota?.limit
+  if (limit == null) return t('这把 Key 不限量（默认）')
+  const used = Number(k.quota?.used) || 0
+  const lines = [
+    t('上限：{n} Token', { n: compactTokens(limit) }),
+    t('本窗口已用：{n} Token', { n: compactTokens(used) }),
+    resetText(k.quota?.reset),
+  ]
+  if (k.quota?.exceeded) lines.push(t('⚠️ 已用尽：这把 Key 的请求当前会被拒绝'))
+  return lines.join('\n')
+}
+
 /**
  * 弹窗里「当前选的摘要」。为什么要有它：限制是**看不见的** —— 弹窗一关，列表上只剩
  * 「限制：…」一行；而多选的触发器只显示连接后的一行文案，清单长了会被省略号收掉。
@@ -436,6 +525,30 @@ function KeyModal({ target, providers, modelsByProvider, onClose, onSaved }: Key
   )
 
   /**
+   * 配额编辑（默认无限）。
+   *
+   * `quotaLimited = false` 时提交 `quotaTokens: null`（后端落成 `None` = 无限）。
+   * 初值：已配额度的 Key 展开成「有限 + 原阈值」，没配的保持无限 —— 打开弹窗
+   * 看到的就是它当前的真实状态，不会因为「默认值」而让用户误以为要设限。
+   */
+  const [quotaLimited, setQuotaLimited] = React.useState<boolean>(
+    () => typeof target?.quotaTokens === 'number' && target.quotaTokens > 0,
+  )
+  const [quotaValue, setQuotaValue] = React.useState<string>(
+    () => (typeof target?.quotaTokens === 'number' && target.quotaTokens > 0
+      ? String(target.quotaTokens)
+      : '1000000'),
+  )
+  /** 重置方式：'daily' 或固定小时数（字符串，提交时换算成秒） */
+  const [resetMode, setResetMode] = React.useState<string>(() => {
+    const reset = target?.quotaReset
+    if (reset && typeof reset === 'object' && typeof reset.fixed === 'number') {
+      return String(Math.max(1, Math.round(reset.fixed / 3600)))
+    }
+    return 'daily'
+  })
+
+  /**
    * 空候选的说明文案分两种：没勾提供商时是「先选提供商」，勾了却是空才是「这几家
    * 现在没有可用模型」（后端没给该家的清单 = 没登录态）。有候选时不写这句 ——
    * 那时浮层里空只可能是搜索没匹配上。
@@ -458,17 +571,38 @@ function KeyModal({ target, providers, modelsByProvider, onClose, onSaved }: Key
     savingRef.current = true
     setSaving(true)
     setStatus(t('保存中…'))
+    // 配额的三态：不限 → null；有限 → 正整数。非法输入在下面提前挡回，
+    // 不把 NaN 发给后端（后端会按 400 拒，但本地提示更直接）
+    let quotaTokens: number | null = null
+    if (quotaLimited) {
+      const parsed = Number(quotaValue.replace(/[^0-9]/g, ''))
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        setStatus(t('配额必须大于 0（或关掉配额开关表示不限量）'))
+        savingRef.current = false
+        setSaving(false)
+        return
+      }
+      quotaTokens = parsed
+    }
+    // 重置方式：'daily' 原样，数字则是「每 N 小时」→ 秒
+    const quotaReset: string | { fixed: number } =
+      resetMode === 'daily' ? 'daily' : { fixed: Math.max(1, Number(resetMode)) * 3600 }
     try {
       const api = shared().workbuddyDesktop
       if (!api) throw new Error(t('后端桥不可用'))
       if (editingId) {
-        // 只提交两个白名单：别名与启停都不动（部分更新语义，见后端 api_keys::update）
-        const next = await api.updateKey(editingId, { allowedProviders, allowedModels })
+        // 只提交两个白名单与配额：别名与启停都不动（部分更新语义，见后端 api_keys::update）
+        const next = await api.updateKey(editingId, {
+          allowedProviders,
+          allowedModels,
+          quotaTokens,
+          quotaReset,
+        })
         // 先解除守卫再关窗（旧实现同序：saving = false 在 closeModal 之前）
         stopSaving()
         onSaved(next)
         onClose()
-        toast(t('✅ 可用范围已保存'))
+        toast(t('✅ 可用范围与配额已保存'))
         return
       }
       const trimmedKey = keyValue.trim()
@@ -478,6 +612,8 @@ function KeyModal({ target, providers, modelsByProvider, onClose, onSaved }: Key
       }
       const next = await api.createKey({
         name: name.trim(), key: trimmedKey || undefined, allowedProviders, allowedModels,
+        quotaTokens,
+        quotaReset,
       })
       stopSaving()
       onSaved(next, next?.created?.id)
@@ -571,6 +707,56 @@ function KeyModal({ target, providers, modelsByProvider, onClose, onSaved }: Key
                 收掉 —— 勾了哪几家 / 哪些模型要在这儿摊开。id 沿用旧实现的：page-gateway.css
                 按它给这行加了上边距（它是「当前选择」而不是「使用说明」）。 */}
             <p id='key-restrict-summary'>{restrictionSummary(allowedProviders, allowedModels)}</p>
+          </DialogSection>
+          {/* ── 配额（Token 用量上限）──────────────────────────────
+              默认关（= 不限量）：与后端的默认值一致，也让「只想改个名字」的
+              用户不会被一个新出现的必填项挡住。开关关着时不提交阈值，
+              后端收到 null 即落成无限。 */}
+          <DialogSection>
+            <h3>{t('配额')}</h3>
+            <label className='flex items-center gap-2 text-[12.5px]'>
+              <input
+                type='checkbox'
+                checked={quotaLimited}
+                onChange={event => setQuotaLimited(event.currentTarget.checked)}
+              />
+              <span>{t('限制这把 Key 的 Token 用量（默认不限量）')}</span>
+            </label>
+            {quotaLimited ? (
+              <div className='flex flex-wrap items-center gap-2.5 text-[12.5px]'>
+                <Label htmlFor='key-quota' className='text-[12.5px] whitespace-nowrap text-subtle'>
+                  {t('上限')}
+                </Label>
+                <Input
+                  id='key-quota'
+                  type='text'
+                  inputMode='numeric'
+                  className='w-32'
+                  value={quotaValue}
+                  onChange={event => setQuotaValue(event.currentTarget.value)}
+                />
+                <span className='text-subtle'>Token</span>
+                <Label htmlFor='key-quota-reset' className='text-[12.5px] whitespace-nowrap text-subtle'>
+                  {t('重置')}
+                </Label>
+                <select
+                  id='key-quota-reset'
+                  className='rounded border border-border bg-transparent px-2 py-1.5 text-[12.5px]'
+                  value={resetMode}
+                  onChange={event => setResetMode(event.currentTarget.value)}
+                >
+                  <option value='daily'>{t('每天 0 点')}</option>
+                  {[1, 6, 12, 24, 168].map(hours => (
+                    <option key={hours} value={String(hours)}>
+                      {t('每 {n} 小时', { n: hours })}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : null}
+            <p>
+              {t('按窗口内已完成的请求累计 Token 判定；用满后这把 Key 的请求返回 429，窗口翻页自动恢复。这是软限制 —— 正在跑的请求不计入。')}
+            </p>
           </DialogSection>
           <div className='min-h-[18px] text-[11.5px] text-muted-foreground'>{status}</div>
         </DialogBody>
@@ -772,6 +958,40 @@ function KeysPage() {
           </div>
         )
       }
+      case 'quota': {
+        const percent = quotaPercent(k)
+        const exceeded = k.quota?.exceeded === true
+        return (
+          <div className='quotacell' title={quotaTitle(k)}>
+            <span className={exceeded ? 'qtext over' : 'qtext'}>{quotaText(k)}</span>
+            {percent !== null ? (
+              <span className='qbar' aria-hidden='true'>
+                <span
+                  className={exceeded ? 'qfill over' : 'qfill'}
+                  style={{ width: `${percent}%` }}
+                />
+              </span>
+            ) : null}
+          </div>
+        )
+      }
+      case 'usage': {
+        const usage = k.usage
+        if (!usage || !Number(usage.requests)) {
+          return <span className='muted'>{t('无记录')}</span>
+        }
+        return (
+          <div className='usagecell'>
+            <span>{compactTokens(usage.tokens)} Token</span>
+            <span className='muted'>
+              {t('{n} 次', { n: Number(usage.requests) })}
+              {usage.lastUsedAt
+                ? ` · ${shared().wbApp?.formatTime?.(usage.lastUsedAt) ?? ''}`
+                : ''}
+            </span>
+          </div>
+        )
+      }
       case 'time':
         return (
           <span className='muted'>{k.createdAt ? shared().wbApp?.formatTime?.(k.createdAt) : '—'}</span>
@@ -825,6 +1045,8 @@ function KeysPage() {
           <colgroup>
             <col className='k-name' data-col='name' />
             <col className='k-key' data-col='key' />
+            <col className='k-quota' data-col='quota' />
+            <col className='k-usage' data-col='usage' />
             <col className='k-time' data-col='time' />
             <col className='k-state' data-col='state' />
             <col className='k-act' data-col='act' />
@@ -834,6 +1056,8 @@ function KeysPage() {
               <th data-col='name'>{t('名称')}</th>
               {/* 「Key」是产品固定叫法（无中文），不进词典 */}
               <th data-col='key'>Key</th>
+              <th data-col='quota'>{t('配额')}</th>
+              <th data-col='usage'>{t('用量（7天）')}</th>
               <th data-col='time'>{t('创建时间')}</th>
               <th data-col='state'>{t('启用')}</th>
               <th className='r' data-col='act'>{t('操作')}</th>

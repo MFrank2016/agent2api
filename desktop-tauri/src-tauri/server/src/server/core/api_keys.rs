@@ -88,6 +88,48 @@ const LEGACY_NAME: &str = "默认 Key";
 /// 与旧版一致的最小长度
 pub const MIN_KEY_LENGTH: usize = 8;
 
+/// 配额重置方式。
+///
+/// 只有两种，**刻意不提供「永不重置」**：那等价于一个一次性总额，
+/// 用完就永久废掉这把 Key，与「临时维护、别把用户锁死」的取向相反。
+/// 要长期不限量就直接把配额留空（`quota_tokens = None`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuotaReset {
+    /// 每天本地时区 0 点重置（默认）。与 `core::limiter` 的自然日窗口同锚点。
+    Daily,
+    /// 固定周期：窗口对齐自然时间（整 N 小时一轮回），长度 = `seconds`。
+    Fixed(i64),
+}
+
+impl QuotaReset {
+    /// 窗口种类键：与 `core::limiter` 的 `rule_kind` **同一套编码**
+    /// （自然日 = 0，固定周期 = 周期秒数）。共用这套编码是为了让两边能直接
+    /// 复用同一个窗口起点函数 —— 两套编码各写一遍，时区/DST 处理迟早漂开。
+    pub fn kind(self) -> i64 {
+        match self {
+            QuotaReset::Daily => 0,
+            QuotaReset::Fixed(seconds) => seconds,
+        }
+    }
+
+    /// 公开形态（前端下拉直接读它）
+    pub fn to_json(self) -> Value {
+        match self {
+            QuotaReset::Daily => Value::String("daily".to_string()),
+            QuotaReset::Fixed(seconds) => {
+                json!({ "fixed": seconds })
+            }
+        }
+    }
+}
+
+/// 配额固定周期的上下限（秒）：1 小时 ~ 30 天。
+///
+/// 下限 1 小时：窗口太短会让「刚恢复又被打满」反复出现，配额的意义变成限速。
+/// 上限 30 天：比这更长的周期与「不设配额」在使用体感上没有区别。
+pub const MIN_QUOTA_PERIOD_SECONDS: i64 = 3_600;
+pub const MAX_QUOTA_PERIOD_SECONDS: i64 = 2_592_000;
+
 /// 一条 Key 记录
 #[derive(Clone, Debug)]
 pub struct ApiKeyEntry {
@@ -100,6 +142,15 @@ pub struct ApiKeyEntry {
     pub allowed_providers: Vec<String>,
     /// 可用模型白名单（**对外模型名**，含映射 alias）；**空 = 不限制**
     pub allowed_models: Vec<String>,
+    /// 配额上限（窗口内累计 Token）；**`None` = 无限，这是默认值**。
+    ///
+    /// 默认无限是硬要求：配额字段是本轮新加的，旧记录读出来必须是 `None`，
+    /// 否则升级一次就把所有存量 Key 按某个猜测的阈值限流了。
+    /// 与两个白名单的「空 = 不限制」同一取向（见模块头那条硬不变量）。
+    pub quota_tokens: Option<i64>,
+    /// 配额的重置窗口；`quota_tokens` 为 `None` 时无意义（但仍原样存取，
+    /// 用户把配额关掉再打开时不必重设窗口）。
+    pub quota_reset: QuotaReset,
     /// 这条记录的 `key` **解不开**（密钥文件被删/被换），处于降级态。
     ///
     /// 为 true 时 `key` 里放的是**原样的密文信封**（不是明文）：
@@ -145,6 +196,44 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
 /// 白名单列表 → 落盘形态（**空也写成 `[]`**，见模块头）
 fn list_value(list: &[String]) -> Value {
     Value::Array(list.iter().map(|item| Value::String(item.clone())).collect())
+}
+
+/// 配额的落盘 / 读取形态。
+///
+/// ── 读侧为什么只认「正数」────────────────────────────────────
+/// `quotaTokens` 的三种合法形态：缺失 / `null` = 无限；正数 = 上限；
+/// 其余（0、负数、非数字、非有限）一律当**无限**。0 不能当「一 Token 都不许用」：
+/// 手改配置写了个 0 或界面上清空输入框，都不该让这把 Key 静默变成废 Key
+/// （那与「升级不能让 Key 失效」是同一条取向）。
+///
+/// ── 写侧为什么恒写 `quotaTokens` 键 ─────────────────────────
+/// 与两个白名单同一理由：配置形状稳定，手改配置时看得出这个位置存在。
+/// `quotaReset` 同样恒写，`daily` 是字符串、固定周期是 `{"fixed": 秒数}`。
+fn quota_reset_from(value: Option<&Value>) -> QuotaReset {
+    match value {
+        Some(Value::String(text)) if text == "daily" => QuotaReset::Daily,
+        Some(Value::Object(fields)) => {
+            let seconds = fields.get("fixed").and_then(Value::as_i64);
+            match seconds {
+                Some(seconds)
+                    if (MIN_QUOTA_PERIOD_SECONDS..=MAX_QUOTA_PERIOD_SECONDS).contains(&seconds) =>
+                {
+                    QuotaReset::Fixed(seconds)
+                }
+                // 越界 / 缺失：回落默认（自然日），不夹逼 —— 「把 90 天夹成 30 天」
+                // 会悄悄改变用户配好的语义（与 `limiter::parse_rules` 同一条理由）
+                _ => QuotaReset::Daily,
+            }
+        }
+        // 旧记录没有这个键，或写成了认不出的形态
+        _ => QuotaReset::Daily,
+    }
+}
+
+/// 配额上限 → 可选的 Token 数（`None` = 无限，见 [`quota_reset_from`] 的说明）
+fn quota_tokens_from(value: Option<&Value>) -> Option<i64> {
+    let raw = value?.as_i64()?;
+    (raw > 0).then_some(raw)
 }
 
 /// 「有一把网关 Key 解不开」的**进程级一次性**告警。
@@ -244,6 +333,9 @@ impl ApiKeyEntry {
             created_at: value.get("createdAt").and_then(Value::as_i64).unwrap_or(0),
             allowed_providers: string_list(value.get("allowedProviders")),
             allowed_models: string_list(value.get("allowedModels")),
+            // 配额：缺失 / 脏值一律读成「无限」（见 `quota_tokens_from`）
+            quota_tokens: quota_tokens_from(value.get("quotaTokens")),
+            quota_reset: quota_reset_from(value.get("quotaReset")),
             key_unreadable,
         })
     }
@@ -276,6 +368,12 @@ impl ApiKeyEntry {
             "createdAt": self.created_at,
             "allowedProviders": list_value(&self.allowed_providers),
             "allowedModels": list_value(&self.allowed_models),
+            // 恒写：无限也要显式是 null（见 `quota_reset_from` 的说明）
+            "quotaTokens": match self.quota_tokens {
+                Some(tokens) => Value::from(tokens),
+                None => Value::Null,
+            },
+            "quotaReset": self.quota_reset.to_json(),
         }))
     }
 
@@ -294,6 +392,11 @@ impl ApiKeyEntry {
             "createdAt": self.created_at,
             "allowedProviders": list_value(&self.allowed_providers),
             "allowedModels": list_value(&self.allowed_models),
+            "quotaTokens": match self.quota_tokens {
+                Some(tokens) => Value::from(tokens),
+                None => Value::Null,
+            },
+            "quotaReset": self.quota_reset.to_json(),
         })
     }
 }
@@ -354,6 +457,10 @@ fn legacy_entry(raw: &Map<String, Value>) -> Option<ApiKeyEntry> {
         // 与它升级前的行为（放行一切）逐字一致
         allowed_providers: Vec::new(),
         allowed_models: Vec::new(),
+        // 旧字段形态同样没有配额概念 —— 无限（`None`），与升级前的
+        // 「不限制任何用量」逐字一致
+        quota_tokens: None,
+        quota_reset: QuotaReset::Daily,
         key_unreadable,
     })
 }
@@ -582,6 +689,8 @@ pub fn add(
     key: Option<&str>,
     allowed_providers: Vec<String>,
     allowed_models: Vec<String>,
+    quota_tokens: Option<i64>,
+    quota_reset: QuotaReset,
 ) -> Result<ApiKeyEntry, String> {
     let mut entries = list();
     let key = match key.map(str::trim).filter(|k| !k.is_empty()) {
@@ -605,6 +714,9 @@ pub fn add(
         created_at,
         allowed_providers,
         allowed_models,
+        // 只接受正数（与读侧的 `quota_tokens_from` 同一口径：0 / 负数 = 无限）
+        quota_tokens: quota_tokens.filter(|tokens| *tokens > 0),
+        quota_reset,
         // 刚生成的 Key 当然是明文可读的，与降级态无关
         key_unreadable: false,
     };
@@ -615,19 +727,29 @@ pub fn add(
     Ok(entry)
 }
 
-/// 改名 / 启停 / 改白名单（`None` = 该项不动，与原来的两字段语义一致）。
+/// 改名 / 启停 / 改白名单 / 改配额（`None` = 该项不动，与原来的两字段语义一致）。
 ///
 /// ── 白名单为什么用 `Option<Vec<String>>` 而不是 `Vec<String>` ──────
 /// `PATCH /api/keys/{id}` 是部分更新：旧版前端只发 `{name}` / `{enabled}`，
 /// 用 `Vec` 表达「不改」只能靠「空列表」，而那正是「清除限制」的语义 ——
 /// 于是「在管理页改个名字」会把已有的限制静默清掉。`Option` 把这两件事分开：
 /// `None` = 不动，`Some(vec![])` = 清成不限制，`Some(list)` = 设成 list。
+///
+/// ── 配额为什么是 `Option<Option<i64>>`（双层）────────────────────
+/// 比白名单多一层，因为「关掉配额」本身是一个有意义的写入（落成 `null`）：
+///   - `None`            = 不动（旧前端只发 name/enabled 时走这条）
+///   - `Some(None)`      = 改成无限
+///   - `Some(Some(n))`   = 设成 n（非正数按无限处理，与读侧同一口径）
+/// 用单层 `Option<i64>` 表达不了「改成无限」—— 那与「不动」撞成同一个值，
+/// 于是用户关不掉配额。
 pub fn update(
     id: &str,
     name: Option<&str>,
     enabled: Option<bool>,
     allowed_providers: Option<Vec<String>>,
     allowed_models: Option<Vec<String>>,
+    quota_tokens: Option<Option<i64>>,
+    quota_reset: Option<QuotaReset>,
 ) -> Result<ApiKeyEntry, String> {
     let mut entries = list();
     let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
@@ -644,6 +766,12 @@ pub fn update(
     }
     if let Some(list) = allowed_models {
         entry.allowed_models = list;
+    }
+    if let Some(limit) = quota_tokens {
+        entry.quota_tokens = limit.filter(|tokens| *tokens > 0);
+    }
+    if let Some(reset) = quota_reset {
+        entry.quota_reset = reset;
     }
     let updated = entry.clone();
     save(&entries)?;

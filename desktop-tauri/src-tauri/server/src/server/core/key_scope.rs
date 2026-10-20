@@ -52,6 +52,18 @@ pub struct KeyScope {
     allowed_providers: HashSet<String>,
     /// 允许的对外模型名（小写），空集合 = 不限制
     allowed_models: HashSet<String>,
+    /// 命中记录的 id（**身份**，不是限制）。
+    ///
+    /// 它随请求带到记账点，落进 `requests.key_id` —— Key 页的用量列与 Key 级
+    /// 配额都靠这一列。与两个白名单不同，它**不参与任何判定**：命中记录却拿不到
+    /// id 是不可能的（`from_entry` 一定有值），所以这里不需要「空 = 不限制」
+    /// 那种语义，空串只出现在 `provider_only` 构造的测试作用域上。
+    key_id: String,
+    /// 命中记录的展示名快照（落进 `requests.key_name`）。
+    ///
+    /// 与 `account_name` 同一理由：Key 可以改名、可以被删除，但明细的寿命长于
+    /// 配置，报表仍要显示一个可读的名字而不是一串 id。
+    key_name: String,
 }
 
 impl KeyScope {
@@ -60,6 +72,8 @@ impl KeyScope {
         Self {
             allowed_providers: normalize(&entry.allowed_providers),
             allowed_models: normalize(&entry.allowed_models),
+            key_id: entry.id.clone(),
+            key_name: entry.name.clone(),
         }
     }
 
@@ -78,8 +92,22 @@ impl KeyScope {
         Self {
             allowed_providers,
             allowed_models: HashSet::new(),
+            // 模型测试没有网关 Key 身份：它由面板内部发起，落库时 key_id 为空串
+            // （报表按 `is_test` 排除，不会污染 Key 用量）
+            key_id: String::new(),
+            key_name: String::new(),
         }
     }
+    /// 命中记录的 id（空串 = 没有可归属的 Key）
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    /// 命中记录的展示名快照
+    pub fn key_name(&self) -> &str {
+        &self.key_name
+    }
+
 
     /// 是否限制提供商（界面上「有没有勾」的判据，也用于日志措辞）
     pub fn restricts_providers(&self) -> bool {

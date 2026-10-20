@@ -441,6 +441,11 @@ impl RequestStats {
         client_model: &str,
         client_reasoning: &str,
         client: &str,
+        // 命中的网关 Key 身份（schema v17；空串 = 没有可归属的 Key）。
+        // 同一理由：入口鉴权时就定了，进行中行也该带上 —— 等收尾再补会让
+        // Key 列在转发期间空一格。
+        key_id: &str,
+        key_name: &str,
         is_test: bool,
     ) {
         if id.is_empty() {
@@ -457,6 +462,8 @@ impl RequestStats {
                 client_model,
                 client_reasoning,
                 client,
+                key_id,
+                key_name,
                 is_test,
             )?;
             // 陈旧清理与插入同事务：僵尸行的判定时点与本次开始时点一致，

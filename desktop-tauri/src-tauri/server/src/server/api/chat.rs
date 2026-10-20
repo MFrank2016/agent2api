@@ -88,7 +88,16 @@ pub async fn chat_completions(
     let parsed = serde_json::from_slice::<Value>(&body).ok();
     let Some(mut payload) = parsed.filter(Value::is_object) else {
         let error = GatewayError::bad_request("请求体必须是 JSON 对象");
-        record_early_failure(&state, started_at, "", "", &client, &error);
+        record_early_failure(
+            &state,
+            started_at,
+            "",
+            "",
+            &client,
+            scope.as_ref().map_or("", |scope| scope.key_id()),
+            scope.as_ref().map_or("", |scope| scope.key_name()),
+            &error,
+        );
         return error.payload_response();
     };
     // ② messages 必须是数组
@@ -100,7 +109,16 @@ pub async fn chat_completions(
         let error = GatewayError::bad_request("缺少 messages 数组");
         let model = model_field_text(&payload);
         let reasoning = pipeline::client_reasoning_of(&payload);
-        record_early_failure(&state, started_at, &model, &reasoning, &client, &error);
+        record_early_failure(
+            &state,
+            started_at,
+            &model,
+            &reasoning,
+            &client,
+            scope.as_ref().map_or("", |scope| scope.key_id()),
+            scope.as_ref().map_or("", |scope| scope.key_name()),
+            &error,
+        );
         return error.payload_response();
     }
 
@@ -134,6 +152,8 @@ pub async fn chat_completions(
                 &model_field_text(&payload),
                 &client_reasoning,
                 &client,
+                scope.as_ref().map_or("", |scope| scope.key_id()),
+                scope.as_ref().map_or("", |scope| scope.key_name()),
                 &error,
             );
             return error.payload_response();
@@ -153,6 +173,11 @@ pub async fn chat_completions(
     // 原始请求体**的哈希，与「某一家是否被处理」无关。
     let dedupe_key = pipeline::sha256_hex(&body);
     let telemetry = Arc::new(RequestTelemetry::with_id());
+    // 命中的网关 Key 身份（schema v17）：挂到 telemetry 旁路，记账点从快照里读。
+    // `None`（免鉴权 / 环境变量 Key / 未知 Key）时不挂，槽位保持空串。
+    if let Some(scope) = scope.as_ref() {
+        telemetry.set_key(scope.key_id(), scope.key_name());
+    }
     // 「进行中」行：模型解析已成功、转发即将开始 —— 先插一条 status=0 的明细，
     // 让请求日志在响应还没跑完时就能看到这条请求（收尾时由 `record` 的 UPDATE
     // 补全终态字段，生命周期见 `RequestStats::record_started`）。早失败路径
@@ -168,6 +193,8 @@ pub async fn chat_completions(
             &client_model,
             &client_reasoning,
             &client,
+            scope.as_ref().map_or("", |scope| scope.key_id()),
+            scope.as_ref().map_or("", |scope| scope.key_name()),
             // 真实流量：不是模型测试（见 `RecordContext::is_test`）
             false,
         );

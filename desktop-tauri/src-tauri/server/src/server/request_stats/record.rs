@@ -116,6 +116,19 @@ pub struct RequestEntry {
     pub account_id: String,
     #[serde(rename = "accountName", default)]
     pub account_name: String,
+    /// **本次请求命中的网关 Key id**（schema v17；空串 = 没有可归属的 Key）。
+    ///
+    /// 四种成因都收敛成空串：免鉴权模式、环境变量 Key、面板内部的 AI 助手、
+    /// 模型测试。与 `provider` / `account_id` 的既有空串口径一致 ——
+    /// 消费点不必分四路判断。
+    ///
+    /// 存储契约与 `account_id` 同构：身份只认 id（Key 改名不该拆成两行），
+    /// 展示名另存 `key_name` 快照（Key 删除后明细仍要可读）。
+    #[serde(rename = "keyId", default)]
+    pub key_id: String,
+    /// 命中 Key 的展示名快照（与 `key_id` 同源同刻；空串 = 同上）
+    #[serde(rename = "keyName", default)]
+    pub key_name: String,
     /// HTTP 状态码；还没发出请求就失败时用 0
     #[serde(default)]
     pub status: i64,
@@ -451,6 +464,11 @@ pub struct NewRequestEntry {
     pub model: String,
     pub account_id: String,
     pub account_name: String,
+    /// 命中的网关 Key 身份（schema v17；空串 = 没有可归属的 Key）。
+    /// 来源是 telemetry 旁路的 `set_key`（见 `RecordContext` 的说明）。
+    pub key_id: String,
+    /// 命中 Key 的展示名快照（与 `key_id` 同源同刻）
+    pub key_name: String,
     pub status: i64,
     pub duration_ms: i64,
     /// 上游首帧到达相对请求开始的耗时（采集点记绝对时刻，记账点做减法；
@@ -501,6 +519,10 @@ impl NewRequestEntry {
             model: model.into(),
             account_id: String::new(),
             account_name: String::new(),
+            // Key 身份同样「有采集才有值」：命中网关 Key 才有（见
+            // `RequestEntry::key_id` 的四种空串成因）
+            key_id: String::new(),
+            key_name: String::new(),
             status,
             duration_ms: 0,
             first_response_ms: None,
@@ -565,6 +587,10 @@ impl NewRequestEntry {
             model: self.model,
             account_id: self.account_id,
             account_name: self.account_name,
+            // Key 身份同理原样透传：入口已经按「命中的那把」定好，存储层不做
+            // 任何推导（不认识配置，也不该在这里回查）
+            key_id: self.key_id.trim().to_string(),
+            key_name: self.key_name.trim().to_string(),
             status: self.status,
             duration_ms: self.duration_ms.max(0),
             // 首响透传：负值（时钟回拨造成的理论值）夹成 0 在记账点已做，

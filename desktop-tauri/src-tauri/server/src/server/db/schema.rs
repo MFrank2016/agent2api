@@ -319,7 +319,33 @@ pub fn is_reserved(key: &str) -> bool {
 /// 关掉页面再回来还能接着聊。存**整条消息流的 JSON**（而不是逐条消息一行）的
 /// 理由与 `kv` 表同一取向：读写单元天然是「一整个会话」，逐条存只会让每次保存
 /// 变成 N 次写入 + 一次事务，而没有任何一处需要「按单条消息查」。
-pub const SCHEMA_VERSION: i64 = 16;
+///
+/// ── v17：requests 补网关 Key 身份（`key_id` / `key_name`）────────
+/// 见 [`V17_SCHEMA`]。明细记下「这次请求是哪把网关 Key 发的」，供 Key 页的
+/// 用量列与 Key 级配额判定读。
+///
+/// **为什么是 v17 而不是 v16**：本仓的 v16 已经被上游的「AI 助手对话会话」
+/// （`assistant_sessions`）占用；这条 Key 身份迁移来自另一条 fork 线，那边
+/// 的 v16 指的是它。两边的 16 不是同一件事，合到一起时必须给后来者重新编号
+/// —— 否则已升到 v16 的库会被判成「已是最新」而跳过建列，`requests` 缺
+/// `key_id` 后配额判定与用量查询会在运行时直接报错。
+///
+/// 为什么是 id + name 两列而不是只存 id：与 `account_id` / `account_name`
+/// 完全同构 —— Key 可以改名，身份只认 id（改名不该把它拆成两行），但 Key
+/// 被删除后明细的寿命长于配置，报表仍要显示一个可读的名字而不是一串 id。
+///
+/// 为什么空串表示「没有 Key」：免鉴权模式、环境变量 Key（
+/// `WORKBUDDY_PROXY_API_KEY`，没有列表记录）、面板内部发起的 AI 助手与模型
+/// 测试，这四种情形都没有可归属的 Key。收敛成同一个值之后，消费点不必分四路
+/// 判断 —— 与 `provider` / `account_id` 的既有空串口径一致。
+///
+/// 为什么索引是 `(key_id, ts)` 而不是只 `key_id`：配额判定要
+/// `WHERE key_id = ? AND ts >= ?`，Key 用量同理；只有 key_id 的话区间条件
+/// 退化成过滤。与 v9 给 `account_id` 建索引同一理由。
+///
+/// **历史数据不回填**：v17 之前的明细根本没记过 Key 身份，无从推断 ——
+/// 按「不猜值」的既有纪律，旧行一律落在空串（未知 Key）组。
+pub const SCHEMA_VERSION: i64 = 17;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -858,6 +884,18 @@ CREATE TABLE IF NOT EXISTS assistant_sessions (
 CREATE INDEX IF NOT EXISTS idx_assistant_sessions_updated ON assistant_sessions(updated_at DESC);
 ";
 
+/// 版本 17：requests 补网关 Key 身份两列 + 索引（schema v17）。
+///
+/// 与 v12 同一形态（既有表加列，幂等靠版本号）；索引那条与 v15 同形态
+/// （`CREATE INDEX IF NOT EXISTS`）。来历与取舍见 [`SCHEMA_VERSION`] 的 v17 段。
+const V17_SCHEMA: &str = "
+-- ── requests 补网关 Key 身份（schema v17）─────────────────────
+ALTER TABLE requests ADD COLUMN key_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE requests ADD COLUMN key_name TEXT NOT NULL DEFAULT '';
+-- ── Key 维度的区间扫描索引（配额判定 + 用量查询）───────────────
+CREATE INDEX IF NOT EXISTS idx_requests_key_ts ON requests(key_id, ts);
+";
+
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
 /// **库版本高于本程序时返回 `Err` 拒绝打开**（v14 起有意反转的一条既有决定，
@@ -1024,6 +1062,10 @@ fn apply_version(
         // v16：assistant_sessions 助手对话会话表（见 V16_SCHEMA 与
         // SCHEMA_VERSION 的 v16 段）。新表用 CREATE IF NOT EXISTS，幂等。
         16 => conn.execute_batch(V16_SCHEMA),
+        // v17：requests 补网关 Key 身份两列 + 索引（见 V17_SCHEMA 与
+        // SCHEMA_VERSION 的 v17 段）。ALTER TABLE ADD COLUMN 不能重复跑，
+        // 幂等靠版本号（与 v12 同口径）。
+        17 => conn.execute_batch(V17_SCHEMA),
         _ => Ok(()),
     }
 }

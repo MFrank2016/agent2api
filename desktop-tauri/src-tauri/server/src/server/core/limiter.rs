@@ -419,7 +419,11 @@ fn rule_kind(rule: &LimiterRule) -> i64 {
 }
 
 /// 种类键 → 当前窗口起点（毫秒）：0 = 本地自然日 0 点，其余按固定周期对齐。
-fn kind_window_start(kind: i64, now_ms: i64) -> i64 {
+///
+/// `pub(crate)` 而不是私有：Key 级配额（`core::key_quota`）用同一套窗口编码
+/// （自然日 = 0、固定周期 = 秒数）与同一个锚点。两处各写一遍时区 / DST 处理
+/// 迟早漂开 —— 那正是「同一个窗口在两处算出不同起点」的经典来源。
+pub(crate) fn kind_window_start(kind: i64, now_ms: i64) -> i64 {
     if kind == 0 {
         local_midnight_ms(now_ms)
     } else {

@@ -1147,9 +1147,36 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
         .find(|expected| request_matches_key(&request, expected))
         .cloned();
     if let Some(matched) = matched {
-        // 命中的那把 Key 的限制随请求带到 handler（见函数头）
-        if let Some(scope) = scope_for_key(&snapshot.raw(), &matched) {
-            crate::server::core::key_scope::attach(&mut request, scope);
+        // 命中的那把 Key 的限制随请求带到 handler（见函数头）。
+        // 这里取整条记录而不是只取 scope：配额判定需要 `quota_tokens` /
+        // `quota_reset`，而 `KeyScope` 只装身份与白名单。
+        if let Some(entry) =
+            crate::server::core::api_keys::entry_for_key_from(&snapshot.raw(), &matched)
+        {
+            // ── Key 级配额（schema v17）──────────────────────────────
+            // 判定只读内存缓存（见 `core::key_quota`），热路径零 IO；
+            // 没配配额的 Key（`quota_tokens = None`，默认）在这里直接短路，
+            // 连缓存都不碰。
+            //
+            // **只管 `/v1/` 的模型流量，不管 `/api/` 的管理接口**：配额是
+            // 「这把 Key 还能不能消耗模型额度」，而管理接口不消耗额度。
+            // 更要紧的是 —— 若把管理接口也拦下，用户就**再也解不开**配额了
+            // （`PATCH /api/keys/{id}` 本身就带这把 Key，会被自己挡回），
+            // 那是一处必须靠改库才能恢复的自锁。与「面板会话不产生模型用量」
+            // 是同一条边界。
+            if path.starts_with("/v1/")
+                && crate::server::core::key_quota::exceeded(&entry, logging::now_ms())
+            {
+                logging::log(
+                    "[Security]",
+                    &format!("⏳ 网关 Key「{}」已用满配额，拒绝请求: {path}", entry.name),
+                );
+                return quota_exceeded_response(&entry);
+            }
+            crate::server::core::key_scope::attach(
+                &mut request,
+                crate::server::core::key_scope::KeyScope::from_entry(&entry),
+            );
         }
         return next.run(request).await;
     }
@@ -1157,6 +1184,32 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
     let method = request.method().as_str().to_string();
     logging::log("[Security]", &format!("❌ 拒绝未授权的请求: {method} {path}"));
     errors::unauthorized_response()
+}
+
+/// 配额超限的响应体（429 + OpenAI 风格错误）。
+///
+/// 走 `GatewayError` 而不是手写 JSON：客户端对网关错误已经按那个形状解析
+/// （`error.message` / `error.type`），换一套形状等于让「配额用尽」与其它
+/// 网关错误在客户端侧分成两条互不相干的处理路径。
+///
+/// `type` 是 `rate_limit_error`（429 的既有归类，见 `GatewayError::error_type`），
+/// 消息里带上重置方式与上限，让用户不必翻配置就知道「什么时候能再用」。
+fn quota_exceeded_response(entry: &crate::server::core::api_keys::ApiKeyEntry) -> Response {
+    let reset = match entry.quota_reset {
+        crate::server::core::api_keys::QuotaReset::Daily => "每天 0 点".to_string(),
+        crate::server::core::api_keys::QuotaReset::Fixed(seconds) => {
+            format!("每 {} 小时", (seconds / 3600).max(1))
+        }
+    };
+    let limit = entry.quota_tokens.unwrap_or(0);
+    crate::server::errors::GatewayError::with_status(
+        429,
+        format!(
+            "网关 Key「{}」本轮配额已用尽（上限 {} Token，{}重置）",
+            entry.name, limit, reset
+        ),
+    )
+    .payload_response()
 }
 
 /// 在**给定快照**里找命中的 Key 并构造它的限制（R9）。

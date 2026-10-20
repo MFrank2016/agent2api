@@ -45,7 +45,35 @@ use crate::server::logging;
 use crate::server::ServerState;
 
 fn list_json(state: &ServerState) -> Value {
-    let keys: Vec<Value> = api_keys::list().iter().map(api_keys::ApiKeyEntry::public_json).collect();
+    let now = logging::now_ms();
+    // 近 7 天的用量（一次 `GROUP BY key_id`，走 `idx_requests_key_ts`）。
+    // 与配额判定**分开**：那边看当前窗口，这边看 7 天滚动 —— 两个区间不同，
+    // 合并成一次查询会让任一侧的口径被另一侧牵着走。
+    let usage = crate::server::core::key_quota::usage_summary(now);
+    let keys: Vec<Value> = api_keys::list()
+        .iter()
+        .map(|entry| {
+            let mut value = entry.public_json();
+            if let Some(object) = value.as_object_mut() {
+                // 用量：区间内的请求数 / Token / 最近使用；没有记录的 Key 给零值
+                object.insert(
+                    "usage".to_string(),
+                    usage
+                        .get(&entry.id)
+                        .map(|item| item.to_json())
+                        .unwrap_or_else(|| {
+                            crate::server::core::key_quota::KeyUsage::default().to_json()
+                        }),
+                );
+                // 配额快照：当前窗口已用 / 上限 / 窗口起点 / 是否超限
+                object.insert(
+                    "quota".to_string(),
+                    crate::server::core::key_quota::quota_json(entry, now),
+                );
+            }
+            value
+        })
+        .collect();
     // 可用提供商多选的候选：**注册表 + 已建的自定义家**（加一家内置 provider 时
     // 这里自动多一项，前端零改动）。带上 count 让界面能显示「这家有几个账号」——
     // 用户在这里勾「允许哪几家」时，那几家有没有账号是他最需要知道的信息。
@@ -143,6 +171,79 @@ fn parse_allowlist(
     Ok(Some(out))
 }
 
+/// 从请求体里读配额上限（三态，与 `parse_allowlist` 同一取舍）。
+///
+/// - 键缺失 → `None`（不动）
+/// - `null` / 0 / 负数 → `Some(None)`（改成无限）
+/// - 正数 → `Some(Some(n))`
+///
+/// 返回外层 `Option` 表达「这条请求有没有提到配额」，内层 `Option` 表达
+/// 「配额是无限还是某个数」—— 与 `api_keys::update` 的 `Option<Option<i64>>`
+/// 参数一一对应。
+fn parse_quota_tokens(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<Option<i64>>, Response> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    match value {
+        Value::Null => Ok(Some(None)),
+        _ => {
+            let Some(raw) = value.as_i64() else {
+                return Err(errors::management_error(
+                    400,
+                    format!("{key} 必须是整数（Token 数）或 null"),
+                ));
+            };
+            // 0 / 负数按「无限」处理：与读侧 `quota_tokens_from` 同一口径
+            Ok(Some((raw > 0).then_some(raw)))
+        }
+    }
+}
+
+/// 从请求体里读配额重置方式（缺失 = 不动）。
+///
+/// 两种合法写法：字符串 `"daily"`，或对象 `{"fixed": 秒数}`。秒数越界 / 类型
+/// 不对给 400 —— 与白名单的「认不出就报错」同一取向（静默夹逼会悄悄改变
+/// 用户配好的语义）。
+fn parse_quota_reset(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<api_keys::QuotaReset>, Response> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    match value {
+        Value::String(text) if text == "daily" => Ok(Some(api_keys::QuotaReset::Daily)),
+        Value::Object(fields) => {
+            let Some(seconds) = fields.get("fixed").and_then(Value::as_i64) else {
+                return Err(errors::management_error(
+                    400,
+                    format!("{key} 的对象形态必须是 {{\"fixed\": 秒数}}"),
+                ));
+            };
+            if !(api_keys::MIN_QUOTA_PERIOD_SECONDS..=api_keys::MAX_QUOTA_PERIOD_SECONDS)
+                .contains(&seconds)
+            {
+                return Err(errors::management_error(
+                    400,
+                    format!(
+                        "{key} 的固定周期必须在 {}~{} 秒之间",
+                        api_keys::MIN_QUOTA_PERIOD_SECONDS,
+                        api_keys::MAX_QUOTA_PERIOD_SECONDS
+                    ),
+                ));
+            }
+            Ok(Some(api_keys::QuotaReset::Fixed(seconds)))
+        }
+        _ => Err(errors::management_error(
+            400,
+            format!("{key} 必须是 \"daily\" 或 {{\"fixed\": 秒数}}"),
+        )),
+    }
+}
+
 fn body_object(body: &Bytes) -> Result<serde_json::Map<String, Value>, Response> {
     let payload = parse_body(body).map_err(|error| errors::management_error(400, error.message))?;
     payload
@@ -203,9 +304,26 @@ pub async fn create_key(State(state): State<ServerState>, body: Bytes) -> Respon
         Ok(value) => value.unwrap_or_default(),
         Err(response) => return response,
     };
-    match api_keys::add(name, key, allowed_providers, allowed_models) {
+    // 新建时配额同样「没给 = 默认」：`None` 是无限（见 `api_keys::add`）
+    let quota_tokens = match parse_quota_tokens(&object, "quotaTokens") {
+        Ok(value) => value.flatten(),
+        Err(response) => return response,
+    };
+    let quota_reset = match parse_quota_reset(&object, "quotaReset") {
+        Ok(value) => value.unwrap_or_else(crate::server::core::key_quota::default_reset),
+        Err(response) => return response,
+    };
+    match api_keys::add(
+        name,
+        key,
+        allowed_providers,
+        allowed_models,
+        quota_tokens,
+        quota_reset,
+    ) {
         Ok(entry) => {
-            logging::log("[Config]", &format!("✅ 新增 API Key「{}」，客户端需带 Authorization: Bearer <key>", entry.name));
+            // 配置变了：配额缓存的「启用中的窗口种类集合」可能变，清掉重算
+            crate::server::core::key_quota::invalidate();
             let mut payload = list_json(&state);
             if let Some(map) = payload.as_object_mut() {
                 map.insert("created".to_string(), entry.public_json());
@@ -234,14 +352,33 @@ pub async fn update_key(State(state): State<ServerState>, Path(id): Path<String>
         Ok(value) => value,
         Err(response) => return response,
     };
+    // 配额同样三态：键缺失 = 不动；null/0/负数 = 改成无限；正数 = 设成它
+    let quota_tokens = match parse_quota_tokens(&object, "quotaTokens") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let quota_reset = match parse_quota_reset(&object, "quotaReset") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     if let Some(false) = enabled {
         // 停用受与删除同一道约束：它同样会让「启用的 Key」归零
         if let Err(response) = guard_last_active_key(&api_keys::list(), &id, "停用") {
             return response;
         }
     }
-    match api_keys::update(&id, name, enabled, allowed_providers, allowed_models) {
+    match api_keys::update(
+        &id,
+        name,
+        enabled,
+        allowed_providers,
+        allowed_models,
+        quota_tokens,
+        quota_reset,
+    ) {
         Ok(entry) => {
+            // 配额上限 / 窗口可能变了：清缓存，下一个请求按新配置判定
+            crate::server::core::key_quota::invalidate();
             logging::log(
                 "[Config]",
                 &format!("API Key「{}」已更新（{}）", entry.name, if entry.enabled { "启用" } else { "停用" }),
@@ -259,6 +396,8 @@ pub async fn delete_key(State(state): State<ServerState>, Path(id): Path<String>
     }
     match api_keys::remove(&id) {
         Ok(()) => {
+            // 配置变了：清掉配额缓存（该 Key 的窗口种类可能不再被任何 Key 使用）
+            crate::server::core::key_quota::invalidate();
             let remaining = config::current().api_key_set();
             logging::log(
                 "[Config]",
