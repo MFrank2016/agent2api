@@ -24,7 +24,7 @@
 
 use serde_json::{json, Map, Value};
 
-use super::models::CatPawError;
+use super::models::{CatPawError, MAX_JSON_NESTING_DEPTH};
 
 /// `tool_choice` 的归一形态（原实现 `toolChoiceMode`）
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,13 +193,16 @@ pub fn select_tools(all: &[Value], choice: &ToolChoice) -> Result<Vec<Value>, Ca
     }
 }
 
-/// JSON 值合法性校验（原实现 `validateJsonValue`）：嵌套深度 ≤12、
+/// JSON 值合法性校验（原实现 `validateJsonValue`）：嵌套深度受限、
 /// 对象内不允许 `__proto__` / `constructor` / `prototype` 三个键。
 ///
 /// 为什么网关也要挡这三个键：它们会一路进上游 JSON（上游是 JS 生态，
 /// 原型污染是真实攻击面），且这类输入没有任何正常用途。
+///
+/// 深度上限见 [`MAX_JSON_NESTING_DEPTH`]：原实现写死 12，会把 Codex 这类
+/// 合法且较深的工具 schema 误杀，故放宽。
 fn validate_json_value(value: &Value, path: &str, depth: usize) -> Result<(), CatPawError> {
-    if depth > 12 {
+    if depth > MAX_JSON_NESTING_DEPTH {
         return Err(CatPawError::bad_request(format!("{path} 嵌套过深")));
     }
     match value {
