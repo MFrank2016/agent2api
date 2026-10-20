@@ -7,10 +7,10 @@
 [简体中文](../README.md) | [English](./README.en.md) | [繁體中文](./README.zh-Hant.md) | [日本語](./README.ja.md) | **한국어** | [Português (BR)](./README.pt-BR.md)
 
 [![license](https://img.shields.io/badge/license-MIT%20%2B%20고지-green)](../LICENSE)
-[![release](https://img.shields.io/github/v/release/aimod-cc/agent2api?include_prereleases)](https://github.com/aimod-cc/agent2api/releases/latest)
+[![release](https://img.shields.io/github/v/release/Agent2API/agent2api?include_prereleases)](https://github.com/Agent2API/agent2api/releases/latest)
 [![docker pulls](https://img.shields.io/docker/pulls/aimodcc/agent2api)](https://hub.docker.com/r/aimodcc/agent2api)
-[![stars](https://img.shields.io/github/stars/aimod-cc/agent2api?style=flat&color=yellow)](https://github.com/aimod-cc/agent2api/stargazers)
-[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Docker-blue)](https://github.com/aimod-cc/agent2api/releases/latest)
+[![stars](https://img.shields.io/github/stars/Agent2API/agent2api?style=flat&color=yellow)](https://github.com/Agent2API/agent2api/stargazers)
+[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Docker-blue)](https://github.com/Agent2API/agent2api/releases/latest)
 
 [✨ 핵심 기능](#-핵심-기능) • [💬 커뮤니티 및 지원](#-커뮤니티-및-지원) • [🤝 지원 공급자](#-지원-공급자) • [🚀 빠른 시작](#-빠른-시작) • [🐳 Docker 배포](#-docker-배포) • [📸 화면 미리보기](#-화면-미리보기) • [🔧 개발 및 빌드](#-개발-및-빌드) • [📜 사용 고지](#-사용-고지)
 
@@ -87,7 +87,7 @@ Agent2API는 여러 AI 데스크톱 클라이언트에 로그인된 계정을 �
 
 ## 🚀 빠른 시작
 
-[Releases](https://github.com/aimod-cc/agent2api/releases/latest)에서 설치 프로그램(NSIS, 중국어 간체, 기본 설치 경로 `C:\Program Files\Agent2API`, 설치 시 관리자 권한 필요)을 내려받아 설치 후 실행하면 됩니다. **Node나 다른 런타임은 필요하지 않습니다.**
+[Releases](https://github.com/Agent2API/agent2api/releases/latest)에서 설치 프로그램(NSIS, 중국어 간체, 기본 설치 경로 `C:\Program Files\Agent2API`, 설치 시 관리자 권한 필요)을 내려받아 설치 후 실행하면 됩니다. **Node나 다른 런타임은 필요하지 않습니다.**
 
 1. 첫 실행 시 앱 프로세스 안에서 로컬 게이트웨이(포트 3065)가 시작되고 메인 창이 열립니다. 이전 버전의 데이터 디렉터리나 데이터 파일이 발견되면 마이그레이션 안내 대화상자가 표시되며, 안내에 따라 진행하면 됩니다.
 2. "계정" 페이지에서 "계정 추가"를 누르고 프로바이더를 고른 뒤, 대화상자 안내대로 로그인하거나 자격 증명을 입력하면 됩니다(웹 로그인 / SMS 인증 코드 / 자격 증명 붙여넣기 / 이 PC 로그인 상태 가져오기).
@@ -161,7 +161,7 @@ services:
 | `AGENT2API_ALLOW_NO_KEY` | `1`이면 fail-closed 해제(키 미설정이어도 `/v1` 허용, 순수 내부망 한정) |
 | `AGENT2API_CAPTCHA_ENABLED` | 로그인 페이지 사람 확인 위젯: 기본 `1`(켜짐), `0`은 끔 |
 | `AGENT2API_SELF_UPDATE` | 컨테이너 안의 업데이트 창구: 기본 `1`(켜짐. 패널에서 "다운로드 후 업데이트" 가능). `0`이면 꺼지고 수동 업그레이드만 가능 |
-| `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | 심화: "업데이트 확인 / 업데이트 다운로드"를 자체 소스로 교체합니다. 전자는 저장소를 바꾸고(기본값은 업스트림 `aimod-cc/agent2api`, fork 후 변경 가능), 후자는 API 루트를 바꿉니다(기본 `https://api.github.com`, GitHub와 같은 형태의 release JSON을 반환해야 함). 자체 소스 설정 후 다운로드 허용 목록은 **그 소스 자신의 호스트**만 추가로 허용합니다(스킴은 소스를 따름: `http://`를 설정하면 평문 다운로드도 허용. 로컬 연습 / 내부 미러용) |
+| `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | 심화: "업데이트 확인 / 업데이트 다운로드"를 자체 소스로 교체합니다. 전자는 저장소를 바꾸고(기본값은 업스트림 `Agent2API/agent2api`, fork 후 변경 가능), 후자는 API 루트를 바꿉니다(기본 `https://api.github.com`, GitHub와 같은 형태의 release JSON을 반환해야 함). 자체 소스 설정 후 다운로드 허용 목록은 **그 소스 자신의 호스트**만 추가로 허용합니다(스킴은 소스를 따름: `http://`를 설정하면 평문 다운로드도 허용. 로컬 연습 / 내부 미러용) |
 
 소스에서 빌드하려면: 이 저장소를 클론한 뒤 `docker compose up -d --build`(이미지에는 게이트웨이와 패널만 들어가며 Rust 도구 체인은 포함되지 않습니다).
 
@@ -244,17 +244,17 @@ npm run build:icon         # 아이콘 소스 이미지 생성(아이콘 디자�
 
 ## ⭐ Star History
 
-<a href="https://star-history.com/#aimod-cc/agent2api&Date">
+<a href="https://star-history.com/#Agent2API/agent2api&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date" />
   </picture>
 </a>
 
 <div align="center">
 
-**[최신 버전 내려받기](https://github.com/aimod-cc/agent2api/releases/latest)** • **[문제 보고](https://github.com/aimod-cc/agent2api/issues)**
+**[최신 버전 내려받기](https://github.com/Agent2API/agent2api/releases/latest)** • **[문제 보고](https://github.com/Agent2API/agent2api/issues)**
 
 이 프로젝트가 도움이 되었다면 ⭐️ Star 를 눌러 주세요!
 

@@ -7,10 +7,10 @@
 [简体中文](../README.md) | [English](./README.en.md) | **繁體中文** | [日本語](./README.ja.md) | [한국어](./README.ko.md) | [Português (BR)](./README.pt-BR.md)
 
 [![license](https://img.shields.io/badge/license-MIT%20%2B%20附加聲明-green)](../LICENSE)
-[![release](https://img.shields.io/github/v/release/aimod-cc/agent2api?include_prereleases)](https://github.com/aimod-cc/agent2api/releases/latest)
+[![release](https://img.shields.io/github/v/release/Agent2API/agent2api?include_prereleases)](https://github.com/Agent2API/agent2api/releases/latest)
 [![docker pulls](https://img.shields.io/docker/pulls/aimodcc/agent2api)](https://hub.docker.com/r/aimodcc/agent2api)
-[![stars](https://img.shields.io/github/stars/aimod-cc/agent2api?style=flat&color=yellow)](https://github.com/aimod-cc/agent2api/stargazers)
-[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Docker-blue)](https://github.com/aimod-cc/agent2api/releases/latest)
+[![stars](https://img.shields.io/github/stars/Agent2API/agent2api?style=flat&color=yellow)](https://github.com/Agent2API/agent2api/stargazers)
+[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Docker-blue)](https://github.com/Agent2API/agent2api/releases/latest)
 
 [✨ 核心特性](#-核心特性) • [💬 社群與支援](#-社群與支援) • [🤝 支援的供應商](#-支援的供應商) • [🚀 快速開始](#-快速開始) • [🐳 Docker 部署](#-docker-部署) • [📸 介面預覽](#-介面預覽) • [🔧 開發與建置](#-開發與建置) • [📜 使用聲明](#-使用聲明)
 
@@ -87,7 +87,7 @@ Agent2API 把多家 AI 桌面客戶端裡已登入的帳號接到一起，共用
 
 ## 🚀 快速開始
 
-從 [Releases](https://github.com/aimod-cc/agent2api/releases/latest) 下載安裝包（NSIS，簡體中文，預設裝到 `C:\Program Files\Agent2API`，安裝時需要管理員授權），安裝後啟動即可，**無需安裝 Node 或任何其它執行環境**。
+從 [Releases](https://github.com/Agent2API/agent2api/releases/latest) 下載安裝包（NSIS，簡體中文，預設裝到 `C:\Program Files\Agent2API`，安裝時需要管理員授權），安裝後啟動即可，**無需安裝 Node 或任何其它執行環境**。
 
 1. 首次啟動即在應用程式行程內啟動本機閘道（連接埠 3065）並開啟主視窗；若偵測到舊版本的資料目錄或資料檔案，會彈窗提示遷移，依指引操作即可。
 2. 點「帳號」頁的「新增帳號」，選供應商後依彈窗提示完成登入或填寫憑證即可（方式以彈窗為準：網頁登入 / 手機驗證碼 / 貼上憑證 / 匯入本機登入狀態）。
@@ -161,7 +161,7 @@ services:
 | `AGENT2API_ALLOW_NO_KEY` | 設 `1` 關閉 fail-closed（未設 Key 也放行 `/v1`，僅限純內網） |
 | `AGENT2API_CAPTCHA_ENABLED` | 登入頁人機驗證元件：預設 `1` 開啟，`0` 關閉 |
 | `AGENT2API_SELF_UPDATE` | 容器內的更新入口：預設 `1` 開啟（面板可「下載並更新」）；設 `0` 關閉，只走手動升級 |
-| `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | 進階：把「檢查更新 / 下載更新」換成自建源。前者換儲存庫（預設跟上游 `aimod-cc/agent2api`，fork 後可改），後者換 API 根（預設 `https://api.github.com`，需返回與 GitHub 同形的 release JSON）。配了自建源後，下載白名單只額外放行**該源自己的網域**（按源的 scheme：配 `http://` 就允許明文下載，僅建議本地演練 / 內網映像用） |
+| `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | 進階：把「檢查更新 / 下載更新」換成自建源。前者換儲存庫（預設跟上游 `Agent2API/agent2api`，fork 後可改），後者換 API 根（預設 `https://api.github.com`，需返回與 GitHub 同形的 release JSON）。配了自建源後，下載白名單只額外放行**該源自己的網域**（按源的 scheme：配 `http://` 就允許明文下載，僅建議本地演練 / 內網映像用） |
 
 從原始碼建置：複製本專案後 `docker compose up -d --build`（映像裡只有閘道與面板，不含 Rust 工具鏈）。
 
@@ -244,17 +244,17 @@ npm run build:icon         # 產生圖示來源圖（改圖示設計後執行，
 
 ## ⭐ Star History
 
-<a href="https://star-history.com/#aimod-cc/agent2api&Date">
+<a href="https://star-history.com/#Agent2API/agent2api&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date" />
   </picture>
 </a>
 
 <div align="center">
 
-**[下載最新版](https://github.com/aimod-cc/agent2api/releases/latest)** • **[問題回饋](https://github.com/aimod-cc/agent2api/issues)**
+**[下載最新版](https://github.com/Agent2API/agent2api/releases/latest)** • **[問題回饋](https://github.com/Agent2API/agent2api/issues)**
 
 如果這個專案對你有幫助，歡迎點一個 ⭐️ Star！
 

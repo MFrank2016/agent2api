@@ -7,10 +7,10 @@
 [简体中文](../README.md) | [English](./README.en.md) | [繁體中文](./README.zh-Hant.md) | [日本語](./README.ja.md) | [한국어](./README.ko.md) | **Português (BR)**
 
 [![license](https://img.shields.io/badge/license-MIT%20%2B%20Aviso-green)](../LICENSE)
-[![release](https://img.shields.io/github/v/release/aimod-cc/agent2api?include_prereleases)](https://github.com/aimod-cc/agent2api/releases/latest)
+[![release](https://img.shields.io/github/v/release/Agent2API/agent2api?include_prereleases)](https://github.com/Agent2API/agent2api/releases/latest)
 [![docker pulls](https://img.shields.io/docker/pulls/aimodcc/agent2api)](https://hub.docker.com/r/aimodcc/agent2api)
-[![stars](https://img.shields.io/github/stars/aimod-cc/agent2api?style=flat&color=yellow)](https://github.com/aimod-cc/agent2api/stargazers)
-[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Docker-blue)](https://github.com/aimod-cc/agent2api/releases/latest)
+[![stars](https://img.shields.io/github/stars/Agent2API/agent2api?style=flat&color=yellow)](https://github.com/Agent2API/agent2api/stargazers)
+[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Docker-blue)](https://github.com/Agent2API/agent2api/releases/latest)
 
 [✨ Principais recursos](#-principais-recursos) • [💬 Comunidade e suporte](#-comunidade-e-suporte) • [🤝 Provedores compatíveis](#-provedores-compatíveis) • [🚀 Início rápido](#-início-rápido) • [🐳 Implantação com Docker](#-implantação-com-docker) • [📸 Capturas de tela](#-capturas-de-tela) • [🔧 Desenvolvimento e build](#-desenvolvimento-e-build) • [📜 Aviso de uso](#-aviso-de-uso)
 
@@ -87,7 +87,7 @@ Panorama dos recursos de proxy reverso por plataforma (✓ suportado · ✗ não
 
 ## 🚀 Início rápido
 
-Baixe o instalador na página de [Releases](https://github.com/aimod-cc/agent2api/releases/latest) (NSIS, chinês simplificado, instala por padrão em `C:\Program Files\Agent2API` e exige aprovação de administrador durante a instalação) e basta iniciá-lo — **não é necessário instalar Node nem qualquer outro runtime**.
+Baixe o instalador na página de [Releases](https://github.com/Agent2API/agent2api/releases/latest) (NSIS, chinês simplificado, instala por padrão em `C:\Program Files\Agent2API` e exige aprovação de administrador durante a instalação) e basta iniciá-lo — **não é necessário instalar Node nem qualquer outro runtime**.
 
 1. Na primeira execução, o gateway local (porta 3065) sobe dentro do processo do aplicativo e a janela principal abre. Se um diretório ou arquivo de dados de uma versão antiga for encontrado, um diálogo orienta a migração — basta seguir as instruções.
 2. Clique em "Adicionar conta" na página de Contas, escolha um provedor e siga o diálogo: entre ou preencha as credenciais (login pela web / código por SMS / colar credenciais / importar o estado de login desta máquina).
@@ -161,7 +161,7 @@ Variáveis de ambiente (todas opcionais):
 | `AGENT2API_ALLOW_NO_KEY` | `1` desativa o fail-closed (serve `/v1` mesmo sem chave configurada — só para redes internas) |
 | `AGENT2API_CAPTCHA_ENABLED` | Widget de verificação humana na tela de login: `1` ativado (padrão), `0` desativado |
 | `AGENT2API_SELF_UPDATE` | Ponto de atualização dentro do contêiner: `1` ativado por padrão (o painel oferece "Baixar e atualizar"); `0` desativa e deixa apenas a atualização manual |
-| `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | Avançado: aponte "verificar atualizações / baixar atualizações" para a sua própria fonte. O primeiro troca o repositório (por padrão segue o upstream `aimod-cc/agent2api`; em fork, sobrescreva), o segundo troca a raiz da API (padrão `https://api.github.com`; deve devolver um JSON de release no formato do GitHub). Com uma fonte própria configurada, a lista de permissões de download passa a aceitar, além disso, apenas **o próprio host dessa fonte** (o esquema segue a fonte: uma fonte `http://` também permite download em texto puro — só para ensaios locais / espelhos internos) |
+| `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | Avançado: aponte "verificar atualizações / baixar atualizações" para a sua própria fonte. O primeiro troca o repositório (por padrão segue o upstream `Agent2API/agent2api`; em fork, sobrescreva), o segundo troca a raiz da API (padrão `https://api.github.com`; deve devolver um JSON de release no formato do GitHub). Com uma fonte própria configurada, a lista de permissões de download passa a aceitar, além disso, apenas **o próprio host dessa fonte** (o esquema segue a fonte: uma fonte `http://` também permite download em texto puro — só para ensaios locais / espelhos internos) |
 
 Compilar a partir do código: clone o repositório e rode `docker compose up -d --build` (a imagem contém apenas o gateway e o painel, sem toolchain Rust).
 
@@ -244,17 +244,17 @@ Uma ressalva: a LICENSE traz um **Aviso de uso** após o texto da MIT, cujo item
 
 ## ⭐ Star History
 
-<a href="https://star-history.com/#aimod-cc/agent2api&Date">
+<a href="https://star-history.com/#Agent2API/agent2api&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date" />
   </picture>
 </a>
 
 <div align="center">
 
-**[Baixe a versão mais recente](https://github.com/aimod-cc/agent2api/releases/latest)** • **[Reporte um problema](https://github.com/aimod-cc/agent2api/issues)**
+**[Baixe a versão mais recente](https://github.com/Agent2API/agent2api/releases/latest)** • **[Reporte um problema](https://github.com/Agent2API/agent2api/issues)**
 
 Se este projeto for útil para você, uma ⭐️ Star é muito bem-vinda!
 
