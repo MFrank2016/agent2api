@@ -867,7 +867,7 @@ mod store_hooks {
     use crate::server::db::Db;
 
     use super::{benefit_cooldown_group, daily_pool_reset_at, models};
-    use super::{CODEARTS_ADAPTER, CodeArtsAdapter, ProviderAdapter};
+    use super::{CODEARTS_ADAPTER, ProviderAdapter};
 
     static SEQ: AtomicUsize = AtomicUsize::new(0);
 
