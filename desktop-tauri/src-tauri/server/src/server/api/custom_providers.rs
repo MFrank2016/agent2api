@@ -58,11 +58,25 @@ pub async fn get_custom_providers(State(_state): State<ServerState>) -> Response
 
 // ─── POST /api/custom-providers ─────────────────────────────
 
-/// 新建提供商 + 该家第一个账号。
+/// 新建提供商 + 该家第一个账号；**或**往一个已有提供商里再加一个账号。
 ///
-/// body：`{name, protocol, baseUrl, apiKey?}`（`apiKey` 落进账号记录，
-/// `name` 同时作为账号的默认备注名 —— 界面上分组名与账号名相同是刻意的：
-/// 单账号的家里两个名字一致最不容易混淆，用户可以随后在账号上改备注名）。
+/// body：`{name, protocol, baseUrl, apiKey?, providerId?}`（`apiKey` 落进账号
+/// 记录，`name` 同时作为账号的默认备注名）。
+///
+/// ── `providerId`：多账号共用一个提供商 ─────────────────────
+/// 给了 `providerId` 就**不再新建提供商**，而是把账号挂到那一家名下：
+///   - 该 id 必须存在且是自定义提供商，否则 404（不静默新建，避免拼错 id
+///     时悄悄多出一家）；
+///   - 本调用**不修改**该提供商的 name / protocol / baseUrl —— 那三样是这一家
+///     的既有定义，加账号不该顺手改掉它（要改走 `PATCH /api/custom-providers/{id}`）；
+///   - 因此这条路径**没有回滚问题**：只写账号一条，失败时不会留下空分组。
+///
+/// 不给 `providerId` 时行为与改造前逐字一致（新建提供商 + 首个账号），
+/// 所以旧客户端不受影响。
+///
+/// 为什么需要它：此前「导入一个账号」只能走「新建提供商」这一条路，于是批量
+/// 导入 N 个同站账号就会留下 N 个单账号供应商 —— 分组列表被撑成一堆只含
+/// 一个账号的空壳，而它们其实是同一个上游的不同凭证。
 ///
 /// ── 两步写入的回滚 ────────────────────────────────────────
 /// 提供商先落盘（账号记录的 `provider` 字段要指向它的 id），账号第二步写入
@@ -75,6 +89,50 @@ pub async fn create_custom_provider(State(state): State<ServerState>, body: Byte
         Ok(object) => object,
         Err(response) => return response,
     };
+    // 复用已有提供商：只写账号，不动提供商定义。
+    // 先把 id 复制成 String 再 move `object` —— 直接借 `object` 里的 &str
+    // 会在下面 `Value::Object(object)` 处撞借用检查。
+    let reuse_id = object
+        .get("providerId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    if let Some(provider_id) = reuse_id {
+        let Some(provider) = custom_providers::get(&provider_id) else {
+            return errors::management_error(
+                404,
+                format!("自定义提供商「{provider_id}」不存在"),
+            );
+        };
+        let provider_name = provider
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let payload = Value::Object(object);
+        let store = state.store();
+        return match store.add_custom_account(&provider_id, &payload, provider_name.as_deref()) {
+            Ok(upsert) => {
+                logging::log(
+                    "[CustomProvider]",
+                    &format!(
+                        "✅ 往自定义提供商「{}」添加账号（{}）",
+                        provider_name.as_deref().unwrap_or(&provider_id),
+                        if upsert.created { "新建" } else { "更新既有" }
+                    ),
+                );
+                // 响应形状与「新建提供商」那条保持一致（provider / account /
+                // created / list），前端按同一份契约读，不必为两条路径分支
+                ok_json(json!({
+                    "provider": provider,
+                    "account": upsert.account,
+                    "created": upsert.created,
+                    "list": store.list_accounts(),
+                }))
+            }
+            Err(error) => crate::server::api::accounts::store_error(error),
+        };
+    }
     let payload = Value::Object(object);
     let provider = match custom_providers::create(&payload) {
         Ok(provider) => provider,
