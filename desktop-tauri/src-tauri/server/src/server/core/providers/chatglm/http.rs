@@ -71,7 +71,7 @@ pub fn request_headers(
 }
 
 /// 把传输错误翻译成网关错误（超时 → 504，其余 → 502）
-fn transport_error(what: &str, error: reqwest::Error) -> GatewayError {
+fn transport_error(what: &str, error: wreq::Error) -> GatewayError {
     if error.is_timeout() {
         GatewayError::with_status(504, format!("{what}超时，请稍后重试"))
     } else {

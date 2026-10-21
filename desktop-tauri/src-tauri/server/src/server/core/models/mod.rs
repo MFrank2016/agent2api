@@ -432,7 +432,7 @@ impl ModelCatalog {
             // 与 Node 一致：显式 Accept + 官方 UA（服务端按 UA 识别客户端通道，
             // 缺失时会只下发旧版兼容清单）。Accept 由 send_raw 统一补
             // `application/json`（Node 这里给的也是同一个值），不必重复声明 ——
-            // reqwest 的 header() 是 append，重复给会变成两个 Accept 头。
+            // wreq 的 header() 是 append，重复给会变成两个 Accept 头。
             let mut headers: Vec<(String, String)> =
                 vec![("User-Agent".to_string(), params.user_agent.to_string())];
             headers.extend(params.headers.iter().cloned());

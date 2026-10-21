@@ -71,7 +71,7 @@
 //!     login.rs     无头登录与登录任务表
 //!     proxies.rs   账号级出网代理解析（Clash 读取在 clash.rs）
 //!     clash.rs     Clash Verge 配置读取与快照缓存
-//!     egress.rs    出网点（按出口缓存 reqwest Client）+ 出口连通性测试
+//!     egress.rs    出网点（按出口缓存 wreq Client）+ 出口连通性测试
 //!     billing/     积分 / 签到（checkin.rs） / 运营活动
 //!     models/      模型目录（workbuddy 单家：内置清单 + /v3/config 远程刷新）
 //!     routing.rs   账号选路（严格优先级 + 限额冷却判定）

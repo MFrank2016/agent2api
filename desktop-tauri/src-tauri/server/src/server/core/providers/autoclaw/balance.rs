@@ -668,7 +668,7 @@ fn check_userapi_response(
 }
 
 /// 传输错误 → 可读的网关错误（超时给 504，与既有计费接口的分档口径一致）。
-fn describe_transport(what: &str, error: &reqwest::Error) -> GatewayError {
+fn describe_transport(what: &str, error: &wreq::Error) -> GatewayError {
     if error.is_timeout() {
         GatewayError::with_status(504, format!("{what}超时"))
     } else {

@@ -51,7 +51,7 @@ pub const PROVIDER_ID: &str = "nous";
 /// 探测（`egress::client_for_system_proxy()`）—— 本家上游在海外，系统里配好的
 /// 代理往往就是本机唯一能出网的那条；系统没配代理时它等价于直连，不引入新的
 /// 失败面。转发链路的出口由编排层按账号解析后单独给（见 `TransportRequest`）。
-pub(crate) fn client_for(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::Client> {
+pub(crate) fn client_for(proxy: Option<&ResolvedProxy>) -> Arc<wreq::Client> {
     match proxy {
         Some(proxy) => egress::client_for(Some(proxy)),
         None => egress::client_for_system_proxy(),

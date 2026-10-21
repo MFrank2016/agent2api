@@ -31,7 +31,7 @@ pub const IDLE_TIMEOUT_PREFIX: &str = "流式响应空闲超时";
 /// 给一条上游字节流装上空闲守卫（`idle` 取设置页「流式响应空闲超时」）。
 ///
 /// 入参 / 出参都是 `BoxStream<Result<Bytes, io::Error>>`：两个调用点
-/// （`ForwardStream::new` 与自定义家的翻译流）都已在构造时把 reqwest 错误
+/// （`ForwardStream::new` 与自定义家的翻译流）都已在构造时把 wreq 错误
 /// 描述成文案折进 `io::Error`（见各自的说明），这里只管计时。
 pub fn idle_guard(
     inner: BoxStream<'static, Result<Bytes, std::io::Error>>,

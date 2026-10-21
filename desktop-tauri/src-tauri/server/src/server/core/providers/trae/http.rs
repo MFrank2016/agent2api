@@ -59,7 +59,7 @@ pub async fn post_json(
 }
 
 /// 读响应体，最多 `MAX_BODY_BYTES`。
-async fn read_limited(response: reqwest::Response) -> String {
+async fn read_limited(response: wreq::Response) -> String {
     let limit = MAX_BODY_BYTES;
     match response.bytes().await {
         Ok(bytes) if bytes.len() <= limit => String::from_utf8_lossy(&bytes).into_owned(),

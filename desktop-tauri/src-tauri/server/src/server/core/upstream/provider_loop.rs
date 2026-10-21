@@ -35,7 +35,7 @@
 //! **只替换「一次发送」，不替换账号循环**：选路、
 //! telemetry 记账全部共用；不走 `build_chat_request` 那条路，因为会话式协议的
 //! 「一次发送」是 round + turn + 工具循环，产出的是同形的 `ForwardOutcome`
-//! 而不是 `reqwest::Response`。分流点是账号循环里的一处 `if adapter.is_stateful()`，
+//! 而不是 `wreq::Response`。分流点是账号循环里的一处 `if adapter.is_stateful()`，
 //! 实现见 `attempt_stateful`（只做「凭证 → 记账 → 转发 → 错误透传」；
 //! 无状态路径的重试 / 刷新动作不套用，适配器给的 `classify_conversation_error`
 //! 只取其中的限额**记账**语义，标记冷却后仍按队列顺延）。
@@ -1789,7 +1789,7 @@ async fn attempt_queue(
 /// 门控后的 Chat 响应形态：`Live` = 未消费的 `Response`（原样直通）；
 /// `Held` = 预读产物（用预读字节 + 剩余流重建，见 `upstream::refusal`）。
 enum Gate {
-    Live(reqwest::Response),
+    Live(wreq::Response),
     Held(refusal::HeldHead),
 }
 
@@ -2378,7 +2378,7 @@ fn cancelled_failure() -> OutboundFailure {
 async fn send_or_cancel(
     transport: &TransportRequest,
     telemetry: &crate::server::core::upstream::usage::RequestTelemetry,
-) -> Result<reqwest::Response, super::request::UpstreamRequestError> {
+) -> Result<wreq::Response, super::request::UpstreamRequestError> {
     let Some(token) = telemetry.cancel_token() else {
         return send_chat_request(transport).await;
     };
@@ -2443,7 +2443,7 @@ async fn send_with_retry(
     capture: Option<&crate::server::core::debug_traffic::TrafficCapture>,
     telemetry: &crate::server::core::upstream::usage::RequestTelemetry,
     degraded: bool,
-) -> Result<reqwest::Response, OutboundFailure> {
+) -> Result<wreq::Response, OutboundFailure> {
     loop {
         // 手动终止：发送前先看令牌（退避睡眠 / 上一轮失败之后回到这里）。
         // 出口是 `cancelled_failure`，但调用方（attempt_queue）在分类动作之前

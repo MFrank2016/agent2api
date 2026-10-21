@@ -206,7 +206,7 @@ async fn signed_request(
     let signed = signer::sign(method, url, headers, payload, &signing, host_signed)
         .map_err(|reason| GatewayError::with_status(500, format!("CodeArts 余额请求签名失败：{reason}")))?;
     let is_post = method.eq_ignore_ascii_case("post");
-    let verb = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
+    let verb = wreq::Method::from_bytes(method.as_bytes()).unwrap_or(wreq::Method::GET);
     let mut request = egress::client_for(None)
         .request(verb, url)
         .timeout(std::time::Duration::from_secs(20));

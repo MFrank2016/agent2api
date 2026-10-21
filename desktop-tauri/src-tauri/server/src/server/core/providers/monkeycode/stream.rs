@@ -104,7 +104,7 @@ pub struct TaskStream {
 ///
 /// ── 代理为什么不作用于 WS（如实说明）─────────────────────────
 /// `proxy` 在编排层的语义是「账号级出网代理」；本家**只有建任务那一次 HTTP
-/// 调用**经过它（reqwest 直连 egress 层）。任务流是 WebSocket，tokio-tungstenite
+/// 调用**经过它（wreq 直连 egress 层）。任务流是 WebSocket，tokio-tungstenite
 /// 没有代理支持，参考实现（Node `ws`）同样不给任务流挂代理 —— 因此这里与
 /// 参考一致地直连，并在配了代理时留一条 verbose 记录，避免「以为走了代理」。
 pub async fn connect(

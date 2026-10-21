@@ -249,7 +249,7 @@ pub async fn create_task(
 }
 
 /// 传输层错误 → 网关错误（超时 504、其余 502；与各家同款文案）。
-fn transport_error(what: &str, error: reqwest::Error) -> GatewayError {
+fn transport_error(what: &str, error: wreq::Error) -> GatewayError {
     if error.is_timeout() {
         GatewayError::with_status(504, format!("{what}超时，请稍后重试"))
     } else {

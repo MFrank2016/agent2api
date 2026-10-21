@@ -26,7 +26,7 @@ use crate::server::errors::GatewayError;
 const REQUEST_TIMEOUT_MS: u64 = 20_000;
 
 /// 把传输错误翻译成网关错误（超时 → 504，其余 → 502）。
-fn transport_error(what: &str, error: reqwest::Error) -> GatewayError {
+fn transport_error(what: &str, error: wreq::Error) -> GatewayError {
     if error.is_timeout() {
         GatewayError::with_status(504, format!("{what}超时，请稍后重试"))
     } else {
@@ -84,7 +84,7 @@ pub async fn post_json_value(
 
 /// 发起一次 SSE 流式 POST（对话流；**不设总超时**，长推理不被截断）。
 ///
-/// 返回原始 `reqwest::Response`（调用方遍历 `bytes_stream()`）。调用方负责
+/// 返回原始 `wreq::Response`（调用方遍历 `bytes_stream()`）。调用方负责
 /// 读空闲兜底（编排层对出站流有统一处理，这里只做连接建立）。
 pub async fn sse_post(
     url: &str,
@@ -92,7 +92,7 @@ pub async fn sse_post(
     body: &Value,
     proxy: Option<&ResolvedProxy>,
     what: &str,
-) -> Result<reqwest::Response, GatewayError> {
+) -> Result<wreq::Response, GatewayError> {
     let client = egress::client_for(proxy);
     let mut request = client.post(url).header("Accept", "text/event-stream");
     for (name, value) in headers {

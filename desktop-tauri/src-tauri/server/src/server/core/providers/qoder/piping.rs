@@ -41,12 +41,12 @@ use super::{chat, record_limited, LimitContext};
 
 /// 流式首帧预读：把上游拉到**第一个内容帧**（或流结束）才决定返回什么。
 ///
-/// 返回 `(预读到的内容帧, 剩余字节流)`。剩余流已装上空闲守卫、reqwest 错误
+/// 返回 `(预读到的内容帧, 剩余字节流)`。剩余流已装上空闲守卫、wreq 错误
 /// 已折进 `io::Error`、半行缓冲已拼回流头 —— `drive_stream` 接手后按既有
 /// 语义续传。额度/鉴权类**首帧前**错误的去向见模块头；**排队态**在
 /// `AttemptError::Queued` 里单独交回，由调用方决定退避重发（见那里的说明）。
 pub(super) async fn prefetch_stream_head(
-    response: reqwest::Response,
+    response: wreq::Response,
     limit: &LimitContext,
     telemetry: &std::sync::Arc<RequestTelemetry>,
 ) -> Result<

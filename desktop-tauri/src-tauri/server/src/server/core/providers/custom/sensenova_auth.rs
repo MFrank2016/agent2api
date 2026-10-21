@@ -19,7 +19,7 @@
 //! `platform.sensenova.cn`，IAM 域是 `iam.sensecoreapi.cn`，clientId = `nova`。
 //!
 //! ── 为什么自己跟跳转、自己管 Cookie ──────────────────────────
-//! `auth_http::send_raw` 走 reqwest 的默认跳转策略（自动跟，但**读不到
+//! `auth_http::send_raw` 走 wreq 的默认跳转策略（自动跟，但**读不到
 //! Set-Cookie**），而这条链路每一步都要带着会话 Cookie 走下一跳。源实现用
 //! `redirect: 'manual'` + 一个极简 Cookie Jar（只认 `name=value`，不处理
 //! Domain / Path / 过期）——那套在这里逐条复刻：这条流程里的 Cookie 全是
@@ -263,7 +263,7 @@ fn authorize_url(challenge: &str, state: &str) -> Result<String, String> {
 /// 返回最终那一步的状态码与地址；**不做**「非 2xx 即错」的判定 ——
 /// 调用方按自己的语义读状态（授权页停在 4xx 与正常停页要分开报）。
 async fn follow(
-    client: &reqwest::Client,
+    client: &wreq::Client,
     start: &str,
     jar: &mut CookieJar,
 ) -> Result<Followed, String> {
@@ -313,7 +313,7 @@ fn resolve_url(current: &str, location: &str) -> Result<String, String> {
 }
 
 /// 读一个响应体里的 JSON（读不出 / 不是 JSON 给 None；状态码由调用方先读走）
-async fn response_json(response: reqwest::Response) -> Option<Value> {
+async fn response_json(response: wreq::Response) -> Option<Value> {
     let text = response.text().await.ok()?;
     if text.trim().is_empty() {
         return None;
@@ -340,7 +340,7 @@ struct CookieJar {
 }
 
 impl CookieJar {
-    fn capture(&mut self, response: &reqwest::Response) {
+    fn capture(&mut self, response: &wreq::Response) {
         for header in response.headers().get_all("set-cookie") {
             let Ok(text) = header.to_str() else { continue };
             let pair = text.split(';').next().unwrap_or("");

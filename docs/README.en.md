@@ -159,6 +159,7 @@ Trends: 24-hour **cache hit rate** (line) and **token consumption** (area) on tw
 ### Requirements
 
 - Rust >= 1.77 and the Tauri 2 toolchain (to compile the desktop app itself; Windows also needs the WebView2 runtime)
+- BoringSSL build dependencies: cmake, nasm, libclang (wreq's TLS backend; see [TLS fingerprint notes](./tls-fingerprint.md))
 - Node.js >= 18.17 (only to run `npm run tauri:*` and frontend build scripts; the desktop app does not depend on Node at runtime)
 - Target platforms: Windows and macOS desktops, plus a Docker server (**there is no Linux desktop app**: the Tauri bundle only configures Windows NSIS and macOS app/dmg)
 

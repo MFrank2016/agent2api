@@ -153,13 +153,13 @@ pub fn scan_finish_reason(text: &str) -> Option<String> {
 
 /// 把上游流拉到「能判定是否被拒」为止（见模块头）。
 ///
-/// 入参是**未消费**的 `reqwest::Response`（调用点在本函数之后不再需要它）：
+/// 入参是**未消费**的 `wreq::Response`（调用点在本函数之后不再需要它）：
 /// 状态码与响应头在这里取出，字节流被包上进空闲守卫（与 `ForwardStream::new`
 /// 同一件事，只是提前到这里 —— 预读期间上游卡住也不能把请求挂死）。
-pub async fn hold_head(response: reqwest::Response) -> HeldHead {
+pub async fn hold_head(response: wreq::Response) -> HeldHead {
     let status = response.status().as_u16();
     let headers = response.headers().clone();
-    // 与 `ForwardStream::new` / 聚合器同款：reqwest 错误就地描述成文案折进 io::Error
+    // 与 `ForwardStream::new` / 聚合器同款：wreq 错误就地描述成文案折进 io::Error
     let inner = response.bytes_stream().map(|item| {
         item.map_err(|error| {
             std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))

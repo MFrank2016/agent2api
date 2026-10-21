@@ -746,7 +746,7 @@ struct LimitContext {
 /// 决定（见 `forward_conversation` 的循环）。冷却标记在调用方落（它持有 store
 /// 与账号标识的完整上下文）。
 async fn drive_aggregate(
-    response: reqwest::Response,
+    response: wreq::Response,
     mut translator: Translator,
     telemetry: std::sync::Arc<crate::server::core::upstream::usage::RequestTelemetry>,
     limit: &LimitContext,

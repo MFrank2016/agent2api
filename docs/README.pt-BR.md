@@ -159,6 +159,7 @@ Tendências: **taxa de acerto de cache** (linha) e **consumo de tokens** (área)
 ### Requisitos
 
 - Rust >= 1.77 e o toolchain do Tauri 2 (para compilar o app desktop; no Windows também é preciso o runtime WebView2)
+- Dependências de build do BoringSSL: cmake, nasm, libclang (backend TLS do wreq; veja [impressão digital TLS](./tls-fingerprint.md))
 - Node.js >= 18.17 (apenas para rodar `npm run tauri:*` e scripts de build do frontend; o app desktop não depende de Node em tempo de execução)
 - Plataformas alvo: desktops Windows / macOS / Linux (bundles por plataforma: NSIS no Windows, app+dmg no macOS, deb+AppImage no Linux) e servidor Docker
 

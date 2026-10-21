@@ -159,6 +159,7 @@ docker run -d --name agent2api --restart unless-stopped -p 3065:3065 -v ./data:/
 ### 环境要求
 
 - Rust >= 1.77 与 Tauri 2 工具链（编译桌面端本体；Windows 上还需 WebView2 运行时）
+- BoringSSL 构建依赖：cmake、nasm、libclang（wreq 的 TLS 后端；详见 [TLS 指纹说明](./docs/tls-fingerprint.md)）
 - Node.js >= 18.17（只用于 `npm run tauri:*` 与前端构建脚本，桌面端运行时不依赖 Node）
 - 目标平台：Windows / macOS / Linux 桌面端、Windows / Linux 服务端（无 GUI）、Docker 服务端
 

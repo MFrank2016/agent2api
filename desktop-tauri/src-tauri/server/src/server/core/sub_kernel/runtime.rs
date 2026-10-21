@@ -285,12 +285,12 @@ async fn controller_put_json(
 /// HTTPS_PROXY 悄悄改写（否则控制器调用会打到环境代理上并失败）。与
 /// egress 的直连客户端同一手法，但那里缓存键带超时设置、代理可配，这里
 /// 独立一份免得与出网缓存互相干扰。
-fn controller_client() -> reqwest::Client {
-    reqwest::Client::builder()
+fn controller_client() -> wreq::Client {
+    wreq::Client::builder()
         .no_proxy()
         .connect_timeout(Duration::from_secs(3))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .unwrap_or_else(|_| wreq::Client::new())
 }
 
 /// 轮询控制器拿「全部 provider 的节点清单」：`{subId: [节点名]}`。

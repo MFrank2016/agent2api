@@ -114,7 +114,7 @@ pub async fn fetch_with_egress(
     url: &str,
     headers: &[(String, String)],
     timeout_ms: Option<u64>,
-) -> Result<reqwest::Response, UpdateError> {
+) -> Result<wreq::Response, UpdateError> {
     fetch_via_candidates("[Update]", url, headers, timeout_ms)
         .await
         .map_err(|detail| UpdateError::new(format!("无法连接 GitHub：{detail}")))
@@ -133,7 +133,7 @@ pub async fn fetch_public(
     url: &str,
     headers: &[(String, String)],
     timeout_ms: Option<u64>,
-) -> Result<reqwest::Response, String> {
+) -> Result<wreq::Response, String> {
     let host = url::Url::parse(url)
         .ok()
         .and_then(|parsed| parsed.host_str().map(str::to_string))
@@ -150,14 +150,14 @@ async fn fetch_via_candidates(
     url: &str,
     headers: &[(String, String)],
     timeout_ms: Option<u64>,
-) -> Result<reqwest::Response, String> {
+) -> Result<wreq::Response, String> {
     let candidates = resolve_egress_candidates();
     let multiple = candidates.len() > 1;
-    let mut last_error: Option<reqwest::Error> = None;
+    let mut last_error: Option<wreq::Error> = None;
     for (label, proxy) in &candidates {
         let client = egress::client_for(proxy.as_ref());
         let mut builder = client.get(url);
-        // 请求级总超时只给 API 探测用（响应是小 JSON）。reqwest 0.12 的
+        // 请求级总超时只给 API 探测用（响应是小 JSON）。wreq 0.12 的
         // `.timeout()` 覆盖到 body 读完为止 —— 下载传 None，安装包几十上百 MB
         // 不可能 30 秒内下完；卡死场景由 egress 客户端的 read_timeout 兜底
         if let Some(timeout_ms) = timeout_ms {

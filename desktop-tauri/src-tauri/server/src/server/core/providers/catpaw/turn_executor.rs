@@ -343,7 +343,7 @@ impl Drop for InterruptedNote {
 /// 或终态上报，没有别的出口。
 pub(super) async fn drive_stream(
     ctx: TurnContext,
-    response: reqwest::Response,
+    response: wreq::Response,
     sender: mpsc::Sender<Result<Bytes, std::io::Error>>,
     mut guard: FinishGuard,
     history: HistoryFingerprints,
@@ -417,7 +417,7 @@ pub(super) async fn drive_stream(
 /// 非流式分支：消费完 SSE 聚合成完整 `chat.completion`。
 pub(super) async fn drive_aggregate(
     ctx: TurnContext,
-    response: reqwest::Response,
+    response: wreq::Response,
     mut guard: FinishGuard,
     history: HistoryFingerprints,
 ) -> Result<Value, CatPawError> {

@@ -87,10 +87,10 @@ pub async fn put_cline_headers(State(_state): State<ServerState>, body: Bytes) -
 /// 非法项一律 `Err`（400 文案），不做静默修正。**字符合法性必须在这里拦**：
 /// 头名不是 HTTP token（含空格、冒号、非 ASCII）或头值带控制字符时，
 /// `core::upstream::request::send_chat_request` 的 `builder.header(...)` 会
-/// 拿不到合法的 `HeaderName`/`HeaderValue`，reqwest 把这次请求标成构造失败
+/// 拿不到合法的 `HeaderName`/`HeaderValue`，wreq 把这次请求标成构造失败
 /// —— 于是**每一条** Cline 请求都发不出去，而客户端看到的是「上游请求失败
 /// （…）」，与真实原因（配置里有个畸形头名）毫无关系，且配置已落库、
-/// 重启也在。校验用 `HeaderName`/`HeaderValue` 的 `try_from`：与 reqwest
+/// 重启也在。校验用 `HeaderName`/`HeaderValue` 的 `try_from`：与 wreq
 /// 构造请求时用的是**同一套规则**，不需要另维护一张字符白名单。
 fn validated_overrides(entries: &Map<String, Value>) -> Result<BTreeMap<String, String>, String> {
     if entries.len() > MAX_ENTRIES {
@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn a_header_name_with_illegal_characters_is_rejected() {
         // 空格、冒号、非 ASCII 都不是 HTTP token：存下去会让每条 Cline 请求
-        // 在 reqwest 构造阶段失败（不是这里的假设，是 http crate 的规则）
+        // 在 wreq 构造阶段失败（不是这里的假设，是 http crate 的规则）
         for key in ["X My Header", "Accept:", "X-自定义头"] {
             let result = validated_overrides(&entries(&[(key, "v")]));
             assert!(result.is_err(), "{key} 不该被接受");

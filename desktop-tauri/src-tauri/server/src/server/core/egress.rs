@@ -1,4 +1,4 @@
-//! 出网统一入口：按出口缓存 reqwest Client + 出口连通性测试。
+//! 出网统一入口：按出口缓存 wreq Client + 出口连通性测试。
 //!
 //! 对照 Node 版 src/workbuddy-proxy.mjs 的 `dispatchFor` / `createDispatcher` /
 //! `proxyFetch` / `testProxyConnectivity` 四块。
@@ -6,16 +6,16 @@
 //! ── 为什么需要缓存 Client ───────────────────────────────────
 //! Node 版用 undici 的 dispatcher 缓存：每个出口一个 dispatcher（内含连接池），
 //! 否则每个请求都要**重新和代理建一条 TCP 连接**，SSE 长连接场景下开销很直观。
-//! reqwest 的等价物是 `Client`：`Client` 内部自带连接池，因此「一个出口一个
+//! wreq 的等价物是 `Client`：`Client` 内部自带连接池，因此「一个出口一个
 //! Client」就是「一个出口一个连接池」。
 //!
-//! ── 超时旋钮的映射（重要：Node 与 reqwest 不是一一对应）──────
+//! ── 超时旋钮的映射（重要：Node 与 wreq 不是一一对应）──────
 //! Node 版（undici）给的是三个**传输层**超时：
 //!   connectTimeout: 30s     TCP 建连（含到代理的那一段）
 //!   headersTimeout: 600s    建连完成 → 收到响应头
 //!   bodyTimeout:    0       响应体读取**不限时**（SSE 长连接靠调用方的 signal 控制）
 //!
-//! reqwest 只有两个旋钮，且语义不同：
+//! wreq 只有两个旋钮，且语义不同：
 //!   connect_timeout             ← 对应 undici 的 connectTimeout（同语义，直接映射），
 //!                                 值来自设置页「请求超时 → 连接中超时」
 //!   read_timeout                ← 每个读取操作之间的传输层后备：它作用于**每一次**
@@ -38,7 +38,7 @@
 //! 插入序，命中时挪到末尾）。这里用同样的策略：`HashMap` + 最近使用序号，
 //! 超限时淘汰序号最小的（即最久未用），并记录最后一轮的使用序号。
 //! 与 Node 的差异：Node 的淘汰会显式 `destroyDispatcher` 关掉连接池，
-//! reqwest 的 `Client` 没有「强制关闭」接口（只能 drop，drop 时连接池随句柄
+//! wreq 的 `Client` 没有「强制关闭」接口（只能 drop，drop 时连接池随句柄
 //! 引用计数归零而释放）。这里就是 drop —— 效果一致，但释放时点取决于
 //! 是否还有在途请求持有该 Client 的 Arc 克隆（在途请求会正常跑完）。
 
@@ -55,7 +55,7 @@ use crate::server::logging;
 /// 默认 User-Agent，**必须设置**。
 ///
 /// ── 为什么这条不是「顺手加的」而是必需 ────────────────────────
-/// reqwest 默认**不发** User-Agent 头；undici（Node 版用的 fetch）默认发
+/// wreq 默认**不发** User-Agent 头；undici（Node 版用的 fetch）默认发
 /// `undici`。实测（2026-09）计费接口在缺失 User-Agent 时直接返回
 /// `HTTP 403 {"code":10085,"msg":"请求不合法，如有疑问请联系客服"}`，
 /// 带上任意非空 UA 就正常返回 `code:0`。
@@ -65,7 +65,7 @@ use crate::server::logging;
 /// 不做「顺手改成 WorkBuddy 客户端 UA」这种会改变上游风控判定的改动
 /// （计费链路 Node 版本来就不带客户端 UA，只有 banner 的白名单头带）。
 ///
-/// 客户端级默认头**不会覆盖**请求级头（reqwest 只在 HeaderMap 空缺时插入），
+/// 客户端级默认头**不会覆盖**请求级头（wreq 只在 HeaderMap 空缺时插入），
 /// 所以 banner 的 `whitelistHeaders` 里那个真正的 WorkBuddy UA 依然生效。
 const DEFAULT_USER_AGENT: &str = "undici";
 
@@ -87,14 +87,14 @@ const IP_LOOKUP_MAX_MS: u64 = 6_000;
 /// 缓存里的一个 Client：`(最近一次取用的序号, 客户端)`
 struct CacheEntry {
     used_at: u64,
-    client: Arc<reqwest::Client>,
+    client: Arc<wreq::Client>,
 }
 
 /// 出口 → Client 的缓存。
 ///
 /// 键是**不含凭证**的 `协议://主机:端口`（与 Node 的 dispatcher 键一致）：
 /// 把密码放进缓存键会让它在内存里多留一份，而且同主机不同密码本就不该共用一个池。
-/// 凭证通过 `reqwest::Proxy::basic_auth` 挂在客户端上，仍然生效。
+/// 凭证通过 `wreq::Proxy::basic_auth` 挂在客户端上，仍然生效。
 #[derive(Default)]
 struct ClientCache {
     entries: HashMap<String, CacheEntry>,
@@ -115,7 +115,7 @@ const DIRECT_KEY: &str = "__direct__";
 /// 不同 —— 这里更早地放弃，并把原因写进日志）。
 ///
 /// `timeouts` 拼在键里：两项传输层超时（连接 / 读取后备）是**建 Client 时**
-/// 固定的（reqwest 没有逐请求改它们的入口），配置一改必须建新 Client ——
+/// 固定的（wreq 没有逐请求改它们的入口），配置一改必须建新 Client ——
 /// 把值放进键里，「改设置 → 下一次取用自动命中新键 → 新客户端」就是自然结果，
 /// 旧值对应的条目由 LRU 淘汰（在途请求仍持着旧 Client 的 Arc 跑完）。
 fn cache_key(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> String {
@@ -145,9 +145,9 @@ fn cache_key(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> Strin
 ///
 /// **socks5 映射成 socks5h**（有意偏离 Node 的 URI 字面量，行为却更贴近）：
 /// undici 的 Socks5ProxyAgent 把目标主机名按域名（ATYP=0x03）交给代理去解析，
-/// 即「远端解析」；而 reqwest 的 `socks5://` 是**本地**解析（socks5h 才是远端）。
+/// 即「远端解析」；而 wreq 的 `socks5://` 是**本地**解析（socks5h 才是远端）。
 /// 用户配 socks5 出口往往正是为了绕开本机 DNS 污染，用 `socks5://` 会让这个
-/// 意图落空。因此这里在构造 reqwest 代理 URI 时换成 socks5h ——
+/// 意图落空。因此这里在构造 wreq 代理 URI 时换成 socks5h ——
 /// 账号里存的、UI 上显示的仍然是 socks5，只有内部实现换了个等价 scheme。
 fn build_proxy_url(proxy: &ResolvedProxy) -> String {
     let auth = if proxy.username.is_empty() {
@@ -199,11 +199,11 @@ fn describe_proxy(proxy: &ResolvedProxy) -> &str {
 ///
 /// 抽出来是因为 `build_client`（显式出口）与 `build_system_proxy_client`
 /// （跟随系统代理）只差「代理怎么装」一段，超时 / UA / 连接池必须逐字一致。
-fn base_builder(timeouts: &TimeoutSettings) -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+fn base_builder(timeouts: &TimeoutSettings) -> wreq::ClientBuilder {
+    apply_emulation(wreq::Client::builder())
         .connect_timeout(Duration::from_millis(timeouts.connect_ms()))
         // 单次读取超时（等响应头 + 数据块间隔的传输层后备，取两项设置的大者）；
-        // **没有**设总超时（.timeout()）—— 那会掐断 SSE 长连接。各阶段真正的
+        // **没有**设总超时（.timeout()）—— 那会掰断 SSE 长连接。各阶段真正的
         // 判定在转发层自己的计时器上（见 egress 头部的旋钮映射与模块头）
         .read_timeout(Duration::from_millis(timeouts.read_timeout_backstop_ms()))
         // 默认 UA（理由见 DEFAULT_USER_AGENT）：不设会被计费接口判为「请求不合法」
@@ -212,16 +212,33 @@ fn base_builder(timeouts: &TimeoutSettings) -> reqwest::ClientBuilder {
         .pool_max_idle_per_host(8)
 }
 
-/// 构造一个出口对应的 reqwest Client。
+/// TLS / HTTP2 指纹模拟档位（`AGENT2API_TLS_EMULATION`，默认 `chrome`）。
 ///
-/// 注意 `Builder::proxy()` 会**同时关掉系统代理自动探测**（reqwest 的文档明说
+/// 为什么默认开：上游已按 JA3 / JA4 与 HTTP2 指纹做风控，rustls 默认栈是最
+/// 好认的「非浏览器」指纹；换成 Chrome 后与真实浏览器同档。`off` 保留给排障
+/// （怀疑指纹模拟本身触发风控时，可一键回到默认栈对比）。
+///
+/// 选型理由与备选方案见 `docs/tls-fingerprint.md`。
+fn apply_emulation(builder: wreq::ClientBuilder) -> wreq::ClientBuilder {
+    match std::env::var("AGENT2API_TLS_EMULATION").ok().as_deref() {
+        Some("off") => builder,
+        Some("safari") => builder.emulation(wreq_util::Emulation::Safari26),
+        Some("firefox") => builder.emulation(wreq_util::Emulation::Firefox151),
+        Some("edge") => builder.emulation(wreq_util::Emulation::Edge148),
+        _ => builder.emulation(wreq_util::Emulation::Chrome149),
+    }
+}
+
+/// 构造一个出口对应的 wreq Client。
+///
+/// 注意 `Builder::proxy()` 会**同时关掉系统代理自动探测**（wreq 的文档明说
 /// "Adding a proxy will disable the automatic usage of the system proxy"）——
 /// 这正是我们要的：出口由账号配置决定，不能被 `HTTPS_PROXY` 之类环境变量
 /// 悄悄改写（否则「直连」可能实际上走了环境里的代理，与 UI 显示不符）。
-/// 反过来，构造**直连** Client 时必须显式 `.no_proxy()`：reqwest 默认会去读
+/// 反过来，构造**直连** Client 时必须显式 `.no_proxy()`：wreq 默认会去读
 /// 环境变量里的代理设置，不关掉的话用户机器上设了 `HTTPS_PROXY` 就会
 /// 「配置为直连却走了代理」。
-fn build_client(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> Result<reqwest::Client, String> {
+fn build_client(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> Result<wreq::Client, String> {
     build_client_with(proxy, timeouts, false)
 }
 
@@ -229,19 +246,19 @@ fn build_client(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> Re
 ///
 /// 为什么需要这个开关：多步登录链路（商汤日日新的 OAuth2 + PKCE，见
 /// `providers::custom::sensenova_auth`）要自己读每一步的 `Location` 与
-/// `Set-Cookie`，自动跟转会把这些中间响应吞掉。reqwest 0.12 的跳转策略只能
+/// `Set-Cookie`，自动跟转会把这些中间响应吞掉。wreq 0.12 的跳转策略只能
 /// 在建 Client 时定（`RequestBuilder` 上没有逐请求的 `redirect()`），
 /// 所以它做成一个构造开关而不是请求参数。
 fn build_client_with(
     proxy: Option<&ResolvedProxy>,
     timeouts: &TimeoutSettings,
     no_redirect: bool,
-) -> Result<reqwest::Client, String> {
+) -> Result<wreq::Client, String> {
     // 每请求换出口 IP：不复用连接池 —— 每条请求新建到代理的隧道，从而拿到新出口 IP
     let no_reuse = proxy.map(|p| p.no_reuse).unwrap_or(false);
     let mut builder = base_builder(timeouts);
     if no_redirect {
-        builder = builder.redirect(reqwest::redirect::Policy::none());
+        builder = builder.redirect(wreq::redirect::Policy::none());
     }
     if no_reuse {
         builder = builder
@@ -260,9 +277,9 @@ fn build_client_with(
                 .ok_or_else(|| format!("代理端口非法（{}）", describe_proxy(proxy)))?;
             let url = build_proxy_url(&ResolvedProxy { port: Some(port), ..proxy.clone() });
             // Proxy::all 返回 Result：release 是 panic=abort，绝不能用 unwrap
-            let parsed = reqwest::Proxy::all(&url)
+            let parsed = wreq::Proxy::all(&url)
                 .map_err(|error| format!("代理地址无效（{}）: {error}", describe_proxy(proxy)))?;
-            // reqwest 从 URI 里解析用户名/密码作为 basic auth（build_proxy_url 已编码），
+            // wreq 从 URI 里解析用户名/密码作为 basic auth（build_proxy_url 已编码），
             // http/socks5 两种协议都支持；这里不再单独调 basic_auth，
             // 免得两个来源的凭证打架
             builder = builder.proxy(parsed);
@@ -277,7 +294,7 @@ fn build_client_with(
 /// 构造一个**跟随系统代理**的 Client（Windows / macOS 的系统设置 + 环境变量）。
 ///
 /// ── 为什么需要第三条出口 ────────────────────────────────────
-/// 另外两条出口（直连 / 指定代理）都显式关掉了 reqwest 的自动探测：
+/// 另外两条出口（直连 / 指定代理）都显式关掉了 wreq 的自动探测：
 /// 转发链路的出口由账号配置决定，不能被机器环境悄悄改写 —— 这条口径对转发
 /// 是对的，但对「没有账号可挂」的请求不成立：
 ///   - **登录链路**（Antigravity 的换码 / userinfo / 粘贴校验 / project 发现）：
@@ -287,8 +304,8 @@ fn build_client_with(
 ///     访问 Google 的那个代理」就写在系统设置里（浏览器能打开授权页正是靠它）。
 /// 因此这条出口的语义是「与浏览器同口径」：系统配了代理就跟随它，没配就是
 /// 直连 —— 不是「一定走代理」。显式配了代理的账号仍走 `client_for(Some(..))`。
-fn build_system_proxy_client(timeouts: &TimeoutSettings) -> Result<reqwest::Client, String> {
-    // 既不调 `.no_proxy()` 也不调 `.proxy()`：reqwest 的 `auto_sys_proxy`
+fn build_system_proxy_client(timeouts: &TimeoutSettings) -> Result<wreq::Client, String> {
+    // 既不调 `.no_proxy()` 也不调 `.proxy()`：wreq 的 `auto_sys_proxy`
     // 因此保持默认开启（`system-proxy` feature，见 server/Cargo.toml 的说明）
     base_builder(timeouts)
         .build()
@@ -299,14 +316,14 @@ fn build_system_proxy_client(timeouts: &TimeoutSettings) -> Result<reqwest::Clie
 ///
 /// 只服务需要自己管 Cookie、逐步读 `Location` / `Set-Cookie` 的多步登录链路
 /// （商汤日日新，见 `providers::custom::sensenova_auth`）——那种链路一步一跳，
-/// 自动跟转会吞掉中间响应，而 reqwest 的跳转策略只能建 Client 时定。
+/// 自动跟转会吞掉中间响应，而 wreq 的跳转策略只能建 Client 时定。
 /// 不进 LRU 缓存是刻意的：跳转策略与其它出口的 key 不同维，混进同一张表会
 /// 让「同一个代理有时跟转、有时不跟」这种最难查的行为分叉成为可能；而登录
 /// 是低频动作（每个账号一天几次），新建 Client 的代价可以忽略。
 ///
 /// 构造失败退回 `client_for(proxy)`（自动跟转的那条出口）：那条链路会失败，
 /// 但错误会如实回到用户面前 —— 硬约束是绝不 panic（release 是 panic=abort）。
-pub fn client_without_redirects(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::Client> {
+pub fn client_without_redirects(proxy: Option<&ResolvedProxy>) -> Arc<wreq::Client> {
     let timeouts = crate::server::config::timeout_settings();
     match build_client_with(proxy, &timeouts, true) {
         Ok(client) => Arc::new(client),
@@ -323,10 +340,10 @@ pub fn client_without_redirects(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::C
 /// 跟随系统代理的 Client（进程级缓存一份）。
 ///
 /// 与 `client_for` 不同**不进 LRU**：它没有「出口参数」这一维，进程内一份
-/// 即可。系统代理改了要重启网关才生效（reqwest 在 build 时探测一次）——
+/// 即可。系统代理改了要重启网关才生效（wreq 在 build 时探测一次）——
 /// 登录与 Antigravity 的请求都是低频操作，这个取舍不影响正确性。
-pub fn client_for_system_proxy() -> Arc<reqwest::Client> {
-    static CLIENT: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
+pub fn client_for_system_proxy() -> Arc<wreq::Client> {
+    static CLIENT: OnceLock<Arc<wreq::Client>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
             let timeouts = crate::server::config::timeout_settings();
@@ -336,7 +353,7 @@ pub fn client_for_system_proxy() -> Arc<reqwest::Client> {
                 // **保持「跟随系统代理」语义**（Client::new() 的 auto_sys_proxy
                 // 同样默认开启），只是少了自定义超时。
                 logging::log("[Upstream]", &format!("⚠️ {error}，系统代理出口回退默认客户端"));
-                reqwest::Client::new()
+                wreq::Client::new()
             }))
         })
         .clone()
@@ -345,15 +362,15 @@ pub fn client_for_system_proxy() -> Arc<reqwest::Client> {
 /// 取（或创建）某个出口对应的 Client；`proxy` 为 None 时是直连客户端。
 ///
 /// 返回 `Arc<Client>`：调用方克隆这个 Arc 而不是 Client 本身
-/// （reqwest 的 Client 内部已经是 Arc，但显式包一层让缓存与丢弃的语义更清楚）。
+/// （wreq 的 Client 内部已经是 Arc，但显式包一层让缓存与丢弃的语义更清楚）。
 ///
 /// ── 为什么构造在锁外 ──────────────────────────────────────
-/// `reqwest::Proxy::all(...)` 对 socks5 URI 会调 `url.socket_addrs()` 做一次
+/// `wreq::Proxy::all(...)` 对 socks5 URI 会调 `url.socket_addrs()` 做一次
 /// **阻塞式 DNS 解析**（http 代理不需要，但 socks 分支要走）。硬约束是
 /// 「持锁不阻塞」—— 所以在锁外构造，锁内只做一次查表 + 插入。
 /// 并发构造同一个出口时两次都建 Client（各自持自己的连接池），
 /// 后者覆盖前者 —— 最坏结果是多建了一个池，不影响正确性。
-pub fn client_for(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::Client> {
+pub fn client_for(proxy: Option<&ResolvedProxy>) -> Arc<wreq::Client> {
     // 超时设置逐次取用（配置一改，下一次就命中新键并建新 Client，见 cache_key）
     let timeouts = crate::server::config::timeout_settings();
     let key = cache_key(proxy, &timeouts);
@@ -381,10 +398,10 @@ pub fn client_for(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::Client> {
         // —— `Client::new()` 的 auto_sys_proxy 默认开启（见 Cargo.toml 的
         // `system-proxy` 说明），直接用它会让「直连」出口在极端路径上悄悄
         // 走系统代理；二级兜底才是裸 Client::new()（两处 build 都失败）。
-        reqwest::Client::builder()
+        wreq::Client::builder()
             .no_proxy()
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+            .unwrap_or_else(|_| wreq::Client::new())
     }));
     // ③ 回填缓存（锁内只做插入与淘汰）
     let mut guard = lock_clients();
@@ -427,7 +444,7 @@ fn lock_clients() -> std::sync::MutexGuard<'static, Option<ClientCache>> {
 /// 只在「一个响应字节都没收到」的连接/传输错误时换出口；一旦拿到响应
 /// （含 4xx/5xx）立即返回，交回账号降级链处理。
 /// 直连出口的 Client：账号未配代理但本家跟随系统代理时用系统代理，否则真直连。
-fn direct_client(system_proxy_when_unset: bool) -> Arc<reqwest::Client> {
+fn direct_client(system_proxy_when_unset: bool) -> Arc<wreq::Client> {
     if system_proxy_when_unset {
         client_for_system_proxy()
     } else {
@@ -439,9 +456,9 @@ pub async fn dispatch<F>(
     egress: &AccountEgress,
     system_proxy_when_unset: bool,
     build: F,
-) -> Result<reqwest::Response, reqwest::Error>
+) -> Result<wreq::Response, wreq::Error>
 where
-    F: Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+    F: Fn(&wreq::Client) -> wreq::RequestBuilder,
 {
     let candidates = crate::server::core::egress_rotation::candidates(egress);
     if candidates.is_empty() {
@@ -452,7 +469,7 @@ where
         _ => candidates.len(),
     };
     let penalty = crate::server::config::timeout_settings().connect_ms() as f64;
-    let mut last_error: Option<reqwest::Error> = None;
+    let mut last_error: Option<wreq::Error> = None;
     for proxy in candidates.iter().take(limit) {
         let started = logging::now_ms();
         match build(&client_for(Some(proxy))).send().await {
@@ -513,7 +530,7 @@ impl ConnectivityResult {
 ///
 /// 单独打 ipify 而不是从上游响应里读 —— 上游不回显客户端 IP；
 /// 查不到不代表出口不可用，所以这里的错误一律吞掉。
-async fn read_exit_ip(client: &reqwest::Client, proxy: Option<&ResolvedProxy>, timeout_ms: u64) -> String {
+async fn read_exit_ip(client: &wreq::Client, proxy: Option<&ResolvedProxy>, timeout_ms: u64) -> String {
     let _ = proxy; // 出口已由 client 决定；保留参数是为了调用处可读
     let request = client
         .get(IP_ECHO_URL)
@@ -608,15 +625,15 @@ pub async fn test_proxy(proxy: Option<&ResolvedProxy>) -> ConnectivityResult {
 /// 错误链的可读描述（对照 Node 版 `proxyErrorDetail`）。
 ///
 /// Node 版从 `error.cause` 一路下钻拼出 `分段 → 分段`，因为 undici 的连接类
-/// 错误（ECONNREFUSED / ETIMEDOUT）常挂在 cause 上。reqwest 的错误链用
+/// 错误（ECONNREFUSED / ETIMEDOUT）常挂在 cause 上。wreq 的错误链用
 /// `source()` 表达（如 `error sending request` → `client error (Connect)` →
 /// `tcp connect error` → `Connection refused`），所以这里用
 /// `std::error::Error::source()` 做同样的下钻。
 ///
-/// 去重是必要的：reqwest 的若干层 source 文案会重复（如 `error sending request`）。
-pub fn describe_error_detail(error: &reqwest::Error) -> String {
+/// 去重是必要的：wreq 的若干层 source 文案会重复（如 `error sending request`）。
+pub fn describe_error_detail(error: &wreq::Error) -> String {
     let mut parts: Vec<String> = Vec::new();
-    // 顶层 reqwest 错误自己的文案（含 URL 与超时语义）
+    // 顶层 wreq 错误自己的文案（含 URL 与超时语义）
     let head = error.to_string();
     if !head.is_empty() {
         parts.push(head);

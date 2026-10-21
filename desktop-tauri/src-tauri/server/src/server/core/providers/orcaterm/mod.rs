@@ -70,7 +70,7 @@ pub const LIGHTAI_BASE: &str = "https://lightai.cloud.tencent.com";
 /// `oauth_expires_at` + `auth_identity`）
 pub const DESKTOP_DATA_FILE: &str = "com.orcaterm-desktop.app/data.bin";
 
-/// 出站 User-Agent（Web 版同款；上游不敏感，但不能用 reqwest 默认值）
+/// 出站 User-Agent（Web 版同款；上游不敏感，但不能用 wreq 默认值）
 pub const USER_AGENT: &str = concat!(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ",
     "(KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"

@@ -275,7 +275,7 @@ pub fn build_plan(
 pub async fn send(
     plan: &ChatPlan,
     proxy: Option<&ResolvedProxy>,
-) -> Result<reqwest::Response, GatewayError> {
+) -> Result<wreq::Response, GatewayError> {
     let client = egress::client_for(proxy);
     let mut builder = client.post(&plan.url).body(plan.body.clone());
     for (key, value) in &plan.headers {
@@ -323,7 +323,7 @@ pub async fn send(
 /// 那是**不可达但类型上成立**的分支，只能靠调用方 `unwrap` 才能消掉，
 /// 而 release 是 panic=abort，不能 unwrap。返回裸错误即让类型如实反映契约：
 /// 「调用我 = 我已经不成功」。
-pub async fn http_error(status: u16, response: reqwest::Response) -> AttemptError {
+pub async fn http_error(status: u16, response: wreq::Response) -> AttemptError {
     let text = response.text().await.unwrap_or_default();
     let classified = errors::classify_upstream_error(status, &text);
     if classified.kind == errors::UpstreamKind::Queued {

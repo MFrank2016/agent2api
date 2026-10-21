@@ -148,7 +148,7 @@ pub(super) async fn query(
 }
 
 /// 传输层错误 → 可读错误（超时与其它失败分开，与其它各家同一口径）
-fn transport_error(error: &reqwest::Error) -> GatewayError {
+fn transport_error(error: &wreq::Error) -> GatewayError {
     if error.is_timeout() {
         GatewayError::with_status(504, "ZCode 窗口限额查询超时")
     } else {

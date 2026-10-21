@@ -144,7 +144,7 @@ pub fn build_plan(
 pub async fn send(
     plan: &ChatPlan,
     proxy: Option<&ResolvedProxy>,
-) -> Result<reqwest::Response, GatewayError> {
+) -> Result<wreq::Response, GatewayError> {
     let client = egress::client_for(proxy);
     let mut builder = client.post(&plan.url).body(plan.body.clone());
     for (key, value) in &plan.headers {
@@ -179,7 +179,7 @@ pub async fn send(
 }
 
 /// 失败响应 → 客户端可用错误（流内错误另走 [`drive_stream`]）。
-pub async fn http_error(status: u16, response: reqwest::Response) -> GatewayError {
+pub async fn http_error(status: u16, response: wreq::Response) -> GatewayError {
     let text = response.text().await.unwrap_or_default();
     let detail: String = text.chars().take(300).collect();
     let kind = protocol::classify_upstream_error(status, &text);
@@ -324,7 +324,7 @@ fn tail_frames(translator: &mut Translator) -> String {
 /// 返回 `(预读到的帧, 剩余字节流)`。首帧前就撞上错误 → 交回带状态码的 `Err`，
 /// 编排层据此换号（此刻一个字节都还没下发）。
 pub(super) async fn prefetch_stream_head(
-    response: reqwest::Response,
+    response: wreq::Response,
     limit: &LimitContext,
 ) -> Result<(Vec<Frame>, futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>), GatewayError> {
     let source = response.bytes_stream().map(|item| {
@@ -460,7 +460,7 @@ pub async fn drive_stream(
 
 /// 非流式：拉完整条流再聚合成一个 `chat.completion`。
 pub async fn drive_aggregate(
-    response: reqwest::Response,
+    response: wreq::Response,
     mut translator: Translator,
     telemetry: std::sync::Arc<RequestTelemetry>,
     limit: &LimitContext,

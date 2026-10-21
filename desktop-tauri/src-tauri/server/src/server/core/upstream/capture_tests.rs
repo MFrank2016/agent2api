@@ -14,7 +14,7 @@ const CHAT: &str = concat!(
     "data: [DONE]\n\n"
 );
 
-fn response(body: &'static str) -> reqwest::Response {
+fn response(body: &'static str) -> wreq::Response {
     axum::http::Response::builder()
         .status(200)
         .header("content-type", "text/event-stream")

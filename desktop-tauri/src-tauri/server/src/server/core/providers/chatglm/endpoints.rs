@@ -136,7 +136,7 @@ pub const PATH_PAYMENT_ME: &str = "/chatglm/payment-api/v1/cs/me";
 ///
 /// ── 这个平面要求带 User-Agent（实测）──────────────────────────
 /// `agent-api` 下所有接口（含模型目录 `operation/detail`）在**完全不带 UA** 时
-/// 一律 `40002 bad request`；带任意 UA（`undici` / `node` / `reqwest` / 浏览器
+/// 一律 `40002 bad request`；带任意 UA（`undici` / `node` / `wreq` / 浏览器
 /// 均可）就正常。本仓库的出站客户端恒带 `undici`（见 `core::egress`），因此
 /// 走 `http::*` 不需要额外处理 —— 但**探测脚本**忘了带 UA 会误判成签名错误。
 pub const PATH_TASK_CENTER: &str = "/chatglm/agent-api/task/center";

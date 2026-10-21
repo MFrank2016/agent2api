@@ -597,7 +597,7 @@ mod tests {
         .collect::<Vec<_>>();
         let url = "https://snap-access.cn-north-4.myhuaweicloud.com/v1/model/builtin";
         let signed = sign("GET", url, &headers, b"", &credential, false).expect("签名应当成功");
-        let mut request = reqwest::Client::new().get(url);
+        let mut request = wreq::Client::new().get(url);
         for (name, value) in signed {
             request = request.header(name.as_str(), value.as_str());
         }

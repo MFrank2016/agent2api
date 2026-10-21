@@ -9,7 +9,7 @@
 //! **协议无关**的形态（URL + 头 + 已序列化的 body + 出口）。
 //!
 //! 只保留的三件事：
-//!   1. `send_chat_request`：按出口取 reqwest Client 发一次请求，
+//!   1. `send_chat_request`：按出口取 wreq Client 发一次请求，
 //!      不读 body（SSE 需要 `bytes_stream()`）；
 //!   2. `read_upstream_error`：把上游错误响应归一化成 `{code, message}`
 //!      —— 「怎么读一个 HTTP 错误体」是协议层的事，与哪一家无关；
@@ -30,7 +30,7 @@ use crate::server::errors::GatewayError;
 /// 单次对话请求的总超时（除退避重试外的等待时间）。
 ///
 /// 与 Node 版的差别：Node 的 proxyFetch 不设总超时（bodyTimeout: 0），
-/// 完全靠客户端断开与上游主动结束。Rust 侧的 reqwest client 用
+/// 完全靠客户端断开与上游主动结束。Rust 侧的 wreq client 用
 /// `read_timeout(600s)` 限制「两次数据之间」的间隔（见 core::egress 的说明），
 /// 这里不再叠加总超时 —— 那会掐断长回答的 SSE 流。
 pub const NO_TOTAL_TIMEOUT: Option<u64> = None;
@@ -102,7 +102,7 @@ impl UpstreamErrorDetail {
 /// 用 `response.text()` 把响应体整个吃掉，调用方拿不到第二份；不在这里顺手
 /// 旁路，错误响应体就永远进不了调试报文（而失败现场恰恰是最需要看的那一半）。
 pub async fn read_upstream_error(
-    response: reqwest::Response,
+    response: wreq::Response,
     capture: Option<&crate::server::core::debug_traffic::TrafficCapture>,
 ) -> UpstreamErrorDetail {
     if let Some(capture) = capture {
@@ -156,10 +156,10 @@ fn rotation_attempts(plan: &RotationPlan) -> usize {
 /// 发一次上游请求（不读 body，保留原始响应给流式转发与错误解析）。
 ///
 /// 与 `core::auth_http::send_raw` 的分工：那个把响应读成文本，用于管理接口；
-/// 这个把 `reqwest::Response` 原样交给调用方，SSE 需要 `bytes_stream()`。
+/// 这个把 `wreq::Response` 原样交给调用方，SSE 需要 `bytes_stream()`。
 pub async fn send_chat_request(
     plan: &TransportRequest,
-) -> Result<reqwest::Response, UpstreamRequestError> {
+) -> Result<wreq::Response, UpstreamRequestError> {
     let url = plan.url.clone();
     let payload = plan.payload.clone();
     let headers = plan.headers.clone();

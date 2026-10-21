@@ -3,7 +3,7 @@
 //! 对照 Node 版 src/workbuddy-proxy.mjs 的「账号代理」部分（归一/解析/描述）。
 //! 本模块只做**纯逻辑**：把账号里存的 proxy 配置解析成可用的连接信息。
 //! Clash Verge 配置的真实读取（三个候选目录 + 两个 YAML + 3 秒 TTL 缓存）
-//! 在 `core::clash`；真实出网（按出口缓存 reqwest Client）在 `core::egress`。
+//! 在 `core::clash`；真实出网（按出口缓存 wreq Client）在 `core::egress`。
 //! 三者拆分是因为它们的变化原因不同：本模块随**账号数据格式**变，
 //! clash.rs 随**Clash 版本**变，egress.rs 随**HTTP 客户端实现**变。
 //!

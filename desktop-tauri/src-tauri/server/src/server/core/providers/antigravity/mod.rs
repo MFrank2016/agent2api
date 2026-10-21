@@ -106,11 +106,11 @@ use crate::server::core::proxies::ResolvedProxy;
 /// （浏览器能打开授权页正是靠它）。因此本家的口径是**与浏览器一致**：
 ///   1. 账号显式配了代理（`proxy` 为 Some）→ 走它，优先级最高；
 ///   2. 没配 → `client_for_system_proxy()`（系统设置 + 环境变量）；
-///   3. 系统也没配代理 → reqwest 探测不到，等价于直连，不引入新的失败面。
+///   3. 系统也没配代理 → wreq 探测不到，等价于直连，不引入新的失败面。
 ///
 /// 登录链路（换码 / userinfo / 粘贴校验 / project 发现）同理：此刻账号还不
 /// 存在，`proxy` 恒为 None，走第 2 条。
-pub(crate) fn client_for(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::Client> {
+pub(crate) fn client_for(proxy: Option<&ResolvedProxy>) -> Arc<wreq::Client> {
     match proxy {
         Some(proxy) => egress::client_for(Some(proxy)),
         None => egress::client_for_system_proxy(),

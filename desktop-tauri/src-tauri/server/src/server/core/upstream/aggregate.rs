@@ -61,12 +61,12 @@ pub struct AggregatedCompletion {
 /// 「整片只有换行」的分片在流式里会被丢掉，非流式若照抄就把同一个噪声以
 /// 词间换行的形式交给了客户端（见 `sse.rs` 模块头的实测）。
 pub async fn aggregate_sse_completion(
-    response: reqwest::Response,
+    response: wreq::Response,
     telemetry: Arc<RequestTelemetry>,
     policy: FramePolicy,
 ) -> Result<AggregatedCompletion, GatewayError> {
-    // 与 `ForwardStream::new` 同款：reqwest 错误在这里就地描述成文案折进
-    // io::Error（`describe_error_detail` 只认 reqwest::Error）
+    // 与 `ForwardStream::new` 同款：wreq 错误在这里就地描述成文案折进
+    // io::Error（`describe_error_detail` 只认 wreq::Error）
     let capture = telemetry.capture();
     let stream = response.bytes_stream().map(move |item| {
         let item = item.map_err(|error| {
@@ -85,7 +85,7 @@ pub async fn aggregate_sse_completion(
 /// 自定义家的翻译协议（responses / anthropic 上游）在进入本函数前先过
 /// `providers::custom` 的 `ProtocolTranslateStream` —— 本函数与
 /// [`aggregate_sse_completion`] 共用同一套聚合规则，只是输入从
-/// reqwest::Response 换成已翻译的帧流。telemetry / policy 的语义
+/// wreq::Response 换成已翻译的帧流。telemetry / policy 的语义
 /// 与那个函数完全一致（见它的说明）。
 /// 原始报文由输入流在翻译前采集，本函数不重复采集内部 chat 帧。
 pub async fn aggregate_frame_stream(
@@ -155,7 +155,7 @@ async fn aggregate_frame_stream_inner(
             if text.starts_with(super::stall::IDLE_TIMEOUT_PREFIX) {
                 return GatewayError::with_status(502, text);
             }
-            // 错误描述已在构造时折进 io::Error（reqwest 直连在
+            // 错误描述已在构造时折进 io::Error（wreq 直连在
             // `aggregate_sse_completion`、翻译流在 `ProtocolTranslateStream`）
             GatewayError::with_status(502, format!("上游流式传输中断: {error}"))
         })?;

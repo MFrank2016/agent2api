@@ -77,7 +77,7 @@ pub const CHANNEL: &str = "chunlei";
 /// `http.get` 的 params 为空，见 `balance.rs` 模块头），这里没有它的常量。
 pub const WEB_QUERY: &str = "clienttype=400&app_id=123971023&web=1&channel=chunlei&version=1.4.4";
 
-/// 出站 User-Agent（kuku2api 实测可用；上游对 UA 敏感，不能用 reqwest 默认值）
+/// 出站 User-Agent（kuku2api 实测可用；上游对 UA 敏感，不能用 wreq 默认值）
 pub const USER_AGENT: &str = concat!(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ",
     "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"

@@ -136,7 +136,7 @@ pub async fn send_raw(
     headers: &[(String, String)],
     proxy: Option<&ResolvedProxy>,
     timeout_ms: Option<u64>,
-) -> Result<ApiResponse, reqwest::Error> {
+) -> Result<ApiResponse, wreq::Error> {
     let client = egress::client_for(proxy);
     let mut builder = match method {
         "POST" => client.post(url),
@@ -166,8 +166,8 @@ pub async fn send_raw(
     Ok(ApiResponse { status, ok, payload })
 }
 
-/// 把 reqwest 的传输错误翻译成可读中文（保留原因链，便于排障）
-fn describe_transport_error(error: &reqwest::Error) -> String {
+/// 把 wreq 的传输错误翻译成可读中文（保留原因链，便于排障）
+fn describe_transport_error(error: &wreq::Error) -> String {
     if error.is_timeout() {
         "连接上游超时".to_string()
     } else if error.is_connect() {

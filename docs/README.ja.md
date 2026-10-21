@@ -159,6 +159,7 @@ docker run -d --name agent2api --restart unless-stopped -p 3065:3065 -v ./data:/
 ### 動作環境
 
 - Rust >= 1.77 と Tauri 2 ツールチェーン（デスクトップアプリ本体のコンパイル用。Windows では WebView2 ランタイムも必要）
+- BoringSSL のビルド依存: cmake、nasm、libclang（wreq の TLS バックエンド。詳細は [TLS フィンガープリント](./tls-fingerprint.md)）
 - Node.js >= 18.17（`npm run tauri:*` とフロントエンドのビルドスクリプトの実行のみ。デスクトップアプリは実行時に Node へ依存しません）
 - 対象プラットフォーム: Windows / macOS / Linux のデスクトップ（各プラットフォームの bundle: Windows NSIS、macOS app+dmg、Linux deb+AppImage）と Docker のサーバー
 

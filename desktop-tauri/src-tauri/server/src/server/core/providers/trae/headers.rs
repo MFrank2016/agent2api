@@ -95,7 +95,7 @@ mod tests {
             };
             let got = solo_headers(&identity, case["stream"].as_bool().unwrap());
             // 头名**按大小写无关比对**：Go 的 `http.Header.Set` 会把键规范化
-            // （源码写 `X-OS-Version`，向量里是 `X-Os-Version`），而 hyper/reqwest
+            // （源码写 `X-OS-Version`，向量里是 `X-Os-Version`），而 hyper/wreq
             // 在 HTTP/1 与 HTTP/2 上写出的又是另一套（HTTP/2 强制小写）。
             // 头名本就大小写不敏感（RFC 9110 §5.1），这里追求逐字节相同
             // 既做不到也没意义 —— 与 codearts 那边"DPoP 不需要与 Go 对齐"同一条道理。

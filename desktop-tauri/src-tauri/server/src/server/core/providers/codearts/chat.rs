@@ -16,7 +16,7 @@
 //!      reasoning，若按 content 判空就会把一次成功的回答报成失败）。
 //! 所以本模块把这三块都写成可单独调用的纯函数，测试直接喂字节。
 //!
-//! 真正的网络编排（拿到 `reqwest::Response`、按首包门决定是否交给客户端、
+//! 真正的网络编排（拿到 `wreq::Response`、按首包门决定是否交给客户端、
 //! 换账号）与 accio 同构，放在适配器里复用既有机制。
 
 use serde_json::{json, Value};
@@ -707,12 +707,14 @@ pub fn upstream_http_error(
 pub const ERROR_BODY_BUDGET: usize = 8 * 1024;
 
 /// 读诊断体，带上限；第二个返回值表示是否被截断。
-pub async fn read_error_body(mut response: reqwest::Response) -> (Vec<u8>, bool) {
+pub async fn read_error_body(response: wreq::Response) -> (Vec<u8>, bool) {
+    use futures::StreamExt;
     let mut body: Vec<u8> = Vec::new();
     let mut truncated = false;
+    let mut stream = response.bytes_stream();
     loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
                 let room = ERROR_BODY_BUDGET.saturating_sub(body.len());
                 if chunk.len() > room {
                     body.extend_from_slice(&chunk[..room]);
@@ -726,8 +728,8 @@ pub async fn read_error_body(mut response: reqwest::Response) -> (Vec<u8>, bool)
                     break;
                 }
             }
-            Ok(None) => break,
-            Err(_) => {
+            None => break,
+            Some(Err(_)) => {
                 // 读诊断体本身失败：手上这一截照样有用，并如实标注不完整
                 truncated = true;
                 break;
@@ -1018,7 +1020,7 @@ mod tests {
             Some(&credential),
         )
         .expect("应当能构造请求");
-        let mut request = reqwest::Client::new()
+        let mut request = wreq::Client::new()
             .post(&endpoint)
             .timeout(std::time::Duration::from_secs(30));
         for (name, value) in headers {
@@ -1135,7 +1137,7 @@ mod tests {
         )
         .expect("gzip 这一发应当能签名");
 
-        let client = reqwest::Client::new();
+        let client = wreq::Client::new();
         let mut shots = Vec::new();
         for (label, headers, body) in [
             ("A 裸 body", headers.clone(), raw.clone()),
@@ -1252,7 +1254,7 @@ mod tests {
             Some(&fresh),
         )
         .expect("应当能构造请求");
-        let mut request = reqwest::Client::new()
+        let mut request = wreq::Client::new()
             .post(&endpoint)
             .timeout(std::time::Duration::from_secs(120));
         for (name, value) in headers {
@@ -1304,7 +1306,7 @@ mod tests {
         ];
         let signed = super::super::signer::sign("GET", catalog, &headers, b"", &super::super::oauth::signer_credential(credential), false)
             .expect("签名应当成功");
-        let mut request = reqwest::Client::new()
+        let mut request = wreq::Client::new()
             .get(catalog)
             .timeout(std::time::Duration::from_secs(30));
         for (name, value) in signed {
@@ -1503,7 +1505,7 @@ const HEAD_BUFFER_LIMIT: usize = 64 * 1024;
 /// 上游这里已经是 OpenAI chunk 形状，所以拿到内容之后是**透传**，不做二次翻译
 /// （与 qoder/accio 不同，那两家的帧要重写）。
 pub async fn prefetch_head(
-    response: reqwest::Response,
+    response: wreq::Response,
 ) -> Result<
     (
         Vec<u8>,
@@ -1609,8 +1611,8 @@ mod head_gate_tests {
         format!("http://{addr}/sse")
     }
 
-    async fn open(url: &str) -> reqwest::Response {
-        reqwest::Client::new().get(url).send().await.expect("mock 上游应当可达")
+    async fn open(url: &str) -> wreq::Response {
+        wreq::Client::new().get(url).send().await.expect("mock 上游应当可达")
     }
 
     #[tokio::test]
@@ -1699,7 +1701,7 @@ mod catalog_fixtures {
             ("is_confidential".to_string(), "false".to_string()),
         ];
         let signed = signer::sign("GET", &url, &headers, b"", &signer_credential, host_signed).expect("签名应当成功");
-        let mut request = reqwest::Client::new().get(&url).timeout(std::time::Duration::from_secs(30));
+        let mut request = wreq::Client::new().get(&url).timeout(std::time::Duration::from_secs(30));
         for (name, value) in signed {
             request = request.header(name.as_str(), value.as_str());
         }

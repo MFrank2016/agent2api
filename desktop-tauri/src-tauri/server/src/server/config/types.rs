@@ -804,7 +804,7 @@ impl TimeoutSettings {
 
     /// 传输层 read_timeout 的后备上限：取「等响应头」与「流空闲」两者的大者。
     ///
-    /// reqwest 的 `read_timeout` 作用于每一次读（既覆盖首包前、也覆盖数据块
+    /// wreq 的 `read_timeout` 作用于每一次读（既覆盖首包前、也覆盖数据块
     /// 之间），而这两个阶段是分开的旋钮 —— 后备值取大者，保证它**永不**成为
     /// 哪个旋钮的隐藏天花板（真正的判定在各阶段自己的计时器，见
     /// `upstream::request` 与 `upstream::ForwardStream`）。

@@ -512,7 +512,7 @@ fn build_chat_headers(token: &str, session_id: &str) -> Vec<(String, String)> {
 }
 
 /// 覆盖式写头：同名（HTTP 头名大小写不敏感）**替换**而非追加 ——
-/// reqwest 对 `.header()` 的重复调用是追加出多值头，伪装头的覆盖语义
+/// wreq 对 `.header()` 的重复调用是追加出多值头，伪装头的覆盖语义
 /// 必须是替换（与 cline-proxy `http.Header.Set` 同语义）。
 fn upsert_header(headers: &mut Vec<(String, String)>, key: String, value: String) {
     if let Some(slot) = headers
@@ -775,7 +775,7 @@ mod tests {
 
     #[test]
     fn a_same_name_header_is_replaced_not_appended() {
-        // 覆盖合并的语义：同名（大小写不敏感）替换。追加的话 reqwest 会发出
+        // 覆盖合并的语义：同名（大小写不敏感）替换。追加的话 wreq 会发出
         // 多值头（`headers_mut().append()`），上游看到的是两个值
         let mut headers = vec![("X-PLATFORM".to_string(), "terminal".to_string())];
         upsert_header(&mut headers, "x-platform".to_string(), "extension".to_string());

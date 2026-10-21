@@ -664,7 +664,7 @@ async fn forward_translated(
 /// 「字节 → chat 帧」的翻译 —— 本结构只做管道（上游字节 → 转换器 → 帧队列），
 /// 协议知识全在 `protocol::*_outbound` 的两个转换器里。
 ///
-/// 上游断开时把 reqwest 错误描述成文案转成 `io::Error` 上抛：流式路径由
+/// 上游断开时把 wreq 错误描述成文案转成 `io::Error` 上抛：流式路径由
 /// `ForwardStream` 补「错误帧 + [DONE]」收尾，聚合路径转成 502 —— 与 chat
 /// 协议同一条错误语义。调试采集器在这里采**上游原始字节**（翻译前），
 /// 与 chat 路径「采上游原样吐出的东西」的语义一致。
@@ -707,7 +707,7 @@ impl ProtocolTranslateStream {
     fn new(
         kind: OutboundKind,
         model: &str,
-        response: reqwest::Response,
+        response: wreq::Response,
         telemetry: &Arc<RequestTelemetry>,
     ) -> Self {
         use futures::StreamExt;
@@ -776,7 +776,7 @@ impl futures::Stream for ProtocolTranslateStream {
                 }
                 std::task::Poll::Ready(Some(Err(error))) => {
                     self.upstream_done = true;
-                    // 文案已在构造时描述好（见 inner 字段说明）：reqwest 错误的
+                    // 文案已在构造时描述好（见 inner 字段说明）：wreq 错误的
                     // 描述、空闲守卫的超时原文，原样上抛
                     return std::task::Poll::Ready(Some(Err(error)));
                 }

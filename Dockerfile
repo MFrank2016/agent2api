@@ -42,6 +42,12 @@ ARG TARGETARCH
 # SQLite、ring 的 C/汇编源码用）。注意 libc6-dev-arm64-cross 只是
 # gcc-aarch64-linux-gnu 的 Recommends，--no-install-recommends 下必须显式
 # 列出，否则交叉编译 C 代码时会捡宿主的 /usr/include 头文件报错。
+# BoringSSL（wreq 的 TLS 后端）构建依赖：cmake + nasm + libclang。
+# 与 TARGETARCH 无关，两种架构都要装。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake nasm libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN if [ "$TARGETARCH" = "arm64" ]; then \
         rustup target add aarch64-unknown-linux-gnu \
         && apt-get update \

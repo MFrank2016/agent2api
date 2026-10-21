@@ -342,7 +342,7 @@ fn release_json(payload: &Value, repository: &str) -> Value {
 ///     （官方对次级限流的建议是「至少等一分钟」）。
 ///
 /// 这个值会落进任务状态（`retry_at`），因此**重启不会提前解除冷却**。
-fn retry_deadline(headers: &reqwest::header::HeaderMap, status: u16) -> i64 {
+fn retry_deadline(headers: &wreq::header::HeaderMap, status: u16) -> i64 {
     let now = logging::now_ms();
     let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
     let retry = header("retry-after").and_then(|value| {

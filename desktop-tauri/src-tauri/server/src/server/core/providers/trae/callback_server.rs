@@ -230,7 +230,7 @@ mod tests {
     /// 谁负责收尾）都是运行时性质，纯函数测试一条也验不到。
     async fn hit(port: u16, path_and_query: &str) -> (u16, String) {
         let url = format!("http://127.0.0.1:{port}{path_and_query}");
-        match reqwest::get(url).await {
+        match wreq::get(url).send().await {
             Ok(response) => {
                 let status = response.status().as_u16();
                 let body = response.text().await.unwrap_or_default();

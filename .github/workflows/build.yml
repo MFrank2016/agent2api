@@ -92,6 +92,13 @@ jobs:
           # universal 需要两个目标都装上（合并时两个架构各编一遍）
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
+      # BoringSSL（wreq 的 TLS 后端）构建依赖：cmake + nasm + libclang。
+      # 缺任何一个都会在 btls-sys 的 build script 阶段失败，而不是编译期。
+      - name: 安装 BoringSSL 构建依赖
+        run: |
+          brew install cmake nasm llvm
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+
       # 缓存 Rust 依赖：冷编译约 10 分钟，命中后大幅缩短。
       # key 里带上 Cargo.lock 的哈希，依赖变动时自动失效。
       # target 路径按 .cargo/config.toml 的 target-dir 指向仓库根的 target/
@@ -134,6 +141,15 @@ jobs:
 
       - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
+
+      # BoringSSL 构建依赖：windows runner 自带 cmake / nasm / LLVM，
+      # 只需把 libclang 所在目录显式告诉 bindgen。
+      - name: 配置 BoringSSL 构建依赖
+        shell: pwsh
+        run: |
+          cmake --version
+          nasm -v
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: 缓存 Rust 依赖
         uses: Swatinem/rust-cache@v2
@@ -208,7 +224,10 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf \
-            build-essential
+            build-essential \
+            cmake \
+            nasm \
+            libclang-dev
           # 打印实际版本：排查「构建机换代导致行为变化」时这是第一条线索
           pkg-config --modversion webkit2gtk-4.1 gtk+-3.0 ayatana-appindicator3-0.1
 
@@ -319,6 +338,15 @@ jobs:
 
       - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
+
+      # BoringSSL 构建依赖：windows runner 自带 cmake / nasm / LLVM，
+      # 只需把 libclang 所在目录显式告诉 bindgen。
+      - name: 配置 BoringSSL 构建依赖
+        shell: pwsh
+        run: |
+          cmake --version
+          nasm -v
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: 缓存 Rust 依赖
         uses: Swatinem/rust-cache@v2

@@ -452,7 +452,7 @@ pub struct TrafficEntry {
 
 /// 头集合脱敏：凭据类字段换成 [`REDACTED`]，其余原样。
 ///
-/// 收 `Vec<(String, String)>`（适配器给出的形态）与 `HeaderMap`（reqwest 响应）
+/// 收 `Vec<(String, String)>`（适配器给出的形态）与 `HeaderMap`（wreq 响应）
 /// 两种来源，统一输出 JSON 对象 —— 重名头按**后到覆盖**（与 HTTP 语义一致，
 /// 且这两种来源里重名极少见）。
 pub fn redact_headers<'a>(headers: impl IntoIterator<Item = (&'a str, &'a str)>) -> Value {
@@ -558,7 +558,7 @@ impl TrafficCapture {
     ///
     /// 顺带清空已累积的响应体：重试场景下上一次尝试的 body 不该混进来
     /// （见 [`Self::reset_request`] 的「最后一次为准」）。
-    pub fn attach_response(&self, status: u16, headers: &reqwest::header::HeaderMap) {
+    pub fn attach_response(&self, status: u16, headers: &wreq::header::HeaderMap) {
         let mut guard = self.lock();
         guard.entry.status = Some(status);
         guard.body.clear();

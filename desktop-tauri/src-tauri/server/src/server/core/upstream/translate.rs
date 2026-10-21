@@ -54,7 +54,7 @@ use crate::server::core::protocol::antigravity_stream::ChatFromAntigravityStream
 use crate::server::core::protocol::chatglm_stream::ChatFromChatglmStream;
 use crate::server::core::protocol::commandcode_outbound::ChatFromCommandCodeStream;
 
-/// 上游 Anthropic SSE → 标准 chat SSE 的字节流（`reqwest::Response` 直接进来）。
+/// 上游 Anthropic SSE → 标准 chat SSE 的字节流（`wreq::Response` 直接进来）。
 ///
 /// 管道结构：`响应字节 → 空闲守卫 → 转换器 → 帧队列`。错误在构造时就描述成
 /// 文案折进 `io::Error`（与 `ForwardStream::new` 同一手法）：空闲守卫的入参是
@@ -77,12 +77,12 @@ pub struct AnthropicToChatStream {
 impl AnthropicToChatStream {
     /// `model` 是**上游真名**（下发帧里的 `model` 字段，见模块头第 2 条）。
     pub fn new(
-        response: reqwest::Response,
+        response: wreq::Response,
         model: &str,
         telemetry: &Arc<super::usage::RequestTelemetry>,
     ) -> Self {
         use futures::StreamExt;
-        // reqwest 错误就地描述成文案（折进 io::Error 之后只剩文本可读）；
+        // wreq 错误就地描述成文案（折进 io::Error 之后只剩文本可读）；
         // 空闲守卫用设置页「请求超时」的「流式响应空闲超时」那一档 ——
         // 与 chat 路径、自定义家路径三处同源，改设置三处一起变
         let described = response.bytes_stream().map(|item| {
@@ -147,7 +147,7 @@ impl Stream for AnthropicToChatStream {
 }
 
 /// 上游 **Command Code NDJSON** → 标准 chat SSE 的字节流
-/// （`reqwest::Response` 直接进来）。
+/// （`wreq::Response` 直接进来）。
 ///
 /// 与 [`AnthropicToChatStream`] 逐行同构：管道结构同样是
 /// `响应字节 → 空闲守卫 → 转换器 → 帧队列`，错误同样在构造时就描述成文案折进
@@ -177,12 +177,12 @@ pub struct CommandCodeToChatStream {
 impl CommandCodeToChatStream {
     /// `model` 是**上游真名**（下发帧里的 `model` 字段，见模块头）。
     pub fn new(
-        response: reqwest::Response,
+        response: wreq::Response,
         model: &str,
         telemetry: &Arc<super::usage::RequestTelemetry>,
     ) -> Self {
         use futures::StreamExt;
-        // reqwest 错误就地描述成文案（折进 io::Error 之后只剩文本可读）；
+        // wreq 错误就地描述成文案（折进 io::Error 之后只剩文本可读）；
         // 空闲守卫用设置页「请求超时」的「流式响应空闲超时」那一档 ——
         // 与 chat 路径、Anthropic 那条三处同源，改设置三处一起变
         let described = response.bytes_stream().map(|item| {
@@ -248,7 +248,7 @@ impl Stream for CommandCodeToChatStream {
 }
 
 /// 上游 **智谱清言 SSE（增量帧 + 收尾全文快照混排）** → 标准 chat SSE 的字节流
-/// （`reqwest::Response` 直接进来）。
+/// （`wreq::Response` 直接进来）。
 ///
 /// 与另外三台逐行同构：管道结构同样是
 /// `响应字节 → 空闲守卫 → 转换器 → 帧队列`，错误同样在构造时就描述成文案折进
@@ -284,12 +284,12 @@ pub struct ChatglmToChatStream {
 impl ChatglmToChatStream {
     /// `model` 是**上游真名**（下发帧里的 `model` 字段，见模块头）。
     pub fn new(
-        response: reqwest::Response,
+        response: wreq::Response,
         model: &str,
         telemetry: &Arc<super::usage::RequestTelemetry>,
     ) -> Self {
         use futures::StreamExt;
-        // reqwest 错误就地描述成文案（折进 io::Error 之后只剩文本可读）；
+        // wreq 错误就地描述成文案（折进 io::Error 之后只剩文本可读）；
         // 空闲守卫用设置页「请求超时」的「流式响应空闲超时」那一档 ——
         // 与另外三台四处同源，改设置四处一起变
         let described = response.bytes_stream().map(|item| {
@@ -355,7 +355,7 @@ impl Stream for ChatglmToChatStream {
 }
 
 /// 上游 **Antigravity 的 Gemini v1internal SSE** → 标准 chat SSE 的字节流
-/// （`reqwest::Response` 直接进来）。
+/// （`wreq::Response` 直接进来）。
 ///
 /// 与 [`AnthropicToChatStream`] 逐行同构：管道结构同样是
 /// `响应字节 → 空闲守卫 → 转换器 → 帧队列`，错误同样在构造时就描述成文案折进
@@ -387,13 +387,13 @@ impl AntigravityToChatStream {
     /// 签名缓存兜底档的写入键，拿不到给空串 —— 见
     /// `protocol::antigravity_signature_cache` 的模块头）。
     pub fn new(
-        response: reqwest::Response,
+        response: wreq::Response,
         model: &str,
         session: &str,
         telemetry: &Arc<super::usage::RequestTelemetry>,
     ) -> Self {
         use futures::StreamExt;
-        // reqwest 错误就地描述成文案（折进 io::Error 之后只剩文本可读）；
+        // wreq 错误就地描述成文案（折进 io::Error 之后只剩文本可读）；
         // 空闲守卫用设置页「请求超时」的「流式响应空闲超时」那一档 ——
         // 与另外两台三处同源，改设置三处一起变
         let described = response.bytes_stream().map(|item| {

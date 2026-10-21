@@ -43,7 +43,7 @@ pub(super) const STOP_TIMEOUT_MS: u64 = 3_000;
 /// turn 的 SSE 超时（原实现 `SSE_TIMEOUT_MS = 15 * 60 * 1000`）。
 ///
 /// 为什么是 15 分钟而不是更短：带工具循环的长回答可能跑很久，而这是**总超时**
-/// （reqwest 的 `.timeout()` 覆盖整个响应体），设短了会把正在推进的长回答掐断 ——
+/// （wreq 的 `.timeout()` 覆盖整个响应体），设短了会把正在推进的长回答掐断 ——
 /// 客户端一边收到内容一边被断流。
 pub(super) const SSE_TIMEOUT_MS: u64 = 15 * 60 * 1000;
 
@@ -266,7 +266,7 @@ pub(super) async fn turn_request(
     request: &ConversationRequest,
     ctx: &TurnContext,
     body: &Value,
-) -> Result<reqwest::Response, CatPawError> {
+) -> Result<wreq::Response, CatPawError> {
     let url = format!("{}/api/agent/conversation/turn", request.base_url.trim_end_matches('/'));
     let payload = serde_json::to_string(body)
         .map_err(|error| CatPawError::upstream(format!("请求体序列化失败: {error}")))?;

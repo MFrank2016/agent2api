@@ -1,7 +1,7 @@
 //! 软件更新 —— GitHub Release 检测与安装包下载（对照 workbuddy-update.mjs）。
 //!
 //! ── 为什么检测/下载在后端而不是 Tauri 壳 ────────────────────
-//! 壳侧 reqwest 为省掉 TLS 依赖关掉了默认特性（只能访问本机网关的明文 HTTP），
+//! 壳侧 wreq 为省掉 TLS 依赖关掉了默认特性（只能访问本机网关的明文 HTTP），
 //! 发不出 GitHub 的 HTTPS 请求。因此这里负责联网，壳只做两件事：
 //! 把「当前版本」传进来比较、把下载好的安装包跑起来。
 //!
@@ -23,7 +23,7 @@
 //! 放句柄内部的 `Mutex<Task>`，**下载字节数与进度也在同一把锁里更新**。
 //! 硬约束「持锁不做网络请求、不 await」因此落在：读响应流时按 chunk 加锁更新
 //! 计数 → 放锁 → 写文件。写文件是同步 IO，在 tokio 的工作线程上执行
-//! （reqwest 的 bytes_stream 本身就是 async，每条 chunk 的落盘量很小）。
+//! （wreq 的 bytes_stream 本身就是 async，每条 chunk 的落盘量很小）。
 
 mod check;
 // 公网出网的候选出口实现（`fetch_public`）也被 `core::model_meta`（models.dev
@@ -506,7 +506,7 @@ impl UpdateManager {
             };
             let chunk = chunk.map_err(|error| {
                 if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                    // 主动取消会让 reqwest 报「body 读取中断」，这不是失败
+                    // 主动取消会让 wreq 报「body 读取中断」，这不是失败
                     UpdateError::new("下载已取消")
                 } else {
                     UpdateError::new(format!(

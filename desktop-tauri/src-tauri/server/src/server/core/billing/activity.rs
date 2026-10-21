@@ -892,7 +892,7 @@ pub(super) fn normalize_activity_status(result: &BillingCall) -> Value {
 /// 读满 `max_bytes` 或流自然结束都算成功（返回 Ok(true)）；网络层断流 /
 /// 非法字节返回 Err，由调用方按该模型失败处理并尝试链上的下一个。
 async fn consume_activity_response(
-    response: reqwest::Response,
+    response: wreq::Response,
     max_bytes: usize,
 ) -> Result<bool, ()> {
     consume_response_bytes(response, max_bytes).await.map(|_| true)
@@ -903,7 +903,7 @@ async fn consume_activity_response(
 /// SSE 那路只求「读过了」，JSON 那路（网页会话）要拿到完整字节去解析 ——
 /// 同一条纪律：响应体必须**读**（不读的请求上游可能没记活跃），但绝不无界缓冲。
 async fn consume_response_bytes(
-    response: reqwest::Response,
+    response: wreq::Response,
     max_bytes: usize,
 ) -> Result<Vec<u8>, ()> {
     use futures::StreamExt;

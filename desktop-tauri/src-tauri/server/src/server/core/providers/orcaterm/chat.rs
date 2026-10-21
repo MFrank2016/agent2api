@@ -201,7 +201,7 @@ async fn open_chat_stream(
     model: &str,
     prompt: &str,
     proxy: Option<&ResolvedProxy>,
-) -> Result<reqwest::Response, GatewayError> {
+) -> Result<wreq::Response, GatewayError> {
     let seq_id = random_uuid();
     let url = format!("{LIGHTAI_BASE}/assistant/chat?{ASSISTANT_QUERY}");
     let body = json!({
@@ -587,7 +587,7 @@ fn unwrap_envelope(raw: &str) -> Option<String> {
 
 /// 流式：遍历上游流，把帧写进 mpsc。
 async fn drive_stream(
-    response: reqwest::Response,
+    response: wreq::Response,
     model: &str,
     sender: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), GatewayError> {
@@ -625,7 +625,7 @@ async fn send_frame(
 }
 
 /// 非流式：遍历同样的上游流，聚合为完整 JSON。
-async fn aggregate(response: reqwest::Response, client_model: &str) -> Result<ForwardOutcome, GatewayError> {
+async fn aggregate(response: wreq::Response, client_model: &str) -> Result<ForwardOutcome, GatewayError> {
     let source = response
         .bytes_stream()
         .map(|item| item.map_err(|error| std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))));

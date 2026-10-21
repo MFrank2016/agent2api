@@ -109,8 +109,8 @@ pub fn build_plan(credential: &Credential, body: &Value, base: &str) -> Result<P
 }
 
 /// 发一次请求（**不设总超时**：长推理会被总超时截断，读空闲由 `idle_guard` 兜）。
-async fn send(plan: &Plan, proxy: Option<&ResolvedProxy>) -> Result<reqwest::Response, GatewayError> {
-    // **不设 reqwest 总超时**：`timeout(0)` 不是"不限时"而是"立刻超时"
+async fn send(plan: &Plan, proxy: Option<&ResolvedProxy>) -> Result<wreq::Response, GatewayError> {
+    // **不设 wreq 总超时**：`timeout(0)` 不是"不限时"而是"立刻超时"
     // （实测报 operation timed out，症状是随机 502），而不带总超时的长流
     // 才符合本家的形状 —— 读空闲由下面的 `idle_guard` 管，整流时长不该被截。
     let mut request = egress::client_for(proxy)
@@ -175,7 +175,7 @@ pub(crate) fn status_for(kind: ErrorKind) -> u16 {
 }
 
 /// 非 2xx 响应 → 网关错误（错误体只读一次，读完就丢）。
-async fn http_error(status: u16, response: reqwest::Response, limit: &Limit) -> GatewayError {
+async fn http_error(status: u16, response: wreq::Response, limit: &Limit) -> GatewayError {
     let text = response.text().await.unwrap_or_default();
     let head: String = text.chars().take(240).collect();
     let kind = super::errors::classify(status, &head);
@@ -198,7 +198,7 @@ fn frame_error(code: i64, message: &str, limit: &Limit) -> GatewayError {
 /// chunk 边界的那一帧会静默丢内容（这是本文件最难查的一类 bug，症状是"偶尔
 /// 少开头几个字"）。
 pub(crate) async fn prefetch_head(
-    response: reqwest::Response,
+    response: wreq::Response,
     limit: &Limit,
 ) -> Result<(Vec<Frame>, futures::stream::BoxStream<'static, Result<bytes::Bytes, io::Error>>, SoloStream), GatewayError> {
     let source = response.bytes_stream().map(|item| item.map_err(|error| io::Error::other(egress::describe_error_detail(&error))));
@@ -452,7 +452,7 @@ fn note(frame: &Frame, telemetry: &RequestTelemetry, usage_seen: &mut Option<Val
 
 /// 非流式：内部仍按流式拉全，再折成一个 `chat.completion`。
 async fn drive_aggregate(
-    response: reqwest::Response,
+    response: wreq::Response,
     requested: String,
     telemetry: &RequestTelemetry,
     limit: &Limit,

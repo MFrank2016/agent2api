@@ -36,7 +36,7 @@
 //!      Rust 侧必须一次性把 `Response` 交还给 axum，所以流式转发把
 //!      「上游响应 + 合并器 + 在途槽位」打包成一个 `Stream`，由 axum 拉取。
 //!      好处是**客户端断开自动传播**：响应体被 drop 时整条 Stream 被 drop，
-//!      reqwest 的 `bytes_stream` 随之 drop，hyper 检测到 body 接收端消失后
+//!      wreq 的 `bytes_stream` 随之 drop，hyper 检测到 body 接收端消失后
 //!      会直接 `close_read()` 关掉上游连接（详见 `ForwardStream` 的注释）。
 //!   2. Node 的 `pipeSse` 在 res close 时 abort controller；Rust 侧不需要
 //!      那个 controller —— drop 传播已经覆盖，且没有「忘了 abort」的风险。
@@ -513,7 +513,7 @@ fn lock_table<'a>(
 ///
 /// ── 客户端断开如何传播（本切片的实现方式与依据）───────────────
 /// 这里**不显式取消**上游请求，而是依赖 drop 传播，依据是两层实现细节：
-///   1. `reqwest::Response::bytes_stream()` 返回的流持有 hyper 的 body 接收端
+///   1. `wreq::Response::bytes_stream()` 返回的流持有 hyper 的 body 接收端
 ///      （`Incoming` 的 data channel）。该流被 drop 时接收端消失，hyper 的
 ///      h1 dispatch 在 `try_send_data` 上拿到 `Err(_canceled)`，执行
 ///      `self.conn.close_read()`（hyper 1.x `proto/h1/dispatch.rs` 里
@@ -532,8 +532,8 @@ fn lock_table<'a>(
 pub struct ForwardStream {
     /// 上游字节流（已 consume 掉 Response，流自身是 'static）。
     ///
-    /// 错误统一成 `io::Error`：`new`（reqwest 直连）在 map 时就把错误用
-    /// `describe_error_detail` 描述成文案折进去（那个函数只认 reqwest::Error，
+    /// 错误统一成 `io::Error`：`new`（wreq 直连）在 map 时就把错误用
+    /// `describe_error_detail` 描述成文案折进去（那个函数只认 wreq::Error，
     /// 转换后 poll_next 只拿得到文案）；`from_translated`（翻译协议）的转换层
     /// 同样上抛 io::Error。两个来源在 poll_next 里共用同一条「错误帧 + [DONE]」
     /// 收尾，描述口径也一致。
@@ -566,15 +566,15 @@ impl ForwardStream {
     /// 装配（见 `sse::FramePolicy`）：两项都关时下发帧的字节与接入前完全一致
     /// （workbuddy 的透传逐字节不变是硬要求）。
     pub(super) fn new(
-        response: reqwest::Response,
+        response: wreq::Response,
         slot: Option<InFlightGuard>,
         connection: ConnectionGuard,
         telemetry: Arc<usage::RequestTelemetry>,
         policy: FramePolicy,
     ) -> Self {
         use futures::StreamExt;
-        // reqwest 错误在这里就地描述成文案（`describe_error_detail` 认的是
-        // reqwest::Error；折进 io::Error 之后 poll_next 只能拿到文本）
+        // wreq 错误在这里就地描述成文案（`describe_error_detail` 认的是
+        // wreq::Error；折进 io::Error 之后 poll_next 只能拿到文本）
         let inner = response.bytes_stream().map(|item| {
             item.map_err(|error| {
                 std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))
