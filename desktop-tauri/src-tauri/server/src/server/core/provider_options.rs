@@ -79,6 +79,19 @@ pub fn is_enabled(provider_id: &str, key: &str, default: bool) -> bool {
 /// `set_sanitize_fingerprints` 调用点同一取向：那是「重启后还在不在」的问题，
 /// 不该让一次设置请求失败 —— 否则面板上刚点的那一下会变成错误，而本次运行
 /// 内行为其实已经改了。
+///
+/// ── 两道闸（都是「宁可选错，不要写坏」）──────────────────
+///   - **配置快照未装入时拒绝写入**：`with_raw` 的返回值是 `Option<Option<T>>`，
+///     **外层** `None` 才说明 `config::init` 还没跑（内层 `None` 只是「还没有
+///     `providerOptions` 这个键」，全新安装的正常形态，必须能写）。外层为
+///     `None` 时若照旧往下走，`update()` 里的 `current()` 会回落成
+///     `build(Map::new())`（空底稿），随后 `save_raw` 把「空底稿里没有的键」
+///     **整份删掉** —— 丢的不是这一家的开关，是用户所有配置。当前不可达
+///     （`init` 是 `bootstrap` 的第一件事，`set` 也还没有调用方），但守一道闸
+///     比事后排查便宜。
+///   - **provider id 必须是认得的家**：拼错的 id 会写进一条永远读不到的死记录
+///     （读侧 `is_known_provider` 会把它当残留忽略），而 `Ok` 让调用方以为写成了。
+///     认不出的 id 在写侧就拒绝，比事后在配置里捞死记录便宜。
 pub fn set(provider_id: &str, key: &str, value: bool) -> Result<(), String> {
     if !KNOWN_KEYS.contains(&key) {
         return Err(format!(
@@ -89,9 +102,22 @@ pub fn set(provider_id: &str, key: &str, value: bool) -> Result<(), String> {
     if provider_id.trim().is_empty() {
         return Err("provider id 不能为空".to_string());
     }
-    let mut options = config::with_raw(|raw| raw.get(config_key()).cloned())
-        .flatten()
-        .unwrap_or_else(|| Value::Object(Map::new()));
+    if !is_known_provider(provider_id) {
+        return Err(format!("未知的 provider `{provider_id}`"));
+    }
+    // 写侧必须分清 `with_raw` 的两层 `None`（`Option<Option<Value>>`）：
+    //   - 外层 `None` = 配置快照还没装（`config::init` 未跑）→ 拒绝写入。
+    //     此时往下走的话 `update()` 里的 `current()` 会回落成
+    //     `build(Map::new())`（空底稿），随后 `save_raw` 把「空底稿里没有的键」
+    //     **整份删掉** —— 丢的是用户所有配置，不只是这一家的开关。
+    //   - 内层 `None` = 快照在、但还没有 `providerOptions` 这个键（全新安装的
+    //     正常形态）→ 从空对象开始，这是必须能走通的路。
+    // 用 `flatten()` 会把两层压成一层，于是「首次写入」也会被当成未初始化
+    // 拒绝掉 —— 那正是本条闸最容易写歪的地方。
+    let Some(mut options) = config::with_raw(|raw| raw.get(config_key()).cloned()) else {
+        return Err("配置尚未初始化，无法写入 provider 开关".to_string());
+    };
+    let mut options = options.unwrap_or_else(|| Value::Object(Map::new()));
     let Some(options_map) = options.as_object_mut() else {
         return Err("providerOptions 不是对象".to_string());
     };
@@ -122,6 +148,7 @@ pub fn set(provider_id: &str, key: &str, value: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::config::KEY_SANITIZE_FINGERPRINTS;
     use std::sync::{Mutex, MutexGuard};
 
     /// 这四条都碰**进程级**配置快照（`config::CONFIG`），而 `config::update`
@@ -134,6 +161,55 @@ mod tests {
         CONFIG_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 单元测试进程从不调 `config::init`，所以快照可能是空的（`with_raw` 返回
+    /// `None`）。`set()` 现在把「未初始化」当硬错误（写进去会丢整份配置，见
+    /// 那里的两道闸），于是用例必须先让快照存在。
+    ///
+    /// 只在**真的没有**快照时补一个空的 `providerOptions`：已有快照时什么都不
+    /// 做 —— 否则会盖掉别的模块（如 `http::cors_tests`）刚写进去的键，那正是
+    /// 这个仓库已知的全局状态污染。
+    fn ensure_snapshot() {
+        if config::with_raw(|_| ()).is_some() {
+            return;
+        }
+        let _ = config::update_raw_field(config_key(), Value::Object(Map::new()));
+    }
+
+    /// 绕开 `set()` 的 provider 校验，直接往配置里落一条开关 —— 模拟
+    /// 「自定义家已经删了、配置里还留着它那条」。
+    ///
+    /// 不在这里断言落库成功：单元测试进程没有库，`update_raw_field` 只报「写盘
+    /// 成不成功」，内存快照无论如何都已刷新（见 `config::save_raw` 的说明）。
+    /// 落没落进去由调用方用 [`raw_option`] 回读验证。
+    fn write_raw_option(provider_id: &str, key: &str, value: bool) {
+        let mut options = config::with_raw(|raw| raw.get(config_key()).cloned())
+            .flatten()
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        let Some(map) = options.as_object_mut() else {
+            panic!("providerOptions 必须是对象");
+        };
+        let entry = map
+            .entry(provider_id.to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Some(entry) = entry.as_object_mut() else {
+            panic!("providerOptions.{provider_id} 必须是对象");
+        };
+        entry.insert(key.to_string(), Value::Bool(value));
+        let _ = config::update_raw_field(config_key(), options);
+    }
+
+    /// 直接从配置快照里取值，**不带** provider / key 的合法性校验 ——
+    /// 用来证明「残留确实写进去了」，也是 [`get`] 那道校验的对照组。
+    fn raw_option(provider_id: &str, key: &str) -> Option<bool> {
+        config::with_raw(|raw| {
+            raw.get(config_key())
+                .and_then(|options| options.get(provider_id))
+                .and_then(|options| options.get(key))
+                .and_then(Value::as_bool)
+        })
+        .flatten()
     }
 
     /// 用例结束后把 `providerOptions` 恢复原样，别把「workbuddy 关着」留给
@@ -169,12 +245,18 @@ mod tests {
     fn set_then_get_returns_new_value() {
         let _guard = hold_config();
         let _restore = RestoreOptions::capture();
+        ensure_snapshot();
         // 回归锁定：写后同进程读必须立刻生效。
         // 反例（v1）：用 config::save_raw 只写库、不刷新内存快照，
         // 于是 get 读到旧值，必须重启才生效。
-        set("workbuddy", "sanitizeBlacklistFingerprints", false).expect("写入应当成功");
+        set("workbuddy", KEY_SANITIZE_FINGERPRINTS, false).expect("写入应当成功");
+        assert_eq!(
+            get("workbuddy", KEY_SANITIZE_FINGERPRINTS),
+            Some(false),
+            "写后必须立刻读到新值"
+        );
         assert!(
-            !is_enabled("workbuddy", "sanitizeBlacklistFingerprints", true),
+            !is_enabled("workbuddy", KEY_SANITIZE_FINGERPRINTS, true),
             "写后必须立刻读到新值"
         );
     }
@@ -183,25 +265,72 @@ mod tests {
     fn per_provider_option_is_independent() {
         let _guard = hold_config();
         let _restore = RestoreOptions::capture();
-        set("workbuddy", "sanitizeBlacklistFingerprints", false).unwrap();
-        set("qoder", "sanitizeBlacklistFingerprints", true).unwrap();
-        assert!(!is_enabled("workbuddy", "sanitizeBlacklistFingerprints", true));
-        assert!(is_enabled("qoder", "sanitizeBlacklistFingerprints", true));
+        ensure_snapshot();
+        set("workbuddy", KEY_SANITIZE_FINGERPRINTS, false).unwrap();
+        set("qoder", KEY_SANITIZE_FINGERPRINTS, true).unwrap();
+        // 两边都断言 `Some(..)`：只断 `is_enabled` 的话，`true` 与「没写进去、
+        // 走 default(true)」分不开 —— 那正是本条要排除的空转形态。
+        assert_eq!(get("workbuddy", KEY_SANITIZE_FINGERPRINTS), Some(false));
+        assert_eq!(get("qoder", KEY_SANITIZE_FINGERPRINTS), Some(true));
         // 未设置的 provider 走 default
-        assert!(is_enabled("trae", "sanitizeBlacklistFingerprints", true));
+        assert_eq!(get("trae", KEY_SANITIZE_FINGERPRINTS), None);
+        assert!(
+            is_enabled("trae", KEY_SANITIZE_FINGERPRINTS, true),
+            "未设置的 provider 必须走 default"
+        );
+        assert!(
+            !is_enabled("trae", KEY_SANITIZE_FINGERPRINTS, false),
+            "default 必须被真正采用，而不是被别的值盖住"
+        );
     }
 
     #[test]
     fn unknown_provider_option_is_ignored() {
-        // 已删的自定义家在配置里还留着开关：读的时候忽略，不 panic。
+        // 回归锁定：已删的自定义家在配置里**真的留下**一条开关时，读侧必须忽略它。
+        // 只断言 default 而不写入，等于空转 —— 把 is_known_provider 删掉也照样绿。
+        let _guard = hold_config();
+        let _restore = RestoreOptions::capture();
+        ensure_snapshot();
+        // 绕过 is_known_provider 直接落一条残留（模拟「家删了、配置还在」）
+        write_raw_option("custom-gone", KEY_SANITIZE_FINGERPRINTS, false);
+        // 先证明残留**确实**在快照里：否则下面两条断言都是空转
+        assert_eq!(
+            raw_option("custom-gone", KEY_SANITIZE_FINGERPRINTS),
+            Some(false),
+            "前提：残留值必须真的写进了配置快照"
+        );
+        assert_eq!(
+            get("custom-gone", KEY_SANITIZE_FINGERPRINTS),
+            None,
+            "未知 provider 的残留值必须读不出来"
+        );
         assert!(
-            is_enabled("custom-gone", "sanitizeBlacklistFingerprints", true),
-            "未知 provider 必须走 default"
+            is_enabled("custom-gone", KEY_SANITIZE_FINGERPRINTS, true),
+            "未知 provider 必须走 default，不继承残留值"
         );
     }
 
     #[test]
     fn unknown_key_is_rejected() {
         assert!(set("workbuddy", "nonexistentKey", true).is_err());
+    }
+
+    /// 拼错的 provider id 不能静默写成一条死记录：读侧会把它当残留忽略，
+    /// 而 `Ok` 会让调用方以为设置生效了。
+    #[test]
+    fn unknown_provider_is_rejected_on_write() {
+        let _guard = hold_config();
+        let _restore = RestoreOptions::capture();
+        ensure_snapshot();
+        assert!(
+            set("custom-gone", KEY_SANITIZE_FINGERPRINTS, false).is_err(),
+            "未知 provider 必须被写侧拒绝"
+        );
+        // 拒绝必须是「一个字节都不写」，而不是先写后报错
+        assert_eq!(
+            raw_option("custom-gone", KEY_SANITIZE_FINGERPRINTS),
+            None,
+            "被拒绝的写入不许在配置里留下任何痕迹"
+        );
     }
 }
