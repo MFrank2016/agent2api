@@ -329,6 +329,26 @@ pub fn set_toml_path(text: &str, dotted: &str, value: &Value) -> Result<String, 
             created.set_implicit(true);
             table.insert(segment, toml_edit::Item::Table(created));
         }
+        // inline table（`a = { b = 1 }`）要**原地转成标准表**再下钻。
+        // 旧的 `toml::from_str` 路径本来就会把 inline table 归一成标准表，
+        // 这里报错等于让这些用户以前能切换、现在不能 —— 是回归。
+        // TOML 1.0 规定 inline table 内不能有注释，所以转换不丢 trivia。
+        if table.get(segment).is_some_and(toml_edit::Item::is_inline_table) {
+            // 键的 decor 会原样带进段头方括号：inline table 的键后面是
+            // 「空格 + `=`」，搬过来就成了 `[model_providers ]`。只清后缀，
+            // **保留前缀** —— 前缀里是键前的注释与换行。
+            if let Some(mut key) = table.key_mut(segment) {
+                key.leaf_decor_mut().set_suffix("");
+            }
+            let item = table
+                .get_mut(segment)
+                .ok_or_else(|| format!("TOML 里没有段 `{segment}`（路径: {dotted}）"))?;
+            let mut converted = std::mem::replace(item, toml_edit::Item::None)
+                .into_table()
+                .map_err(|_| format!("TOML 里 `{segment}` 不是表（路径: {dotted}）"))?;
+            converted.decor_mut().clear();
+            *item = toml_edit::Item::Table(converted);
+        }
         table = table
             .get_mut(segment)
             .and_then(|item| item.as_table_mut())
@@ -821,10 +841,38 @@ env_key = "OLD"
     }
 
     #[test]
+    fn set_toml_path_handles_inline_table_root() {
+        // 旧的 `toml::from_str` 路径会把 inline table 归一成标准表，
+        // 这些用户以前能切换；`toml_edit` 遍历报错就是回归。
+        let original = "model_providers = { agent2api = { base_url = \"http://old\" } }\n";
+        let updated = set_toml_path(
+            original,
+            "model_providers.agent2api.base_url",
+            &json!("http://new"),
+        )
+        .expect("inline table 必须被转换而不是报错");
+        assert!(updated.contains("http://new"));
+        assert!(!updated.contains("http://old"));
+    }
+
+    #[test]
+    fn set_toml_path_handles_inline_table_nested() {
+        // 嵌套形态：段内某个键是 inline table。
+        let original = "[model_providers]\nagent2api = { base_url = \"http://old\" }\n";
+        let updated = set_toml_path(
+            original,
+            "model_providers.agent2api.base_url",
+            &json!("http://new"),
+        )
+        .expect("嵌套 inline table 必须被转换而不是报错");
+        assert!(updated.contains("http://new"));
+    }
+
+    #[test]
     fn preview_matches_applied_output() {
-        // 回归锁定：预览与落盘必须是同一份渲染结果。
-        // 反例（v1）：preview 仍走 toml::to_string_pretty，落盘走 toml_edit，
-        // 于是预览说「注释会丢」而实际不丢。
+        // 回归锁定：预览与**落盘文件**必须是同一份渲染结果。
+        // 必须真的调用 preview 与 apply_single 两条路径 —— 都调 render_single
+        // 等于 f(x)==f(x)，把 preview 换回旧实现时测试照样绿。
         let original = "# keep me\nmodel = \"old\"\n";
         let def = crate::server::core::agents::find("codex").expect("codex 必须在注册表");
         // `Profile` 没有 `Default`：用 serde 补默认字段（其余字段都带 `#[serde(default)]`）。
@@ -837,12 +885,23 @@ env_key = "OLD"
             "model": "gpt-5",
         }))
         .expect("测试配置应当能反序列化");
-        let previewed = render_single(def, original, &profile).expect("渲染应当成功");
-        assert!(previewed.contains("# keep me"), "注释必须保留");
-        // 落盘走的也是它，所以两次渲染必须逐字相等。
+
+        let path = std::env::temp_dir().join(format!(
+            "agent2api-preview-test-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, original).expect("写临时文件应当成功");
+
+        let previewed = preview(def, &path, &profile).expect("预览应当成功");
+        apply_single(def, &path, &profile).expect("落盘应当成功");
+        let applied = std::fs::read_to_string(&path).expect("读回应当成功");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(applied.contains("# keep me"), "落盘必须保留注释");
         assert_eq!(
-            previewed,
-            render_single(def, original, &profile).expect("渲染应当成功")
+            previewed["text"].as_str().unwrap_or(""),
+            applied,
+            "预览与落盘必须逐字一致"
         );
     }
 }
