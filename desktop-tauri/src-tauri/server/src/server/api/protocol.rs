@@ -45,6 +45,7 @@ use crate::server::logging;
 use crate::server::ServerState;
 
 use super::disconnect_guard::DisconnectGuard;
+use super::keepalive;
 use super::pipeline::{
     self, error_response, json_response, record_early_failure, sse_response, RecordContext,
 };
@@ -281,16 +282,61 @@ pub async fn responses_endpoint(
         telemetry.set_cancel_token(token);
     }
     let mut guard = DisconnectGuard::new(state.request_stats(), telemetry_id.clone());
-    let outcome = forward_chat(
-        &state,
-        chat_body,
-        &headers,
-        stream,
-        pipeline::sha256_hex(&body),
-        scope,
-        telemetry.clone(),
-    )
-    .await;
+    // 保活流要求 future 是 'static：把状态与请求头 clone 进 async 块，
+    // 而不是把 handler 的借用带进去（与 `api::chat` 的 `async move` 同一做法）。
+    let dedupe_key = pipeline::sha256_hex(&body);
+    let forward_state = state.clone();
+    let forward_headers = headers.clone();
+    let forward_telemetry = telemetry.clone();
+    let forward: keepalive::ForwardFuture = Box::pin(async move {
+        forward_chat(
+            &forward_state,
+            chat_body,
+            &forward_headers,
+            stream,
+            dedupe_key,
+            scope,
+            forward_telemetry,
+        )
+        .await
+    });
+    // 流式请求先与宽限期赛跑：慢上游立刻回 200 + SSE 保活，首字节不再等上游
+    // （与 /v1/chat/completions 同一机制，见 `api::keepalive` 模块头）。
+    let outcome = if stream {
+        match keepalive::race(forward, keepalive::GRACE).await {
+            keepalive::ForwardStart::Ready(outcome) => outcome,
+            keepalive::ForwardStart::Slow(forward) => {
+                guard.handoff();
+                let context = RecordContext {
+                    stats: state.request_stats(),
+                    telemetry: telemetry.clone(),
+                    started_at,
+                    model: requested_model.clone(),
+                    client_model: client_model.clone(),
+                    client_reasoning: client_reasoning.clone(),
+                    status: 200,
+                    raw_request: pipeline::capture_raw_body(&body),
+                    raw_response: None,
+                    is_test: false,
+                    client: client.clone(),
+                };
+                let model = requested_model.clone();
+                let request = original.clone();
+                let materialize: keepalive::Materialize = Box::new(move |outcome, context| {
+                    materialize_responses(outcome, context, &model, &request)
+                });
+                let stream = keepalive::KeepAliveStream::new(
+                    forward,
+                    keepalive::KEEP_ALIVE_INTERVAL,
+                    context,
+                    materialize,
+                );
+                return sse_response(StatusCode::OK, Box::new(stream));
+            }
+        }
+    } else {
+        forward.await
+    };
     let context = RecordContext {
         stats: state.request_stats(),
         telemetry,
@@ -494,16 +540,60 @@ pub async fn messages_endpoint(
         telemetry.set_cancel_token(token);
     }
     let mut guard = DisconnectGuard::new(state.request_stats(), telemetry_id.clone());
-    let outcome = forward_chat(
-        &state,
-        chat_body,
-        &headers,
-        stream,
-        pipeline::sha256_hex(&body),
-        scope,
-        telemetry.clone(),
-    )
-    .await;
+    // 保活流要求 future 是 'static：把状态与请求头 clone 进 async 块，
+    // 而不是把 handler 的借用带进去（与 `api::chat` 的 `async move` 同一做法）。
+    let dedupe_key = pipeline::sha256_hex(&body);
+    let forward_state = state.clone();
+    let forward_headers = headers.clone();
+    let forward_telemetry = telemetry.clone();
+    let forward: keepalive::ForwardFuture = Box::pin(async move {
+        forward_chat(
+            &forward_state,
+            chat_body,
+            &forward_headers,
+            stream,
+            dedupe_key,
+            scope,
+            forward_telemetry,
+        )
+        .await
+    });
+    // 流式请求先与宽限期赛跑：慢上游立刻回 200 + SSE 保活，首字节不再等上游
+    // （与 /v1/chat/completions 同一机制，见 `api::keepalive` 模块头）。
+    let outcome = if stream {
+        match keepalive::race(forward, keepalive::GRACE).await {
+            keepalive::ForwardStart::Ready(outcome) => outcome,
+            keepalive::ForwardStart::Slow(forward) => {
+                guard.handoff();
+                let context = RecordContext {
+                    stats: state.request_stats(),
+                    telemetry: telemetry.clone(),
+                    started_at,
+                    model: requested_model.clone(),
+                    client_model: client_model.clone(),
+                    client_reasoning: client_reasoning.clone(),
+                    status: 200,
+                    raw_request: pipeline::capture_raw_body(&body),
+                    raw_response: None,
+                    is_test: false,
+                    client: client.clone(),
+                };
+                let model = requested_model.clone();
+                let materialize: keepalive::Materialize = Box::new(move |outcome, context| {
+                    materialize_anthropic(outcome, context, &model)
+                });
+                let stream = keepalive::KeepAliveStream::new(
+                    forward,
+                    keepalive::KEEP_ALIVE_INTERVAL,
+                    context,
+                    materialize,
+                );
+                return sse_response(StatusCode::OK, Box::new(stream));
+            }
+        }
+    } else {
+        forward.await
+    };
     let context = RecordContext {
         stats: state.request_stats(),
         telemetry,
@@ -618,4 +708,120 @@ fn anthropic_error_response_with_status(status: u16, message: &str) -> Response 
     let mut response = json_response(body);
     *response.status_mut() = code;
     response
+}
+/// 慢分支：把转发结果变成 Responses 协议的下游字节流（`keepalive::Materialize` 实现）。
+///
+/// 与快分支的流式路径同源：
+///   - `Stream`     → 上游 Chat 帧经 `ResponsesStream` 逐帧翻译；
+///   - `Completion` → 先翻成 Responses 响应对象，再补一帧 `response.completed`；
+///   - `Err`        → 一帧 `error` + 一帧 `response.failed`（与机器内部的错误形态一致）。
+fn materialize_responses(
+    outcome: Result<ForwardOutcome, GatewayError>,
+    mut context: RecordContext,
+    model: &str,
+    request: &Value,
+) -> keepalive::InnerStream {
+    match outcome {
+        Ok(ForwardOutcome::Stream { status, stream: source }) => {
+            context.status = i64::from(status);
+            let mut machine = responses::ResponsesStream::new(model, request);
+            pipeline::transformed_stream(
+                source,
+                context,
+                pipeline::terminal::RESPONSES,
+                move |chunk| machine.push(chunk),
+            )
+        }
+        Ok(ForwardOutcome::Completion { body }) => {
+            context.status = 200;
+            let response = responses::responses_from_chat(&body, model, request);
+            let payload = serde_json::to_string(&json!({ "response": response }))
+                .unwrap_or_else(|_| "{}".to_string());
+            let frames: Vec<Result<Bytes, std::io::Error>> = vec![Ok(Bytes::from(format!(
+                "event: response.completed\ndata: {payload}\n\n"
+            )))];
+            pipeline::transformed_stream(
+                Box::new(futures::stream::iter(frames)),
+                context,
+                pipeline::terminal::RESPONSES,
+                |chunk| vec![Bytes::copy_from_slice(chunk)],
+            )
+        }
+        Err(error) => {
+            context.status = i64::from(error.http_status().as_u16());
+            let message = error.message.clone();
+            context.telemetry.note_error(&message);
+            let error_payload = serde_json::to_string(
+                &json!({ "code": Value::Null, "message": message, "param": Value::Null }),
+            )
+            .unwrap_or_else(|_| "{}".to_string());
+            let frames: Vec<Result<Bytes, std::io::Error>> = vec![
+                Ok(Bytes::from(format!("event: error\ndata: {error_payload}\n\n"))),
+                Ok(Bytes::from_static(
+                    b"event: response.failed\ndata: {\"response\":null}\n\n",
+                )),
+            ];
+            pipeline::transformed_stream(
+                Box::new(futures::stream::iter(frames)),
+                context,
+                pipeline::terminal::RESPONSES,
+                |chunk| vec![Bytes::copy_from_slice(chunk)],
+            )
+        }
+    }
+}
+
+/// 慢分支：把转发结果变成 Anthropic Messages 协议的下游字节流。
+fn materialize_anthropic(
+    outcome: Result<ForwardOutcome, GatewayError>,
+    mut context: RecordContext,
+    model: &str,
+) -> keepalive::InnerStream {
+    match outcome {
+        Ok(ForwardOutcome::Stream { status, stream: source }) => {
+            context.status = i64::from(status);
+            let mut machine = anthropic::AnthropicStream::new(model);
+            pipeline::transformed_stream(
+                source,
+                context,
+                pipeline::terminal::ANTHROPIC,
+                move |chunk| machine.push(chunk),
+            )
+        }
+        Ok(ForwardOutcome::Completion { body }) => {
+            context.status = 200;
+            let response = anthropic::anthropic_from_chat(&body, model);
+            let payload = serde_json::to_string(&json!({ "message": response }))
+                .unwrap_or_else(|_| "{}".to_string());
+            let frames: Vec<Result<Bytes, std::io::Error>> = vec![
+                Ok(Bytes::from(format!("event: message_start\ndata: {payload}\n\n"))),
+                Ok(Bytes::from_static(b"event: message_stop\ndata: {}\n\n")),
+            ];
+            pipeline::transformed_stream(
+                Box::new(futures::stream::iter(frames)),
+                context,
+                pipeline::terminal::ANTHROPIC,
+                |chunk| vec![Bytes::copy_from_slice(chunk)],
+            )
+        }
+        Err(error) => {
+            context.status = i64::from(error.http_status().as_u16());
+            let message = error.message.clone();
+            context.telemetry.note_error(&message);
+            let kind = anthropic::error_kind_for_status(error.http_status().as_u16());
+            let error_payload =
+                serde_json::to_string(&json!({ "error": { "type": kind, "message": message } }))
+                    .unwrap_or_else(|_| "{}".to_string());
+            let frames: Vec<Result<Bytes, std::io::Error>> = vec![
+                Ok(Bytes::from(format!("event: error\ndata: {error_payload}\n\n"))),
+                Ok(Bytes::from_static(b"event: message_stop\ndata: {}\n\n")),
+            ];
+            pipeline::transformed_stream(
+                Box::new(futures::stream::iter(frames)),
+                context,
+                pipeline::terminal::ANTHROPIC,
+                |chunk| vec![Bytes::copy_from_slice(chunk)],
+            )
+        }
+    }
 }
