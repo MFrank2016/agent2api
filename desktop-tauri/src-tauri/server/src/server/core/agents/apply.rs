@@ -13,12 +13,12 @@
 //! 抹掉。cc-switch 与 magpie 都是「只改该改的那一个键」，这里照同一条原则：
 //! 读进来 → 改指定路径 → 写回去。
 //!
-//! ── 注释保不住（已知取舍，预览里如实告知）──────────────────
-//! 写入走的是「解析成值树 → 改键 → 重新序列化」，因此 JSONC / TOML 里的
-//! **注释会丢**（键序在 `preserve_order` 下保住）。要保住注释得用
-//! `jsonc-parser` / `toml_edit` 这类「带 trivia 的语法树」，为几行注释引两棵
-//! 新依赖树不划算。折中办法：`preview` 在检测到原文件有注释时返回
-//! `warnings`，界面照实显示「这些注释会被清掉」；写前有备份，可按备份还原。
+//! ── 注释：TOML 保留，JSONC 仍会丢（如实告知）───────────────
+//! TOML（Codex）走 `set_toml_path`：`toml_edit` 的带 trivia 语法树，只动
+//! 目标键，注释 / 键序 / 行尾注释全保留。JSON / JSONC 仍是
+//! 「解析成值树 → 改键 → 重新序列化」，**注释会丢**（键序在
+//! `preserve_order` 下保住）—— JSONC 的 `preview` 在检测到原文件有
+//! 注释时返回 `warnings`，界面照实显示；写前有备份，可按备份还原。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────
 //! release 是 `panic=abort`：零 unwrap/expect/panic。写文件走「临时文件 +
@@ -297,35 +297,120 @@ fn set_path(root: &mut Value, path: &str, value: Value) {
     }
 }
 
-/// 单配置写入：读原文 → 改指定键 → 原子写回。
+/// 按点分路径写入一个 TOML 值，**保留注释、键序与格式**。
 ///
-/// TOML 走「解析成表 → 改 → 序列化」：`toml` crate 的序列化会丢掉注释。
-/// 这是已知取舍 —— 保住注释要引 `toml_edit`，而它带来的复杂度（读写两套
-/// 数据结构）大于收益：Codex 的 config.toml 通常只有几十行、用户手写注释少。
-/// 写前有备份，真要找回注释可以从备份里抄。注释会被清掉这件事在 `preview`
-/// 里以 `warnings` 明确告知，不静默。
-pub fn apply_single(def: &ClientDef, path: &Path, profile: &Profile) -> Result<(), String> {
-    let original = read_text(path)?.unwrap_or_default();
-    let targets = single_targets(def, profile);
-
-    let rendered = match def.format {
-        ConfigFormat::Toml => {
-            let mut value = parse_toml(&original)?;
-            for (key, item) in &targets {
-                set_path(&mut value, key, item.clone());
+/// ── 与既有 `toml::to_string_pretty` 的分工 ────────────────────
+/// 那条路径是「解析成 `toml::Table` → 改键 → 整体序列化」，注释在解析阶段
+/// 就丢了。本函数用 `toml_edit`（带 trivia 的语法树），只动目标键那一处。
+///
+/// ── 路径形态：支持单段与多段 ──────────────────────────────────
+/// Codex 的 targets 里既有顶层单段键（`model` / `model_provider`），也有
+/// 三段键（`model_providers.agent2api.base_url`）。用 `split('.')` 逐段走，
+/// 不要 `rsplit_once('.')` —— 后者对单段路径直接报错。
+///
+/// ── 缺表时**创建**而不是报错 ──────────────────────────────────
+/// 与既有 `set_path`（apply.rs:288-296）同一语义：首次接管一个只有
+/// `model` 的 config.toml 时，`[model_providers.agent2api]` 段必须被建出来。
+/// 报错会让「第一次切换」必然失败。
+pub fn set_toml_path(text: &str, dotted: &str, value: &Value) -> Result<String, String> {
+    let mut document = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format!("解析 TOML 失败: {error}"))?;
+    let segments: Vec<&str> = dotted.split('.').collect();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return Err(format!("路径含空段: {dotted}"));
+    }
+    let mut table = document.as_table_mut();
+    for segment in &segments[..segments.len() - 1] {
+        if !table.contains_key(segment) {
+            // 新建的中间表标成 implicit：只包含子表时不出 `[model_providers]`
+            // 这种空段头（`[model_providers.agent2api]` 一个就够）。
+            let mut created = toml_edit::Table::new();
+            created.set_implicit(true);
+            table.insert(segment, toml_edit::Item::Table(created));
+        }
+        table = table
+            .get_mut(segment)
+            .and_then(|item| item.as_table_mut())
+            .ok_or_else(|| format!("TOML 里 `{segment}` 不是表（路径: {dotted}）"))?;
+    }
+    let key = segments[segments.len() - 1];
+    let item = json_to_toml_item(value)?;
+    match table.get_mut(key) {
+        // 键已存在：**原地换值**，不动 key 的 decor。
+        // 不能用 `Table::insert` —— 它对已存在的键会调 `key.fmt()`，
+        // 而键前面的注释（`# 实验性设置，别动`）就存在 key 的 leaf decor 里，
+        // 一 fmt 就丢。
+        Some(existing) if existing.is_value() => {
+            let previous = existing.clone();
+            *existing = item;
+            if let (Some(old), Some(new)) = (previous.as_value(), existing.as_value_mut()) {
+                // 行尾注释是**值的 decor**（`base_url = "..."  # 旧地址`），
+                // 新值自带的是默认 decor，不抄过来就丢。
+                *new.decor_mut() = old.decor().clone();
             }
-            toml::to_string_pretty(&value).map_err(|error| format!("生成 TOML 失败: {error}"))?
+        }
+        // 键不存在：新增（decor 用默认值）。
+        _ => {
+            table.insert(key, item);
+        }
+    }
+    Ok(document.to_string())
+}
+
+/// JSON 值 → TOML 值。只支持本项目实际会写的标量。
+fn json_to_toml_item(value: &Value) -> Result<toml_edit::Item, String> {
+    Ok(match value {
+        Value::String(text) => toml_edit::value(text.clone()),
+        Value::Bool(flag) => toml_edit::value(*flag),
+        Value::Number(number) => {
+            if let Some(int) = number.as_i64() {
+                toml_edit::value(int)
+            } else if let Some(float) = number.as_f64() {
+                toml_edit::value(float)
+            } else {
+                return Err(format!("TOML 无法表示的数字: {number}"));
+            }
+        }
+        Value::Array(_) | Value::Object(_) => {
+            return Err("本项目不写复合 TOML 值（数组 / 表），遇到即报错".to_string())
+        }
+        Value::Null => return Err("TOML 没有 null".to_string()),
+    })
+}
+
+/// 渲染单配置客户端写完之后的样子（`apply_single` 与 `preview` 共用）。
+///
+/// TOML 走 `set_toml_path`（带 trivia 的语法树）：注释、键序、行尾注释
+/// 全部保留，逐路径串行写入 —— 每次调用拿上一轮的文本当输入。
+/// 其余格式（JSON / JSONC / JsonEnv）仍走旧的值树路径，注释仍会丢。
+pub fn render_single(def: &ClientDef, original: &str, profile: &Profile) -> Result<String, String> {
+    let targets = single_targets(def, profile);
+    match def.format {
+        ConfigFormat::Toml => {
+            // 逐个路径写入带 trivia 的语法树，注释与键序保留。
+            let mut text = original.to_string();
+            for (key, item) in &targets {
+                text = set_toml_path(&text, key, item)?;
+            }
+            Ok(text)
         }
         _ => {
-            let mut value = parse_json_like(def.format, &original)?;
+            let mut value = parse_json_like(def.format, original)?;
             for (key, item) in &targets {
                 set_path(&mut value, key, item.clone());
             }
-            serde_json::to_string_pretty(&value)
+            Ok(serde_json::to_string_pretty(&value)
                 .map_err(|error| format!("生成 JSON 失败: {error}"))?
-                + "\n"
+                + "\n")
         }
-    };
+    }
+}
+
+/// 单配置写入：读原文 → 渲染 → 原子写回。
+pub fn apply_single(def: &ClientDef, path: &Path, profile: &Profile) -> Result<(), String> {
+    let original = read_text(path)?.unwrap_or_default();
+    let rendered = render_single(def, &original, profile)?;
 
     write_atomic(path, &rendered)?;
 
@@ -480,23 +565,8 @@ pub fn preview(def: &ClientDef, path: &Path, profile: &Profile) -> Result<Value,
         }));
     }
 
-    let targets = single_targets(def, profile);
-    let rendered = match def.format {
-        ConfigFormat::Toml => {
-            let mut value = parse_toml(&original)?;
-            for (key, item) in &targets {
-                set_path(&mut value, key, item.clone());
-            }
-            toml::to_string_pretty(&value).unwrap_or_default()
-        }
-        _ => {
-            let mut value = parse_json_like(def.format, &original)?;
-            for (key, item) in &targets {
-                set_path(&mut value, key, item.clone());
-            }
-            serde_json::to_string_pretty(&value).unwrap_or_default() + "\n"
-        }
-    };
+    // 与 `apply_single` 同一渲染函数：预览说什么，落盘就是什么。
+    let rendered = render_single(def, &original, profile)?;
     let (changed, added) = diff_line_numbers(&original, &rendered);
     Ok(json!({
         "path": path.display().to_string(),
@@ -509,8 +579,9 @@ pub fn preview(def: &ClientDef, path: &Path, profile: &Profile) -> Result<Value,
 
 /// 原文件里有多少注释、会不会被清掉 —— 写进预览的 `warnings`。
 ///
-/// 这不是可选项：写入是「解析成值树再序列化」，注释必然丢失。与其让用户写完
-/// 才发现，不如在预览里当场说清楚（写前有备份，可按备份还原）。
+/// 只有 JSONC 会丢注释：TOML 走 `set_toml_path`（带 trivia），JsonEnv 走
+/// `merge_env`，都不需要告警。JSONC 仍是「解析成值树再序列化」，与其让
+/// 用户写完才发现，不如在预览里当场说清楚（写前有备份，可按备份还原）。
 fn comment_warnings(format: ConfigFormat, original: &str) -> Vec<String> {
     let mut out = Vec::new();
     match format {
@@ -524,15 +595,7 @@ fn comment_warnings(format: ConfigFormat, original: &str) -> Vec<String> {
             }
         }
         ConfigFormat::Toml => {
-            let count = original
-                .lines()
-                .filter(|line| line.trim_start().starts_with('#'))
-                .count();
-            if count > 0 {
-                out.push(format!(
-                    "原文件里有 {count} 行注释；写入会清掉它们（键与其它设置保留，写前有备份）"
-                ));
-            }
+            // TOML 走 `set_toml_path`，注释与键序都保住了 —— 不再告警。
         }
         ConfigFormat::JsonEnv => {
             // .env 走 merge_env：只替换我们那两个键，其它行原样保留 ——
@@ -701,4 +764,85 @@ pub fn restore_latest(client_id: &str, target: &Path) -> Result<PathBuf, String>
         .map_err(|error| format!("读备份 {} 失败: {error}", source.display()))?;
     write_atomic(target, &text)?;
     Ok(source)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_toml_path_handles_single_segment() {
+        // Codex 的 targets 里有顶层单段键（`model` / `model_provider`）。
+        // v1 计划用 rsplit_once('.') 要求至少两段 → 对单段直接报错。
+        let updated = set_toml_path("model = \"old\"\n", "model", &json!("new"))
+            .expect("单段键必须支持");
+        assert!(updated.contains("model = \"new\""));
+    }
+
+    #[test]
+    fn set_toml_path_creates_missing_tables() {
+        // 既有 set_path 会沿路径创建中间对象（apply.rs:288-296）。
+        // 首次接管一个只有 model 的 config.toml 时，provider 段必须被建出来，
+        // 否则用户第一次切换就失败。
+        let updated = set_toml_path(
+            "model = \"gpt-5\"\n",
+            "model_providers.agent2api.base_url",
+            &json!("http://127.0.0.1:3065/v1"),
+        )
+        .expect("缺表时必须创建，不是报错");
+        assert!(updated.contains("[model_providers.agent2api]"));
+        assert!(updated.contains("base_url = \"http://127.0.0.1:3065/v1\""));
+    }
+
+    #[test]
+    fn set_toml_path_preserves_comments_and_order() {
+        let original = r#"# 我的 Codex 配置
+model = "gpt-5"
+
+# 实验性设置，别动
+[model_providers.agent2api]
+base_url = "http://old/v1"   # 旧地址
+env_key = "OLD"
+"#;
+        let updated = set_toml_path(
+            original,
+            "model_providers.agent2api.base_url",
+            &json!("http://127.0.0.1:3065/v1"),
+        )
+        .expect("应当写入成功");
+        assert!(updated.contains("# 我的 Codex 配置"), "顶层注释必须保留");
+        assert!(updated.contains("# 实验性设置，别动"), "段注释必须保留");
+        assert!(updated.contains("# 旧地址"), "行尾注释必须保留");
+        assert!(updated.contains("http://127.0.0.1:3065/v1"));
+        assert!(!updated.contains("http://old/v1"));
+        let model_pos = updated.find("model = \"gpt-5\"").expect("model 行还在");
+        let provider_pos = updated.find("[model_providers.agent2api]").expect("段还在");
+        assert!(model_pos < provider_pos, "键序必须保持");
+    }
+
+    #[test]
+    fn preview_matches_applied_output() {
+        // 回归锁定：预览与落盘必须是同一份渲染结果。
+        // 反例（v1）：preview 仍走 toml::to_string_pretty，落盘走 toml_edit，
+        // 于是预览说「注释会丢」而实际不丢。
+        let original = "# keep me\nmodel = \"old\"\n";
+        let def = crate::server::core::agents::find("codex").expect("codex 必须在注册表");
+        // `Profile` 没有 `Default`：用 serde 补默认字段（其余字段都带 `#[serde(default)]`）。
+        let profile: Profile = serde_json::from_value(json!({
+            "id": "test",
+            "name": "test",
+            "kind": "gateway",
+            "protocol": "responses",
+            "baseUrl": "http://127.0.0.1:3065/v1",
+            "model": "gpt-5",
+        }))
+        .expect("测试配置应当能反序列化");
+        let previewed = render_single(def, original, &profile).expect("渲染应当成功");
+        assert!(previewed.contains("# keep me"), "注释必须保留");
+        // 落盘走的也是它，所以两次渲染必须逐字相等。
+        assert_eq!(
+            previewed,
+            render_single(def, original, &profile).expect("渲染应当成功")
+        );
+    }
 }

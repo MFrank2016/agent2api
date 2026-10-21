@@ -83,6 +83,12 @@ sha1 = "0.10"
 # preserve_order：Agent 页写回 Codex 的 config.toml 时要保住用户原有的键序，
 # 否则每写一次就把整份文件重排一遍（注释仍会丢，写前有备份可回退）
 toml = { version = "0.9", features = ["preserve_order"] }
+# 保留注释与格式地改写 TOML（Codex 的 config.toml 是用户手写的）。
+# `toml`（既有）是「解析成值树」，本 crate 是「带 trivia 的语法树」。
+# **版本必须是 0.25**：该版本已由 `proc-macro-crate` 引入并在 Cargo.lock 中，
+# 提为直接依赖不新增版本树。`toml 0.9.12` 本身已不用 `toml_edit`
+# （它用 toml_parser / toml_writer），所以钉 0.22 会新增第四个版本 —— 不要。
+toml_edit = "0.25"
 # ALTCHA 机器人校验的 challenge 签名（HMAC-SHA256，见 server/altcha.rs）
 hmac = "0.12"
 chrono = "0.4"
