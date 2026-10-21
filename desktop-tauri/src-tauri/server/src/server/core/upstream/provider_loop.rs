@@ -2344,6 +2344,11 @@ fn limit_model_label(requested: &str, wire: &str) -> String {
 ///     **且**要把 `stripNewlineKeepalive` 开关打开（默认关，见
 ///     `config::KEY_STRIP_NEWLINE_KEEPALIVE`）—— 装配规则与两位的先后关系
 ///     写在 [`super::sse::FramePolicy::assembled`]。
+///   - 剥离开头的 think 块（`core::middleware::think_tags`）：判定只依赖文本
+///     本身，所以**没有能力位**，只看开关。默认值来自全局键
+///     `config::KEY_STRIP_LEADING_THINK`（缺省 false），`providerOptions` 里的
+///     同名键可逐家覆盖 —— 逐家开关的读法与 sanitize 那一处同一形态
+///     （`core::provider_options::is_enabled`）。
 ///
 /// 其余 provider（以及没开开关的本两家）得到全关的 `FramePolicy`，下发帧
 /// 逐字节不变（workbuddy 那条「透传逐字节不变」的硬要求只在开关打开时让路一次）。
@@ -2354,6 +2359,11 @@ fn frame_policy_of(adapter: &dyn ProviderAdapter, model: &str) -> super::sse::Fr
             .then(|| super::sse::ModelRewrite { requested: model.to_string() }),
         adapter.sse_strip_newline_chunks(),
         crate::server::config::strip_newline_keepalive(),
+        crate::server::core::provider_options::is_enabled(
+            crate::server::core::providers::kind_id(adapter.kind()),
+            crate::server::config::KEY_STRIP_LEADING_THINK,
+            crate::server::config::strip_leading_think(),
+        ),
     )
 }
 

@@ -41,6 +41,7 @@
 //!   crypto.rs            通用对称加解密（AES-256-GCM + `enc1:` 信封），按
 //!                        `SecretScope` 分密钥域；GitHub 令牌与账号表共用
 //!                        （实现原在 `update/token.rs`，抽出供账号表复用）
+//!   middleware/          下发内容的通用后处理（开头 think 块剥离，默认关）
 //!   legacy_api_key.rs    顶层旧字段 `apiKey`（单 Key 兼容形态）的原地加密迁移；
 //!                        读侧的兼容与降级处理仍在 `api_keys.rs`
 //!   update/              软件更新（版本/出网/下载状态机）（workbuddy-update.mjs）
@@ -93,6 +94,8 @@ pub mod key_quota;
 pub mod legacy_api_key;
 pub mod limiter;
 pub mod login;
+/// 下发内容的通用后处理（与具体上游无关的内容改写，见模块头）。
+pub mod middleware;
 pub mod model_meta;
 pub mod model_rules;
 pub mod models;

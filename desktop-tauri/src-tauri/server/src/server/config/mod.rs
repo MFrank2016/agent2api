@@ -1103,6 +1103,25 @@ pub fn strip_newline_keepalive() -> bool {
     env_strip_newline_keepalive()
 }
 
+/// 只取「剥离响应开头的思考标签」开关的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 [`strip_newline_keepalive`] 同一取舍：它在**每次装配下发策略**时读
+/// （`upstream::provider_loop::frame_policy_of`），而 `current()` 每调一次就
+/// 克隆整个 `raw` Map —— 热路径上没必要。
+///
+/// 本函数只提供**全局默认值**：`providerOptions` 里的同名键可逐家覆盖
+/// （见 `core::provider_options::is_enabled`，调用点把本值当 `default` 传进去）。
+/// 未初始化（启动极早期 / 单元测试里没装配过配置）时给 `false`，与
+/// `cors_enabled` 同一口径；默认关意味着没有明确开启就不改写上游原样字节。
+pub fn strip_leading_think() -> bool {
+    with_raw(|raw| {
+        raw.get(KEY_STRIP_LEADING_THINK)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    })
+    .unwrap_or(false)
+}
+
 /// 只取「长度截断自动续写」开关的轻量读取（**不克隆整份 raw**）。
 ///
 /// 与 [`strip_newline_keepalive`] 同一取舍：转发层**每个请求**都要问一次

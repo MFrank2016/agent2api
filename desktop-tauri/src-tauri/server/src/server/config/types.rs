@@ -196,6 +196,20 @@ pub const KEY_CORS_ENABLED: &str = "corsEnabled";
 /// —— Docker 部署想从第一次启动就打开的，不必先进面板点一次。
 pub const KEY_STRIP_NEWLINE_KEEPALIVE: &str = "stripNewlineKeepalive";
 
+/// 「剥离响应开头的思考标签」开关的键（config.json 键，见
+/// `core::middleware::think_tags`）。
+///
+/// 打开后，下发给客户端的正文若以 `<think>…</think>`（以及 `THINK_TAGS` 里的
+/// 另外三组）**开头**，就把那一块连同标签一起剥掉；正文中间的标签一律不动
+/// （那是用户内容）。只做**开头**这一块：它与 Qoder 那台「把正文中间标签转成
+/// reasoning delta」的机器语义不同，不要互相替代。
+///
+/// **默认关闭**：关着时下发字节与接入前逐字一致。开着才会改写上游原样字节，
+/// 而上游到底会不会这么发是**按家**不同的 —— 所以真正决定开不开的是
+/// `providerOptions`（`core::provider_options::is_enabled`），本键只提供全局
+/// 默认值。键不存在 = 跟随本键（缺省 false）。
+pub const KEY_STRIP_LEADING_THINK: &str = "stripLeadingThink";
+
 /// 机器人校验开关的键（config.json 键，ALTCHA proof-of-work，见 `server::altcha`）。
 ///
 /// **默认开启**：登录 / 注册是公开的认证边界，脚本可以无限打（暴破密码、

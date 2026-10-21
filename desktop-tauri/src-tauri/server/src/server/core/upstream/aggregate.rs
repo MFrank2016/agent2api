@@ -60,6 +60,10 @@ pub struct AggregatedCompletion {
 /// `payload.model = requestedModel`）。保活换行分片同理：上游插的那些
 /// 「整片只有换行」的分片在流式里会被丢掉，非流式若照抄就把同一个噪声以
 /// 词间换行的形式交给了客户端（见 `sse.rs` 模块头的实测）。
+///
+/// 开头 think 块的剥离同样走 `policy`：流式在 `ReasoningCoalescer` 里剥，
+/// 非流式在这里（`into_completion`）剥 —— **两条路径都要改**，只改一条会让
+/// 一半响应保留标签（见 `core::middleware::think_tags`）。
 pub async fn aggregate_sse_completion(
     response: wreq::Response,
     telemetry: Arc<RequestTelemetry>,
@@ -135,6 +139,7 @@ async fn aggregate_frame_stream_inner(
     let mut acc = CompletionAccumulator {
         rewrite: policy.rewrite,
         strip_newline_chunks: policy.strip_newline_chunks,
+        strip_leading_think: policy.strip_leading_think,
         ..Default::default()
     };
     // 首响采集：聚合路径不走 RecordingStream（客户端要的是完整 JSON，
@@ -205,6 +210,9 @@ struct CompletionAccumulator {
     /// 丢弃「整片只有换行」的 content 分片（WorkBuddy / AutoClaw 的保活节拍，
     /// 判据与理由见 `sse::is_newline_keepalive`）。false = 与接入前逐字一致。
     strip_newline_chunks: bool,
+    /// 剥离正文**开头**的 think 块（见 `core::middleware::think_tags`）。
+    /// false = 与接入前逐字一致。
+    strip_leading_think: bool,
 }
 
 impl CompletionAccumulator {
@@ -355,7 +363,15 @@ impl CompletionAccumulator {
             "role".to_string(),
             Value::String(if self.role.is_empty() { "assistant".to_string() } else { self.role }),
         );
-        message.insert("content".to_string(), Value::String(self.content));
+        // 开头 think 块的剥离（非流式路径的**唯一**出口）：流式走
+        // `ReasoningCoalescer`，非流式走这里 —— 两条路径都要改，只改一条会让
+        // 非流式响应保留标签。开关关着时原样搬运（逐字一致）。
+        let content = if self.strip_leading_think {
+            crate::server::core::middleware::think_tags::strip_leading(&self.content).0
+        } else {
+            self.content
+        };
+        message.insert("content".to_string(), Value::String(content));
         if !self.reasoning.is_empty() {
             message.insert("reasoning_content".to_string(), Value::String(self.reasoning));
         }
@@ -600,6 +616,43 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string()
+    }
+
+    /// 非流式路径也要剥开头标签。
+    ///
+    /// 回归锁定：非流式响应走 `CompletionAccumulator`（不是
+    /// `ReasoningCoalescer`）—— 只改流式那一台，这条会红。
+    #[test]
+    fn non_stream_strips_the_leading_think_block() {
+        fn fold_content(strip: bool) -> String {
+            let mut acc = CompletionAccumulator {
+                strip_leading_think: strip,
+                ..Default::default()
+            };
+            let telemetry = RequestTelemetry::new();
+            for delta in [json!({"content": "<think>内心"}), json!({"content": "戏</think>答案"})] {
+                let chunk = json!({
+                    "id": "c1",
+                    "model": "m",
+                    "created": 1,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
+                    "usage": Value::Null,
+                });
+                acc.consume_chunk(&chunk, &telemetry)
+                    .expect("测试里的帧不该被判成上游错误");
+            }
+            let body = acc.into_completion().body;
+            body.pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        }
+        assert_eq!(fold_content(true), "答案", "开启时必须剥掉开头的思考块");
+        assert_eq!(
+            fold_content(false),
+            "<think>内心戏</think>答案",
+            "关着时逐字保留（默认态与接入前一致）"
+        );
     }
 
     #[test]

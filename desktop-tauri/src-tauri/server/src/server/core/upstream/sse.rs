@@ -60,6 +60,13 @@
 //! 关着时帧的字节与接入前逐字一致；开与不开由**适配器**回答
 //! （`ProviderAdapter::sse_strip_newline_chunks`）。判据刻意做成「宁可不丢」，
 //! 见 [`is_newline_keepalive`]。
+//!
+//! ── 剥离响应**开头**的 think 块 ────────────────────────────
+//! 部分上游把整段思考塞在正文最前面（`<think>…</think>`），客户端不认这些
+//! 标签。开关打开时，正文帧先过 `core::middleware::think_tags` 的跨帧过滤器：
+//! 只剥**开头**那一块，正文中间的标签一律不动（那是用户内容）。默认关，关着
+//! 时帧的字节与接入前逐字一致。判据、跨帧语义与「为什么不能缓冲正常响应」
+//! 见那个模块的模块头。
 
 use std::sync::Arc;
 
@@ -67,6 +74,8 @@ use bytes::Bytes;
 use serde_json::Value;
 
 use crate::server::logging;
+
+use crate::server::core::middleware::think_tags::LeadingThinkFilter;
 
 use super::usage::RequestTelemetry;
 
@@ -83,43 +92,56 @@ pub struct ModelRewrite {
     pub requested: String,
 }
 
-/// 下发帧的两项改写开关：都由**适配器**回答，通用层（本状态机与 `aggregate`）
-/// 只执行，不在那里出现 provider 分支。
+/// 下发帧的改写开关：都由**适配器 + 配置**回答，通用层（本状态机与
+/// `aggregate`）只执行，不在那里出现 provider 分支。
 ///
-/// 把两项打包成一个结构而不是各加一个位置参数：它们在链路上**永远同源**
-/// （都来自同一次 `adapter` 查询 + 同一个请求的模型名），拆成两个参数会让
-/// `ForwardStream` / 聚合器的五六个签名各多一个裸 `bool`，调用点上根本读不出
-/// 那个 `true` 是哪一项。
+/// 把几项打包成一个结构而不是各加一个位置参数：它们在链路上**永远同源**
+/// （都来自同一次 `adapter` 查询 + 同一个请求的模型名 + 同一份配置快照），
+/// 拆成多个参数会让 `ForwardStream` / 聚合器的五六个签名各多一个裸 `bool`，
+/// 调用点上根本读不出那个 `true` 是哪一项。
 #[derive(Clone, Debug, Default)]
 pub struct FramePolicy {
     /// model 名回写（None = 原样透传上游的 `model`）
     pub rewrite: Option<ModelRewrite>,
     /// 丢弃「整片只有换行」的 content 分片（见模块头与 [`is_newline_keepalive`]）
     pub strip_newline_chunks: bool,
+    /// 剥离响应**开头**的 `<think>…</think>` 块（见
+    /// `core::middleware::think_tags`）。默认关：关着时下发字节与接入前逐字一致。
+    pub strip_leading_think: bool,
 }
 
 impl FramePolicy {
     /// 只带 model 回写、其余按默认（自定义家的转发路径用它：那家的保活形态
     /// 没有实测过，不去动它的字节）
     pub fn with_rewrite(rewrite: Option<ModelRewrite>) -> Self {
-        Self { rewrite, strip_newline_chunks: false }
+        Self { rewrite, strip_newline_chunks: false, strip_leading_think: false }
     }
 
-    /// 由**能力位 × 全局开关**装配（转发链上唯一的生产入口，见
+    /// 由**能力位 × 开关**装配（转发链上唯一的生产入口，见
     /// `provider_loop::frame_policy_of`）。
     ///
-    /// 两者的**顺序**是有意的：能力位在前、开关在后 ⇒ 这个开关只能**收窄**
-    /// （关掉它，一家本来就声明了能力位的提供商退回逐字节透传），不能**扩张**
-    /// （开了它，也不会替一家没实测过的上游凭空开始丢帧）。反过来的话，
-    /// 「改一个部署参数」就能动到任意一家的下发字节 —— 那正是本仓拒绝的形态：
-    /// 丢帧的依据只覆盖实测过的 WorkBuddy / AutoClaw 两家（见模块头），
-    /// 而部署参数是谁都能设的。
+    /// 前两项（`declared` / `switch_on`）的**顺序**是有意的：能力位在前、开关
+    /// 在后 ⇒ 这个开关只能**收窄**（关掉它，一家本来就声明了能力位的提供商退回
+    /// 逐字节透传），不能**扩张**（开了它，也不会替一家没实测过的上游凭空开始
+    /// 丢帧）。反过来的话，「改一个部署参数」就能动到任意一家的下发字节 ——
+    /// 那正是本仓拒绝的形态：丢帧的依据只覆盖实测过的 WorkBuddy / AutoClaw
+    /// 两家（见模块头），而部署参数是谁都能设的。
     ///
-    /// 默认关（`config::KEY_STRIP_NEWLINE_KEEPALIVE`）：开着才会吃掉模型真·
-    /// 单独成片的那个换行 —— 少一个换行的外观损失换掉整屏断句，值不值由用户判，
-    /// 所以判权留在面板 / 环境变量上，而不是编译期替他决定。
-    pub fn assembled(rewrite: Option<ModelRewrite>, declared: bool, switch_on: bool) -> Self {
-        Self { rewrite, strip_newline_chunks: declared && switch_on }
+    /// 两项都默认关（`config::KEY_STRIP_NEWLINE_KEEPALIVE`）：开着才会吃掉模型
+    /// 真·单独成片的那个换行 —— 少一个换行的外观损失换掉整屏断句，值不值由
+    /// 用户判，所以判权留在面板 / 环境变量上，而不是编译期替他决定。
+    ///
+    /// `strip_leading_think` 与前两项不同：它**没有能力位**。开头 think 块的
+    /// 判定只依赖文本本身（与哪家上游无关），所以只有「开不开」这一道闸，
+    /// 由 `providerOptions` 逐家覆盖全局键 `config::KEY_STRIP_LEADING_THINK`
+    /// （缺省 false，见 `frame_policy_of`）。默认关时下发字节与接入前逐字一致。
+    pub fn assembled(
+        rewrite: Option<ModelRewrite>,
+        declared: bool,
+        switch_on: bool,
+        strip_leading_think: bool,
+    ) -> Self {
+        Self { rewrite, strip_newline_chunks: declared && switch_on, strip_leading_think }
     }
 }
 
@@ -233,6 +255,10 @@ pub struct ReasoningCoalescer {
     /// 丢弃保活换行分片（见模块头与 [`is_newline_keepalive`]）。
     /// false = 帧的字节与接入前逐字一致。
     strip_newline_chunks: bool,
+    /// 剥离开头 think 块（见 `core::middleware::think_tags`）。默认关。
+    strip_leading_think: bool,
+    /// 开头 think 块的跨帧状态（只在 `strip_leading_think` 打开时被使用）
+    think_filter: LeadingThinkFilter,
 }
 
 impl Default for ReasoningCoalescer {
@@ -250,6 +276,8 @@ impl ReasoningCoalescer {
             telemetry: None,
             rewrite: None,
             strip_newline_chunks: false,
+            strip_leading_think: false,
+            think_filter: LeadingThinkFilter::default(),
         }
     }
 
@@ -263,6 +291,7 @@ impl ReasoningCoalescer {
     pub fn with_policy(mut self, policy: FramePolicy) -> Self {
         self.rewrite = policy.rewrite;
         self.strip_newline_chunks = policy.strip_newline_chunks;
+        self.strip_leading_think = policy.strip_leading_think;
         self
     }
 
@@ -294,11 +323,27 @@ impl ReasoningCoalescer {
     /// 这条路径实际不会走到），也不要制造一次客户端侧解析失败。
     pub fn finish(&mut self) -> Vec<Frame> {
         let mut out: Vec<Frame> = Vec::new();
+        self.flush_leading_think(&mut out);
         if !self.acc.is_empty() {
             out.push(self.coalesced_frame());
             self.acc.clear();
         }
         out
+    }
+
+    /// 冲刷还没判定完的开头标签缓冲（流结束 / `[DONE]`）。
+    ///
+    /// 标签没闭合就原样下发（判据见 `LeadingThinkFilter::finish`）：半截标签
+    /// 多半是上游被切断，此时把攒下的正文整段丢掉是不可接受的。开关关着时
+    /// 什么都不做 —— 这条路径不存在，字节与接入前一致。
+    fn flush_leading_think(&mut self, out: &mut Vec<Frame>) {
+        if !self.strip_leading_think {
+            return;
+        }
+        let rest = self.think_filter.finish();
+        if !rest.is_empty() {
+            out.push(self.delta_frame("content", &rest));
+        }
     }
 
     /// 处理一行（已去掉行尾的 `\r`）
@@ -313,6 +358,7 @@ impl ReasoningCoalescer {
         }
         let data = line[5..].trim();
         if data == "[DONE]" {
+            self.flush_leading_think(out);
             if !self.acc.is_empty() {
                 out.push(self.coalesced_frame());
                 self.acc.clear();
@@ -402,47 +448,106 @@ impl ReasoningCoalescer {
             return;
         }
         // 非纯 reasoning 事件：先冲刷累积，再透传（可回写 model，见模块头）
+        //
+        // 开头 think 块的剥离在**这里**（而不是更早）：这一段是正文帧唯一的
+        // 下发出口，放在这里就不可能出现「某条分支漏剥」。判定的结果是三态，
+        // 见 `strip_content`。
+        let frame = match self.strip_content(&chunk, delta) {
+            Strip::Keep => self.rewritten_frame(line, &chunk, None),
+            // 还在判定、且这一帧除了正文什么都没有 → 整帧压住（半截标签不能漏）
+            Strip::Hold => return,
+            Strip::Replace(text) => self.rewritten_frame(line, &chunk, Some(&text)),
+        };
         if !self.acc.is_empty() {
             out.push(self.coalesced_frame());
             self.acc.clear();
         }
-        out.push(self.rewritten_frame(line, &chunk));
+        out.push(frame);
     }
 
-    /// 透传一帧，必要时把 `model` 改写成客户端请求的名字。
+    /// 开头 think 块的剥离判定（只在 `strip_leading_think` 打开时生效）。
     ///
-    /// ── 为什么只改 model、不做别的 ─────────────────────────────
+    /// 三态而不是 `Option`：`Hold` 与 `Replace("")` 的区别是**整帧还要不要**。
+    /// 一个只剩正文的分片压住时整帧不发；带 `role` / `finish_reason` / `usage`
+    /// 的分片必须留下骨架（那些字段客户端只能从这一帧拿到）。
+    fn strip_content(&mut self, chunk: &Value, delta: Option<&Value>) -> Strip {
+        if !self.strip_leading_think {
+            return Strip::Keep;
+        }
+        let Some(text) = delta
+            .and_then(|delta| delta.get("content"))
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        else {
+            // 非字符串正文（多模态分片等）不动：标签剥离只对文本有意义
+            return Strip::Keep;
+        };
+        let released = self.think_filter.push(text);
+        if !self.think_filter.is_done() {
+            return if has_payload_beyond_content(chunk, delta) {
+                Strip::Replace(String::new())
+            } else {
+                Strip::Hold
+            };
+        }
+        // 判定完毕：正文没变（首帧不是标签）就原样透传，保住上游字节
+        if released == text {
+            Strip::Keep
+        } else {
+            Strip::Replace(released)
+        }
+    }
+
+    /// 透传一帧，必要时改写 `model`（和/或 `delta.content`）。
+    ///
+    /// ── 为什么只改这两处、不做别的 ─────────────────────────────
     /// 回写是**客户端可见语义**的修正（客户端按自己给的名字识别响应），
-    /// 因此值得做；帧里的其它字段一律原样透传 —— 上游的异常/噪声字段
-    /// （空 tool_calls 数组之类）即便看起来像是 bug，也不该由网关擅自删除，
-    /// 那会让「代理看到的内容」与「上游发的」出现无从解释的差异。
-    /// 未配置回写（workbuddy）时返回**原行的字节**，透传逐字节不变。
+    /// 开头 think 块的剥离同理（客户端不认那些标签）；帧里的其它字段一律
+    /// 原样透传 —— 上游的异常/噪声字段（空 tool_calls 数组之类）即便看起来
+    /// 像是 bug，也不该由网关擅自删除，那会让「代理看到的内容」与「上游发的」
+    /// 出现无从解释的差异。两处都不需要改时返回**原行的字节**，透传逐字节不变。
+    ///
+    /// `content` 为 `Some` 时把 `choices[0].delta.content` 换成它；`None` 则只做
+    /// model 回写。两条改写走**同一次**克隆 + 序列化：分开做会对同一帧序列化
+    /// 两遍，第二遍还会把第一遍的结果当成上游原文再解析一次。
     ///
     /// 序列化用 `serde_json::to_string`（紧凑、无空格），与源实现
     /// `JSON.stringify(parsed)` 同形；失败时退回原行（宁可少一次改写，
     /// 也不要下发一条拼坏的帧）。
-    fn rewritten_frame(&self, line: &str, chunk: &Value) -> Frame {
-        let Some(rewrite) = &self.rewrite else {
-            return plain_frame(line);
-        };
+    fn rewritten_frame(&self, line: &str, chunk: &Value, content: Option<&str>) -> Frame {
         let Some(object) = chunk.as_object() else {
             return plain_frame(line);
         };
         // 上游没带 model 时**不补**：源实现同样只在 `'model' in parsed` 时才改写
         // （补一个客户端自己会填的字段没有意义，反而给「上游到底回了什么」加噪音）
-        if !object.contains_key("model") {
-            return plain_frame(line);
-        }
-        let current = object.get("model").and_then(Value::as_str).unwrap_or("");
-        if current == rewrite.requested {
+        let rewrite_to = self.rewrite.as_ref().filter(|rewrite| {
+            object.contains_key("model")
+                && object.get("model").and_then(Value::as_str) != Some(rewrite.requested.as_str())
+        });
+        if rewrite_to.is_none() && content.is_none() {
             return plain_frame(line);
         }
         let mut next = chunk.clone();
-        if let Some(map) = next.as_object_mut() {
-            map.insert(
-                "model".to_string(),
-                Value::String(rewrite.requested.clone()),
-            );
+        if let Some(rewrite) = rewrite_to {
+            if let Some(map) = next.as_object_mut() {
+                map.insert(
+                    "model".to_string(),
+                    Value::String(rewrite.requested.clone()),
+                );
+            }
+        }
+        if let Some(text) = content {
+            // 结构不是 `choices[0].delta` 时退回原行：宁可少剥一次，也不拼坏帧
+            let Some(delta) = next
+                .get_mut("choices")
+                .and_then(Value::as_array_mut)
+                .and_then(|choices| choices.first_mut())
+                .and_then(|choice| choice.get_mut("delta"))
+                .and_then(Value::as_object_mut)
+            else {
+                return plain_frame(line);
+            };
+            delta.insert("content".to_string(), Value::String(text.to_string()));
         }
         match serde_json::to_string(&next) {
             Ok(text) => Bytes::from(format!("data: {text}\n\n")),
@@ -464,6 +569,12 @@ impl ReasoningCoalescer {
     /// 客户端/测试做字节比对时不会出现假阳性差异。
     /// 各值用 `serde_json::to_string` 逐个转义，拼出的仍是合法 JSON。
     fn coalesced_frame(&self) -> Frame {
+        self.delta_frame("reasoning_content", &self.acc)
+    }
+
+    /// 只带一个 delta 成员的帧（`reasoning_content` 合并帧与 `content` 补发帧
+    /// 共用同一套 id / created / model 兜底）。`member` 只传本模块的常量字面量。
+    fn delta_frame(&self, member: &str, text: &str) -> Frame {
         let id = match &self.meta.id {
             Some(value) if is_truthy(value) => value.clone(),
             _ => Value::String(format!("wb-coalesce-{}", logging::now_ms())),
@@ -487,11 +598,12 @@ impl ReasoningCoalescer {
         // 逐个值做 JSON 编码（字符串会带引号并转义，数字/布尔/null 原样）
         let encode = |value: &Value| serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
         let text = format!(
-            r#"{{"id":{},"object":"chat.completion.chunk","created":{},"model":{},"choices":[{{"index":0,"delta":{{"reasoning_content":{}}},"finish_reason":null}}]}}"#,
+            r#"{{"id":{},"object":"chat.completion.chunk","created":{},"model":{},"choices":[{{"index":0,"delta":{{"{}":{}}},"finish_reason":null}}]}}"#,
             encode(&id),
             encode(&created),
             encode(&model),
-            encode(&Value::String(self.acc.clone())),
+            member,
+            encode(&Value::String(text.to_string())),
         );
         Bytes::from(format!("data: {text}\n\n"))
     }
@@ -506,6 +618,31 @@ pub fn sse_frame(value: &Value) -> Frame {
 /// 非 `data:` 行的透传形态：原样 + `\n\n`（Node: `line + '\n\n'`）
 fn plain_frame(line: &str) -> Frame {
     Bytes::from(format!("{line}\n\n"))
+}
+
+/// 开头 think 块剥离对**一帧**的判定结果（见 `ReasoningCoalescer::strip_content`）
+enum Strip {
+    /// 不动这一帧（开关关着 / 没有正文 / 判定结果是「不是标签」）
+    Keep,
+    /// 整帧压住（还在判定，且这一帧除了正文没有别的载荷）
+    Hold,
+    /// 用新正文重发这一帧
+    Replace(String),
+}
+
+/// 这一帧除了 `delta.content` 之外还有没有别的载荷。
+///
+/// 用来决定「判定期间能不能整帧丢弃」：`role` / `tool_calls` /
+/// `finish_reason` / `usage` 这些客户端只能从这一帧拿到，丢了就是协议破损。
+/// 收尾/统计/错误的判定复用 [`carries_terminal_signal`]，不在这里抄第二份。
+fn has_payload_beyond_content(chunk: &Value, delta: Option<&Value>) -> bool {
+    if carries_terminal_signal(chunk) {
+        return true;
+    }
+    let Some(delta) = delta.and_then(Value::as_object) else {
+        return true;
+    };
+    delta.keys().any(|key| key != "content")
 }
 
 /// 真值判定（Node 里这一串 `if (chunkObj.id)` 都是真值判定）
@@ -545,6 +682,7 @@ mod tests {
         ReasoningCoalescer::new().with_policy(FramePolicy {
             rewrite: None,
             strip_newline_chunks: strip,
+            ..Default::default()
         })
     }
 
@@ -719,16 +857,16 @@ mod tests {
     fn the_strip_needs_both_the_capability_bit_and_the_switch() {
         let rewrite = Some(ModelRewrite { requested: "m".to_string() });
         assert!(
-            !FramePolicy::assembled(rewrite.clone(), false, true).strip_newline_chunks,
+            !FramePolicy::assembled(rewrite.clone(), false, true, false).strip_newline_chunks,
             "开关不能替一家没声明能力位的提供商开始丢帧"
         );
         assert!(
-            !FramePolicy::assembled(rewrite.clone(), true, false).strip_newline_chunks,
+            !FramePolicy::assembled(rewrite.clone(), true, false, false).strip_newline_chunks,
             "开关关着时，声明了能力位的那两家也不动字节"
         );
-        assert!(FramePolicy::assembled(rewrite.clone(), true, true).strip_newline_chunks);
+        assert!(FramePolicy::assembled(rewrite.clone(), true, true, false).strip_newline_chunks);
         // 开关只管丢弃那一项，model 回写不受它影响（两者是两回事）
-        let policy = FramePolicy::assembled(rewrite, true, false);
+        let policy = FramePolicy::assembled(rewrite, true, false, false);
         assert_eq!(policy.rewrite.map(|value| value.requested).as_deref(), Some("m"));
     }
 
@@ -741,10 +879,11 @@ mod tests {
     fn a_capable_provider_with_the_switch_off_still_streams_byte_identical_frames() {
         let stream: String = CAPTURED.iter().map(|line| format!("{line}\n\n")).collect();
         let declared_but_switched_off =
-            FramePolicy::assembled(None, true, false).strip_newline_chunks;
+            FramePolicy::assembled(None, true, false, false).strip_newline_chunks;
         let mut coalescer = ReasoningCoalescer::new().with_policy(FramePolicy {
             rewrite: None,
             strip_newline_chunks: declared_but_switched_off,
+            ..Default::default()
         });
         let out: String = coalescer
             .push(stream.as_bytes())
@@ -879,5 +1018,58 @@ mod tests {
             feed(&mut coalescer, "data: [DONE]\n\n").trim() == "data: [DONE]",
             "acc 已清空，[DONE] 处不该再补一帧空的思考"
         );
+    }
+
+    /// 开关关着（默认态）时，正文里的 think 标签**逐字节**原样下发。
+    #[test]
+    fn leading_think_strip_is_off_by_default_and_leaves_bytes_alone() {
+        let stream = frame(json!({"content": "<think>x</think>answer"}));
+        let mut coalescer = ReasoningCoalescer::new();
+        assert_eq!(feed(&mut coalescer, &stream), stream, "默认态必须逐字透传");
+    }
+
+    /// 流式路径的开头标签剥离，且跨帧（`<thi` + `nk>`）不残留半截标签。
+    #[test]
+    fn leading_think_strip_removes_the_tag_across_frames() {
+        let mut coalescer = ReasoningCoalescer::new().with_policy(FramePolicy {
+            strip_leading_think: true,
+            ..Default::default()
+        });
+        let first = feed(&mut coalescer, &frame(json!({"content": "<thi"})));
+        assert_eq!(first, "", "半截标签不能漏出去");
+        let second = feed(&mut coalescer, &frame(json!({"content": "nk>x</think>answer"})));
+        assert!(
+            second.contains(r#""content":"answer""#),
+            "剥完标签后正文要完整下发: {second}"
+        );
+        assert!(!second.contains("<thi"), "不能有标签残留: {second}");
+        // 判定完毕后后续正文原样透传
+        let third = frame(json!({"content": "more"}));
+        assert_eq!(feed(&mut coalescer, &third), third, "判定完毕后逐字透传");
+    }
+
+    /// 判定期间撞上收尾帧：正文可以被压住，但 `finish_reason` 必须留下 ——
+    /// 客户端只从这一帧拿 stop reason，吞掉就是「流不完整」。
+    #[test]
+    fn a_terminal_signal_survives_while_the_tag_is_still_open() {
+        let mut coalescer = ReasoningCoalescer::new().with_policy(FramePolicy {
+            strip_leading_think: true,
+            ..Default::default()
+        });
+        let out = feed(
+            &mut coalescer,
+            &raw(json!({
+                "id": "c1",
+                "model": "m",
+                "created": 1,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": "<thi"},
+                    "finish_reason": "stop",
+                }],
+            })),
+        );
+        assert!(out.contains(r#""finish_reason":"stop""#), "收尾信号不能被剥离逻辑吞掉: {out}");
+        assert!(!out.contains("<thi"), "半截标签仍不能漏出去: {out}");
     }
 }

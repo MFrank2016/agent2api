@@ -35,9 +35,10 @@ use crate::server::config;
 use crate::server::logging;
 
 /// 允许的开关名 —— **直接引用全局键常量**，保证与全局开关同名。
-pub const KNOWN_KEYS: [&str; 2] = [
+pub const KNOWN_KEYS: [&str; 3] = [
     crate::server::config::KEY_SANITIZE_FINGERPRINTS,
     crate::server::config::KEY_STRIP_NEWLINE_KEEPALIVE,
+    crate::server::config::KEY_STRIP_LEADING_THINK,
 ];
 
 fn config_key() -> &'static str {
@@ -313,6 +314,23 @@ mod tests {
     #[test]
     fn unknown_key_is_rejected() {
         assert!(set("workbuddy", "nonexistentKey", true).is_err());
+    }
+
+    /// `stripLeadingThink` 必须是**登记过的** per-provider 键：没登记的话，
+    /// `provider_loop::frame_policy_of` 传进来的这个键永远读不到覆盖值，
+    /// 逐家开关会静默失效（写侧也会被拒）。
+    #[test]
+    fn the_think_tag_key_is_a_known_per_provider_key() {
+        let _guard = hold_config();
+        let _restore = RestoreOptions::capture();
+        ensure_snapshot();
+        let key = crate::server::config::KEY_STRIP_LEADING_THINK;
+        set("qoder", key, true).expect("登记过的键必须能写");
+        assert_eq!(get("qoder", key), Some(true), "写后必须立刻读到");
+        // 未设置的 provider 跟随调用方给的 default（默认态 false）
+        assert_eq!(get("workbuddy", key), None);
+        assert!(!is_enabled("workbuddy", key, false));
+        assert!(is_enabled("workbuddy", key, true), "default 必须被真正采用");
     }
 
     /// 拼错的 provider id 不能静默写成一条死记录：读侧会把它当残留忽略，
