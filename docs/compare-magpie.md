@@ -251,9 +251,150 @@ magpie 自己在文档里承认：
 
 ---
 
-## 十一、可借鉴项（按价值 / 成本排序）
+## 十一、Provider 插件 vs 本项目 `ProviderAdapter`
 
-### 11.1 值得做
+这一节单独展开，因为 provider 插件是 magpie 扩展性的**主战场**（20 / 33 个
+市场条目是它），也是与本项目 `ProviderAdapter` trait 唯一真正同构的部分。
+
+### 11.1 两边的 provider 抽象对照
+
+| 维度 | magpie provider 插件 | 本项目 `ProviderAdapter` |
+|---|---|---|
+| 注册方式 | 运行期：Bun 子进程，npm 包 | **编译期**：`adapter_for(kind)` 静态分派 |
+| 实现载体 | JS，`auth.loader` 返回一个 `fetch` | Rust trait，`build_chat_request` 返回 `ChatRequestPlan` |
+| 能力边界 | 网关代管路由/翻译/配额 | 适配器**自己**知道 URL、头、体、错误分类 |
+| 谁能写 | 任何人（npm 发布即可） | 只有能改仓库并提交 PR 的人 |
+| 类型安全 | 无（JS + zod 校验） | 编译期强制 |
+| 崩溃影响 | Bun 子进程，可重启 | 与主进程同命（`panic=abort`） |
+
+**一句话**：magpie 把 provider 做成「给一个 fetch」，本项目把 provider 做成
+「实现 30+ 个语义钩子」。前者开放，后者精确。
+
+### 11.2 钩子级逐项对比
+
+下表左列是 magpie 的钩子，右列是本项目的对应物；「—」表示没有等价物。
+
+| magpie 钩子 | 职责 | 本项目对应物 | 判定 |
+|---|---|---|---|
+| `auth.provider` / `auth.methods[]` | 声明 provider 与登录方式（oauth / api） | `ProviderKind` + `supports_web_login` / `build_login_url` / `exchange_login_code` | ✅ 等价 |
+| `auth.loader` | 返回携带请求的 `fetch` | `build_chat_request` + `ChatRequestPlan {url, headers, body, response}` | ✅ 等价（更强：连响应协议也声明） |
+| `auth.refresh` | 到期前续期 | `ensure_access_token` + `refresh_access_token` + `credentials_expiring` | ✅ 等价（更细：分「临期刷新」与「401 强制刷新」） |
+| `auth.usage` | 计划 / 额度用量 | `supports_usage` + `query_usage` | ✅ 等价 |
+| `auth.checkin` | 每日签到 | **不在 trait 上**，在 `billing::checkin::checkin_for` 按 provider 分派 | ⚠️ 有但位置不同 |
+| `auth.options[]` | 每 provider 开关项（≤16） | —（内置家无此机制；自定义家有 `ProviderQuirks`） | ❌ 缺 |
+| `auth.icon` | 图标 | `providers::PROVIDERS` 静态元数据 | ✅ 等价（静态） |
+| `auth.maxConcurrency` | 并发上限 | **账号级** `maxConcurrent`（`routing::max_concurrent_of`） | ⚠️ 粒度不同 |
+| `provider.models` | 列模型，可带 `serviceTiers` / 决策 / 限额 | `list_models` + `advertise_models` + `model_meta` | ✅ 等价（更强：带能力元数据与本地覆盖） |
+| `chat.headers` | 加请求头 | `build_chat_request` 的 `headers` 字段 | ✅ 等价 |
+| `tool` | 提供工具（经 MCP 给所有 Agent） | — | ❌ 缺 |
+
+**反向：本项目 trait 有、magpie 插件没有的钩子**
+
+| 本项目钩子 | 作用 | magpie 是否有等价物 |
+|---|---|---|
+| `classify_error` | 把 status + 错误体分成 Fatal / Retryable / QuotaLimited 等 | ❌ 插件无法影响分类（网关统一判定） |
+| `classify_conversation_error` | 有状态路径的错误分类 | ❌ |
+| `retry_advice` | 按错误体给出重试预算建议 | ❌ |
+| `quota_cooldown_models` | 一次限额要给哪些模型键记账 | ❌ |
+| `reasoning_patch` / `outbound_reasoning` | 把通用思考档位翻译成本家字段 | ❌（magpie 无思考档位绑定） |
+| `is_stateful` / `forward_conversation` | 有状态会话式转发 | ❌（插件只能提供 `fetch`） |
+| `sse_model_rewrite` / `sse_strip_newline_chunks` | SSE 帧级修正 | ❌ |
+| `is_error_response` | HTTP 200 但体是错误 | ❌ |
+| `system_proxy_when_unset` / `env_credentials_present` | 出口与凭证来源策略 | ❌ |
+| `supports_default_model` / `allows_anonymous_default_session` | 无账号时的降级语义 | ❌ |
+
+### 11.3 这个对比说明什么
+
+**本项目在「适配器语义」上比 magpie 深很多**。原因是场景不同：
+
+- magpie 的上游是**标准 API**（OpenAI / Anthropic / Gemini 官方端点），协议一致，
+  所以插件只需「拿对凭证 + 拼对 URL」，剩下的交给网关统一处理。
+- 本项目的上游是**逆向出来的客户端协议**（会话准入、SSE 信封、NDJSON、
+  设备风控身份、限额信封藏在 200 里），每家都不一样，所以必须在适配器层
+  提供细粒度钩子。
+
+换句话说：**magpie 的插件接口简单，是因为它的上游简单**。把它的接口直接
+搬过来，本项目 27 家逆向协议一家都接不上。
+
+### 11.4 值得借鉴的四个点
+
+#### ① `auth.options[]` —— 每 provider 的开关项
+
+magpie 允许插件声明最多 16 个开关（`{key,label,description,default,confirm}`），
+在设置页渲染成开关，插件运行时通过 `input.magpie.option(s)` 读。
+
+**本项目现状**：内置家的行为开关都是**全局**的（`promptMode`、
+`sanitizeBlacklistFingerprints` 等），没有「这家要不要开 X」的维度。自定义家
+有 `ProviderQuirks`（`urlSuffix` / `headers` / `toolTypeCustom` /
+`emulateOpencode`），但那是**自定义家专属**，内置家享受不到。
+
+**可借鉴**：给内置家加一组 per-provider 开关（如「WorkBuddy 是否走指纹脱敏」、
+「Qoder 是否启用思考标签剥离」）。纯配置层改动，不涉及插件运行时。
+
+#### ② `auth.maxConcurrency` 的**粒度**
+
+magpie 是 **provider 级**并发上限；本项目是 **账号级**
+（`store_util::max_concurrent_public_for`）。
+
+**本项目的粒度其实更合理**（同一家不同账号额度不同），但缺一个
+**provider 级兜底**：某个 provider 全部账号加起来并发过高时，目前无法整体限流。
+
+一个已有的例外值得注意：CodeArts 有 provider 级默认并发
+（`codearts::session::DEFAULT_SESSION_LIMIT`，由
+`max_concurrent_public_for` 按 provider 套上）——但它作用于**单个账号**的
+读数，不是「全 provider 合计」的上限。所以这不构成对「缺 provider 级总量」
+的反驳，反而说明这类「按家定默认值」的需求是真实存在的。
+
+**可借鉴**：在账号级之上加一层 provider 级总量上限。
+
+#### ③ `auth.checkin` 提升为 trait 钩子
+
+本项目的签到分派写在 `billing::checkin::checkin_for` 的 `match provider` 里，
+而 `ProviderAdapter` 上**没有**签到方法。后果：新增一家要同时改两处
+（`adapter.rs` 与 `checkin.rs`），而且 `CHECKIN_PROVIDERS` 是独立维护的
+`[&str; 14]` 数组 —— 新增一家忘了加进去，签到会静默不执行。
+
+**可借鉴**：把 `supports_checkin` / `checkin` 提到 trait 上，让
+`CHECKIN_PROVIDERS` 从 `implemented_kinds()` 派生。这与本项目既有的
+`supports_usage` / `query_usage` 完全同构。
+
+**注意本项目已有的兜底**：`auto_checkin::PROVIDERS_VERSION` +
+`PROVIDERS_ADDED_IN` 解决了「新增家默认勾选」与「用户取消勾选后不被补回来」
+的冲突（只补一次，靠配置里的版本号记账）。所以这里要改的是**声明位置**，
+不是那套版本机制 —— 后者是对的，应当保留。
+
+#### ④ `provider.models` 的「失败保留旧清单」语义
+
+magpie 明确写了「A failed read keeps the last list」。
+
+**本项目现状**：`refresh_models` 的文档写着「刷新失败**不返回错误**：失败时
+保留现有清单」—— **语义一致**。这一项两边已经对齐，不需要改动，列出来是为了
+避免后来者以为这里是缺口。
+
+### 11.5 不建议借鉴的
+
+| 点 | 理由 |
+|---|---|
+| **运行期注册 provider** | 本项目 27 家都要访问 `AccountStore`、`limiter`、`egress`、`model_rules`，这些是强类型 Rust 结构；JS 插件拿不到，只能再开一套 RPC 面（magpie 就是这么做的：Bun 子进程 + stdin/stdout JSON 行）。成本极高，收益只是「不用重新编译」。 |
+| **`auth.loader` 返回 `fetch`** | 本项目的适配器要的不只是一个 fetch，还要声明响应协议（`UpstreamResponse` 四档）、SSE 帧级修正、错误分类。只给 fetch 等于把 90% 的逻辑推回网关，而网关不认识各家方言。 |
+| **把 provider 拆成 npm 包** | 本项目 27 家共享大量内部模块（`auth_http`、`jwt`、`refresh_flight`、`crypto`）。拆出去意味着这些要么公开 API 化，要么每家重写一份。 |
+
+### 11.6 小结
+
+| 项 | 结论 |
+|---|---|
+| provider 抽象 | **不迁移**。本项目的 trait 更深，是场景决定的，不是缺陷 |
+| `auth.options[]` | **值得做**。给内置家加 per-provider 开关 |
+| provider 级并发上限 | **值得做**。当前只有账号级 |
+| `checkin` 提升为 trait 钩子 | **值得做**。消除「改两处」与静默漏配 |
+| `provider.models` 失败保留 | 已对齐，无需改动 |
+| `tool` 钩子 | **可选**。本项目的 MCP 暴露面是另一个话题 |
+
+---
+
+## 十二、可借鉴项（按价值 / 成本排序）
+
+### 12.1 值得做
 
 | # | 项目 | 理由 | 成本 |
 |---|---|---|---|
@@ -263,19 +404,24 @@ magpie 自己在文档里承认：
 | 4 | **think-tags 通用化** | 把 Qoder 的 `strip_thinking_tags` 提到通用层 | 低 |
 | 5 | **词语拦截（word-guard 式）** | 只查用户文本，reject / mask 两档 | 低 |
 | 6 | **「核心功能做成可开关单元」** | 借鉴设计取向，不需要插件运行时 | 低 |
+| 7 | **per-provider 开关（`auth.options[]` 思路）** | 内置家的行为开关目前只有全局维度，缺「这家要不要开 X」 | 低 |
+| 8 | **provider 级并发上限** | 当前只有账号级；缺某家全部账号合计过载时的兜底 | 低-中 |
+| 9 | **`checkin` 提升为 trait 钩子** | 现在签到分派在 `checkin_for` 的 `match provider` 里，而 `ProviderAdapter` 上没有签到方法——新增一家要同时改 `adapter.rs`、`checkin.rs` 与 `CHECKIN_PROVIDERS` 三处（后者已有 `PROVIDERS_VERSION` 版本兜底，但漏加会让该家既不签到也不出现在界面清单） | 中低 |
 
-### 11.2 需先评估
+### 12.2 需先评估
 
 | 项目 | 说明 |
 |---|---|
 | **路由组 / 嵌套组** | 本项目已有模型映射 + 聚合目录，需先判断「组」能否用现有机制表达，很可能覆盖 80% 场景 |
 | **通用参数覆盖** | magpie 的 operations 模型（set/delete/regex/条件）值得参考，但它只能看 body（不看头） |
+| **`tool` 钩子（插件工具 → MCP）** | magpie 把插件工具暴露成 MCP server 给所有 Agent；本项目是否需要对外暴露工具是独立的产品决策 |
 
-### 11.3 明确不建议
+### 12.3 明确不建议
 
 | 项目 | 理由 |
 |---|---|
 | **插件运行时本身** | 本项目 `ProviderAdapter` trait 已有 20+ 钩子，能力不比插件 API 少；全仓 `panic=abort` + 零 unwrap 与「运行期加载任意 JS / 进程」根本冲突；magpie 的插件安全是「靠信任」而非技术隔离 |
+| **运行期注册 provider / 把 provider 拆成 npm 包** | 27 家适配器共享 `auth_http` / `jwt` / `refresh_flight` / `crypto` 等内部模块，且都要访问 `AccountStore`、`limiter`、`egress` 等强类型结构；拆包等于把这些全部公开 API 化，或每家重写一份 |
 | **意图路由** | 需要额外一次模型调用做分类，而本项目额度来自用户自己的账号——用一次额度决定用哪份额度，收益未必为正 |
 | **5 小时窗口预热** | 依赖 Claude / ChatGPT 的特定计费结构，本项目上游是日额度 / 积分制 |
 | **Claude 走真实 CLI + MCP 桥接** | 那是为绕开 Anthropic 的第三方 system-prompt 分类器，本项目上游无此约束 |
@@ -284,7 +430,7 @@ magpie 自己在文档里承认：
 
 ---
 
-## 十二、本项目已有、magpie 没有的能力
+## 十三、本项目已有、magpie 没有的能力
 
 调研中确认以下能力为**本项目独有**，不应在「借鉴」叙事里被稀释：
 
@@ -297,7 +443,7 @@ magpie 自己在文档里承认：
 
 ---
 
-## 十三、参考
+## 十四、参考
 
 - magpie 仓库：<https://github.com/yetone/magpie>
 - 社区注册表：<https://github.com/magpie-community/plugins>
