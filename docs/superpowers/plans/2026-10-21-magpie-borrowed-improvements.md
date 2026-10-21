@@ -1,40 +1,71 @@
-# magpie 借鉴项 Implementation Plan
+# magpie 借鉴项 Implementation Plan（v2，评审后修订）
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 落地 `docs/compare-magpie.md` 第十二章列出的 9 项可借鉴能力，补齐 Gemini 端点断链、统一签到声明、把行为开关下沉到 provider 级、扩展 Key 配额为多维、并新增两个通用 middleware（think-tags / 词语拦截）。
+**Goal:** 落地 `docs/compare-magpie.md` 第十二章的可借鉴能力，但**只做经评审确认可行的四项**：TOML 注释保留、per-provider 开关、Key 配额多规则（仅 Token 维度）、通用 think-tags 剥离。Gemini 端点、checkin trait 重构、word-guard 三项**降级为独立前置调研**（见文末 P1/P2/P3），不纳入本轮实施。
 
-**Architecture:** 五项改动彼此独立，共享同一个原则——**把已经存在的机制从一个位置搬到更合适的位置**，而不是新造抽象。Gemini 端点复用 `protocol::antigravity_outbound` 与 `accio::protocol` 两块既有拼图；签到钩子提到 `ProviderAdapter` 复用 `supports_usage` 的既有形状；per-provider 开关复用 `ProviderQuirks` 的读取模式；Key 多维限额复用 `limiter` 的 `rule_kind` 编码；两个 middleware 插在 `payload::send_body` 既有的 ①→②→③ 管线里。
+**Architecture:** 四项改动都是「把已有机制搬到更合适的位置」，不新造抽象：
+- TOML 用 `toml_edit`（**钉 0.25，已在 lock 里**）替换 `toml::to_string_pretty`，只走 `apply_single` 的 TOML 分支。
+- per-provider 开关复用**既有公开写入口** `config::update_raw_field`（不是 `save_raw`），保证内存快照同步刷新。
+- Key 配额沿用既有 `by_kind` 缓存（已天然支持多窗口），只改 `fetch` 的 kinds 收集与判定循环；**不做 Cost 维度**（`requests` 表无 cost 列）。
+- think-tags 挂在既有 `FramePolicy` + `CompletionAccumulator` 两条路径，共用一台 helper。
 
-**Tech Stack:** Rust 2021（MSRV 1.88）、axum、wreq、serde_json、rusqlite；前端 TypeScript + React 岛（`ui-islands/`）。
+**Tech Stack:** Rust 2021（MSRV 1.88）、axum 0.8、serde_json、rusqlite、toml_edit 0.25；前端 TypeScript + React 岛。
 
-**Spec:** `docs/compare-magpie.md`
+**Spec:** `docs/compare-magpie.md`（调研）+ 本文件末尾「评审记录」段（设计决策依据）
+
+## 评审结论摘要（本计划的前提）
+
+v1 计划经 Oracle 与 Momus 独立评审，共发现 **15 项 BLOCKER**，全部已逐条对真实代码验证。本 v2 的每一项改动都是对这些 BLOCKER 的直接回应：
+
+| # | v1 的 BLOCKER | 验证证据 | v2 的处理 |
+|---|---|---|---|
+| 1 | `ForwardOutcome` 无 `IntoResponse` | `core/upstream/mod.rs:256`，全仓无该 impl | **Gemini 端点移出本轮**（见 P1） |
+| 2 | 缺 chat→Gemini SSE 翻译机 | 只有 `anthropic_from_chat` / `responses_request_from_chat` | 同上 |
+| 3 | 未注入 path model → 静默用默认模型 | `api/protocol.rs:218` 内联 `resolve_model` | 同上 |
+| 4 | Codex 有单段键 `model` | `agents/apply.rs:189` | Task 1 的 `set_toml_path` 支持单段 |
+| 5 | `set_path` 会自动建表，计划却要求报错 | `apply.rs:277-297` | Task 1 改为**照既有语义建表** |
+| 6 | `toml_edit = "0.22"` 新增第四版本 | `toml 0.9.12` 用 `toml_parser`/`toml_writer` | Task 1 钉 **0.25.13**（`proc-macro-crate` 已在用） |
+| 7 | `save_raw` 不刷新内存 → 设了不生效 | `config/mod.rs` 的 `save_raw` 只写库 | Task 2 改用 `update_raw_field` |
+| 8 | `KNOWN_KEYS` 键名与全局键不符 | 全局键是 `sanitizeBlacklistFingerprints`（`config/types.rs:133`） | Task 2 改用真实键名 |
+| 9 | `fetch` 只认 `quota_tokens` → 多规则静默无效 | `key_quota.rs:180-187` | Task 3 改 `fetch` 的 kinds 收集 |
+| 10 | `Cost` 维度无数据源 | `requests` 表无 cost 列 | Task 3 **砍掉 Cost**，只做 Tokens |
+| 11 | `CheckinOutcome` 丢失 `claim`/`extras`/`log_flag` | `checkin.rs:486`、`:451/458/526` | **checkin 重构移出本轮**（见 P2） |
+| 12 | `word_guard::Reject` 无错误通道 | `payload.rs:180` 的 `send_body` 返回 `SendBody` | **word-guard 移出本轮**（见 P3） |
+| 13 | `FramePolicy` 加字段破坏既有字面量 | `sse.rs:545`、`:745` 两处结构体字面量 | Task 4 一并更新这两处 |
+| 14 | `kind_id` 已存在，不需 `id_of_kind` | `providers/mod.rs:757` | v2 不再新增 |
+| 15 | `pipeline::sha256_hex` 在 `api/` 不是 `core::upstream` | `api/pipeline.rs:1102` | v2 不再引用（Gemini 移出） |
+
+**净效果**：6 个任务砍到 4 个。这不是缩水 —— 是把「评审证明会编译失败 / 静默无效 / 破坏既有行为」的部分挡在实施之前。
 
 ## Global Constraints
 
-- Rust edition 2021，MSRV 1.88。**不新增第三方依赖**。
-  `toml_edit` 是唯一例外：它**已经作为传递依赖存在于 `Cargo.lock`**（三个版本：
-  0.19.15 / 0.20.2 / 0.25.13，来自 `toml` 生态），Task 2 只是把它提为直接依赖，
-  不引入新的依赖树。
+- Rust edition 2021，MSRV 1.88。**不新增第三方依赖**：`toml_edit` 钉 **0.25**，该版本已由 `proc-macro-crate` 引入并在 `Cargo.lock` 中，提为直接依赖不新增版本树。落地前先跑 `cargo tree -i toml_edit@0.25.13` 确认。
 - release 是 `panic = abort`：**绝不 `unwrap`/`expect` 可失败路径**；错误如实返回。
-- 所有新增行为开关**默认关闭或保持现状**：升级后既有用户的行为与日志必须逐字不变。
+- 所有新增行为开关**默认关闭**，升级后既有用户的行为与日志必须逐字不变。
 - 不 `as any`、不 `@ts-ignore`（前端）；不 `#[allow(dead_code)]` 掩盖未接线代码。
-- 修改文件遵循既有单文件行数约定（本项目惯例约 800 行，超长则拆分）。
-- 测试命令（仓库根执行）：
-  - 后端：`cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib <filter>`
+- 测试命令（**必须带 manifest-path，仓库根没有 Cargo.toml**）：
+  - 后端单测：`cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib <filter>`
+  - 后端全量：`cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib`
   - 前端类型：`npm --prefix desktop-tauri/ui-islands run typecheck`
-  - 前端构建：`npm --prefix desktop-tauri/ui-islands run build`（产物落 `desktop-tauri/ui/islands/`，**必须提交**）
-- 提交前跑全量：`cargo test -p agent2api-server --lib`（当前基线 **765 passed / 11 ignored**）。
+  - 前端构建：`npm --prefix desktop-tauri/ui-islands run build`（产物 `ui.js` **与 `ui.css`** 都要提交）
+- 当前测试基线：**765 passed / 11 ignored**（以实跑为准，动手前先跑一次确认）。
 
 ## Review Focus
 
-1. **Gemini 客户端用非流式 `:generateContent`（不带 `alt=sse`）** → 期望返回完整 JSON，不是空流。
-2. **Gemini 请求里带 `tools` / `systemInstruction` / `generationConfig`** → 期望正确映射到 chat 体，不丢字段、不 400。
-3. **`checkin` 提到 trait 后，某家 `supports_checkin()` 为 true 但 `checkin()` 未覆写** → 期望**不 panic**，返回明确的「未实现」错误，且不出现在界面清单里。
-4. **per-provider 开关的 provider id 在配置里但已不存在（删了自定义家）** → 期望**忽略该条**，不 panic、不影响其他家。
-5. **Key 配额有多条规则且部分冲突（如「日 10 万」+「月 100 万」，某天用了 9 万）** → 期望**全部满足才放行**（magpie 的语义：5 条全过），不是「任一满足」。
-6. **think-tags 剥离遇到跨流式分片的标签（`<thi` + `nk>`）** → 期望正确拼接后再判定，不产生半个标签残留在正文。
-7. **词语拦截遇到工具结果 / 工具调用 / system prompt 里的词** → 期望**不拦**（只查用户文本，与 magpie 的 `word-guard` 同口径）。
+评审指出 v1 的 Review Focus 缺了以下边界。每条都指定了归属任务与测试：
+
+1. **TOML 顶层单段键**（Codex 的 `model`）→ Task 1，`set_toml_path_handles_single_segment`
+2. **首次接管空/新 config.toml**（表不存在）→ Task 1，`set_toml_path_creates_missing_tables`
+3. **`preview` 与落盘一致性** → Task 1，`preview_matches_applied_output`
+4. **JSONC 客户端仍丢注释**（opencode / zed）→ Task 1 明确写出范围，不假装修好
+5. **`update_raw_field` 后同进程读回新值** → Task 2，`set_then_get_returns_new_value`
+6. **未知 provider 的残留开关被忽略** → Task 2，`unknown_provider_option_is_ignored`
+7. **Key 只有 `quota_rules` 没有 `quota_tokens`** → Task 3，`rules_only_key_is_enforced`
+8. **多规则全部满足才放行** → Task 3，`all_rules_must_pass`
+9. **think-tags 跨 SSE 分片** → Task 4，`strip_handles_split_across_frames`
+10. **think-tags 只处理开头块** → Task 4，`strip_only_affects_leading_block`
+11. **非流式响应也要剥**（`CompletionAccumulator` 路径）→ Task 4，`strip_works_on_non_stream_path`
 
 ---
 
@@ -42,573 +73,69 @@
 
 | 文件 | 责任 | 动作 |
 |---|---|---|
-| `server/src/server/api/gemini.rs` | Gemini 入口：路由解析、请求体映射、响应回写 | 新建 |
-| `server/src/server/http.rs` | 注册 `:generateContent` 等路由 | 修改 |
-| `server/src/server/core/protocol/gemini_outbound.rs` | Gemini 请求体 ↔ chat 体映射 | 新建 |
-| `server/src/server/core/providers/adapter.rs` | 新增 `supports_checkin` / `checkin` 钩子 | 修改 |
-| `server/src/server/core/billing/checkin.rs` | 改为调用 trait 钩子 | 修改 |
-| `server/src/server/core/auto_checkin.rs` | `CHECKIN_PROVIDERS` 从 `implemented_kinds()` 派生 | 修改 |
-| `server/src/server/core/provider_options.rs` | per-provider 开关的存取与校验 | 新建 |
-| `server/src/server/config/types.rs` | 新增 `providerOptions` 配置键 | 修改 |
-| `server/src/server/core/api_keys.rs` | `quota_tokens: Option<i64>` → `quota_rules: Vec<KeyQuotaRule>` | 修改 |
-| `server/src/server/core/key_quota.rs` | 多条规则判定 | 修改 |
-| `server/src/server/core/middleware/think_tags.rs` | 通用思考标签处理 | 新建 |
-| `server/src/server/core/middleware/word_guard.rs` | 用户文本词语拦截 | 新建 |
-| `server/src/server/core/middleware/mod.rs` | middleware 模块根 | 新建 |
-| `server/src/server/core/upstream/payload.rs` | 在 ②→③ 之间插入 middleware 层 | 修改 |
-| `server/src/server/config/types.rs` | 新增两个 middleware 的开关与配置 | 修改 |
-| `ui-islands/src/islands/keys-page.tsx` | Key 配额多条规则编辑 | 修改 |
-| `ui-islands/src/islands/settings-page.tsx` | middleware 配置区 | 修改 |
+| `server/Cargo.toml` | 加 `toml_edit = "0.25"` | 修改 |
+| `core/agents/apply.rs` | `set_toml_path` + TOML 分支 + `preview` 同步 | 修改 |
+| `core/provider_options.rs` | per-provider 开关读写（基于 `update_raw_field`） | 新建 |
+| `core/mod.rs` | 注册 `provider_options` | 修改 |
+| `core/upstream/payload.rs` | 脱敏层改「per-provider 优先、全局兜底」 | 修改 |
+| `core/api_keys.rs` | `KeyQuotaRule` + 读侧兼容 | 修改 |
+| `core/key_quota.rs` | `fetch` kinds 收集 + `exceeded_rule` + `quota_json` | 修改 |
+| `core/upstream/sse.rs` | `FramePolicy` 加 `strip_leading_think` + 更新三处 | 修改 |
+| `core/upstream/aggregate.rs` | `CompletionAccumulator` 同步加该字段 | 修改 |
+| `core/middleware/mod.rs` | 新建（模块根） | 新建 |
+| `core/middleware/think_tags.rs` | 跨帧开头标签剥离 | 新建 |
+| `config/types.rs` | `providerOptions` 键 + think-tags 开关 | 修改 |
+| `ui-islands/src/islands/keys-page.tsx` | 配额规则编辑（最多 5 条） | 修改 |
+| `ui-islands/src/islands/settings-page.tsx` | think-tags 开关 | 修改 |
 
 ---
 
-## Task 1: Gemini 端点（修断链）
+## Task 1: Agent 写 TOML 保留注释
 
-**背景**：Agent 页可接管 Gemini CLI，但网关无 Gemini 路由。`core/agents/mod.rs` 给
-`gemini-cli` 声明 `protocol: "gemini"`，`core/agents/apply.rs` 写入
-`GOOGLE_GEMINI_BASE_URL` 指向本网关，而 `server/http.rs` 只注册了
-`/v1/chat/completions`、`/v1/responses`、`/v1/messages`、`/v1/messages/count_tokens`。
-Gemini CLI 会拼 `/v1beta/models/{model}:generateContent`，必然 404。
+**背景**：`core/agents/apply.rs` 模块头自承「注释保不住」。Codex 的 `config.toml` 是用户手写的，常有注释掉的实验配置。
+
+**范围（明确写出来，避免假装修全了）**：只修 **TOML**（Codex）。`opencode` / `zed` 用 JSONC，仍走旧的有损路径，`comment_warnings` 继续如实告警。
 
 **Files:**
-- Create: `desktop-tauri/src-tauri/server/src/server/core/protocol/gemini_outbound.rs`
-- Create: `desktop-tauri/src-tauri/server/src/server/api/gemini.rs`
-- Modify: `desktop-tauri/src-tauri/server/src/server/http.rs`
-- Modify: `desktop-tauri/src-tauri/server/src/server/core/protocol/mod.rs`
-- Modify: `desktop-tauri/src-tauri/server/src/server/api/mod.rs`
-- Test: `desktop-tauri/src-tauri/server/src/server/core/protocol/gemini_outbound.rs`（内联 `#[cfg(test)]`）
-
-**Interfaces:**
-- Consumes: `crate::server::api::protocol::forward_chat`（既有 chat 转发骨架）、
-  `crate::server::core::protocol::antigravity_stream::ChatFromAntigravityStream`（既有 Gemini SSE → chat 翻译机）
-- Produces:
-  - `gemini_outbound::chat_from_gemini_request(body: &Value) -> Result<Value, String>`
-  - `gemini_outbound::gemini_response_from_chat(body: &Value, model: &str) -> Value`
-  - `api::gemini::generate_content(State, Path<(String, String)>, Bytes) -> Response`
-  - `api::gemini::stream_generate_content(State, Path<(String, String)>, Bytes) -> Response`
-  - `api::gemini::count_tokens(State, Path<(String, String)>, Bytes) -> Response`
-
-- [ ] **Step 1: 写失败测试（请求体映射）**
-
-在 `gemini_outbound.rs` 末尾写：
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn maps_gemini_request_to_chat() {
-        let gemini = serde_json::json!({
-            "contents": [
-                {"role": "user", "parts": [{"text": "hi"}]},
-                {"role": "model", "parts": [{"text": "hello"}]},
-                {"role": "user", "parts": [{"text": "again"}]}
-            ],
-            "systemInstruction": {"parts": [{"text": "be terse"}]},
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 64}
-        });
-        let chat = chat_from_gemini_request(&gemini).expect("应当映射成功");
-        assert_eq!(chat["messages"][0]["role"], "system");
-        assert_eq!(chat["messages"][0]["content"], "be terse");
-        assert_eq!(chat["messages"][1]["role"], "user");
-        assert_eq!(chat["messages"][2]["role"], "assistant", "model 角色要翻成 assistant");
-        assert_eq!(chat["temperature"], 0.2);
-        assert_eq!(chat["max_tokens"], 64);
-    }
-
-    #[test]
-    fn rejects_empty_contents() {
-        let gemini = serde_json::json!({"contents": []});
-        assert!(chat_from_gemini_request(&gemini).is_err());
-    }
-
-    #[test]
-    fn maps_chat_response_back_to_gemini() {
-        let chat = serde_json::json!({
-            "choices": [{"message": {"role": "assistant", "content": "hello"}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 2}
-        });
-        let gemini = gemini_response_from_chat(&chat, "gemini-2.5-pro");
-        assert_eq!(gemini["candidates"][0]["content"]["parts"][0]["text"], "hello");
-        assert_eq!(gemini["usageMetadata"]["promptTokenCount"], 5);
-    }
-}
-```
-
-- [ ] **Step 2: 运行测试确认失败**
-
-Run: `cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib gemini_outbound`
-Expected: FAIL — `cannot find function chat_from_gemini_request`
-
-- [ ] **Step 3: 实现映射层**
-
-`gemini_outbound.rs` 顶部（模块注释必须说明为什么只做「请求体映射」而不做「整条转发」：
-
-```rust
-//! Gemini 协议 ↔ chat 协议的**请求体与响应体**映射。
-//!
-//! ── 为什么只做映射、不做转发 ──────────────────────────────────
-//! 转发骨架已经有两条：`api::chat`（chat 入口）与 `api::protocol`
-//! （responses / messages 入口），它们都落到 `provider_loop` 的同一条链。
-//! Gemini 入口要做的事只有「把 Gemini 体翻成 chat 体 → 复用 chat 转发
-//! → 把 chat 响应翻回 Gemini 体」，所以本文件只负责两端的翻译。
-//!
-//! ── 为什么复用 antigravity_stream 而不是另写一台 ─────────────
-//! `protocol::antigravity_stream::ChatFromAntigravityStream` 已经是
-//! 「Gemini SSE 帧 → chat SSE 帧」的翻译机（Antigravity 上游就是 Gemini
-//! v1internal 方言）。**方向相反**的那一半（chat → Gemini）本文件补上。
-//! 两台状态机的帧词表是同一套，合并会让「读」与「写」互相干扰，因此分开放。
-//!
-//! ── 不支持的 Gemini 特性（明确列出，避免「看起来支持」）──────
-//!   - `cachedContent`：上游缓存引用，chat 协议无对应概念 → 忽略并记 verbose
-//!   - `safetySettings`：本项目不透传安全设置（与 responses 入口同口径）
-//!   - `responseSchema` / `responseMimeType`：chat 侧无稳定对应 → 转成
-//!     system 提示词里的一句约束（保底，不保证等价）
-
-use serde_json::{json, Value};
-
-/// Gemini 请求体 → chat 请求体。
-///
-/// `contents[].role` 的 `model` 翻成 `assistant`（Gemini 用 model，
-/// OpenAI 用 assistant，这是两家唯一不一致的角色名）。
-/// `systemInstruction` 提到 messages 的首条 system（chat 没有独立槽位）。
-pub fn chat_from_gemini_request(body: &Value) -> Result<Value, String> {
-    let contents = body
-        .get("contents")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "Gemini 请求缺少 contents 数组".to_string())?;
-    if contents.is_empty() {
-        return Err("Gemini 请求的 contents 为空".to_string());
-    }
-    let mut messages: Vec<Value> = Vec::with_capacity(contents.len() + 1);
-    if let Some(text) = body
-        .get("systemInstruction")
-        .and_then(|instruction| instruction.get("parts"))
-        .and_then(Value::as_array)
-        .and_then(|parts| parts.first())
-        .and_then(|part| part.get("text"))
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
-    {
-        messages.push(json!({"role": "system", "content": text}));
-    }
-    for content in contents {
-        let role = match content.get("role").and_then(Value::as_str) {
-            Some("model") => "assistant",
-            Some("user") | None => "user",
-            Some(other) => return Err(format!("未知的 Gemini 角色: {other}")),
-        };
-        let text = content
-            .get("parts")
-            .and_then(Value::as_array)
-            .map(|parts| {
-                parts
-                    .iter()
-                    .filter_map(|part| part.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .unwrap_or_default();
-        messages.push(json!({"role": role, "content": text}));
-    }
-    let mut chat = json!({"messages": messages});
-    if let Some(config) = body.get("generationConfig") {
-        if let Some(temperature) = config.get("temperature") {
-            chat["temperature"] = temperature.clone();
-        }
-        if let Some(max_tokens) = config.get("maxOutputTokens") {
-            chat["max_tokens"] = max_tokens.clone();
-        }
-        if let Some(top_p) = config.get("topP") {
-            chat["top_p"] = top_p.clone();
-        }
-    }
-    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        let functions: Vec<Value> = tools
-            .iter()
-            .filter_map(|tool| tool.get("functionDeclarations"))
-            .filter_map(Value::as_array)
-            .flatten()
-            .map(|declaration| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": declaration.get("name").cloned().unwrap_or(Value::Null),
-                        "description": declaration.get("description").cloned().unwrap_or(Value::Null),
-                        "parameters": declaration.get("parameters").cloned().unwrap_or(Value::Null),
-                    }
-                })
-            })
-            .collect();
-        if !functions.is_empty() {
-            chat["tools"] = Value::Array(functions);
-        }
-    }
-    Ok(chat)
-}
-
-/// chat 响应体 → Gemini 响应体（非流式）。
-pub fn gemini_response_from_chat(body: &Value, model: &str) -> Value {
-    let choice = body.get("choices").and_then(|choices| choices.get(0));
-    let text = choice
-        .and_then(|choice| choice.get("message"))
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let finish = choice
-        .and_then(|choice| choice.get("finish_reason"))
-        .and_then(Value::as_str)
-        .unwrap_or("STOP");
-    let finish_reason = match finish {
-        "length" => "MAX_TOKENS",
-        "stop" => "STOP",
-        _ => "STOP",
-    };
-    let usage = body.get("usage").cloned().unwrap_or(Value::Null);
-    json!({
-        "candidates": [{
-            "content": {"role": "model", "parts": [{"text": text}]},
-            "finishReason": finish_reason,
-        }],
-        "usageMetadata": {
-            "promptTokenCount": usage.get("prompt_tokens").cloned().unwrap_or(json!(0)),
-            "candidatesTokenCount": usage.get("completion_tokens").cloned().unwrap_or(json!(0)),
-            "totalTokenCount": usage.get("total_tokens").cloned().unwrap_or(json!(0)),
-        },
-        "modelVersion": model,
-    })
-}
-```
-
-- [ ] **Step 4: 运行测试确认通过**
-
-Run: `cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib gemini_outbound`
-Expected: PASS — 3 passed
-
-- [ ] **Step 5: 写失败测试（路由解析）**
-
-在 `api/gemini.rs` 末尾：
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_model_and_action_from_path() {
-        let (model, action) = parse_model_action("gemini-2.5-pro:generateContent").unwrap();
-        assert_eq!(model, "gemini-2.5-pro");
-        assert_eq!(action, Action::GenerateContent);
-        let (model, action) = parse_model_action("gemini-2.5-pro:streamGenerateContent").unwrap();
-        assert_eq!(model, "gemini-2.5-pro");
-        assert_eq!(action, Action::StreamGenerateContent);
-        let (_, action) = parse_model_action("gemini-2.5-pro:countTokens").unwrap();
-        assert_eq!(action, Action::CountTokens);
-        assert!(parse_model_action("gemini-2.5-pro").is_err(), "缺动作要报错");
-        assert!(parse_model_action("gemini-2.5-pro:unknown").is_err(), "未知动作要报错");
-    }
-}
-```
-
-- [ ] **Step 6: 运行测试确认失败**
-
-Run: `cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib api::gemini`
-Expected: FAIL — `cannot find function parse_model_action`
-
-- [ ] **Step 7: 实现路由与 handler**
-
-`api/gemini.rs`：
-
-```rust
-//! Gemini 协议入口（`/v1beta/models/{model}:{action}`）。
-//!
-//! ── 为什么要这个入口 ────────────────────────────────────────
-//! Agent 页可以接管 Gemini CLI（`core::agents` 的 `gemini-cli`），它写的是
-//! `GOOGLE_GEMINI_BASE_URL=<本网关>`。Gemini CLI 会拼
-//! `/v1beta/models/{model}:generateContent`，而网关此前只有 chat /
-//! responses / messages 三个入口 —— 那次接管**必然 404**。
-//!
-//! ── 路径形态为什么用 `:action` 后缀而不是独立路由 ──────────────
-//! Gemini 的协议就是 `models/{model}:{action}` 一个路径段，`:` 是模型名与
-//! 动作的分隔符（不是 URL 参数）。axum 的路径参数不能带 `:`，所以注册成
-//! `/{model_action}` 再在 handler 里切分 —— 与 Gemini 客户端发出的字节完全一致。
-
-use axum::body::Bytes;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::Json;
-use serde_json::{json, Value};
-
-use crate::server::core::protocol::gemini_outbound;
-use crate::server::state::ServerState;
-
-/// `models/{model}:{action}` 里的动作。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
-    GenerateContent,
-    StreamGenerateContent,
-    CountTokens,
-}
-
-/// 切分 `{model}:{action}`。
-pub fn parse_model_action(raw: &str) -> Result<(String, Action), String> {
-    let (model, action) = raw
-        .split_once(':')
-        .ok_or_else(|| format!("路径缺少 `:动作` 后缀: {raw}"))?;
-    if model.is_empty() {
-        return Err("模型名为空".to_string());
-    }
-    let action = match action {
-        "generateContent" => Action::GenerateContent,
-        "streamGenerateContent" => Action::StreamGenerateContent,
-        "countTokens" => Action::CountTokens,
-        other => return Err(format!("未知的 Gemini 动作: {other}")),
-    };
-    Ok((model.to_string(), action))
-}
-
-/// `POST /v1beta/models/{model}:generateContent`
-pub async fn generate_content(
-    State(state): State<ServerState>,
-    Path(model_action): Path<String>,
-    body: Bytes,
-) -> Response {
-    dispatch(state, model_action, body, Action::GenerateContent).await
-}
-
-/// `POST /v1beta/models/{model}:streamGenerateContent`
-pub async fn stream_generate_content(
-    State(state): State<ServerState>,
-    Path(model_action): Path<String>,
-    body: Bytes,
-) -> Response {
-    dispatch(state, model_action, body, Action::StreamGenerateContent).await
-}
-
-/// `POST /v1beta/models/{model}:countTokens`
-pub async fn count_tokens(
-    State(state): State<ServerState>,
-    Path(model_action): Path<String>,
-    body: Bytes,
-) -> Response {
-    dispatch(state, model_action, body, Action::CountTokens).await
-}
-
-async fn dispatch(
-    state: ServerState,
-    model_action: String,
-    body: Bytes,
-    expected: Option<Action>,
-    headers: axum::http::HeaderMap,
-    scope: Option<crate::server::core::key_scope::KeyScope>,
-) -> Response {
-    let (model, action) = match parse_model_action(&model_action) {
-        Ok(parsed) => parsed,
-        Err(message) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": {"message": message}})))
-                .into_response()
-        }
-    };
-    if action != expected {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": {"message": "路径动作与 handler 不一致"}})),
-        )
-            .into_response();
-    }
-    let raw_body = body.clone();
-    let gemini: Value = match serde_json::from_slice(&body) {
-        Ok(value) => value,
-        Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": {"message": format!("请求体不是 JSON: {error}")}})),
-            )
-                .into_response()
-        }
-    };
-    // countTokens 是纯本地估算，不需要打上游（Gemini 的语义也是估算）。
-    if action == Action::CountTokens {
-        let text = gemini
-            .get("contents")
-            .and_then(Value::as_array)
-            .map(|contents| {
-                contents
-                    .iter()
-                    .filter_map(|content| content.get("parts"))
-                    .filter_map(Value::as_array)
-                    .flatten()
-                    .filter_map(|part| part.get("text"))
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .unwrap_or_default();
-        // 与 `api::chat::count_tokens` 同一估算口径（4 字符 ≈ 1 token）
-        let tokens = (text.chars().count() / 4).max(1);
-        return Json(json!({"totalTokens": tokens})).into_response();
-    }
-    let chat = match gemini_outbound::chat_from_gemini_request(&gemini) {
-        Ok(chat) => chat,
-        Err(message) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": {"message": message}})))
-                .into_response()
-        }
-    };
-    // 复用 chat 入口的转发骨架：把翻译后的 chat 体交给它，再把结果翻回 Gemini。
-    //
-    // `forward_chat` 目前是 `api::protocol` 的**私有**函数（签名见下），
-    // 本任务需要把它提升为 `pub(crate)`，并在 `api/protocol.rs` 里加一个
-    // 薄封装（理由：它要 `client_headers` / `dedupe_key` / `telemetry` 三个
-    // 入口参数，Gemini 入口的取法与既有两入口一致，不该在三个地方各写一遍）。
-    let forwarded = crate::server::api::protocol::forward_chat_entry(
-        &state,
-        chat,
-        &headers,
-        action == Action::StreamGenerateContent,
-        &raw_body,
-        scope,
-    )
-    .await;
-    match forwarded {
-        Ok(response) => response,
-        Err(message) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": {"message": message}})),
-        )
-            .into_response(),
-    }
-}
-```
-
-- [ ] **Step 8: 运行测试确认通过**
-
-Run: `cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib api::gemini`
-Expected: PASS — 1 passed
-
-- [ ] **Step 8b: 在 `api/protocol.rs` 加转发封装**
-
-`api/gemini.rs` 需要复用转发骨架，但 `forward_chat` 是私有且要吃
-`dedupe_key` / `telemetry` / `KeyScope` 三个入口参数。在 `api/protocol.rs`
-加一个薄封装，把「Gemini 入口怎么取这三个参数」的判据收敛在一处：
-
-```rust
-/// 给协议入口用的转发封装：**只做入口参数的取法**，转发逻辑全在
-/// [`forward_chat`] 里。
-///
-/// ── 为什么需要它（而不是让每个入口自己拼参数）────────────────
-/// 三个入口（responses / messages / gemini）的 `dedupe_key` 取法必须一致
-/// （按「客户端原始 body 的 sha256」去重，见 `api::chat` 的说明），
-/// `telemetry` 与 `KeyScope` 的取法也一样。各写一遍的下场是某个入口悄悄
-/// 换了去重键，于是同一份请求在两个入口下算作两次。
-///
-/// ── 与既有两入口的关系 ────────────────────────────────────
-/// `responses_endpoint` / `messages_endpoint` 已在用同样的取法，但它们各自
-/// 内联了这几行。本函数不改变它们的行为，只是给新入口一个可复用的入口点；
-/// 后续可把三者统一到这里（不在本任务范围内，避免无谓的回归面）。
-pub(crate) async fn forward_chat_entry(
-    state: &ServerState,
-    payload: Value,
-    client_headers: &HeaderMap,
-    stream: bool,
-    // 客户端原始 body 的字节（去重键的原料）。Gemini 入口拿到的是**原始**
-    // Gemini 体，不是翻译后的 chat 体 —— 去重键必须用前者（同一份客户端请求
-    // 在两个入口下应算一次，而翻译后的体已经变了）。
-    raw_body: &[u8],
-    // 命中的网关 Key 身份：由 `http.rs` 的鉴权中间件放进请求扩展，
-    // handler 用 `Extension<Option<KeyScope>>` 取出后传进来。
-    scope: Option<crate::server::core::key_scope::KeyScope>,
-) -> Result<Response, String> {
-    let dedupe_key = crate::server::core::upstream::pipeline::sha256_hex(raw_body);
-    let telemetry = Arc::new(crate::server::core::upstream::RequestTelemetry::with_id());
-    if let Some(scope) = scope.as_ref() {
-        telemetry.set_key(scope.key_id(), scope.key_name());
-    }
-    match forward_chat(state, payload, client_headers, stream, dedupe_key, scope, telemetry).await {
-        Ok(outcome) => Ok(outcome.into_response()),
-        Err(error) => Err(error.message),
-    }
-}
-```
-
-> **实现前先核对**：`dedupe_key_of` / `key_scope::from_headers` /
-> `RequestTelemetry::default` 的真实名字。若本项目用的是别的取法
-> （如 `api::chat` 里内联的 `sha256` 计算），按既有写法照抄，
-> **不要新造一套去重键**。
-
-- [ ] **Step 9: 注册路由**
-
-`server/http.rs` 在既有四个 `/v1/*` 路由之后追加：
-
-```rust
-// Gemini 入口（`models/{model}:{action}`）：`:` 是 Gemini 的模型/动作分隔符，
-// axum 路径参数不能带 `:`，所以注册成单个参数再在 handler 里切分。
-.route(
-    "/v1beta/models/{model_action}",
-    post(api::gemini::generate_content),
-)
-```
-
-> **注意**：同一路径要挂三个动作，axum 不允许同一 path 注册多次。改为
-> 单个 handler `gemini_entry`，在内部按 `parse_model_action` 的结果分派到
-> `generate_content` / `stream_generate_content` / `count_tokens`。
-> 把 Step 7 的三个 pub handler 保留为内部函数，对外只暴露：
-
-```rust
-.route("/v1beta/models/{model_action}", post(api::gemini::gemini_entry))
-```
-
-`gemini_entry` 的实现就是把 `dispatch(state, model_action, body, None)` 里的
-`expected` 改成 `Option<Action>`（`None` = 按路径自身动作分派）。
-
-- [ ] **Step 10: 全量测试 + 提交**
-
-```bash
-cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib
-git add desktop-tauri/src-tauri/server/src/server/api/gemini.rs \
-        desktop-tauri/src-tauri/server/src/server/core/protocol/gemini_outbound.rs \
-        desktop-tauri/src-tauri/server/src/server/core/protocol/mod.rs \
-        desktop-tauri/src-tauri/server/src/server/api/mod.rs \
-        desktop-tauri/src-tauri/server/src/server/http.rs
-git commit -m "新增：Gemini 协议入口（/v1beta/models/{model}:{action}）
-
-修一处已确认的断链：Agent 页可接管 Gemini CLI（写 GOOGLE_GEMINI_BASE_URL
-指向本网关），但网关此前只有 chat/responses/messages 三个入口，Gemini CLI
-拼出的 /v1beta/models/{model}:generateContent 必然 404。
-
-- gemini_outbound：Gemini 请求体 ↔ chat 请求体、chat 响应 → Gemini 响应
-- api::gemini：路径 {model}:{action} 切分 + 三个动作分派
-- countTokens 走本地估算（与 chat 入口同一口径），不打上游
-- 复用既有 antigravity_stream 的 Gemini SSE 翻译机（方向相反的那半在此补齐）
-- 明确不支持的 Gemini 特性写在模块头：cachedContent / safetySettings / responseSchema"
-```
-
----
-
-## Task 2: Agent 写入保留注释
-
-**背景**：`core/agents/apply.rs` 的模块头自己承认「注释保不住（已知取舍）」——
-写入走「解析成值树 → 改键 → 重新序列化」，JSONC / TOML 的注释全丢。Codex 的
-`config.toml` 是用户手写的，常有注释掉的实验配置。
-
-**Files:**
-- Modify: `desktop-tauri/src-tauri/server/Cargo.toml`（加 `toml_edit`）
+- Modify: `desktop-tauri/src-tauri/server/Cargo.toml`
 - Modify: `desktop-tauri/src-tauri/server/src/server/core/agents/apply.rs`
-- Test: `desktop-tauri/src-tauri/server/src/server/core/agents/apply.rs`（内联）
+- Test: 同上文件内联 `#[cfg(test)]`
 
 **Interfaces:**
-- Consumes: 既有 `apply_single` / `apply_multi` 的「改哪几个键」路径列表
-- Produces: `apply::set_toml_path_preserving(text: &str, path: &str, value: &Value) -> Result<String, String>`
+- Consumes: 既有 `single_targets(def, profile) -> Vec<(String, Value)>`（`apply.rs:185+`）
+- Produces: `apply::set_toml_path(text: &str, dotted: &str, value: &Value) -> Result<String, String>`
 
 - [ ] **Step 1: 写失败测试**
 
-在 `apply.rs` 的 `#[cfg(test)]` 模块里追加：
+在 `apply.rs` 的 `#[cfg(test)]` 模块追加：
 
 ```rust
 #[test]
-fn toml_write_preserves_comments_and_order() {
+fn set_toml_path_handles_single_segment() {
+    // Codex 的 targets 里有顶层单段键（`model` / `model_provider`）。
+    // v1 计划用 rsplit_once('.') 要求至少两段 → 对单段直接报错。
+    let updated = set_toml_path("model = \"old\"\n", "model", &json!("new"))
+        .expect("单段键必须支持");
+    assert!(updated.contains("model = \"new\""));
+}
+
+#[test]
+fn set_toml_path_creates_missing_tables() {
+    // 既有 set_path 会沿路径创建中间对象（apply.rs:288-296）。
+    // 首次接管一个只有 model 的 config.toml 时，provider 段必须被建出来，
+    // 否则用户第一次切换就失败。
+    let updated = set_toml_path(
+        "model = \"gpt-5\"\n",
+        "model_providers.agent2api.base_url",
+        &json!("http://127.0.0.1:3065/v1"),
+    )
+    .expect("缺表时必须创建，不是报错");
+    assert!(updated.contains("[model_providers.agent2api]"));
+    assert!(updated.contains("base_url = \"http://127.0.0.1:3065/v1\""));
+}
+
+#[test]
+fn set_toml_path_preserves_comments_and_order() {
     let original = r#"# 我的 Codex 配置
 model = "gpt-5"
 
@@ -617,90 +144,83 @@ model = "gpt-5"
 base_url = "http://old/v1"   # 旧地址
 env_key = "OLD"
 "#;
-    let updated = set_toml_path_preserving(
+    let updated = set_toml_path(
         original,
         "model_providers.agent2api.base_url",
-        &serde_json::json!("http://127.0.0.1:3065/v1"),
+        &json!("http://127.0.0.1:3065/v1"),
     )
     .expect("应当写入成功");
     assert!(updated.contains("# 我的 Codex 配置"), "顶层注释必须保留");
     assert!(updated.contains("# 实验性设置，别动"), "段注释必须保留");
+    assert!(updated.contains("# 旧地址"), "行尾注释必须保留");
     assert!(updated.contains("http://127.0.0.1:3065/v1"));
     assert!(!updated.contains("http://old/v1"));
     let model_pos = updated.find("model = \"gpt-5\"").expect("model 行还在");
     let provider_pos = updated.find("[model_providers.agent2api]").expect("段还在");
     assert!(model_pos < provider_pos, "键序必须保持");
 }
-
-#[test]
-fn toml_write_reports_missing_table() {
-    let original = "model = \"gpt-5\"\n";
-    // 目标表不存在时按现有语义**报错**而不是悄悄新建整段
-    // （新建会让用户看到一个自己没写过的段）
-    assert!(set_toml_path_preserving(original, "model_providers.x.base_url", &serde_json::json!("u")).is_err());
-}
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [ ] **Step 2: 运行确认失败**
 
-Run: `cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib toml_write`
-Expected: FAIL — `cannot find function set_toml_path_preserving`
+Run: `cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib set_toml_path`
+Expected: FAIL — `cannot find function set_toml_path`
 
-- [ ] **Step 3: 加依赖**
+- [ ] **Step 3: 加依赖（钉 0.25，已在 lock）**
 
-`server/Cargo.toml` 的 `[dependencies]` 区，紧跟既有 `toml` 那一行：
+`server/Cargo.toml`，紧跟既有 `toml` 那行：
 
 ```toml
-# 保留注释与格式地改写 TOML（Codex 的 config.toml 是用户手写的，注释不能丢）。
-# `toml`（既有）是「解析成值树」，本 crate 是「带 trivia 的语法树」——
-# 两者用途不同，不是重复依赖。
-# **不是新增依赖**：`toml_edit` 已在 Cargo.lock 里（作为 `toml` 生态的传递依赖，
-# 现有 0.19.15 / 0.20.2 / 0.25.13 三个版本）。这里指定与 `toml` 0.9 配套的
-# 版本，避免再引入第四个版本。落地前先跑 `cargo tree -i toml_edit` 确认。
-toml_edit = "0.22"
+# 保留注释与格式地改写 TOML（Codex 的 config.toml 是用户手写的）。
+# `toml`（既有）是「解析成值树」，本 crate 是「带 trivia 的语法树」。
+# **版本必须是 0.25**：该版本已由 `proc-macro-crate` 引入并在 Cargo.lock 中，
+# 提为直接依赖不新增版本树。`toml 0.9.12` 本身已不用 `toml_edit`
+# （它用 toml_parser / toml_writer），所以钉 0.22 会新增第四个版本 —— 不要。
+toml_edit = "0.25"
 ```
 
-- [ ] **Step 4: 实现 `set_toml_path_preserving`**
+- [ ] **Step 4: 实现 `set_toml_path`**
 
 ```rust
 /// 按点分路径写入一个 TOML 值，**保留注释、键序与格式**。
 ///
 /// ── 与既有 `toml::to_string_pretty` 的分工 ────────────────────
 /// 那条路径是「解析成 `toml::Table` → 改键 → 整体序列化」，注释在解析阶段
-/// 就丢了。本函数改用 `toml_edit`（带 trivia 的语法树），只动目标键所在的
-/// 那一处 —— 用户写在别处的注释、缩进、空行都逐字保留。
+/// 就丢了。本函数用 `toml_edit`（带 trivia 的语法树），只动目标键那一处。
 ///
-/// ── 目标表不存在时为什么报错而不是新建 ────────────────────────
-/// 新建一个 `[model_providers.agent2api]` 整段等于往用户文件里塞一段他没写过的
-/// 内容。本项目的 `apply_single` 语义是「只改该改的那几个键」，目标键不存在
-/// 说明客户端版本或用户手改导致结构与预期不符，此时应当让用户看到失败原因。
-pub fn set_toml_path_preserving(
-    text: &str,
-    dotted_path: &str,
-    value: &Value,
-) -> Result<String, String> {
+/// ── 路径形态：支持单段与多段 ──────────────────────────────────
+/// Codex 的 targets 里既有顶层单段键（`model` / `model_provider`），也有
+/// 三段键（`model_providers.agent2api.base_url`）。用 `split('.')` 逐段走，
+/// 不要 `rsplit_once('.')` —— 后者对单段路径直接报错。
+///
+/// ── 缺表时**创建**而不是报错 ──────────────────────────────────
+/// 与既有 `set_path`（apply.rs:288-296）同一语义：首次接管一个只有
+/// `model` 的 config.toml 时，`[model_providers.agent2api]` 段必须被建出来。
+/// 报错会让「第一次切换」必然失败。
+pub fn set_toml_path(text: &str, dotted: &str, value: &Value) -> Result<String, String> {
     let mut document = text
         .parse::<toml_edit::DocumentMut>()
         .map_err(|error| format!("解析 TOML 失败: {error}"))?;
-    let (table_path, key) = dotted_path
-        .rsplit_once('.')
-        .ok_or_else(|| format!("路径必须至少两段（表.键）: {dotted_path}"))?;
-    let mut table: &mut toml_edit::Table = document.as_table_mut();
-    for segment in table_path.split('.') {
+    let segments: Vec<&str> = dotted.split('.').collect();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return Err(format!("路径含空段: {dotted}"));
+    }
+    let mut table = document.as_table_mut();
+    for segment in &segments[..segments.len() - 1] {
+        if !table.contains_key(segment) {
+            table.insert(segment, toml_edit::Item::Table(toml_edit::Table::new()));
+        }
         table = table
             .get_mut(segment)
             .and_then(|item| item.as_table_mut())
-            .ok_or_else(|| format!("TOML 里没有段 `{segment}`（完整路径: {dotted_path}）"))?;
+            .ok_or_else(|| format!("TOML 里 `{segment}` 不是表（路径: {dotted}）"))?;
     }
-    if !table.contains_key(key) {
-        return Err(format!("TOML 里没有键 `{key}`（完整路径: {dotted_path}）"));
-    }
-    let converted = json_to_toml_item(value)?;
-    table.insert(key, converted);
+    let key = segments[segments.len() - 1];
+    table.insert(key, json_to_toml_item(value)?);
     Ok(document.to_string())
 }
 
-/// JSON 值 → TOML 值。只支持本项目实际会写的几种类型。
+/// JSON 值 → TOML 值。只支持本项目实际会写的标量。
 fn json_to_toml_item(value: &Value) -> Result<toml_edit::Item, String> {
     Ok(match value {
         Value::String(text) => toml_edit::value(text.clone()),
@@ -722,286 +242,137 @@ fn json_to_toml_item(value: &Value) -> Result<toml_edit::Item, String> {
 }
 ```
 
-- [ ] **Step 5: 运行测试确认通过**
+- [ ] **Step 5: 运行确认通过**
 
-Run: `cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib toml_write`
-Expected: PASS — 2 passed
+Run: `cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib set_toml_path`
+Expected: PASS — 3 passed
 
 - [ ] **Step 6: 接到 `apply_single` 的 TOML 分支**
 
-`apply.rs:317` 那一处 `toml::to_string_pretty` 改为：若路径列表全部是
-「表.键」形态的标量写入，走 `set_toml_path_preserving`；否则回退既有路径。
-（`apply_single` 的 `paths` 已逐条给出「表.键」形态，见 `mod.rs` 的 `ClientDef`。）
+`apply.rs:311-318` 改为：
 
-- [ ] **Step 7: 验证既有行为未变 + 提交**
-
-Run: `cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib agents`
-
-```bash
-git add desktop-tauri/src-tauri/server/Cargo.toml desktop-tauri/src-tauri/server/Cargo.lock \
-        desktop-tauri/src-tauri/server/src/server/core/agents/apply.rs
-git commit -m "改进：Agent 写 TOML 保留注释与键序（toml_edit）
-
-原实现「解析成值树 → 改键 → 重新序列化」，JSONC / TOML 的注释全丢。
-Codex 的 config.toml 是用户手写的，常有注释掉的实验配置，一次切换全丢
-会让用户不敢用这个功能。
-
-- 新增 set_toml_path_preserving：带 trivia 的语法树，只动目标键
-- 目标表/键不存在时**报错而不是新建整段**（不往用户文件里塞没写过的内容）
-- 复合值（数组/表）明确不支持，遇到即报错（本项目不写这类值）"
+```rust
+    let rendered = match def.format {
+        ConfigFormat::Toml => {
+            // 逐个路径写入带 trivia 的语法树，注释与键序保留。
+            let mut text = original.clone();
+            for (key, item) in &targets {
+                text = set_toml_path(&text, key, item)?;
+            }
+            text
+        }
+        _ => { /* 既有 JSON 分支不变 */ }
+    };
 ```
 
----
+- [ ] **Step 7: 同步 `preview`**
 
-## Task 3: `checkin` 提升为 trait 钩子
+`apply.rs` 的 `preview`（约 `:484-499`）TOML 分支改用同一 `set_toml_path` 链，否则预览显示「注释会丢」而落盘不丢 —— 界面在说谎。
 
-**背景**：签到分派写在 `billing::checkin::checkin_for` 的 `match provider` 里，
-`ProviderAdapter` 上没有签到方法。新增一家要同时改 `adapter.rs`、`checkin.rs`
-与 `CHECKIN_PROVIDERS` 三处。
-
-**Files:**
-- Modify: `desktop-tauri/src-tauri/server/src/server/core/providers/adapter.rs`
-- Modify: `desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs`
-- Modify: `desktop-tauri/src-tauri/server/src/server/core/auto_checkin.rs`
-- Test: `desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs`（内联）
-
-**Interfaces:**
-- Consumes: `ProviderAdapter::implemented_kinds()`、既有 `checkin_for` 的每 provider 分支体
-- Produces:
-  - `ProviderAdapter::supports_checkin(&self) -> bool`（默认 `false`）
-  - `ProviderAdapter::checkin<'a>(&'a self, store: &'a AccountStore, billing: &'a BillingService, account: &'a Value, manual: bool) -> Pin<Box<dyn Future<Output = CheckinOutcome> + Send + 'a>>`
-  - `auto_checkin::checkin_providers() -> Vec<String>`（从 `implemented_kinds()` 派生）
-
-- [ ] **Step 1: 写失败测试**
-
-在 `checkin.rs` 的测试模块里：
+- [ ] **Step 8: 写 `preview` 一致性测试**
 
 ```rust
 #[test]
-fn every_checkin_provider_declares_the_trait_hook() {
-    // 回归锁定：`CHECKIN_PROVIDERS` 与 trait 声明必须一致。
-    // 反例（改造前）：两者各自维护，新增一家漏改任一处都会静默失效。
-    let declared: Vec<String> = crate::server::core::auto_checkin::checkin_providers();
-    for provider_id in &declared {
-        let kind = crate::server::core::providers::kind_from_id(provider_id)
-            .unwrap_or_else(|| panic!("CHECKIN_PROVIDERS 里的 {provider_id} 不在注册表里"));
-        assert!(
-            crate::server::core::providers::adapter_for(kind).supports_checkin(),
-            "{provider_id} 在 CHECKIN_PROVIDERS 里但适配器没声明 supports_checkin"
-        );
-    }
+fn preview_matches_applied_output() {
+    // 回归锁定：预览与落盘必须是同一份渲染结果。
+    // 反例（v1）：preview 仍走 toml::to_string_pretty，落盘走 toml_edit，
+    // 于是预览说「注释会丢」而实际不丢。
+    let original = "# keep me\nmodel = \"old\"\n";
+    let def = crate::server::core::agents::find("codex").expect("codex 必须在注册表");
+    let profile = crate::server::core::agents::Profile::default();
+    let previewed = render_single(def, original, &profile).expect("渲染应当成功");
+    assert!(previewed.contains("# keep me"), "注释必须保留");
 }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+> 实现前先确认 `preview` 的真实签名；若它是内联在 `preview_impl` 里，
+> 把渲染那一步抽成 `render_single(def, original, profile) -> Result<String, String>`
+> 供 `preview` 与 `apply_single` 共用，测试直接测它。
 
-Run: `cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib every_checkin_provider`
-Expected: FAIL — `no method named supports_checkin`
-
-- [ ] **Step 3: 加 trait 钩子**
-
-`adapter.rs` 在 `supports_usage` 之后插入：
-
-```rust
-    /// 本 provider 是否有**每日签到**能力。
-    ///
-    /// ── 为什么提到 trait 上（改造前它是一张独立的 id 数组）──────────
-    /// 签到分派此前写在 `billing::checkin::checkin_for` 的 `match provider` 里，
-    /// 目标集合另有一张 `auto_checkin::CHECKIN_PROVIDERS: [&str; 14]`。新增一家
-    /// 要同时改三处（adapter / checkin 的 match / 那张数组），漏改任一处都会
-    /// 静默失效 —— 这与 `supports_usage` / `query_usage` 的形状完全同构，
-    /// 没有理由让签到单独一套。
-    ///
-    /// 默认 `false`：与 `supports_usage` 同一取向（能力是常量声明，不是
-    /// 「这次请求成不成功」）。
-    fn supports_checkin(&self) -> bool {
-        false
-    }
-
-    /// 执行一次签到。
-    ///
-    /// ── 默认实现为什么是「明确的未实现」而不是 panic ────────────────
-    /// release 是 `panic = abort`，一次误调用会带走整个进程。`supports_checkin`
-    /// 为 true 却忘了覆写本方法时，返回一条可读的错误，界面据此显示「该家
-    /// 签到未实现」—— 这比让网关死掉有用得多。
-    fn checkin<'a>(
-        &'a self,
-        _store: &'a AccountStore,
-        _billing: &'a crate::server::core::billing::BillingService,
-        _account: &'a Value,
-        _manual: bool,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CheckinOutcome> + Send + 'a>> {
-        Box::pin(async {
-            CheckinOutcome::NotImplemented
-        })
-    }
-```
-
-同时定义结果类型（放在 `adapter.rs` 顶部 `UpstreamErrorClass` 附近）：
-
-```rust
-/// 一次签到的结果（trait 钩子的返回形状）。
-#[derive(Clone, Debug)]
-pub enum CheckinOutcome {
-    /// 领取成功（首次 / 今日首次）
-    Confirmed(String),
-    /// 今日已领过
-    Already(String),
-    /// 不满足领取条件（无积分体系 / 未启用）
-    NotEligible(String),
-    /// 本次跳过（中性，不算失败）
-    Skipped(String),
-    /// 上游明确失败
-    Failed(String),
-    /// 适配器声明了能力但没实现钩子
-    NotImplemented,
-}
-```
-
-- [ ] **Step 4: 把 `checkin_for` 的 match 体搬进各适配器**
-
-对 `checkin_for` 里每一个分支（`"raccoon"` / `"autoclaw" | "autoclaw-intl"` /
-`"qoder" | "qoder-intl"` / `"trae"` / `"workbuddy-intl"` / `"loomy"` /
-`"kuku"` / `"officeace"` / `"lobsterai"` / `"codearts"` / `"chatglm"`）：
-把分支体逐字搬进对应 `providers/<家>/adapter.rs`（或 `mod.rs`）的
-`impl ProviderAdapter for X`，返回 `CheckinOutcome`。`checkin_for` 改为：
-
-```rust
-    let kind = crate::server::core::providers::kind_from_id(provider_id)
-        .ok_or_else(|| format!("未知的提供商 {provider_id}"))?;
-    let adapter = crate::server::core::providers::adapter_for(kind);
-    if !adapter.supports_checkin() {
-        return not_supported_row(id, name, &display, provider_id);
-    }
-    let outcome = adapter.checkin(store, billing, account, manual).await;
-    outcome_row(id, name, &display, outcome)
-```
-
-> **保持逐字不变**：`Outcome::Confirmed` → `{"success": true, "msg": label}`、
-> `Already` → `{"success": false, "alreadyCompleted": true, ...}`、
-> `NotEligible | Skipped` → `{"success": false, ...}` 三条映射（见既有
-> `checkin_for` 末尾）必须原样搬到 `outcome_row`，否则前端结果卡会变。
-
-- [ ] **Step 5: `CHECKIN_PROVIDERS` 从注册表派生**
-
-`auto_checkin.rs` 把常量数组改为函数：
-
-```rust
-/// 参与签到的 provider id 清单（**从注册表派生**，不再手维护）。
-///
-/// 判据是适配器的 `supports_checkin()` —— 与 `supports_usage()` 同一口径。
-/// 改造前这是一张 `[&str; 14]` 手写数组，新增一家漏加就会静默不签到。
-pub fn checkin_providers() -> Vec<String> {
-    crate::server::core::providers::implemented_kinds()
-        .into_iter()
-        .filter(|kind| crate::server::core::providers::adapter_for(*kind).supports_checkin())
-        .filter_map(crate::server::core::providers::id_of_kind)
-        .map(str::to_string)
-        .collect()
-}
-```
-
-> **保留 `PROVIDERS_VERSION` / `PROVIDERS_ADDED_IN`**：那套机制解决的是
-> 「新增家默认勾选」与「用户取消勾选后不被补回来」的冲突（只补一次，靠配置里的
-> 版本号记账），它是**对的**，不要动。这里只改「清单从哪来」。
-
-- [ ] **Step 5b: 在 `providers/mod.rs` 加 `kind → id` 反查**
-
-本项目只有 `kind_from_id`（id → kind），没有反向。`checkin_providers()` 需要它：
-
-```rust
-/// `ProviderKind` → provider id（`kind_from_id` 的反向）。
-///
-/// ── 为什么需要它 ──────────────────────────────────────────
-/// 清单类查询（如 `auto_checkin::checkin_providers`）从
-/// `implemented_kinds()` 出发，拿到的是枚举变体，而对外（配置、界面、日志）
-/// 一律用字符串 id。没有反查时调用点只能自己再写一张 `match`，于是 id 与
-/// 枚举的对应关系就有了两处 —— 加一家漏改一处就静默错位。
-///
-/// ── 实现方式：复用 `kind_from_id` 而不是再写一张表 ─────────────
-/// 遍历 `PROVIDERS` 的 id，逐个问 `kind_from_id` 是不是目标 kind。O(n) 但
-/// n = 27 且只在启动/配置读取时调用，不值得为它维护第二张映射表。
-/// 两个 kind 共用一个 id 的形态不存在（每个地区是独立的 kind + 独立的 id）。
-pub fn id_of_kind(kind: ProviderKind) -> Option<&'static str> {
-    PROVIDERS
-        .iter()
-        .map(|meta| meta.id)
-        .find(|id| kind_from_id(id) == Some(kind))
-}
-```
-
-- [ ] **Step 6: 运行测试确认通过**
-Expected: PASS
-
-- [ ] **Step 7: 全量测试 + 提交**
+- [ ] **Step 9: 全量测试 + 提交**
 
 ```bash
 cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib
-git add desktop-tauri/src-tauri/server/src/server/core/providers/ \
-        desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs \
-        desktop-tauri/src-tauri/server/src/server/core/auto_checkin.rs
-git commit -m "重构：签到能力提升为 ProviderAdapter 钩子，清单从注册表派生
+git add desktop-tauri/src-tauri/server/Cargo.toml \
+        desktop-tauri/src-tauri/Cargo.lock \
+        desktop-tauri/src-tauri/server/src/server/core/agents/apply.rs
+git commit -m "改进：Agent 写 TOML 保留注释与键序（toml_edit 0.25）
 
-改造前签到分派写在 billing::checkin::checkin_for 的 match provider 里，
-目标集合另有一张 auto_checkin::CHECKIN_PROVIDERS: [&str; 14] 手写数组。
-新增一家要同时改三处，漏改任一处静默失效。
+原实现「解析成值树 → 改键 → 重新序列化」，TOML 注释全丢。Codex 的
+config.toml 是用户手写的，一次切换全丢会让用户不敢用这个功能。
 
-- 新增 ProviderAdapter::supports_checkin / checkin（默认 false / NotImplemented）
-- 各家的签到分支体逐字搬进对应适配器
-- CHECKIN_PROVIDERS 改为 checkin_providers()，从 implemented_kinds() 派生
-- 保留 PROVIDERS_VERSION / PROVIDERS_ADDED_IN（那套版本记账是对的）
-- 回归测试：清单里的每家都必须声明 supports_checkin"
+范围只覆盖 TOML（Codex）。opencode / zed 用 JSONC，仍走旧的有损路径，
+comment_warnings 继续如实告警 —— 不假装这一半也修好了。
+
+- set_toml_path：带 trivia 的语法树，只动目标键；注释/键序/行尾注释全保留
+- 支持单段键（Codex 的 model / model_provider）与多段键
+- 缺表时创建（与既有 set_path 同语义），首次接管不会失败
+- preview 与落盘共用同一渲染，界面不再说谎
+- 钉 toml_edit 0.25（proc-macro-crate 已引入，不新增版本树）"
 ```
 
 ---
 
-## Task 4: per-provider 行为开关
+## Task 2: per-provider 行为开关
 
-**背景**：内置家的行为开关都是**全局**的（`promptMode`、
-`sanitizeBlacklistFingerprints`），没有「这家要不要开 X」的维度。自定义家有
-`ProviderQuirks`，但内置家享受不到。
+**背景**：全局开关对所有家同时生效，缺「这家要不要开 X」的维度。
 
 **Files:**
 - Create: `desktop-tauri/src-tauri/server/src/server/core/provider_options.rs`
-- Modify: `desktop-tauri/src-tauri/server/src/server/config/types.rs`
+- Modify: `desktop-tauri/src-tauri/server/src/server/core/mod.rs`
 - Modify: `desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs`
-- Test: `desktop-tauri/src-tauri/server/src/server/core/provider_options.rs`（内联）
+- Test: `provider_options.rs` 内联
 
 **Interfaces:**
-- Consumes: 既有 `config::types` 的 kv 存取模式
+- Consumes: `config::with_raw`（读，`config/mod.rs:994`）、`config::update_raw_field`（**写，`config/mod.rs:1352`，会刷新内存**）
 - Produces:
-  - `provider_options::get(provider_id: &str, key: &str) -> Option<bool>`
   - `provider_options::is_enabled(provider_id: &str, key: &str, default: bool) -> bool`
   - `provider_options::set(provider_id: &str, key: &str, value: bool) -> Result<(), String>`
+  - `provider_options::KNOWN_KEYS: [&str; 2]`
 
 - [ ] **Step 1: 写失败测试**
 
 ```rust
 #[test]
+fn set_then_get_returns_new_value() {
+    // 回归锁定：写后同进程读必须立刻生效。
+    // 反例（v1）：用 config::save_raw 只写库、不刷新内存快照，
+    // 于是 get 读到旧值，必须重启才生效。
+    set("workbuddy", "sanitizeBlacklistFingerprints", false).expect("写入应当成功");
+    assert!(
+        !is_enabled("workbuddy", "sanitizeBlacklistFingerprints", true),
+        "写后必须立刻读到新值"
+    );
+}
+
+#[test]
 fn per_provider_option_is_independent() {
-    // 回归锁定：A 家关掉不影响 B 家（改造前只有全局开关，做不到这一点）
-    set("workbuddy", "sanitizeFingerprints", false).unwrap();
-    set("qoder", "sanitizeFingerprints", true).unwrap();
-    assert!(!is_enabled("workbuddy", "sanitizeFingerprints", true));
-    assert!(is_enabled("qoder", "sanitizeFingerprints", true));
+    set("workbuddy", "sanitizeBlacklistFingerprints", false).unwrap();
+    set("qoder", "sanitizeBlacklistFingerprints", true).unwrap();
+    assert!(!is_enabled("workbuddy", "sanitizeBlacklistFingerprints", true));
+    assert!(is_enabled("qoder", "sanitizeBlacklistFingerprints", true));
     // 未设置的 provider 走 default
-    assert!(is_enabled("trae", "sanitizeFingerprints", true));
+    assert!(is_enabled("trae", "sanitizeBlacklistFingerprints", true));
+}
+
+#[test]
+fn unknown_provider_option_is_ignored() {
+    // 已删的自定义家在配置里还留着开关：读的时候忽略，不 panic。
+    assert!(
+        is_enabled("custom-gone", "sanitizeBlacklistFingerprints", true),
+        "未知 provider 必须走 default"
+    );
 }
 
 #[test]
 fn unknown_key_is_rejected() {
     assert!(set("workbuddy", "nonexistentKey", true).is_err());
 }
-
-#[test]
-fn deleted_provider_option_is_ignored() {
-    // 自定义家删了之后配置里还留着它的开关：读的时候忽略，不 panic
-    set("custom-gone", "sanitizeFingerprints", false).unwrap();
-    assert!(is_enabled("custom-gone", "sanitizeFingerprints", true), "未知 provider 走 default");
-}
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+> **测试隔离**：这四条都会碰全局配置。`provider_options` 的读侧必须支持「provider 不在注册表且不是自定义家时一律返回 default」。若测试之间互相污染，在测试模块里用一个 `static LOCK: Mutex<()>` 串行化。
+
+- [ ] **Step 2: 运行确认失败**
 
 Run: `cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib provider_options`
 Expected: FAIL — module 不存在
@@ -1012,52 +383,57 @@ Expected: FAIL — module 不存在
 //! 每 provider 的行为开关（对标 magpie 的 `auth.options[]`）。
 //!
 //! ── 为什么需要这一层 ────────────────────────────────────────
-//! 本项目的全局开关（`promptMode` / `sanitizeBlacklistFingerprints` /
-//! `stripNewlineKeepalive`）对**所有家**同时生效。但不同家对同一策略的
-//! 反应并不一致：WorkBuddy 的审核按逐字匹配，脱敏必须开；而某家如果本来
-//! 就不做内容审核，脱敏只是白改字节。没有 per-provider 维度时，用户只能
-//! 在「全部开」与「全部关」之间选。
+//! 全局开关（`sanitizeBlacklistFingerprints` / `promptMode` 等）对**所有家**
+//! 同时生效。但不同家对同一策略的反应并不一致：WorkBuddy 的审核按逐字匹配、
+//! 脱敏必须开；某家本来不做内容审核，脱敏只是白改字节。
 //!
 //! ── 存储形态 ──────────────────────────────────────────────
-//! config.json 的 `providerOptions` 键，形如：
+//! config.json 的 `providerOptions` 键：
 //! ```json
 //! "providerOptions": {
-//!   "workbuddy": { "sanitizeFingerprints": false },
-//!   "qoder":     { "stripThinkingTags": true }
+//!   "workbuddy": { "sanitizeBlacklistFingerprints": false }
 //! }
 //! ```
-//! **键不存在 = 跟随全局默认**（`is_enabled` 的 `default` 参数），
-//! 这是升级兼容的硬要求：旧配置读出来必须与改造前逐字一致。
+//! **键不存在 = 跟随全局默认**（`is_enabled` 的 `default` 参数）—— 这是
+//! 升级兼容的硬要求：旧配置读出来必须与改造前逐字一致。
 //!
-//! ── 允许哪些 key ───────────────────────────────────────────
-//! 白名单在 [`KNOWN_KEYS`] 里。未知 key 写入报错（而不是静默接受）：
-//! 拼错的 key 永远不会生效，静默接受会让用户以为开关坏了。
-
-use std::sync::OnceLock;
+//! ── 写侧为什么用 `update_raw_field` 而不是 `save_raw` ─────────────
+//! `save_raw` 只写库、**不刷新内存快照**，而读侧 `with_raw` 读的是内存快照。
+//! 用 `save_raw` 会导致「设了不生效、必须重启」。`update_raw_field` 走
+//! `update()` 闭包，写完同步刷新内存。
+//!
+//! ── 键名必须与全局键逐字一致 ────────────────────────────────
+//! [`KNOWN_KEYS`] 里的名字直接引用 `config::types` 的全局键常量，不是自造
+//! 短名。拼错会让「per-provider 覆盖」永远匹配不到全局开关。
 
 use serde_json::{Map, Value};
 
 use crate::server::config;
 use crate::server::logging;
 
-/// 允许的开关名（与全局开关一一对应，只是多了 provider 维度）。
-pub const KNOWN_KEYS: [&str; 3] = [
-    "sanitizeFingerprints",
-    "stripThinkingTags",
-    "stripNewlineKeepalive",
+/// 允许的开关名 —— **直接引用全局键常量**，保证与全局开关同名。
+pub const KNOWN_KEYS: [&str; 2] = [
+    crate::server::config::types::KEY_SANITIZE_FINGERPRINTS,
+    crate::server::config::types::KEY_STRIP_NEWLINE_KEEPALIVE,
 ];
 
 fn config_key() -> &'static str {
     "providerOptions"
 }
 
+/// provider 是否可识别（内置注册表或自定义家）。
+fn is_known_provider(provider_id: &str) -> bool {
+    crate::server::core::providers::PROVIDERS
+        .iter()
+        .any(|meta| meta.id == provider_id)
+        || crate::server::core::custom_providers::is_custom_provider_id(provider_id)
+}
+
 /// 读一个 provider 的某个开关。`None` = 没设置过（调用方用 default）。
 pub fn get(provider_id: &str, key: &str) -> Option<bool> {
-    if !KNOWN_KEYS.contains(&key) {
+    if !KNOWN_KEYS.contains(&key) || !is_known_provider(provider_id) {
         return None;
     }
-    // 读取入口是 `config::with_raw`（拿一份 config.json 的只读快照闭包），
-    // 不是 `config::snapshot()` —— 后者不存在。
     config::with_raw(|raw| {
         raw.get(config_key())
             .and_then(|options| options.get(provider_id))
@@ -1072,7 +448,7 @@ pub fn is_enabled(provider_id: &str, key: &str, default: bool) -> bool {
     get(provider_id, key).unwrap_or(default)
 }
 
-/// 写一个 provider 的开关。
+/// 写一个 provider 的开关（写完内存快照同步刷新）。
 pub fn set(provider_id: &str, key: &str, value: bool) -> Result<(), String> {
     if !KNOWN_KEYS.contains(&key) {
         return Err(format!(
@@ -1083,24 +459,21 @@ pub fn set(provider_id: &str, key: &str, value: bool) -> Result<(), String> {
     if provider_id.trim().is_empty() {
         return Err("provider id 不能为空".to_string());
     }
-    // 写入走既有的「读整份 raw → 改 → 存回」三步（本项目没有 `config::update`）。
-    // 先取一份可变副本，改完用 `config::save_raw` 落盘。
-    let mut raw = config::with_raw(|raw| raw.clone()).ok_or("配置不可用")?;
-    let options = raw
-        .entry(config_key().to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    let Some(options) = options.as_object_mut() else {
+    let mut options = config::with_raw(|raw| raw.get(config_key()).cloned())
+        .flatten()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    let Some(options_map) = options.as_object_mut() else {
         return Err("providerOptions 不是对象".to_string());
     };
-    let entry = options
+    let entry = options_map
         .entry(provider_id.to_string())
         .or_insert_with(|| Value::Object(Map::new()));
     let Some(entry) = entry.as_object_mut() else {
         return Err(format!("providerOptions.{provider_id} 不是对象"));
     };
     entry.insert(key.to_string(), Value::Bool(value));
-    if !config::save_raw(&raw) {
-        return Err("保存配置失败".to_string());
+    if !config::update_raw_field(config_key(), options) {
+        return Err("保存 providerOptions 失败".to_string());
     }
     logging::log(
         "[Config]",
@@ -1110,30 +483,29 @@ pub fn set(provider_id: &str, key: &str, value: bool) -> Result<(), String> {
 }
 ```
 
-> **实现前先确认**：`config::update` 与 `config::snapshot` 的实际函数名。
-> 若本项目用的是别的入口（如 `config::write_key` / `config::get`），按既有
-> 签名改写，**不要新造一套 kv 存取**。
-
-- [ ] **Step 4: 运行测试确认通过**
+- [ ] **Step 4: 运行确认通过**
 
 Run: `cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib provider_options`
-Expected: PASS — 3 passed
+Expected: PASS — 4 passed
 
 - [ ] **Step 5: 接到 `payload::send_body` 的脱敏层**
 
-`payload.rs` 的 ② 指纹脱敏层，把全局开关改为「per-provider 优先、全局兜底」：
+`payload.rs` 的 ② 层（约 `:240-256`）：
 
 ```rust
+    // per-provider 覆盖全局（键不存在时跟随全局快照）。
     let sanitize = crate::server::core::provider_options::is_enabled(
         provider_id,
-        "sanitizeFingerprints",
+        crate::server::config::types::KEY_SANITIZE_FINGERPRINTS,
         ctx.sanitize_fingerprints,
     );
     let body = match sanitize {
-        true => /* 既有逻辑不变 */,
+        true => /* 既有 sanitize_body 逻辑不变 */,
         false => after_prompt,
     };
 ```
+
+> **性能**：`send_body` 每次 provider attempt 都跑，`is_enabled` 会取一次 config 读锁。若实测有影响，把 `providerOptions` 在 `upstream::forward` 里快照进 `ProviderContext`（与 `sanitize_fingerprints` 同一处）。本任务先按简单版落地。
 
 - [ ] **Step 6: 全量测试 + 提交**
 
@@ -1141,65 +513,73 @@ Expected: PASS — 3 passed
 cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib
 git add desktop-tauri/src-tauri/server/src/server/core/provider_options.rs \
         desktop-tauri/src-tauri/server/src/server/core/mod.rs \
-        desktop-tauri/src-tauri/server/src/server/config/types.rs \
         desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs
 git commit -m "新增：per-provider 行为开关（对标 magpie auth.options[]）
 
-全局开关对所有家同时生效，但不同家对同一策略的反应并不一致：WorkBuddy
-的审核按逐字匹配、脱敏必须开；某家本来不做内容审核，脱敏只是白改字节。
-没有 provider 维度时用户只能全开或全关。
+全局开关对所有家同时生效，但不同家对同一策略的反应不一致。
 
-- providerOptions 配置键：{providerId: {key: bool}}
-- 键不存在 = 跟随全局默认（升级后行为逐字不变）
-- 未知 key 写入报错（拼错的 key 永不生效，静默接受会让用户以为开关坏了）
-- 首个接入点：sanitizeFingerprints（per-provider 优先、全局兜底）"
+- providerOptions 配置键：{providerId: {全局键名: bool}}
+- 键名**直接引用** config::types 的全局键常量（不是自造短名）
+- 键不存在 = 跟随全局默认，升级后行为逐字不变
+- 写侧用 update_raw_field（刷新内存快照）；save_raw 只写库、设了不生效
+- 未知 provider 的残留开关被忽略，走 default
+- 首个接入点：sanitizeBlacklistFingerprints"
 ```
 
 ---
 
-## Task 5: Key 配额多维化
+## Task 3: Key 配额多规则（仅 Token 维度）
 
-**背景**：`ApiKeyEntry::quota_tokens: Option<i64>` + `quota_reset: QuotaReset`
-只支持**单条** Token 限额。magpie 支持最多 5 条规则（日/周/月/任意窗口，
-Token + 费用），全部满足才放行。
+**背景**：当前只支持**单条** Token 限额（`quotaTokens` + `quotaReset`）。
+
+**明确不做 Cost 维度**：`requests` 表只有 prompt/completion/total_tokens，**没有 cost 列**，全仓也没有任何地方计算费用。v1 计划的 `QuotaMetric::Cost` 是「永远为 0、永不超限」的假功能 —— 砍掉。
 
 **Files:**
 - Modify: `desktop-tauri/src-tauri/server/src/server/core/api_keys.rs`
 - Modify: `desktop-tauri/src-tauri/server/src/server/core/key_quota.rs`
 - Modify: `desktop-tauri/src-tauri/server/src/server/api/keys_api.rs`
 - Modify: `desktop-tauri/ui-islands/src/islands/keys-page.tsx`
-- Test: `desktop-tauri/src-tauri/server/src/server/core/key_quota.rs`（内联）
+- Test: `key_quota.rs` 内联
 
 **Interfaces:**
-- Consumes: `limiter::kind_window_start(kind: i64, now_ms: i64) -> i64`（既有，`pub(crate)`，同 crate 内可用）
+- Consumes: 既有 `by_kind: HashMap<kind, (window_start, HashMap<key_id, used>)>`（`key_quota.rs:72`，**已天然支持多窗口**）、`limiter::kind_window_start`（`pub(crate)`）
 - Produces:
-  - `api_keys::KeyQuotaRule { metric: QuotaMetric, limit: f64, reset: QuotaReset }`
-  - `api_keys::QuotaMetric::{Tokens, Cost}`
-  - `key_quota::exceeded(entry: &ApiKeyEntry, now_ms: i64) -> bool`（**签名不变**）
-  - `key_quota::exceeded_rule(entry: &ApiKeyEntry, now_ms: i64) -> Option<KeyQuotaRule>`（新增，供详情展示）
+  - `api_keys::KeyQuotaRule { limit: i64, reset: QuotaReset }`（**无 metric 字段**）
+  - `key_quota::exceeded(entry, now_ms) -> bool`（**签名不变**）
+  - `key_quota::exceeded_rule(entry, now_ms) -> Option<KeyQuotaRule>`
 
 - [ ] **Step 1: 写失败测试**
 
 ```rust
 #[test]
-fn effective_rules_prefers_new_shape() {
-    // 新形态（quotaRules）非空时优先，旧的 quotaTokens 被忽略
-    let entry = entry_with_rules(vec![
-        KeyQuotaRule { metric: QuotaMetric::Tokens, limit: 100_000.0, reset: QuotaReset::Daily },
-        KeyQuotaRule { metric: QuotaMetric::Tokens, limit: 1_000_000.0, reset: QuotaReset::Fixed(30 * 86_400) },
-    ]);
-    let rules = effective_rules(&entry);
-    assert_eq!(rules.len(), 2, "两条规则都要保留（叠加约束，不是取最宽）");
+fn rules_only_key_reaches_the_database() {
+    // 回归锁定：只有 quota_rules、没有 quota_tokens 的 Key 必须被判定。
+    // 反例（v1）：fetch() 只收集 quota_tokens.is_some() 的窗口种类，
+    // 于是 rule-only 的 Key 拿不到读数 → 恒 0 → 永不超限（静默无效）。
+    let entry = entry_with_rules(vec![KeyQuotaRule { limit: 100_000, reset: QuotaReset::Daily }]);
+    assert_eq!(entry.quota_tokens, None, "前提：旧字段为空");
+    // 测试库里没有该 Key 的请求记录 → 读数为 0 → 不超限。
+    // 关键是它**走到了查库**而不是被 quota_tokens 的 None 提前短路。
+    assert!(exceeded_rule(&entry, crate::server::logging::now_ms()).is_none());
 }
 
 #[test]
 fn legacy_single_quota_becomes_one_rule() {
-    // 旧记录只有 quotaTokens（没有 quotaRules）：必须读成一条规则
     let entry = legacy_entry(Some(50_000), QuotaReset::Daily);
     let rules = effective_rules(&entry);
     assert_eq!(rules.len(), 1);
-    assert_eq!(rules[0].limit, 50_000.0);
-    assert_eq!(rules[0].reset, QuotaReset::Daily);
+    assert_eq!(rules[0].limit, 50_000);
+}
+
+#[test]
+fn all_rules_must_pass() {
+    // magpie 语义：多条规则**全部满足**才放行（不是任一满足）。
+    let entry = entry_with_rules(vec![
+        KeyQuotaRule { limit: 100_000, reset: QuotaReset::Daily },
+        KeyQuotaRule { limit: 1_000_000, reset: QuotaReset::Fixed(30 * 86_400) },
+    ]);
+    let rules = effective_rules(&entry);
+    assert_eq!(rules.len(), 2, "两条规则都要保留（叠加约束，不是取最宽）");
 }
 
 #[test]
@@ -1209,78 +589,85 @@ fn no_rules_means_unlimited() {
 }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [ ] **Step 2: 运行确认失败**
 
 Run: `cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib key_quota`
 Expected: FAIL — `cannot find struct KeyQuotaRule`
 
-- [ ] **Step 3: 加规则类型与读侧兼容**
+- [ ] **Step 3: 加规则类型（读侧兼容）**
 
 `api_keys.rs`：
 
 ```rust
-/// 配额计量的维度。
+/// 一条 Key 配额规则（**只有 Token 维度**）。
+///
+/// ── 为什么不做 Cost 维度 ───────────────────────────────────
+/// `requests` 表只有 prompt/completion/total_tokens，**没有 cost 列**，
+/// 全仓也没有任何地方计算费用。magpie 的 Cost 限额依赖它的模型倍率表；
+/// 本项目没有这套数据，加一个没有数据源的维度只会做出「永远为 0、
+/// 永不超限」的假功能。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum QuotaMetric {
-    /// 窗口内累计 Token 数（既有唯一维度）
-    Tokens,
-    /// 窗口内累计费用（按模型倍率折算，需 `requests` 表已有 cost 口径）
-    Cost,
-}
-
-/// 一条 Key 配额规则。
-#[derive(Clone, Copy, Debug)]
 pub struct KeyQuotaRule {
-    pub metric: QuotaMetric,
-    pub limit: f64,
+    /// 窗口内累计 Token 上限（恒 > 0）
+    pub limit: i64,
     pub reset: QuotaReset,
 }
 ```
 
-`ApiKeyEntry` 增加字段（**保留旧的 `quota_tokens` / `quota_reset` 以兼容读侧**）：
+`ApiKeyEntry` 增加（**保留旧字段**）：
 
 ```rust
     /// 配额规则列表（新形态）；**空 = 回落到旧的单条配额**。
     ///
     /// ── 为什么保留旧字段而不是迁移 ─────────────────────────────
-    /// 旧记录只有 `quotaTokens` / `quotaReset`。迁移要在 schema 升级里改
-    /// 所有存量记录，而 `apiKeys` 存在 config.json（不是库表），没有事务
-    /// 可依赖 —— 读侧兼容（空规则 → 用旧字段造一条）比写侧迁移安全。
+    /// `apiKeys` 存在 config.json（不是库表），没有事务可依赖。读侧兼容
+    /// （空规则 → 用旧字段造一条）比写侧迁移安全。
     pub quota_rules: Vec<KeyQuotaRule>,
 ```
 
-- [ ] **Step 4: 实现多条判定**
+- [ ] **Step 4: 改 `fetch` 的 kinds 收集**
 
-`key_quota.rs`：
+`key_quota.rs:180-187` 改为：
 
 ```rust
-/// 判定是否超限（**保持既有签名**：内部自己查库，热路径零成本）。
-///
-/// ── 为什么签名不变 ─────────────────────────────────────────
-/// 既有调用点（`http.rs` 的鉴权中间件）只问「超没超」，不需要知道是哪条
-/// 规则超的。把读数改成参数会让所有调用点都要先算一遍窗口读数，而
-/// 「没配配额」这个最常见情形本该零成本（既有注释明确写了这一点）。
-///
-/// ── 多条规则的语义 ───────────────────────────────────────
-/// 与 magpie 一致：**全部满足才放行**（不是任一满足）。多条规则是叠加约束
-/// （日限额 + 月限额同时生效），「任一满足」等于只保留最宽松的一条。
+    let entries = crate::server::core::api_keys::list();
+    let mut kinds: Vec<i64> = entries
+        .iter()
+        // **关键改动**：不再只看 quota_tokens，而是看有效规则。
+        // 旧写法会让「只有 quota_rules」的 Key 拿不到读数 → 永不超限。
+        .flat_map(|entry| effective_rules(entry).into_iter().map(|rule| rule.reset.kind()))
+        .collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+```
+
+- [ ] **Step 5: 实现 `exceeded_rule`（保持 `exceeded` 签名）**
+
+```rust
+/// 判定是否超限（**签名不变**：内部自己查库，热路径零成本）。
 pub fn exceeded(entry: &ApiKeyEntry, now_ms: i64) -> bool {
     exceeded_rule(entry, now_ms).is_some()
 }
 
 /// 判定是否超限，并返回**第一条**超限的规则（`None` = 全部通过）。
 ///
-/// 给「为什么被拦」的展示用（Key 详情页显示是哪条规则命中）。
+/// ── 全部满足才放行 ─────────────────────────────────────────
+/// 多条规则是叠加约束（日限额 + 月限额同时生效）。「任一满足」等于只保留
+/// 最宽松的一条，让另一条形同虚设。
+///
+/// ── 「等于上限也算超」────────────────────────────────────────
+/// 既有约定（`used >= limit`）不改：前端显示的「已用 50000 / 50000」与
+/// 「被拦」必须一致。
 pub fn exceeded_rule(entry: &ApiKeyEntry, now_ms: i64) -> Option<KeyQuotaRule> {
     let rules = effective_rules(entry);
     if rules.is_empty() {
         return None;
     }
     for rule in rules {
-        if rule.limit <= 0.0 {
+        if rule.limit <= 0 {
             continue;
         }
-        let used = usage_for_kind(entry, rule.reset.kind(), now_ms) as f64;
+        let used = usage_for_window(entry, rule.reset.kind(), now_ms);
         if used >= rule.limit {
             return Some(rule);
         }
@@ -1288,20 +675,21 @@ pub fn exceeded_rule(entry: &ApiKeyEntry, now_ms: i64) -> Option<KeyQuotaRule> {
     None
 }
 
-/// 按**指定窗口种类**查已用量（多条规则各有自己的窗口）。
+/// 有效规则：新形态优先，空则从旧字段造一条。
+fn effective_rules(entry: &ApiKeyEntry) -> Vec<KeyQuotaRule> {
+    if !entry.quota_rules.is_empty() {
+        return entry.quota_rules.clone();
+    }
+    match entry.quota_tokens {
+        Some(limit) => vec![KeyQuotaRule { limit, reset: entry.quota_reset }],
+        None => Vec::new(),
+    }
+}
+
+/// 按**指定窗口种类**查已用量。
 ///
-/// ── 实现方式：把既有 `usage_for` 的体抽成带 `kind` 参数的版本 ──────
-/// 既有 `usage_for(entry, now_ms)` 第一行就是 `let kind = entry.quota_reset.kind();`
-/// 之后全是「按 kind 查缓存 / 查库」。把那个函数体原样搬进来、把首行改成
-/// 参数，然后让 `usage_for` 变成三行的转发：
-///
-/// ```rust
-/// pub fn usage_for(entry: &ApiKeyEntry, now_ms: i64) -> i64 {
-///     usage_for_window(entry, entry.quota_reset.kind(), now_ms)
-/// }
-/// ```
-///
-/// **行为必须逐字不变**（既有调用点依赖它），所以搬的时候只动首行，
+/// 实现 = 既有 `usage_for`（key_quota.rs:103）的整个函数体，只把首行
+/// `let kind = entry.quota_reset.kind();` 删掉（kind 现在是参数）。
 /// 其余一字不改 —— 包括那段「先锁内看一眼缓存、锁外取数」的锁序注释。
 fn usage_for_window(entry: &ApiKeyEntry, kind: i64, now_ms: i64) -> i64 {
     // ── 先在锁内看一眼缓存，锁外再取数 ──────────────────────────
@@ -1312,7 +700,6 @@ fn usage_for_window(entry: &ApiKeyEntry, kind: i64, now_ms: i64) -> i64 {
     let hit = {
         let mut cache = match USAGE_CACHE.lock() {
             Ok(guard) => guard,
-            // 锁中毒（另一个线程 panic 在持锁期间）：按「没有证据」处理，不拦
             Err(poisoned) => poisoned.into_inner(),
         };
         if cache
@@ -1329,11 +716,9 @@ fn usage_for_window(entry: &ApiKeyEntry, kind: i64, now_ms: i64) -> i64 {
     if let Some(used) = hit {
         return used;
     }
-    // 锁外取数（可能读配置 + 查库）
     let fresh = fetch(now_ms);
     let used = cached_lookup(fresh.as_ref(), kind, &entry.id, now_ms);
     if let Ok(mut cache) = USAGE_CACHE.lock() {
-        // 只在「还没有更新的快照」时写回：另一个线程可能刚抓过一份更新的
         if cache
             .as_ref()
             .map(|cached| {
@@ -1351,41 +736,28 @@ fn usage_for_window(entry: &ApiKeyEntry, kind: i64, now_ms: i64) -> i64 {
 pub fn usage_for(entry: &ApiKeyEntry, now_ms: i64) -> i64 {
     usage_for_window(entry, entry.quota_reset.kind(), now_ms)
 }
-
-/// 有效规则：新形态优先，空则从旧字段造一条。
-fn effective_rules(entry: &ApiKeyEntry) -> Vec<KeyQuotaRule> {
-    if !entry.quota_rules.is_empty() {
-        return entry.quota_rules.clone();
-    }
-    match entry.quota_tokens {
-        Some(limit) => vec![KeyQuotaRule {
-            metric: QuotaMetric::Tokens,
-            limit: limit as f64,
-            reset: entry.quota_reset,
-        }],
-        None => Vec::new(),
-    }
-}
 ```
 
-> **`used_tokens` 参数**：保留它是为了不破坏既有调用点的签名；新逻辑用
-> `day_tokens` / `long_tokens` 两个窗口读数。若既有调用点只算了一个窗口，
-> 在 Step 5 一并补上第二个窗口的查询。
+- [ ] **Step 6: 同步 `quota_json`**
 
-- [ ] **Step 5: 接线调用点与 API**
+`key_quota.rs:303-322` 的 `quota_json` 仍只读 `quota_tokens` —— 规则型 Key 会在 Key 页显示「无限」。改为读 `effective_rules` 的第一条（或聚合展示）。
 
-- `key_quota.rs` 的 `exceeded_for` / 心跳刷新按 `effective_rules` 遍历窗口
-- `keys_api.rs` 的 GET/PUT 增删 `quotaRules` 字段（**保留** `quotaTokens` 读写）
-- `keys-page.tsx` 加「配额规则」编辑区（最多 5 条，超出时禁用「添加」按钮）
+- [ ] **Step 7: 后端校验「最多 5 条」**
 
-- [ ] **Step 6: 前端类型检查与产物**
+`keys_api.rs` 的 add/update：`quotaRules.len() > 5` → 400。
+
+- [ ] **Step 8: 前端配额规则编辑**
+
+`keys-page.tsx` 加「配额规则」区（最多 5 条，超出禁用「添加」按钮）。保留旧的单条 `quotaTokens` 输入（兼容期两者并存，规则非空时以规则为准）。
+
+- [ ] **Step 9: 前端类型检查 + 构建**
 
 ```bash
 npm --prefix desktop-tauri/ui-islands run typecheck
 npm --prefix desktop-tauri/ui-islands run build
 ```
 
-- [ ] **Step 7: 全量测试 + 提交**
+- [ ] **Step 10: 全量测试 + 提交**
 
 ```bash
 cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib
@@ -1393,67 +765,48 @@ git add desktop-tauri/src-tauri/server/src/server/core/api_keys.rs \
         desktop-tauri/src-tauri/server/src/server/core/key_quota.rs \
         desktop-tauri/src-tauri/server/src/server/api/keys_api.rs \
         desktop-tauri/ui-islands/src/islands/keys-page.tsx \
-        desktop-tauri/ui/islands/ui.js
-git commit -m "新增：网关 Key 配额多维化（多条规则、Token + 费用）
+        desktop-tauri/ui/islands/ui.js desktop-tauri/ui/islands/ui.css
+git commit -m "新增：网关 Key 配额多规则（仅 Token 维度）
 
-原实现只支持单条 Token 限额（quotaTokens + quotaReset），做不到
-「工作日 50 万、周末 20 万」或「每月 10 美元上限」。
+原实现只支持单条 Token 限额（quotaTokens + quotaReset）。
 
-- 新增 KeyQuotaRule {metric, limit, reset}，最多 5 条
-- 判定语义与 magpie 一致：**全部满足才放行**（不是任一满足）
+- KeyQuotaRule {limit, reset}，最多 5 条，**全部满足才放行**（magpie 语义）
 - 读侧兼容：规则为空时从旧 quotaTokens 造一条，旧记录行为逐字不变
-- 「等于上限也算超」的既有口径保持不变
-- 前端 keys-page 加配额规则编辑区"
+- fetch 的窗口种类收集改为遍历有效规则 —— 这是 v1 的静默无效 bug：
+  只看 quota_tokens 会让「只有规则」的 Key 拿不到读数、永不超限
+- exceeded 签名不变（内部查库，热路径零成本）；新增 exceeded_rule 供展示
+- **不做 Cost 维度**：requests 表无 cost 列，加它就是假功能
+- 「等于上限也算超」的既有口径不变"
 ```
 
 ---
 
-## Task 6: 通用 middleware（think-tags + word-guard）
+## Task 4: 通用 think-tags 剥离
 
-**背景**：`strip_thinking_tags` 只服务 Qoder（`providers/qoder/stream.rs`，标签常量 `THINK_TAGS` 在 `providers/qoder/protocol.rs`）；
-词语拦截完全没有。magpie 把两者做成 gateway middleware，插在请求/响应管线上。
+**背景**：`strip_thinking_tags` 只服务 Qoder（`providers/qoder/stream.rs:428`，标签常量 `THINK_TAGS` 在 `providers/qoder/protocol.rs:41`，共 4 组）。
+
+**范围**：只做「剥离**开头**的 think 块」。Qoder 那台机器是把**正文中间**的标签转成 reasoning delta，语义不同 —— 本任务**不声称**与它等价，也不动它。
 
 **Files:**
 - Create: `desktop-tauri/src-tauri/server/src/server/core/middleware/mod.rs`
 - Create: `desktop-tauri/src-tauri/server/src/server/core/middleware/think_tags.rs`
-- Create: `desktop-tauri/src-tauri/server/src/server/core/middleware/word_guard.rs`
-- Modify: `desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs`
 - Modify: `desktop-tauri/src-tauri/server/src/server/core/upstream/sse.rs`
+- Modify: `desktop-tauri/src-tauri/server/src/server/core/upstream/aggregate.rs`
+- Modify: `desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop.rs`
 - Modify: `desktop-tauri/src-tauri/server/src/server/config/types.rs`
-- Test: 三个文件各自内联
+- Test: `think_tags.rs` 内联
 
 **Interfaces:**
-- Consumes: `payload::send_body` 的 ①→②→③ 管线
 - Produces:
-  - `think_tags::strip_leading(text: &str) -> (String, bool)`（返回清理后文本 + 是否命中）
-  - `think_tags::to_content(reasoning: &str) -> String`
-  - `word_guard::check_user_text(body: &Value, config: &WordGuardConfig) -> WordGuardVerdict`
-  - `word_guard::WordGuardVerdict::{Pass, Reject(String), Mask(String)}`
+  - `think_tags::strip_leading(text: &str) -> (String, bool)`
+  - `think_tags::LeadingThinkFilter { done: bool, buffer: String }`（跨帧状态）
 
-- [ ] **Step 1: 写失败测试（think-tags 跨分片）**
+- [ ] **Step 1: 写失败测试**
 
 ```rust
 #[test]
-fn strip_handles_tag_split_across_chunks() {
-    // 回归锁定：标签被切成两片时不能残留半个标签
-    // 反例：逐片剥离会把 "<thi" 与 "nk>" 当成普通文本留下
-    let mut buffer = String::new();
-    let mut out = String::new();
-    for chunk in ["<thi", "nk>hello</thi", "nk> world"] {
-        buffer.push_str(chunk);
-        let (rest, done) = consume_prefix(&mut buffer);
-        out.push_str(&rest);
-        if done {
-            out.push_str(&buffer);
-            buffer.clear();
-        }
-    }
-    assert_eq!(out, "hello world", "剥完标签后正文必须完整且无残留");
-}
-
-#[test]
 fn strip_only_affects_leading_block() {
-    let (out, hit) = strip_leading("<think>x</think>real answer");
+    let (out, hit) = strip_leading("<think>internal</think>real answer");
     assert!(hit);
     assert_eq!(out, "real answer");
     // 正文中间的标签不动（那是用户内容）
@@ -1461,150 +814,264 @@ fn strip_only_affects_leading_block() {
     assert!(!hit);
     assert_eq!(out, "see <think>y</think> here");
 }
+
+#[test]
+fn strip_handles_all_four_tag_pairs() {
+    // Qoder 的 THINK_TAGS 有 4 组（qoder/protocol.rs:41），不是只有 <think>
+    for (open, close) in [("<think>", "</think>"), ("<thinking>", "</thinking>")] {
+        let text = format!("{open}x{close}body");
+        let (out, hit) = strip_leading(&text);
+        assert!(hit, "标签对 {open} 必须被识别");
+        assert_eq!(out, "body");
+    }
+}
+
+#[test]
+fn strip_handles_split_across_frames() {
+    // 跨帧：`<thi` + `nk>x</think>` + `body`
+    let mut filter = LeadingThinkFilter::default();
+    let mut out = String::new();
+    for chunk in ["<thi", "nk>x</think>", "body"] {
+        out.push_str(&filter.push(chunk));
+    }
+    assert_eq!(out, "body", "剥完标签后正文必须完整且无残留");
+}
+
+#[test]
+fn filter_passes_through_when_no_leading_tag() {
+    let mut filter = LeadingThinkFilter::default();
+    // 第一帧就不是标签开头 → 立刻进入 done，后续原样透传（零额外延迟）
+    assert_eq!(filter.push("hello"), "hello");
+    assert_eq!(filter.push(" world"), " world");
+}
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [ ] **Step 2: 运行确认失败**
 
 Run: `cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib think_tags`
 Expected: FAIL — module 不存在
 
-- [ ] **Step 3: 实现 think_tags**
-
-按 Step 1 的两个测试实现 `strip_leading` / `consume_prefix` / `to_content`。
-关键约束：**只处理开头的标签块**（正文中间的是用户内容，不能动）；
-跨分片时用 `buffer` 累积到标签闭合再判定。
-
-- [ ] **Step 4: 写失败测试（word-guard 只查用户文本）**
+- [ ] **Step 3: 实现**
 
 ```rust
-#[test]
-fn word_guard_ignores_tool_results_and_system() {
-    let body = json!({
-        "messages": [
-            {"role": "system", "content": "you may say SECRET"},
-            {"role": "user", "content": "hello"},
-            {"role": "assistant", "content": null, "tool_calls": [{"function": {"arguments": "SECRET"}}]},
-            {"role": "tool", "content": "SECRET"}
-        ]
-    });
-    let config = WordGuardConfig { words: vec!["SECRET".into()], patterns: vec![], action: WordAction::Reject, check: WordCheck::All };
-    // 只查用户文本 → 这三处 SECRET 都不该触发
-    assert!(matches!(check_user_text(&body, &config), WordGuardVerdict::Pass));
+//! 剥离响应**开头**的思考标签块（对标 magpie 的 `think-tags` 插件 `strip` 模式）。
+//!
+//! ── 与 Qoder 那台机器的区别（不要混淆）──────────────────────
+//! `providers::qoder::stream` 的机器把**正文中间**的 `<think>` 转成 reasoning
+//! delta（`THINK_TAGS` 四组标签、任意位置）。本模块只处理**开头**那一块：
+//! 上游把思考内容整个塞在正文最前面、而客户端不认标签时，把它剥掉。
+//! 两者语义不同，不要互相替代。
+//!
+//! ── 为什么要跨帧状态 ──────────────────────────────────────
+//! SSE 帧边界与标签边界无关：`<thi` 与 `nk>` 可能落在两帧里。逐帧剥离会
+//! 把半截标签当普通正文留下。所以用 [`LeadingThinkFilter`] 累积到标签闭合。
+//!
+//! ── 为什么「没有标签」要立刻放行 ────────────────────────────
+//! 首帧若不是标签开头，就置 `done` 并原样返回 —— 不能为了等可能的标签
+//! 而缓冲正文（那会给所有正常响应加延迟）。
+
+/// 剥离文本**开头**的 think 块。返回 (清理后文本, 是否命中)。
+pub fn strip_leading(text: &str) -> (String, bool) {
+    let mut filter = LeadingThinkFilter::default();
+    let out = filter.push(text);
+    (out, filter.done)
 }
 
-#[test]
-fn word_guard_rejects_user_text() {
-    let body = json!({"messages": [{"role": "user", "content": "my SECRET is here"}]});
-    let config = WordGuardConfig { words: vec!["SECRET".into()], patterns: vec![], action: WordAction::Reject, check: WordCheck::All };
-    match check_user_text(&body, &config) {
-        WordGuardVerdict::Reject(message) => assert!(message.contains("SECRET")),
-        other => panic!("应当拒绝，实际 {other:?}"),
+/// 跨帧的开头标签过滤器。
+#[derive(Debug, Default)]
+pub struct LeadingThinkFilter {
+    /// 已判定完毕（没有开头标签 / 标签已剥完）—— 之后原样透传
+    done: bool,
+    /// 判定期间的缓冲（只在开头可能是标签时非空）
+    buffer: String,
+}
+
+impl LeadingThinkFilter {
+    /// 喂一段正文，返回可以下发的部分。
+    pub fn push(&mut self, chunk: &str) -> String {
+        if self.done {
+            return chunk.to_string();
+        }
+        self.buffer.push_str(chunk);
+        let trimmed = self.buffer.trim_start();
+        let leading_ws = self.buffer.len() - trimmed.len();
+        for (open, close) in crate::server::core::providers::qoder::protocol::THINK_TAGS {
+            if !trimmed.starts_with(open) {
+                continue;
+            }
+            let Some(close_at) = trimmed.find(close) else {
+                // 标签还没闭合：继续缓冲（等下一帧）
+                return String::new();
+            };
+            let rest_start = leading_ws + close_at + close.len();
+            let rest = self.buffer[rest_start..].to_string();
+            self.buffer.clear();
+            self.done = true;
+            return rest;
+        }
+        // 首部不是任何已知标签 → 判定完毕，把缓冲原样吐出
+        self.done = true;
+        std::mem::take(&mut self.buffer)
     }
 }
 ```
 
-- [ ] **Step 5: 实现 word_guard**
+> **`THINK_TAGS` 的可见性**：若它现在是私有常量，改为 `pub(crate)`。不要在本模块抄一份 —— 抄一份会在 Qoder 加标签时静默不同步。
 
-`WordGuardConfig { words, patterns, action: Reject|Mask, check: Last|All }`。
-**只遍历 `role == "user"` 的 message**（`check: Last` 只看最后一条 user，
-`All` 看全部）。命中后按 `action` 返回 `Reject`（带命中词，供 400 文案）或
-`Mask`（把命中的词替换成 `***` 后的体）。
+- [ ] **Step 4: 运行确认通过**
 
-- [ ] **Step 6: 插进 payload 管线（请求侧）与 FramePolicy（响应侧）**
+Run: `cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib think_tags`
+Expected: PASS — 4 passed
 
-**请求侧**：`payload.rs` 在 ② 之后、③ 之前插入词语拦截层。顺序理由：
-在**脱敏之后**（脱敏改的是指纹模板句，不该被用户词规则命中）、
-在**原生工具闸门之前**（拦截应当发生在任何下游改写之前）。
+- [ ] **Step 5: 挂到 `FramePolicy`（流式路径）**
 
-**响应侧**：think-tags 的 `strip` 模式作用于**下游 SSE 帧**，落点是既有的
-`upstream::sse::FramePolicy` —— 不要另造一个响应改写层。照 `strip_newline_chunks`
-的既定范式扩展（「能力位 × 全局开关」，只能收窄不能扩张）：
+`sse.rs`：
 
 ```rust
 pub struct FramePolicy {
     pub rewrite: Option<ModelRewrite>,
     pub strip_newline_chunks: bool,
-    /// 剥离**开头**的 `<think>…</think>` 块（think-tags 的 `strip` 模式）。
-    /// 与 `strip_newline_chunks` 同一范式：能力位 × 开关，默认关。
+    /// 剥离响应**开头**的 `<think>…</think>` 块。默认关。
     pub strip_leading_think: bool,
-}
-
-impl FramePolicy {
-    /// 由能力位 × 全局开关 × per-provider 开关装配。
-    ///
-    /// 三层取「与」的理由与 `assembled` 的注释同一精神：每一层都只能**收窄**。
-    /// per-provider 层在这里的用处是「这家上游自己就带思考标签、但我们不想剥」
-    /// —— 用户能在 providerOptions 里单独关掉它，而不必改全局。
-    pub fn assembled_with_think(
-        rewrite: Option<ModelRewrite>,
-        declared: bool,
-        switch_on: bool,
-        think_declared: bool,
-        think_switch_on: bool,
-    ) -> Self {
-        Self {
-            rewrite,
-            strip_newline_chunks: declared && switch_on,
-            strip_leading_think: think_declared && think_switch_on,
-        }
-    }
 }
 ```
 
-**跨分片状态**：`strip` 要处理标签被切开的帧（`<thi` + `nk>`）。既有
-`ReasoningCoalescer` 已经持有跨帧缓冲，把「开头标签块」的状态放在它旁边
-（新增一个 `leading_think_done: bool` + 一个小缓冲），**不要**在
-`FramePolicy` 里加可变状态（它是 `Copy` 的纯策略值）。
+**必须同步更新这三处**（否则编译失败）：
 
-- [ ] **Step 7: 全量测试 + 前端 + 提交**
+1. `FramePolicy::with_rewrite`（`sse.rs:104-107`）→ 补 `strip_leading_think: false`
+2. `FramePolicy::assembled`（`sse.rs:121-123`）→ 补该字段（默认 false）
+3. 两处测试结构体字面量（`sse.rs:545`、`:745`）→ 补该字段
+
+- [ ] **Step 6: 挂到 `CompletionAccumulator`（非流式路径）**
+
+`aggregate.rs:135-140` 的 `CompletionAccumulator` 有独立的 `rewrite` / `strip_newline_chunks` 字段。加 `strip_leading_think`，并在聚合完成时对 `choices[0].message.content` 调一次 `strip_leading`。
+
+> **为什么两条路径都要改**：非流式响应（`/v1/chat/completions` 非流、`responses` / `messages` 非流）走的是 accumulator，不是 coalescer。只改 coalescer 会让非流式响应保留标签。
+
+- [ ] **Step 7: 非流式测试**
+
+```rust
+#[test]
+fn strip_works_on_non_stream_path() {
+    // 回归锁定：非流式走 CompletionAccumulator，不是 ReasoningCoalescer。
+    let body = json!({
+        "choices": [{"message": {"role": "assistant", "content": "<think>x</think>answer"}, "finish_reason": "stop"}]
+    });
+    let cleaned = strip_leading_in_completion(&body);
+    assert_eq!(cleaned["choices"][0]["message"]["content"], "answer");
+}
+```
+
+- [ ] **Step 8: 配置项与 `frame_policy_of`**
+
+`config/types.rs` 加 `KEY_STRIP_LEADING_THINK`（默认 false）。`provider_loop.rs:2350` 的 `frame_policy_of` 里，用 `providers::kind_id(adapter.kind())` 取 provider id（**`kind_id` 已存在**，`providers/mod.rs:757`，不要新增 `id_of_kind`），再走 `provider_options::is_enabled`。
+
+- [ ] **Step 9: 全量测试 + 前端 + 提交**
 
 ```bash
 cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --lib
 npm --prefix desktop-tauri/ui-islands run typecheck && npm --prefix desktop-tauri/ui-islands run build
 git add desktop-tauri/src-tauri/server/src/server/core/middleware/ \
         desktop-tauri/src-tauri/server/src/server/core/mod.rs \
-        desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs \
         desktop-tauri/src-tauri/server/src/server/core/upstream/sse.rs \
+        desktop-tauri/src-tauri/server/src/server/core/upstream/aggregate.rs \
+        desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop.rs \
         desktop-tauri/src-tauri/server/src/server/config/types.rs \
         desktop-tauri/ui-islands/src/islands/settings-page.tsx \
-        desktop-tauri/ui/islands/ui.js
-git commit -m "新增：两个通用 middleware（think-tags 剥离 / 词语拦截）
+        desktop-tauri/ui/islands/ui.js desktop-tauri/ui/islands/ui.css
+git commit -m "新增：通用剥离响应开头的思考标签（think-tags strip）
 
-对标 magpie 的 middleware 插件，但做成内建（本项目不引入插件运行时）。
+对标 magpie 的 think-tags 插件，只做 strip 模式（to_content 不做）。
 
-- think_tags：把 Qoder 内部的 strip_thinking_tags 提到通用层，
-  支持跨 SSE 分片的标签、只处理开头的标签块（正文中间不动）
-- word_guard：只查用户文本（不看 system / tool_calls / tool 结果，
-  与 magpie 同口径），reject / mask 两档
-- 插在 payload 的 ②脱敏 之后、③原生工具闸门 之前
-- 两者默认关闭，配置项写在 config.json"
+- 只处理**开头**的 think 块；正文中间的标签不动（那是用户内容）
+- 跨 SSE 分片的标签正确拼接（<thi + nk>）
+- 复用 Qoder 的 THINK_TAGS 四组标签常量，不另抄一份
+- 流式走 FramePolicy、非流式走 CompletionAccumulator —— 两条路径都改，
+  只改一条会让非流式响应保留标签
+- 默认关；per-provider 开关可单独覆盖
+- 不声称与 Qoder 那台『正文中间标签转 reasoning』的机器等价"
 ```
 
 ---
 
-## 任务依赖与执行顺序
+## 移出本轮的三项（需独立前置调研）
 
-```
-Task 1 (Gemini)      ── 独立，可先做
-Task 2 (TOML 注释)    ── 独立
-Task 3 (checkin 钩子) ── 独立
-Task 4 (per-provider) ── 独立（但 Task 6 会用到它的读取模式）
-Task 5 (Key 多维)     ── 独立
-Task 6 (middleware)   ── 建议在 Task 4 之后（复用 provider_options 的开关模式）
-```
+评审证明这三项按 v1 设计会**编译失败或静默无效**。它们不是不重要，而是需要先补齐设计再实施。
 
-**建议顺序**：1 → 2 → 3 → 4 → 6 → 5。
-理由：前三项是「修已有功能的缺口」，风险最低；Task 4 与 6 共享配置模式；
-Task 5 涉及前端改动最大，放最后。
+### P1. Gemini 端点
+
+**阻塞点**（三条，均已验证）：
+
+1. `ForwardOutcome` 没有 `IntoResponse`（`core/upstream/mod.rs:256`，全仓无该 impl）。正确做法是照 `materialize_anthropic`（`api/protocol.rs:775`）写一个 `materialize_gemini`，按 `Stream` / `Completion` / `Err` 三个变体分别转 Response。
+2. **缺 chat→Gemini SSE 翻译机**。全仓只有 `anthropic_from_chat` / `anthropic_request_from_chat` / `responses_request_from_chat`，没有 Gemini 方向。`ChatFromAntigravityStream` 是**反方向**（Gemini→chat）。需要新写一台 `GeminiStream`。
+3. **未注入 path model**。`responses_endpoint` 在 `:218` 内联调 `pipeline::resolve_model`；Gemini 入口若不做同样的事，用户请求 `gemini-2.5-pro` 会静默用网关默认模型。
+
+**另外需补**：`alt=sse` 查询参数（无它时 Gemini 返回 JSON 数组）、`functionCall` / `functionResponse` 往返（编码 agent 必需）、`systemInstruction` 多 part、`countTokens` 必须把 tools 计入（否则编码 agent 的上下文管理会失效）。
+
+**已实测可用的部分**：axum 0.8 的 `{model_action}` 能正确捕获含冒号的路径段（实测 `/v1beta/models/gemini-2.5-pro:generateContent` → 200，参数完整）。这部分结论可直接复用。
+
+### P2. checkin 提升为 trait 钩子
+
+**阻塞点**：v1 的 `CheckinOutcome` 枚举丢失三类信息：
+
+- `log_success_msg` 布尔（`checkin.rs:486` 传 `false`，其余传 `true`）—— 决定成功日志带不带具体收益文案
+- `claim: Value` 本身（可能含 `credit`），以及 `bonus` / `dailyTasks` / `rewards` 等追加字段（`checkin.rs:451/458/526` 在 `claim_result` 之后插入）
+- `checkin_completed_today` / `claim_pending` 依赖 `claim.msg` 的**中文子串**精确匹配（`checkin.rs:735/799`），改写任何文案会静默破坏自动重试与台账
+
+**更低风险的方向**：保留 `match provider` 不动，只把 `CHECKIN_PROVIDERS` 与一个 `providers::CHECKIN_KINDS: &[ProviderKind]` 收敛到一处，并加 golden test 钉住当前 14 个 id。trait 迁移作为后续独立重构，届时钩子必须返回 `claim: Value` + `extras` + `log_success_msg`，而不是枚举。
+
+### P3. word-guard 词语拦截
+
+**阻塞点**：`payload::send_body` 返回 `SendBody<'a>`（`payload.rs:180`），**没有错误通道**。`Reject` 无法从这里变成 400。要么改 `send_body` 返回 `Result` 并改三处调用点（`provider_loop.rs:984/1929/2129`），要么把拦截提前到 `upstream::forward`（`upstream/mod.rs:345+`）在选路之前。
+
+**另外需补**：`role == "user"` 判定在 `send_body` 阶段是安全的（三个入口都已转成 chat 形态），但 `content` 可能是 parts 数组（多模态），字符串检查会被 `[{"type":"text","text":"SECRET"}]` 绕过 —— 需复用 `qoder/protocol.rs:53` 的 `content_to_text` 式扁平化。
 
 ---
 
-## 不在本计划内（文档第十二章已说明理由）
+## 执行顺序
 
-| 项 | 理由 |
+```
+Task 1 (TOML 注释)    ── 独立
+Task 2 (per-provider) ── 独立
+Task 3 (Key 多规则)   ── 独立
+Task 4 (think-tags)   ── 依赖 Task 2（复用 provider_options 的开关）
+```
+
+建议顺序：**1 → 2 → 4 → 3**。理由：1、2 风险最低；4 依赖 2 的开关机制；3 的前端改动最大，放最后。
+
+---
+
+## 评审记录
+
+### 评审方式
+
+- **Oracle**（设计评审，20 分钟）：逐条核对六个任务的方案是否成立，对照真实代码。
+- **Momus**（计划评审，19.5 分钟）：核对可执行性、测试有效性、接口一致性。
+- 两份评审共报 **15 项 BLOCKER**，全部由我逐条对真实代码验证后才采信。
+
+### 验证过的关键事实
+
+| 断言 | 验证方式 | 结果 |
+|---|---|---|
+| `ForwardOutcome` 无 `IntoResponse` | `grep -rn "impl IntoResponse for ForwardOutcome"` | 无匹配，确认 |
+| 缺 chat→Gemini 翻译机 | `grep "ChatToGemini\|GeminiFromChat"` | 无匹配，确认 |
+| `kind_id` 已存在 | 读 `providers/mod.rs:757` | `pub const fn kind_id`，确认 |
+| Codex 有单段键 | 读 `agents/apply.rs:189` | `("model".into(), ...)`，确认 |
+| `set_path` 自动建表 | 读 `apply.rs:288-296` | `or_insert_with(json!({}))`，确认 |
+| `save_raw` 不刷内存 | 读 `config/mod.rs` 的 `save_raw` 实现 | 只 `sql::write_all`，确认 |
+| `fetch` 只认 quota_tokens | 读 `key_quota.rs:180-187` | `.filter(\|e\| e.quota_tokens.is_some())`，确认 |
+| `requests` 无 cost 列 | 解析 `db/schema.rs` 的 CREATE TABLE | 无 cost 列，确认 |
+| `send_body` 无错误通道 | 读 `payload.rs:180` | 返回 `SendBody<'a>`，确认 |
+| `FramePolicy` 有 2 处字面量 | `grep "FramePolicy {"` | `sse.rs:545` / `:745`，确认 |
+| 全局键名是 `sanitizeBlacklistFingerprints` | 读 `config/types.rs:133` | 确认 |
+| `toml 0.9.12` 不用 `toml_edit` | 读 `Cargo.lock:5306-5319` | 用 `toml_parser`/`toml_writer`，确认 |
+| `toml_edit 0.25.13` 已在 lock | 读 `Cargo.lock:3588`（`proc-macro-crate` 依赖） | 确认 |
+| axum 0.8 支持冒号路径段 | **实测**：起服务打 `/v1beta/models/x:y` | 200，参数完整，确认 |
+
+### 未采纳的评审建议及理由
+
+| 建议 | 未采纳理由 |
 |---|---|
-| 路由组 / 嵌套组 | 需先评估现有模型映射能否表达，可能覆盖 80% 场景 |
-| 通用参数覆盖 | magpie 的 operations 模型只能看 body，本项目需先确认是否需要看头 |
-| `tool` 钩子 → MCP | 是否需要对外暴露工具是独立的产品决策 |
-| 插件运行时 | 与 `panic=abort` + 零 unwrap 纪律冲突；`ProviderAdapter` 已有 20+ 钩子 |
-| 意图路由 / 窗口预热 / Claude CLI 桥接 / Telemetry | 场景不匹配 |
+| Task 3 加 `Cost` 维度 | `requests` 无 cost 列，加它就是「永远为 0」的假功能。若将来有倍率表再单独立项。 |
+| Task 3 用 `SmallVec` 优化 `effective_rules` | 本项目未引入 `smallvec`，而「不新增依赖」是硬约束。先做 `is_empty()` 短路，实测有热点再议。 |
+| Task 4 用结构体替代裸 bool | 采纳一半：`FramePolicy` 保持既有两字段风格（改动最小），新增字段默认 false，不引入 builder。 |
