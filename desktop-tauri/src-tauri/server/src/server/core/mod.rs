@@ -98,6 +98,9 @@ pub mod model_rules;
 pub mod models;
 pub mod prompt;
 pub mod protocol;
+/// 每 provider 的行为开关（`providerOptions` 配置键）：覆盖全局同名开关，
+/// 键不存在时跟随全局默认 —— 升级兼容的硬要求，见该模块头。
+pub mod provider_options;
 pub mod providers;
 pub mod proxy_pool;
 pub mod proxy_rotate;

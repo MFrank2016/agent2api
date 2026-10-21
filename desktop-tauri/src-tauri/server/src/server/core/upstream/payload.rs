@@ -12,9 +12,10 @@
 //!      把网关自有提示词写进出站 body；模式与提示词**可按提供商分别配置**
 //!      （`config::KEY_PROMPT_PROVIDERS`），未单独配置的家走全局那一份。
 //!      降级期（`core::degrade`）改用最小中性提示词。`passthrough` + 未降级时**一个字节都不动**（默认路径）。
-//!   ② **指纹脱敏层**（`core::sanitize`）：由全局开关
-//!      `sanitizeBlacklistFingerprints` 决定（快照见
-//!      [`ProviderContext::sanitize_fingerprints`]）：开关关着 → 原样；
+//!   ② **指纹脱敏层**（`core::sanitize`）：判定是**按家**的 —— 先看
+//!      `providerOptions.<这家>.sanitizeBlacklistFingerprints`，没配过就跟随
+//!      全局开关快照（见 [`ProviderContext::sanitize_fingerprints`]，
+//!      读取入口 `core::provider_options::is_enabled`）：关着 → 原样；
 //!      开着 → 在副本上剥离/改写指纹。
 //!
 //! ①② 顺序不能反（与参考项目一致）：脱敏在后，于是网关提示词自己万一命中指纹
@@ -27,11 +28,17 @@
 //! 是否降级」，因为发送名跟着账号所在池走、而降级会在请求中途翻转）；
 //! 「这一家没有可用凭证」时根本走不到处理点，不产生一次已转发的处理。
 //!
-//! ── 与改造前的差异：不再有「按 provider 作用范围」────────────────
-//! 改造前脱敏是按 provider 逐家判定的（配置里勾了哪几家，只有那几家的请求
-//! 过脱敏）。规则集换成硬编码之后这一维**整体去掉**：开关是全局的，
-//! 要么所有出站请求都剥离指纹、要么都不剥离。理由见 `core::sanitize` 的
-//! 模块头（规则是「上游会误拦的固定模板串」，与哪一家上游无关）。
+//! ── 脱敏的「按 provider」维度为什么又回来了 ──────────────────
+//! 改造前脱敏是「配置里勾了哪几家，只有那几家的请求过脱敏」；规则集换成
+//! 硬编码之后那一维**整体去掉**，开关变成全局的（理由见 `core::sanitize`
+//! 的模块头：规则是「上游会误拦的固定模板串」，与哪一家上游无关）。
+//!
+//! 但「所有家同开同关」漏掉了另一件事：不同家对同一策略的**反应**并不
+//! 一致（WorkBuddy 的审核按逐字匹配、脱敏必须开；某家本来不做内容审核，
+//! 脱敏只是白改字节）。于是这一维以**覆盖**的形态回来：全局开关仍是
+//! 默认值，`providerOptions` 只为「要偏离默认的那几家」写一条 ——
+//! 没写过的家行为与改造前逐字一致（升级兼容），这也是 `is_enabled` 的
+//! `default` 参数就是全局快照的原因。
 //!
 //! ── model 字段的按家改写（备援名）────────────────────────────
 //! 候选链经备援扩池后，链上某家的目录里认的可能是**备援名**而不是请求名
@@ -237,7 +244,21 @@ pub(super) fn send_body<'a>(
         None => Cow::Borrowed(ctx.body),
     };
     // ── ② 指纹脱敏层（核心规则见 `core::sanitize`）─────────────────────
-    let body = match ctx.sanitize_fingerprints {
+    // 判定是**这家**的：`providerOptions` 里没有这一家的同名键时跟随全局快照
+    // （`ctx.sanitize_fingerprints`）—— 于是「没配过 per-provider 覆盖」的
+    // 配置行为与改造前逐字一致。配置快照未初始化时 `is_enabled` 也走
+    // default，同一个窗口里行为同样不变。
+    //
+    // 性能：这里是**每次 provider attempt** 一次（同家同池的重复尝试已被
+    // `send_cache` 拦住，见模块头），`is_enabled` 只取一次配置读锁、不克隆
+    // 底稿。若日后实测有影响，把 `providerOptions` 在 `upstream::forward` 里
+    // 快照进 `ProviderContext`（与 `sanitize_fingerprints` 同一处）。
+    let sanitize = crate::server::core::provider_options::is_enabled(
+        provider_id,
+        crate::server::config::KEY_SANITIZE_FINGERPRINTS,
+        ctx.sanitize_fingerprints,
+    );
+    let body = match sanitize {
         true => match crate::server::core::sanitize::sanitize_body(after_prompt.as_ref()) {
             Some((scrubbed, hits)) => {
                 // 命中表可能为空：`sanitize_text` 末尾的去空白也能单独构成一次
