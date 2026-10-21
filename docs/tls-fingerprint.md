@@ -56,6 +56,31 @@ CI 的三条构建链（`build.yml` 的 macOS / Windows / Linux、`warm-cache.ym
 档位对应：`chrome` → Chrome149，`safari` → Safari26，`firefox` → Firefox151，
 `edge` → Edge148（`wreq-util` 的 `Emulation` 枚举）。
 
+### 只取协议选项，不搬浏览器默认头（重要）
+
+`ClientBuilder::emulation(profile)` 会**同时**装入三组协议选项（TLS / HTTP1 /
+HTTP2）**和**整套浏览器默认头（`sec-ch-ua`、`sec-ch-ua-platform`、
+`sec-fetch-*`、浏览器的 `accept`）。本网关的出站是 API 调用，UA 固定为
+`undici`（计费接口要求非空 UA），于是直接调用它会产出真实客户端不可能有的组合：
+
+```
+sec-ch-ua: "Google Chrome";v="149", "Chromium";v="149"   ← 浏览器客户端提示
+sec-ch-ua-platform: "macOS"
+user-agent: undici                                        ← Node fetch
+sec-fetch-dest: document / mode: navigate / site: none     ← 文档导航语义
+accept: text/html,application/xhtml+xml,...                ← 文档导航 Accept
+```
+
+这比不模拟更容易被识别为伪造。因此 `apply_emulation()` 只搬
+`tls_options` / `http1_options` / `http2_options`，`headers` /
+`orig_headers` 一概不取（见 `egress.rs` 的同名注释与回归测试
+`emulation_does_not_inject_browser_headers`）。
+
+修复后实测（`https://tls.peet.ws/api/all`，走生产出口 `client_for(None)`）：
+TLS / HTTP2 指纹与修复前**逐字一致**（`ja4=t13d1516h2_8daaf6152771_d8a2da3f94cd`、
+`h2=52d84b11737d980aef856699f885ca86`），而 HEADERS 帧只剩
+`user-agent: undici` 与 `accept-encoding: gzip,br`。
+
 ## 风险与取舍
 
 1. **`6.0.0-rc.31` 是预发布**：Cargo.toml 锁死版本；升级前必须重跑全量测试与
@@ -74,6 +99,12 @@ CI 的三条构建链（`build.yml` 的 macOS / Windows / Linux、`warm-cache.ym
 ## 验证记录
 
 - `cargo check -p agent2api-server`：通过。
-- `cargo test -p agent2api-server --lib`：**763 passed / 0 failed / 11 ignored**。
+- `cargo test -p agent2api-server --lib`：**764 passed / 0 failed / 11 ignored**。
 - BoringSSL 冷编译：本机 6 分 06 秒（`cargo check` 全量）。
+- 真实指纹实测（`tls.peet.ws`，经生产出口 `client_for(None)`）：
+  - `chrome` 档：`ja4=t13d1516h2_8daaf6152771_d8a2da3f94cd`，
+    `h2=52d84b11737d980aef856699f885ca86`
+  - `off` 档（rustls 默认栈）：`ja4=t13d2811h2_257f3020b3a2_78e6aca7449b`，
+    `h2=787b78994836bff666aa7c3258e52189`
+  - 两档指纹不同 → 模拟确实作用在握手与 H2 参数上，不是只改了头。
 - 未验证：Windows / macOS 实机构建（本机为 Linux；CI 已补依赖，需在 CI 上确认）。

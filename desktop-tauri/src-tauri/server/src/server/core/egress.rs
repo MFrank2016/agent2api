@@ -218,15 +218,31 @@ fn base_builder(timeouts: &TimeoutSettings) -> wreq::ClientBuilder {
 /// 好认的「非浏览器」指纹；换成 Chrome 后与真实浏览器同档。`off` 保留给排障
 /// （怀疑指纹模拟本身触发风控时，可一键回到默认栈对比）。
 ///
+/// ── 为什么不用 `builder.emulation(profile)` ─────────────────
+/// `ClientBuilder::emulation()` 会**同时**装入该档位的 TLS / HTTP1 / HTTP2
+/// 选项**和**整套浏览器默认头（`sec-ch-ua`、`sec-fetch-*`、浏览器的
+/// `accept`）。本网关的出站是 API 调用，UA 固定为 `undici`（见
+/// [`DEFAULT_USER_AGENT`]）；若把 Chrome 的头一并装上，上游会看到
+/// 「`sec-ch-ua: Chrome/149` + `user-agent: undici` + `sec-fetch-dest:
+/// document`」这种真实客户端不可能产生的组合 —— 反而比不模拟更像伪造。
+/// 所以这里只取三组协议选项，默认头一概不取（实测证据见
+/// `emulation_does_not_inject_browser_headers`）。
+///
 /// 选型理由与备选方案见 `docs/tls-fingerprint.md`。
 fn apply_emulation(builder: wreq::ClientBuilder) -> wreq::ClientBuilder {
-    match std::env::var("AGENT2API_TLS_EMULATION").ok().as_deref() {
-        Some("off") => builder,
-        Some("safari") => builder.emulation(wreq_util::Emulation::Safari26),
-        Some("firefox") => builder.emulation(wreq_util::Emulation::Firefox151),
-        Some("edge") => builder.emulation(wreq_util::Emulation::Edge148),
-        _ => builder.emulation(wreq_util::Emulation::Chrome149),
-    }
+    let profile = match std::env::var("AGENT2API_TLS_EMULATION").ok().as_deref() {
+        Some("off") => return builder,
+        Some("safari") => wreq_util::Emulation::Safari26,
+        Some("firefox") => wreq_util::Emulation::Firefox151,
+        Some("edge") => wreq_util::Emulation::Edge148,
+        _ => wreq_util::Emulation::Chrome149,
+    };
+    // 只搬协议选项，不搬 `headers` / `orig_headers`（理由见上）。
+    let emulation = wreq::IntoEmulation::into_emulation(profile);
+    builder
+        .tls_options(emulation.tls_options)
+        .http1_options(emulation.http1_options)
+        .http2_options(emulation.http2_options)
 }
 
 /// 构造一个出口对应的 wreq Client。
@@ -674,5 +690,81 @@ mod tests {
         let egress = AccountEgress::Direct;
         let result = dispatch(&egress, false, |client| client.get("http://127.0.0.1:1/")).await;
         assert!(result.is_err());
+    }
+
+    /// 回归锁定：模拟档位只搬 TLS / HTTP1 / HTTP2 选项，**不搬**浏览器默认头。
+    ///
+    /// 反例（修复前）：`builder.emulation(profile)` 会把 `sec-ch-ua`、
+    /// `sec-fetch-*`、浏览器的 `accept` 一起装上，而 UA 随后被
+    /// [`DEFAULT_USER_AGENT`] 覆盖成 `undici` —— 上游看到「Chrome 的
+    /// 客户端提示 + Node 的 UA + 文档导航语义」，真实客户端不可能这样发，
+    /// 反而比不模拟更容易被判定为伪造。
+    #[tokio::test]
+    async fn emulation_does_not_inject_browser_headers() {
+        use axum::extract::Request;
+        use axum::routing::get;
+        use axum::Router;
+
+        // 本机回显服务：把收到的请求头原样交给测试断言
+        let seen: Arc<Mutex<Option<Vec<(String, String)>>>> = Arc::new(Mutex::new(None));
+        let sink = seen.clone();
+        let app = Router::new().route(
+            "/probe",
+            get(move |req: Request| {
+                let sink = sink.clone();
+                async move {
+                    let captured = req
+                        .headers()
+                        .iter()
+                        .map(|(name, value)| {
+                            (name.as_str().to_string(), value.to_str().unwrap_or("").to_string())
+                        })
+                        .collect::<Vec<_>>();
+                    *sink.lock().unwrap() = Some(captured);
+                    "ok"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = base_builder(&TimeoutSettings::default()).build().unwrap();
+        client
+            .get(format!("http://{addr}/probe"))
+            .send()
+            .await
+            .expect("本机回显服务应当可达");
+
+        let headers = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("回显服务应当收到请求");
+        server.abort();
+
+        let find = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+        };
+
+        // UA 仍是 undici（计费接口要求非空 UA，见 DEFAULT_USER_AGENT 的理由）
+        assert_eq!(find("user-agent").as_deref(), Some(DEFAULT_USER_AGENT));
+        // 浏览器的客户端提示 / 导航语义一个都不该出现
+        for forbidden in [
+            "sec-ch-ua",
+            "sec-ch-ua-mobile",
+            "sec-ch-ua-platform",
+            "sec-fetch-dest",
+            "sec-fetch-mode",
+            "sec-fetch-site",
+        ] {
+            assert!(
+                find(forbidden).is_none(),
+                "不应注入浏览器头 `{forbidden}`，实收头：{headers:?}"
+            );
+        }
     }
 }
