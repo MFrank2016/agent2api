@@ -7,10 +7,10 @@
 [简体中文](../README.md) | [English](./README.en.md) | [繁體中文](./README.zh-Hant.md) | [日本語](./README.ja.md) | **한국어** | [Português (BR)](./README.pt-BR.md)
 
 [![license](https://img.shields.io/badge/license-MIT%20%2B%20고지-green)](../LICENSE)
-[![release](https://img.shields.io/github/v/release/Agent2API/agent2api?include_prereleases)](https://github.com/Agent2API/agent2api/releases/latest)
+[![release](https://img.shields.io/github/v/release/aimod-cc/Agent2API?include_prereleases)](https://github.com/aimod-cc/Agent2API/releases/latest)
 [![docker pulls](https://img.shields.io/docker/pulls/aimodcc/agent2api)](https://hub.docker.com/r/aimodcc/agent2api)
-[![stars](https://img.shields.io/github/stars/Agent2API/agent2api?style=flat&color=yellow)](https://github.com/Agent2API/agent2api/stargazers)
-[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Docker-blue)](https://github.com/Agent2API/agent2api/releases/latest)
+[![stars](https://img.shields.io/github/stars/aimod-cc/Agent2API?style=flat&color=yellow)](https://github.com/aimod-cc/Agent2API/stargazers)
+[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Docker-blue)](https://github.com/aimod-cc/Agent2API/releases/latest)
 
 [✨ 핵심 기능](#-핵심-기능) • [💬 커뮤니티 및 지원](#-커뮤니티-및-지원) • [🤝 지원 공급자](#-지원-공급자) • [🚀 빠른 시작](#-빠른-시작) • [📦 설치와 배포](./install.ko.md) • [📸 화면 미리보기](#-화면-미리보기) • [🔧 개발 및 빌드](#-개발-및-빌드) • [📜 사용 고지](#-사용-고지)
 
@@ -23,7 +23,7 @@ Agent2API는 여러 AI 데스크톱 클라이언트에 로그인된 계정을 �
 ## ✨ 핵심 기능
 
 - 🔌 **OpenAI 호환** —— 클라이언트에 `base_url`만 넣으면 바로 사용. Chat / Responses / Messages 세 가지 프로토콜 모두 지원
-- 🏪 **내장 공급자 17곳** —— WorkBuddy, 小浣熊, CatPaw, Qoder, Trae 등 바로 사용 가능하며 사용자 지정 공급자도 지원
+- 🏪 **내장 공급자 20곳(27개 버전)** —— WorkBuddy, 小浣熊, CatPaw, Qoder, Trae 등 바로 사용 가능하며 사용자 지정 공급자도 지원
 - 🔁 **자격 증명 자동 갱신** —— 토큰은 만료 전 자동 교체, 만료 임박분은 일괄 갱신, 모델 카탈로그도 함께 최신화
 - 🪂 **다중 계정 로테이션** —— 우선순위대로 큐잉, 429는 다음 계정으로, 한도 쿨다운 중엔 기다리지 않고 건너뜀
 - 🛡️ **아웃바운드 프록시** —— 계정마다 전용 출구 IP 지정, 아웃바운드 핑거프린트는 공식 클라이언트로 위장
@@ -70,7 +70,7 @@ Agent2API는 여러 AI 데스크톱 클라이언트에 로그인된 계정을 �
 | Accio(국제판 / 중국판) | ✓ | ✓ | ✓ | ✓ | — | — |
 | ZCode(중국판 / 국제판) | ✓ | ✗ | ✗ | ✓ | — | ✓ |
 | CodeArts | ✓ | ✓ | ✓ | ✓ | — | ✓ |
-| Trae | ✓ | ✓ | ✓ | ✓ | — | — |
+| Trae | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Loomy(iFlytek) | ✓ | ✗ | ✓ | ✓ | ✓ | — |
 | KukuAI(Baidu Wenku) | ✓ | ✗ | ✓ | ✓ | ✓ | — |
 | MonkeyCode(长亭科技, 중국판 / 국제판) | ✓ | ✗ | ✓ | — | — | — |
@@ -79,9 +79,11 @@ Agent2API는 여러 AI 데스크톱 클라이언트에 로그인된 계정을 �
 | OfficeAce(Huawei Cloud, OfficeClaw) | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | OrcaTerm(Tencent Cloud) | ✓ | ✓ | ✓ | ✓ | — | — |
 | 智谱清言(Zhipu Qingyan) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Nous | ✓ | ✓ | ✓ | — | — | — |
+| LobsterAI | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | 사용자 지정 프로바이더 | ✓ | — | ✓ | — | — | — |
 
-> 참고: 모델 목록의 ✓는 온라인 자동 가져오기를 지원한다는 뜻입니다(일부 플랫폼은 내장 정적 목록도 함께 사용). ZCode는 내장 정적 목록만 제공합니다. 토큰 자동 갱신의 ✗는 해당 플랫폼에 사용 가능한 갱신 수단이 없다는 뜻입니다(계정은 자격 증명이 유효한 동안 정상적으로 사용 가능). Qoder 출석은 중국판에서만 지원됩니다.
+> 참고: 모델 목록의 ✓는 온라인 자동 가져오기를 지원한다는 뜻입니다(일부 플랫폼은 내장 정적 목록도 함께 사용). ZCode는 내장 정적 목록만 제공합니다. 토큰 자동 갱신의 ✗는 해당 플랫폼에 사용 가능한 갱신 수단이 없다는 뜻입니다(계정은 자격 증명이 유효한 동안 정상적으로 사용 가능).
 >
 > **智谱清言**은 이 프로젝트에서 **유일하게 "게스트 모드"를 지원**하는 제공자입니다. 로그인 없이 클릭 한 번으로 바로 대화에 쓸 수 있는 자격 증명을 받습니다(무료 할당량은 업스트림이 기기 단위로 발급합니다). 대신 게스트 계정에는 포인트 체계가 없습니다 —— 위 표의 "잔액 조회 / 출석 / 수령"과 **작업 센터의 초보자 과제·일일 과제**는 **로그인된 계정**에만 적용되며(토큰 붙여넣기 또는 클라이언트 로그인 상태 가져오기), 게스트는 건너뜁니다.
 
@@ -204,17 +206,17 @@ macOS 의 `.dmg` 는 **macOS 에서만 빌드할 수 있습니다**(`npm --prefi
 
 ## ⭐ Star History
 
-<a href="https://star-history.com/#Agent2API/agent2api&Date">
+<a href="https://star-history.com/#aimod-cc/Agent2API&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=aimod-cc/Agent2API&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=aimod-cc/Agent2API&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aimod-cc/Agent2API&type=Date" />
   </picture>
 </a>
 
 <div align="center">
 
-**[최신 버전 내려받기](https://github.com/Agent2API/agent2api/releases/latest)** • **[문제 보고](https://github.com/Agent2API/agent2api/issues)**
+**[최신 버전 내려받기](https://github.com/aimod-cc/Agent2API/releases/latest)** • **[문제 보고](https://github.com/aimod-cc/Agent2API/issues)**
 
 이 프로젝트가 도움이 되었다면 ⭐️ Star 를 눌러 주세요!
 

@@ -7,10 +7,10 @@
 [简体中文](../README.md) | **English** | [繁體中文](./README.zh-Hant.md) | [日本語](./README.ja.md) | [한국어](./README.ko.md) | [Português (BR)](./README.pt-BR.md)
 
 [![license](https://img.shields.io/badge/license-MIT%20%2B%20Notice-green)](../LICENSE)
-[![release](https://img.shields.io/github/v/release/Agent2API/agent2api?include_prereleases)](https://github.com/Agent2API/agent2api/releases/latest)
+[![release](https://img.shields.io/github/v/release/aimod-cc/Agent2API?include_prereleases)](https://github.com/aimod-cc/Agent2API/releases/latest)
 [![docker pulls](https://img.shields.io/docker/pulls/aimodcc/agent2api)](https://hub.docker.com/r/aimodcc/agent2api)
-[![stars](https://img.shields.io/github/stars/Agent2API/agent2api?style=flat&color=yellow)](https://github.com/Agent2API/agent2api/stargazers)
-[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Docker-blue)](https://github.com/Agent2API/agent2api/releases/latest)
+[![stars](https://img.shields.io/github/stars/aimod-cc/Agent2API?style=flat&color=yellow)](https://github.com/aimod-cc/Agent2API/stargazers)
+[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Docker-blue)](https://github.com/aimod-cc/Agent2API/releases/latest)
 
 [✨ Key Features](#-key-features) • [💬 Community & Support](#-community--support) • [🤝 Supported Providers](#-supported-providers) • [🚀 Quick Start](#-quick-start) • [📦 Installation & deployment](./install.en.md) • [📸 Screenshots](#-screenshots) • [🔧 Development & Build](#-development--build) • [📜 Usage Notice](#-usage-notice)
 
@@ -23,7 +23,7 @@ Agent2API brings the signed-in accounts of several AI desktop clients together b
 ## ✨ Key Features
 
 - 🔌 **OpenAI-compatible** — point your client at the gateway with a custom `base_url`; Chat, Responses and Messages protocols are all supported
-- 🏪 **17 built-in providers** — WorkBuddy, Raccoon, CatPaw, Qoder, Trae and more work out of the box, plus custom providers via passthrough
+- 🏪 **20 built-in providers (27 editions)** — WorkBuddy, Raccoon, CatPaw, Qoder, Trae and more work out of the box, plus custom providers via passthrough
 - 🔁 **Credentials that renew themselves** — tokens refresh before they expire, near-expiry ones can be renewed in bulk, and the model catalog stays current
 - 🪂 **Multi-account rotation** — accounts queue by priority, a 429 moves on to the next account, and rate-limited accounts are skipped instead of stalling
 - 🛡️ **Egress proxies** — give each account its own exit IP; outbound fingerprints imitate the official clients
@@ -70,7 +70,7 @@ Reverse-proxy capabilities at a glance (✓ supported · ✗ not supported · �
 | Accio (international / domestic) | ✓ | ✓ | ✓ | ✓ | — | — |
 | ZCode (domestic / international) | ✓ | ✗ | ✗ | ✓ | — | ✓ |
 | CodeArts | ✓ | ✓ | ✓ | ✓ | — | ✓ |
-| Trae | ✓ | ✓ | ✓ | ✓ | — | — |
+| Trae | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Loomy (iFlytek) | ✓ | ✗ | ✓ | ✓ | ✓ | — |
 | KukuAI (Baidu Wenku) | ✓ | ✗ | ✓ | ✓ | ✓ | — |
 | MonkeyCode (Chaitin, domestic / international) | ✓ | ✗ | ✓ | — | — | — |
@@ -79,9 +79,11 @@ Reverse-proxy capabilities at a glance (✓ supported · ✗ not supported · �
 | OfficeAce (Huawei Cloud, OfficeClaw) | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | OrcaTerm (Tencent Cloud) | ✓ | ✓ | ✓ | ✓ | — | — |
 | Zhipu Qingyan | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Nous | ✓ | ✓ | ✓ | — | — | — |
+| LobsterAI | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Custom providers | ✓ | — | ✓ | — | — | — |
 
-> Note: in Model list, ✓ means automatic online fetching is supported (some platforms also keep a built-in static table as a fallback); ZCode only has a built-in static table. ✗ in Token auto-refresh means the platform has no usable refresh flow (the account keeps working while its credentials are valid). Qoder check-in is available on the China version only.
+> Note: in Model list, ✓ means automatic online fetching is supported (some platforms also keep a built-in static table as a fallback); ZCode only has a built-in static table. ✗ in Token auto-refresh means the platform has no usable refresh flow (the account keeps working while its credentials are valid).
 >
 > **Zhipu Qingyan** is the only provider here that supports a **guest mode**: no sign-in required — one click gets you a credential that works for chat right away (the free quota is issued by the upstream per device). The catch is that a guest account has no points system — the "Balance" / "Sign-in" / "Claim" columns above, plus the **task center's newbie and daily tasks**, apply only to **signed-in accounts** (paste a token or import the desktop client sign-in state); guests are skipped honestly.
 
@@ -204,17 +206,17 @@ One caveat: the LICENSE file carries a **Usage Notice** after the MIT text, whos
 
 ## ⭐ Star History
 
-<a href="https://star-history.com/#Agent2API/agent2api&Date">
+<a href="https://star-history.com/#aimod-cc/Agent2API&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=aimod-cc/Agent2API&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=aimod-cc/Agent2API&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aimod-cc/Agent2API&type=Date" />
   </picture>
 </a>
 
 <div align="center">
 
-**[Download the latest release](https://github.com/Agent2API/agent2api/releases/latest)** • **[Report an issue](https://github.com/Agent2API/agent2api/issues)**
+**[Download the latest release](https://github.com/aimod-cc/Agent2API/releases/latest)** • **[Report an issue](https://github.com/aimod-cc/Agent2API/issues)**
 
 If this project helps you, a ⭐️ Star is appreciated!
 

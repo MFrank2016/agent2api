@@ -7,10 +7,10 @@
 [简体中文](./README.md) | [English](./docs/README.en.md) | [繁體中文](./docs/README.zh-Hant.md) | [日本語](./docs/README.ja.md) | [한국어](./docs/README.ko.md) | [Português (BR)](./docs/README.pt-BR.md)
 
 [![license](https://img.shields.io/badge/license-MIT%20%2B%20附加声明-green)](./LICENSE)
-[![release](https://img.shields.io/github/v/release/Agent2API/agent2api?include_prereleases)](https://github.com/Agent2API/agent2api/releases/latest)
+[![release](https://img.shields.io/github/v/release/aimod-cc/Agent2API?include_prereleases)](https://github.com/aimod-cc/Agent2API/releases/latest)
 [![docker pulls](https://img.shields.io/docker/pulls/aimodcc/agent2api)](https://hub.docker.com/r/aimodcc/agent2api)
-[![stars](https://img.shields.io/github/stars/Agent2API/agent2api?style=flat&color=yellow)](https://github.com/Agent2API/agent2api/stargazers)
-[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Docker-blue)](https://github.com/Agent2API/agent2api/releases/latest)
+[![stars](https://img.shields.io/github/stars/aimod-cc/Agent2API?style=flat&color=yellow)](https://github.com/aimod-cc/Agent2API/stargazers)
+[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Docker-blue)](https://github.com/aimod-cc/Agent2API/releases/latest)
 
 [✨ 核心特性](#-核心特性) • [💬 社区与支持](#-社区与支持) • [🤝 支持的提供商](#-支持的提供商) • [🚀 快速开始](#-快速开始) • [📦 安装与部署](./docs/install.md) • [📸 界面预览](#-界面预览) • [🔧 开发与构建](#-开发与构建) • [📜 使用声明](#-使用声明)
 
@@ -23,7 +23,7 @@ Agent2API 把多家 AI 桌面客户端里已登录的账号接到一起，共用
 ## ✨ 核心特性
 
 - 🔌 **OpenAI 兼容** —— 客户端填个 `base_url` 就能用，Chat / Responses / Messages 三种协议都支持
-- 🏪 **内置 17 家提供商** —— WorkBuddy、小浣熊、CatPaw、Qoder、Trae 等开箱即用，也支持自定义提供商
+- 🏪 **内置 20 家提供商（27 个版本）** —— WorkBuddy、小浣熊、CatPaw、Qoder、Trae 等开箱即用，也支持自定义提供商
 - 🔁 **凭证自动续期** —— Token 到期自动换新，临期凭证可批量刷新，模型目录也不会过期
 - 🪂 **多账号轮转** —— 按优先级排队，429 自动换账号，限额冷却期内不空等
 - 🛡️ **出网代理** —— 每个账号可配独立出口，出站指纹按官方客户端伪装
@@ -70,7 +70,7 @@ Agent2API 把多家 AI 桌面客户端里已登录的账号接到一起，共用
 | Accio（国际版 / 国内版） | ✓ | ✓ | ✓ | ✓ | — | — |
 | ZCode（国内版 / 国际版） | ✓ | ✗ | ✗ | ✓ | — | ✓ |
 | CodeArts | ✓ | ✓ | ✓ | ✓ | — | ✓ |
-| Trae | ✓ | ✓ | ✓ | ✓ | — | — |
+| Trae | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Loomy（讯飞） | ✓ | ✗ | ✓ | ✓ | ✓ | — |
 | KukuAI（百度文库） | ✓ | ✗ | ✓ | ✓ | ✓ | — |
 | MonkeyCode（长亭科技，国内版 / 国际版） | ✓ | ✗ | ✓ | — | — | — |
@@ -79,9 +79,11 @@ Agent2API 把多家 AI 桌面客户端里已登录的账号接到一起，共用
 | OfficeAce（华为云果办 / OfficeClaw） | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | OrcaTerm（腾讯云遨驰终端） | ✓ | ✓ | ✓ | ✓ | — | — |
 | 智谱清言 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Nous | ✓ | ✓ | ✓ | — | — | — |
+| LobsterAI | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | 自定义提供商 | ✓ | — | ✓ | — | — | — |
 
-> 注：模型列表的 ✓ 表示支持在线自动拉取，部分平台另有内置静态表兜底；ZCode 仅有内置静态表。Token 续期列 ✗ 表示该平台没有可用的续期接口（账号在有效期内不受影响）。Qoder 签到仅中国版可用。
+> 注：模型列表的 ✓ 表示支持在线自动拉取，部分平台另有内置静态表兜底；ZCode 仅有内置静态表。Token 续期列 ✗ 表示该平台没有可用的续期接口（账号在有效期内不受影响）。
 >
 > **智谱清言**是本项目**唯一支持「访客模式」**的一家：不需要登录，点一下就能换到一份可直接对话的凭证（免费额度由上游按设备发放）。代价是访客账号没有积分体系 —— 上表里的「余额查询 / 签到 / 领取类」，以及**任务中心的新手任务与每日任务**，都只对**登录账号**有效（粘贴令牌或导入客户端登录态），访客会被如实跳过。
 
@@ -204,17 +206,17 @@ macOS 的 `.dmg` **只能在 macOS 上构建**（`npm --prefix desktop-tauri run
 
 ## ⭐ Star History
 
-<a href="https://star-history.com/#Agent2API/agent2api&Date">
+<a href="https://star-history.com/#aimod-cc/Agent2API&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=aimod-cc/Agent2API&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=aimod-cc/Agent2API&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aimod-cc/Agent2API&type=Date" />
   </picture>
 </a>
 
 <div align="center">
 
-**[下载最新版](https://github.com/Agent2API/agent2api/releases/latest)** • **[问题反馈](https://github.com/Agent2API/agent2api/issues)**
+**[下载最新版](https://github.com/aimod-cc/Agent2API/releases/latest)** • **[问题反馈](https://github.com/aimod-cc/Agent2API/issues)**
 
 如果这个项目对你有帮助，欢迎点一个 ⭐️ Star！
 

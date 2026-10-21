@@ -7,10 +7,10 @@
 [简体中文](../README.md) | [English](./README.en.md) | **繁體中文** | [日本語](./README.ja.md) | [한국어](./README.ko.md) | [Português (BR)](./README.pt-BR.md)
 
 [![license](https://img.shields.io/badge/license-MIT%20%2B%20附加聲明-green)](../LICENSE)
-[![release](https://img.shields.io/github/v/release/Agent2API/agent2api?include_prereleases)](https://github.com/Agent2API/agent2api/releases/latest)
+[![release](https://img.shields.io/github/v/release/aimod-cc/Agent2API?include_prereleases)](https://github.com/aimod-cc/Agent2API/releases/latest)
 [![docker pulls](https://img.shields.io/docker/pulls/aimodcc/agent2api)](https://hub.docker.com/r/aimodcc/agent2api)
-[![stars](https://img.shields.io/github/stars/Agent2API/agent2api?style=flat&color=yellow)](https://github.com/Agent2API/agent2api/stargazers)
-[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Docker-blue)](https://github.com/Agent2API/agent2api/releases/latest)
+[![stars](https://img.shields.io/github/stars/aimod-cc/Agent2API?style=flat&color=yellow)](https://github.com/aimod-cc/Agent2API/stargazers)
+[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Docker-blue)](https://github.com/aimod-cc/Agent2API/releases/latest)
 
 [✨ 核心特性](#-核心特性) • [💬 社群與支援](#-社群與支援) • [🤝 支援的供應商](#-支援的供應商) • [🚀 快速開始](#-快速開始) • [📦 安裝與部署](./install.zh-Hant.md) • [📸 介面預覽](#-介面預覽) • [🔧 開發與建置](#-開發與建置) • [📜 使用聲明](#-使用聲明)
 
@@ -23,7 +23,7 @@ Agent2API 把多家 AI 桌面客戶端裡已登入的帳號接到一起，共用
 ## ✨ 核心特性
 
 - 🔌 **OpenAI 相容** —— 客戶端填上 `base_url` 就能用，Chat / Responses / Messages 三種協定都支援
-- 🏪 **內建 17 家供應商** —— WorkBuddy、小浣熊、CatPaw、Qoder、Trae 等開箱即用，也支援自訂供應商
+- 🏪 **內建 20 家供應商（27 個版本）** —— WorkBuddy、小浣熊、CatPaw、Qoder、Trae 等開箱即用，也支援自訂供應商
 - 🔁 **憑證自動續期** —— Token 到期自動換新，臨期憑證可批次刷新，模型目錄也不會過期
 - 🪂 **多帳號輪轉** —— 依優先順序排隊，429 自動換帳號，限額冷卻期內不空等
 - 🛡️ **出口代理** —— 每個帳號可配獨立出口，出站指紋按官方客戶端偽裝
@@ -70,7 +70,7 @@ Agent2API 把多家 AI 桌面客戶端裡已登入的帳號接到一起，共用
 | Accio（國際版 / 中國版） | ✓ | ✓ | ✓ | ✓ | — | — |
 | ZCode（中國版 / 國際版） | ✓ | ✗ | ✗ | ✓ | — | ✓ |
 | CodeArts | ✓ | ✓ | ✓ | ✓ | — | ✓ |
-| Trae | ✓ | ✓ | ✓ | ✓ | — | — |
+| Trae | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Loomy（訊飛） | ✓ | ✗ | ✓ | ✓ | ✓ | — |
 | KukuAI（百度文庫） | ✓ | ✗ | ✓ | ✓ | ✓ | — |
 | MonkeyCode（長亭科技，中國版 / 國際版） | ✓ | ✗ | ✓ | — | — | — |
@@ -79,9 +79,11 @@ Agent2API 把多家 AI 桌面客戶端裡已登入的帳號接到一起，共用
 | OfficeAce（華為雲果辦 / OfficeClaw） | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | OrcaTerm（騰訊雲遨馳終端） | ✓ | ✓ | ✓ | ✓ | — | — |
 | 智譜清言 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Nous | ✓ | ✓ | ✓ | — | — | — |
+| LobsterAI | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | 自訂供應商 | ✓ | — | ✓ | — | — | — |
 
-> 註：模型清單的 ✓ 表示支援遠端自動拉取，部分平台另有內建靜態清單備援；ZCode 僅有內建靜態清單。Token 續期欄 ✗ 表示該平台沒有可用的續期介面（帳號在有效期內不受影響）。Qoder 簽到僅中國版可用。
+> 註：模型清單的 ✓ 表示支援遠端自動拉取，部分平台另有內建靜態清單備援；ZCode 僅有內建靜態清單。Token 續期欄 ✗ 表示該平台沒有可用的續期介面（帳號在有效期內不受影響）。
 >
 > **智譜清言**是本專案**唯一支援「訪客模式」**的一家：不需要登入，點一下就能換到一份可直接對話的憑證（免費額度由上游按裝置發放）。代價是訪客帳號沒有積分體系 —— 上表裡的「餘額查詢 / 簽到 / 領取類」，以及**任務中心的新手任務與每日任務**，都只對**登入帳號**有效（貼上權杖或匯入客戶端登入態），訪客會被如實跳過。
 
@@ -204,17 +206,17 @@ macOS 的 `.dmg` **只能在 macOS 上建置**（`npm --prefix desktop-tauri run
 
 ## ⭐ Star History
 
-<a href="https://star-history.com/#Agent2API/agent2api&Date">
+<a href="https://star-history.com/#aimod-cc/Agent2API&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=aimod-cc/Agent2API&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=aimod-cc/Agent2API&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aimod-cc/Agent2API&type=Date" />
   </picture>
 </a>
 
 <div align="center">
 
-**[下載最新版](https://github.com/Agent2API/agent2api/releases/latest)** • **[問題回饋](https://github.com/Agent2API/agent2api/issues)**
+**[下載最新版](https://github.com/aimod-cc/Agent2API/releases/latest)** • **[問題回饋](https://github.com/aimod-cc/Agent2API/issues)**
 
 如果這個專案對你有幫助，歡迎點一個 ⭐️ Star！
 

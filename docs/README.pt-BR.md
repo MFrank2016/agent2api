@@ -7,10 +7,10 @@
 [简体中文](../README.md) | [English](./README.en.md) | [繁體中文](./README.zh-Hant.md) | [日本語](./README.ja.md) | [한국어](./README.ko.md) | **Português (BR)**
 
 [![license](https://img.shields.io/badge/license-MIT%20%2B%20Aviso-green)](../LICENSE)
-[![release](https://img.shields.io/github/v/release/Agent2API/agent2api?include_prereleases)](https://github.com/Agent2API/agent2api/releases/latest)
+[![release](https://img.shields.io/github/v/release/aimod-cc/Agent2API?include_prereleases)](https://github.com/aimod-cc/Agent2API/releases/latest)
 [![docker pulls](https://img.shields.io/docker/pulls/aimodcc/agent2api)](https://hub.docker.com/r/aimodcc/agent2api)
-[![stars](https://img.shields.io/github/stars/Agent2API/agent2api?style=flat&color=yellow)](https://github.com/Agent2API/agent2api/stargazers)
-[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Docker-blue)](https://github.com/Agent2API/agent2api/releases/latest)
+[![stars](https://img.shields.io/github/stars/aimod-cc/Agent2API?style=flat&color=yellow)](https://github.com/aimod-cc/Agent2API/stargazers)
+[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Docker-blue)](https://github.com/aimod-cc/Agent2API/releases/latest)
 
 [✨ Principais recursos](#-principais-recursos) • [💬 Comunidade e suporte](#-comunidade-e-suporte) • [🤝 Provedores compatíveis](#-provedores-compatíveis) • [🚀 Início rápido](#-início-rápido) • [📦 Instalação e implantação](./install.pt-BR.md) • [📸 Capturas de tela](#-capturas-de-tela) • [🔧 Desenvolvimento e build](#-desenvolvimento-e-build) • [📜 Aviso de uso](#-aviso-de-uso)
 
@@ -23,7 +23,7 @@ O Agent2API reúne as contas já conectadas de vários clientes de IA em um úni
 ## ✨ Principais recursos
 
 - 🔌 **Compatível com OpenAI** — aponte o `base_url` do seu cliente para o gateway: Chat, Responses e Messages são todos suportados
-- 🏪 **17 provedores integrados** — WorkBuddy, Raccoon, CatPaw, Qoder, Trae e outros funcionam de imediato, além de provedores personalizados via passthrough
+- 🏪 **20 provedores integrados (27 edições)** — WorkBuddy, Raccoon, CatPaw, Qoder, Trae e outros funcionam de imediato, além de provedores personalizados via passthrough
 - 🔁 **Credenciais que se renovam sozinhas** — tokens são renovados antes de expirar, os próximos do vencimento podem ser atualizados em lote e o catálogo de modelos se mantém atual
 - 🪂 **Rotação de várias contas** — contas entram na fila por prioridade, um 429 passa para a próxima e contas em cooldown são puladas sem espera
 - 🛡️ **Proxies de saída** — cada conta pode ter seu próprio IP de saída; o fingerprint enviado imita o cliente oficial
@@ -70,7 +70,7 @@ Panorama dos recursos de proxy reverso por plataforma (✓ suportado · ✗ não
 | Accio (global / China) | ✓ | ✓ | ✓ | ✓ | — | — |
 | ZCode (China / global) | ✓ | ✗ | ✗ | ✓ | — | ✓ |
 | CodeArts | ✓ | ✓ | ✓ | ✓ | — | ✓ |
-| Trae | ✓ | ✓ | ✓ | ✓ | — | — |
+| Trae | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Loomy (iFlytek) | ✓ | ✗ | ✓ | ✓ | ✓ | — |
 | KukuAI (Baidu Wenku) | ✓ | ✗ | ✓ | ✓ | ✓ | — |
 | MonkeyCode (长亭科技, China / global) | ✓ | ✗ | ✓ | — | — | — |
@@ -79,6 +79,8 @@ Panorama dos recursos de proxy reverso por plataforma (✓ suportado · ✗ não
 | OfficeAce (Huawei Cloud, OfficeClaw) | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | OrcaTerm (Tencent Cloud) | ✓ | ✓ | ✓ | ✓ | — | — |
 | Zhipu Qingyan | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Nous | ✓ | ✓ | ✓ | — | — | — |
+| LobsterAI | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Provedores personalizados | ✓ | — | ✓ | — | — | — |
 
 > Nota: em Lista de modelos, ✓ significa busca automática online (algumas plataformas também mantêm uma tabela estática interna como fallback); o ZCode tem apenas a tabela estática interna. ✗ em Renovação automática do token significa que a plataforma não tem um fluxo de renovação disponível (a conta continua funcionando enquanto as credenciais forem válidas). O check-in do Qoder é somente na versão da China.
@@ -204,17 +206,17 @@ Uma ressalva: a LICENSE traz um **Aviso de uso** após o texto da MIT, cujo item
 
 ## ⭐ Star History
 
-<a href="https://star-history.com/#Agent2API/agent2api&Date">
+<a href="https://star-history.com/#aimod-cc/Agent2API&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=aimod-cc/Agent2API&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=aimod-cc/Agent2API&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aimod-cc/Agent2API&type=Date" />
   </picture>
 </a>
 
 <div align="center">
 
-**[Baixe a versão mais recente](https://github.com/Agent2API/agent2api/releases/latest)** • **[Reporte um problema](https://github.com/Agent2API/agent2api/issues)**
+**[Baixe a versão mais recente](https://github.com/aimod-cc/Agent2API/releases/latest)** • **[Reporte um problema](https://github.com/aimod-cc/Agent2API/issues)**
 
 Se este projeto for útil para você, uma ⭐️ Star é muito bem-vinda!
 

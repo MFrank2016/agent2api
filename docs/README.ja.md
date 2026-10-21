@@ -7,10 +7,10 @@
 [简体中文](../README.md) | [English](./README.en.md) | [繁體中文](./README.zh-Hant.md) | **日本語** | [한국어](./README.ko.md) | [Português (BR)](./README.pt-BR.md)
 
 [![license](https://img.shields.io/badge/license-MIT%20%2B%20告知-green)](../LICENSE)
-[![release](https://img.shields.io/github/v/release/Agent2API/agent2api?include_prereleases)](https://github.com/Agent2API/agent2api/releases/latest)
+[![release](https://img.shields.io/github/v/release/aimod-cc/Agent2API?include_prereleases)](https://github.com/aimod-cc/Agent2API/releases/latest)
 [![docker pulls](https://img.shields.io/docker/pulls/aimodcc/agent2api)](https://hub.docker.com/r/aimodcc/agent2api)
-[![stars](https://img.shields.io/github/stars/Agent2API/agent2api?style=flat&color=yellow)](https://github.com/Agent2API/agent2api/stargazers)
-[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Docker-blue)](https://github.com/Agent2API/agent2api/releases/latest)
+[![stars](https://img.shields.io/github/stars/aimod-cc/Agent2API?style=flat&color=yellow)](https://github.com/aimod-cc/Agent2API/stargazers)
+[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Docker-blue)](https://github.com/aimod-cc/Agent2API/releases/latest)
 
 [✨ 主な機能](#-主な機能) • [💬 コミュニティとサポート](#-コミュニティとサポート) • [🤝 対応プロバイダー](#-対応プロバイダー) • [🚀 クイックスタート](#-クイックスタート) • [📦 インストールとデプロイ](./install.ja.md) • [📸 画面プレビュー](#-画面プレビュー) • [🔧 開発とビルド](#-開発とビルド) • [📜 使用に関する告知](#-使用に関する告知)
 
@@ -23,7 +23,7 @@ Agent2API は、複数の AI デスクトップクライアントでログイン
 ## ✨ 主な機能
 
 - 🔌 **OpenAI 互換** —— クライアントに `base_url` を設定するだけ。Chat / Responses / Messages の 3 プロトコルに対応
-- 🏪 **17 社の組み込みプロバイダー** —— WorkBuddy、小浣熊、CatPaw、Qoder、Trae などがすぐ使え、カスタムプロバイダーにも対応
+- 🏪 **20 社の組み込みプロバイダー（27 エディション）** —— WorkBuddy、小浣熊、CatPaw、Qoder、Trae などがすぐ使え、カスタムプロバイダーにも対応
 - 🔁 **認証情報の自動更新** —— トークンは期限前に自動更新、期限切れ間近のものは一括更新、モデルカタログも追従
 - 🪂 **マルチアカウントのローテーション** —— 優先度順にキューイングし、429 は次のアカウントへ。レート制限中は待たずにスキップ
 - 🛡️ **外向きプロキシ** —— アカウントごとに出口 IP を割り当て、送信フィンガープリントは公式クライアントを装う
@@ -70,7 +70,7 @@ Agent2API は、複数の AI デスクトップクライアントでログイン
 | Accio（国際版 / 中国版） | ✓ | ✓ | ✓ | ✓ | — | — |
 | ZCode（中国版 / 国際版） | ✓ | ✗ | ✗ | ✓ | — | ✓ |
 | CodeArts | ✓ | ✓ | ✓ | ✓ | — | ✓ |
-| Trae | ✓ | ✓ | ✓ | ✓ | — | — |
+| Trae | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Loomy（iFlytek） | ✓ | ✗ | ✓ | ✓ | ✓ | — |
 | KukuAI（Baidu Wenku） | ✓ | ✗ | ✓ | ✓ | ✓ | — |
 | MonkeyCode（長亭科技、中国版 / 国際版） | ✓ | ✗ | ✓ | — | — | — |
@@ -79,6 +79,8 @@ Agent2API は、複数の AI デスクトップクライアントでログイン
 | OfficeAce（Huawei Cloud、OfficeClaw） | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | OrcaTerm（Tencent Cloud） | ✓ | ✓ | ✓ | ✓ | — | — |
 | 智谱清言（Zhipu Qingyan） | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Nous | ✓ | ✓ | ✓ | — | — | — |
+| LobsterAI | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | カスタムプロバイダー | ✓ | — | ✓ | — | — | — |
 
 > 注：モデル一覧の ✓ はオンラインでの自動取得に対応することを意味します（一部のプラットフォームは内蔵の静的テーブルも併用）。ZCode は内蔵の静的テーブルのみです。トークン自動更新の ✗ は、そのプラットフォームに利用可能な更新の仕組みがないことを意味します（アカウントは有効期間内はそのまま利用できます）。Qoder のチェックインは中国版のみです。
@@ -204,17 +206,17 @@ macOS の `.dmg` は **macOS 上でしかビルドできません**（`npm --pre
 
 ## ⭐ Star History
 
-<a href="https://star-history.com/#Agent2API/agent2api&Date">
+<a href="https://star-history.com/#aimod-cc/Agent2API&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Agent2API/agent2api&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=aimod-cc/Agent2API&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=aimod-cc/Agent2API&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aimod-cc/Agent2API&type=Date" />
   </picture>
 </a>
 
 <div align="center">
 
-**[最新版をダウンロード](https://github.com/Agent2API/agent2api/releases/latest)** • **[問題を報告](https://github.com/Agent2API/agent2api/issues)**
+**[最新版をダウンロード](https://github.com/aimod-cc/Agent2API/releases/latest)** • **[問題を報告](https://github.com/aimod-cc/Agent2API/issues)**
 
 このプロジェクトが役に立ったら、⭐️ Star をもらえるとうれしいです！
 
