@@ -63,7 +63,7 @@ const SANITIZE_REWRITES: &[(&str, &str)] = &[
     ),
     (
         "Main branch (you will usually use this for PRs)",
-        "Default branch (you will usually use this for PRs)",
+        "Default branch (you will typically use this for PRs)",
     ),
     (
         "You are a coding agent running in the Codex CLI, a terminal-based coding assistant.",
@@ -81,7 +81,8 @@ const SANITIZE_REWRITES: &[(&str, &str)] = &[
         // 相邻的 11148 / 11101 / 11115 / 99999 均放行）。11128 正是本类拦截自身的错误码，
         // 上游据此识别"在讨论/回显其内部错误码"的请求。
         // 代价：用户对话中任何 11128 都会被改写——但这串数字出现在请求里本身就是拦截条件，
-        // 不改写必然失败。插入连字符保留可读性与指代（零宽空格无效，实测上游会归一化）。
+        // 不改写必然失败。插入一个 ASCII 连字符保留可读性与指代（零宽空格无效，
+        // 实测上游会归一化）：裸数字 11128 改写成 11-128，字节已不同、语义不变。
         "11128",
         "11-128",
     ),
@@ -334,4 +335,27 @@ pub fn sanitize_body(body: &Value) -> Option<(Value, Vec<(String, usize)>)> {
         return None;
     }
     Some((next, hits.into_sorted()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 每条改写规则必须真的改变文本 —— 曾经 5 条里有 4 条 `from == to`（no-op），
+    /// 上游反探测与身份句脱敏实际只有 1 条生效。这条测试防再次被格式化/合并抹平。
+    #[test]
+    fn every_rewrite_actually_changes_the_text() {
+        for (index, (from, to)) in SANITIZE_REWRITES.iter().enumerate() {
+            assert_ne!(from, to, "改写规则 #{index} 的 from 与 to 相同（no-op）：{from}");
+        }
+    }
+
+    /// 裸 11-128 必须被改写掉，且改后不再包含 ASCII 连字符形态。
+    #[test]
+    fn the_bare_rate_limit_code_is_rewritten() {
+        let mut hits = Hits::default();
+        let out = sanitize_text("上游返回 400 code=11128", &mut hits);
+        assert!(!out.contains("11128"), "改写后仍含裸数字形态: {out}");
+        assert!(out.contains("11-128"), "改写后应保留连字符形态: {out}");
+    }
 }

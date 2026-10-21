@@ -91,6 +91,7 @@ pub const SERVER_CODES: &[(&str, i64)] = &[
     ("TrialExpired", 11216),
     ("IpLimit", 10081),
     ("NonStreamNotSupported", 11101),
+    // 注意：曾误写为 `11-128`（Rust 会算成 -117），真实码是 11-128。
     ("RateLimited", 11128),
 ];
 

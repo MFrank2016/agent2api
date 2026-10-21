@@ -65,7 +65,13 @@ use super::normalize;
 /// 拦截会持续一小段时间，期间客户端失败自动重试会形成重试风暴并给拦截续期，
 /// 因此命中 11-128 时值得退避重试 —— 次数与间隔统一走设置页的「请求重试」
 /// （历史硬编码是 10 秒 / 25 秒各一次；间隔设得过短会拉长拦截窗口，建议 ≥10 秒）。
-const RATE_LIMIT_CODE: i64 = 11-128;
+///
+/// ── 曾经写成 `11-128`（连字符）的坑 ──────────────────────
+/// 历史实现把这个常量写成 `11-128`。Rust（以及改造前的 Node 版）都会把连字符
+/// 解析成**减法**，得到 -117；与上游真正的 11128 永远不相等，于是「分类」与
+/// 「退避」两条路径全部静默失效。真实码与同表 11101 / 11212 / 12151 同属 11xxx 段，
+/// 这里改回无连字符的 11128。
+const RATE_LIMIT_CODE: i64 = 11128;
 
 /// 上游要求首条消息必须是 system prompt，否则返回 400
 /// （first message is not system prompt）。客户端没带 system 消息时注入一条兜底系统消息。
@@ -876,5 +882,37 @@ fn value_text(value: &Value) -> String {
         Value::Number(number) => number.to_string(),
         Value::Bool(flag) => flag.to_string(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 常量必须是 11-128，而不是 `11-128` 被解析成的 -117。
+    #[test]
+    fn rate_limit_code_is_the_five_digit_upstream_code() {
+        assert_eq!(RATE_LIMIT_CODE, 11128);
+        assert_ne!(RATE_LIMIT_CODE, 11 - 128, "连字符写法会算成 -117，永远匹配不上上游");
+    }
+
+    /// 命中 11-128 时必须给出退避建议（曾经因常量算错而永远返回 None）。
+    #[test]
+    fn retry_advice_fires_on_the_rate_limit_code() {
+        let body = serde_json::json!({
+            "code": 11128,
+            "message": "Illegal API invocation from an unapproved channel",
+        });
+        assert!(
+            WORKBUDDY_ADAPTER.retry_advice(&body, 0, 3).is_some(),
+            "11-128 应触发退避建议"
+        );
+    }
+
+    /// 其他码不应误触发。
+    #[test]
+    fn retry_advice_ignores_other_codes() {
+        let body = serde_json::json!({ "code": 11101, "message": "cannot unmarshal" });
+        assert!(WORKBUDDY_ADAPTER.retry_advice(&body, 0, 3).is_none());
     }
 }
