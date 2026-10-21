@@ -204,8 +204,9 @@ function groupBalanceOf(members: AccountRecord[]): GroupBalance {
     if (entry === undefined || entry === null) { out.pending++; continue }
     const failure = usageFailureOf(entry)
     if (failure) {
-      // 「未配置查询凭证」在余额列里是中性灰字（不是故障），这里同样不点 ⚠
-      if (!failure.notConfigured) out.failed++
+      // 「未配置查询凭证」与「凭据已失效」在余额列里都是中性灰字（不是故障），
+      // 这里同样不点 ⚠ —— 后者要用户去重新登录，不是网关的错。
+      if (!failure.notConfigured && !failure.credentialDead) out.failed++
       continue
     }
     if (typeof entry !== 'object' || Array.isArray(entry)) { out.uncountable++; continue }
@@ -565,9 +566,15 @@ export function usageSummary(entry: UsageEntry): { text: string; kind: string; t
   if (entry === null) return { text: t('查询中…'), kind: 'muted', title: t('正在查询') }
   const failure = usageFailureOf(entry)
   if (failure) {
-    return failure.notConfigured
-      ? { text: t('未配置'), kind: 'muted', title: t('{message}（去该账号的「设置」里填上查询凭证即可）', { message: failure.message }) }
-      : { text: t('查询失败'), kind: 'bad', title: failure.message }
+    // 「未配置」与「凭据已失效」都是中性提示（账号本身没问题，只是用户要去做一件事），
+    // 其余失败才是红色。判据一律用后端给的 code，不匹配文案。
+    if (failure.notConfigured) {
+      return { text: t('未配置'), kind: 'muted', title: t('{message}（去该账号的「设置」里填上查询凭证即可）', { message: failure.message }) }
+    }
+    if (failure.credentialDead) {
+      return { text: t('需重新登录'), kind: 'muted', title: failure.message }
+    }
+    return { text: t('查询失败'), kind: 'bad', title: failure.message }
   }
   if (typeof entry !== 'object' || entry === null) return { text: t('无数据'), kind: 'muted', title: String(entry) }
   const data = entry as Record<string, unknown>

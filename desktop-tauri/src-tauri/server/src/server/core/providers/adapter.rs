@@ -1071,6 +1071,30 @@ pub trait ProviderAdapter: Send + Sync {
 /// 真实的 400 参数错误混在一起 —— 一个稳定的字符串标记是这里唯一可靠的判据。
 pub const USAGE_NOT_CONFIGURED_CODE: &str = "usage_not_configured";
 
+/// 「凭据已被上游作废、刷新也救不回来」的**机器可识别标记**
+/// （`GatewayError::code`）。
+///
+/// ── 为什么需要这个 code ────────────────────────────────
+/// 余额查询拿到 401 时会先尝试刷新一次；若刷新**也**失败，说明不是 token
+/// 临期，而是会话连同 refresh token 一起被上游注销了（小浣熊的
+/// `authorization_verify_error` 就是这一类）。这种失败再重试多少次都不会
+/// 好，只有「用户重新登录」一条出路。
+///
+/// 没有这个标记时，自动查询会按账号配置的间隔（默认 60 秒）**无休止**地重
+/// 试同一个死凭证 —— 每分钟一条失败日志，日志页被淹，真正需要关注的失败
+/// 反而看不见（与 issue #215 在凭证维护上踩的是同一个坑）。有了它，自动
+/// 查询按 [`USAGE_CREDENTIAL_DEAD_BACKOFF_MS`] 退避，手动查询不受影响。
+pub const USAGE_CREDENTIAL_DEAD_CODE: &str = "usage_credential_dead";
+
+/// 凭据已失效时，自动查询的退避上限（1 小时）。
+///
+/// 为什么是「上限」而不是「固定值」：失败次数不可靠地计数（不新增列），
+/// 所以这里只能给一个足够长的固定间隔 —— 凭证失效是**稳定**状态，上游答案
+/// 不会自己变，1 小时一次足够让用户在修好凭证后自愈，又不会把日志刷屏。
+/// 凭证一变（重新登录 / 重新导入）`updatedAt` 会更新，退避立即失效并回到
+/// 正常间隔（见 `usage_query::failure_backoff`）。
+pub const USAGE_CREDENTIAL_DEAD_BACKOFF_MS: i64 = 60 * 60 * 1000;
+
 /// 「该账号没有配置余额查询凭证」的统一文案（`GatewayError::code` 同为
 /// [`USAGE_NOT_CONFIGURED_CODE`]）。
 ///

@@ -42,7 +42,9 @@ use serde_json::{json, Value};
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::limiter;
-use crate::server::core::providers::adapter::adapter_for;
+use crate::server::core::providers::adapter::{
+    adapter_for, USAGE_CREDENTIAL_DEAD_BACKOFF_MS, USAGE_CREDENTIAL_DEAD_CODE,
+};
 use crate::server::core::usage_records;
 
 use crate::server::logging;
@@ -242,7 +244,11 @@ async fn query_usage_inner(
                         "{}；自动续期也失败：{}（登录态可能已被上游作废，请重新登录或重新导入该账号的凭证）",
                         error.message, refresh_error.message
                     ),
-                    error.code,
+                    // 专用 code：自动查询据此退避，不再每分钟重试同一个死凭证
+                    // （见 `USAGE_CREDENTIAL_DEAD_CODE`）。原始 code 为空时也
+                    // 用这个标记 —— 它描述的是「刷新也救不回来」这个结论，
+                    // 与上游返回的哪个业务码无关。
+                    Some(USAGE_CREDENTIAL_DEAD_CODE.to_string()),
                 ));
             }
             adapter
@@ -461,6 +467,29 @@ fn enforce_token_disable(store: &AccountStore, accounts: &[Value], now: i64) {
 /// 记录表的小查询里）。
 pub const SWEEP_TICK_MS: u64 = 10_000;
 
+/// 自动查询在**凭据已失效**时的额外退避（毫秒）。
+///
+/// 记录里的 `code` 为 [`USAGE_CREDENTIAL_DEAD_CODE`] 时返回
+/// [`USAGE_CREDENTIAL_DEAD_BACKOFF_MS`]（1 小时）；其余情况返回 0（不改变
+/// 原有「失败不退避」行为）。
+///
+/// ── 为什么只对「凭据已失效」退避，而不是对所有失败 ──────────
+/// 其它失败（超时、5xx、上游抖动）都是**临时**的，按配置间隔重试正是要的
+/// （模块头的「失败不退避」取舍针对的就是这类）。而「刷新也救不回来」是
+/// **稳定**结论：上游答案不会自己变，每分钟重试只会把日志刷屏。
+///
+/// 凭证一变（重新登录 / 重新导入）账号的 `updatedAt` 会更新，但这里不读
+/// `updatedAt`：`sweep_due` 的到期判定是「记录 + 配置」的纯函数，掺进账号
+/// 时间戳会让「手动查询顺延」等既有语义变模糊。取而代之的是：用户修好凭证
+/// 后点一次手动查询，成功行会把 `code` 清空，自动查询立刻回到正常间隔。
+fn failure_backoff(record: &usage_records::UsageRecord) -> i64 {
+    if record.code.as_deref() == Some(USAGE_CREDENTIAL_DEAD_CODE) {
+        USAGE_CREDENTIAL_DEAD_BACKOFF_MS
+    } else {
+        0
+    }
+}
+
 /// 起动每账号自动查询的心跳循环（`ServerState::bootstrap` 调一次，进程内
 /// 只有这一个循环）。循环体：扫到期账号 → 占位 → 并发查询 → 落记录 → 钩子。
 pub fn spawn_sweeper(store: AccountStore) {
@@ -511,7 +540,11 @@ async fn sweep_due(store: &AccountStore) {
     .filter_map(|account| {
         let interval = usage_records::query_interval_of(&account)?;
         let id = account.get("id").and_then(Value::as_str)?;
-        let due_at = usage_records::load(id).last_attempt_at + interval * 1000;
+        let record = usage_records::load(id);
+        // 到期 = 上次尝试 + 间隔；连续失败按指数退避（见 [`failure_backoff`]）。
+        // 退避只影响**自动**查询：手动批量 / 单查不走这条筛选，用户随时可以
+        // 点一次拿到最新结论。
+        let due_at = record.last_attempt_at + interval * 1000 + failure_backoff(&record);
         (due_at <= now).then_some((account, interval))
     })
     .collect();
@@ -622,5 +655,37 @@ pub fn snapshot(store: &AccountStore) -> Value {
         "tokenAt": now,
         "tokenUsage": token_usage,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(code: Option<&str>) -> usage_records::UsageRecord {
+        usage_records::UsageRecord {
+            usage: None,
+            error: Some(String::from("x")),
+            code: code.map(str::to_string),
+            remaining: None,
+            unlimited: false,
+            last_success_at: 0,
+            last_attempt_at: 0,
+        }
+    }
+
+    /// 回归锁定：只有「凭据已失效」才退避。
+    ///
+    /// 反例（修复前）：死凭证（刷新也失败）按账号配置的间隔（默认 60 秒）
+    /// 无休止重试，每分钟一条失败日志。
+    #[test]
+    fn credential_dead_backs_off_but_other_failures_do_not() {
+        assert_eq!(
+            failure_backoff(&record(Some(USAGE_CREDENTIAL_DEAD_CODE))),
+            USAGE_CREDENTIAL_DEAD_BACKOFF_MS
+        );
+        // 临时失败（超时 / 5xx）保持「失败不退避」：按配置间隔重试正是要的
+        assert_eq!(failure_backoff(&record(None)), 0);
+        assert_eq!(failure_backoff(&record(Some("usage_not_configured"))), 0);
+    }
 }
 

@@ -53,6 +53,16 @@ export * from './accounts-store'
 export const NOT_CONFIGURED_CODE = 'usage_not_configured'
 
 /**
+ * 「凭据已被上游作废、刷新也救不回来」的标记（与后端
+ * `providers::adapter::USAGE_CREDENTIAL_DEAD_CODE` 逐字一致）。
+ *
+ * 同样是前后端契约常量。它与「未配置」都是**非故障**：账号本身没问题，
+ * 只是需要用户去做一件具体的事（重新登录），所以不该渲染成红色的「查询失败」。
+ * 后端自动查询对这条 code 退避 1 小时（见 `USAGE_CREDENTIAL_DEAD_BACKOFF_MS`）。
+ */
+export const CREDENTIAL_DEAD_CODE = 'usage_credential_dead'
+
+/**
  * 余额的结果缓存：**原地可变**的 Map，改完调 bump() 通知。
  * 为什么不像其余状态那样每次换新对象：写 `null`（「查询中」）这个中间态必须让视图立刻
  * 看到，而它是高频小改动（每次点按钮 / 每轮批量），每次拷贝一份纯属浪费。
@@ -442,13 +452,23 @@ function batchUsageTargets(): AccountRecord[] {
  * 转发照跑，只是用户还没告诉网关那个凭证长什么样。把它渲染成红色的「查询失败」会让
  * 人去排查一个不存在的故障，所以判据用后端给的 `code` **而不是匹配文案**。
  */
-export function usageFailureOf(entry: UsageEntry): { message: string; notConfigured: boolean } | null {
+export function usageFailureOf(entry: UsageEntry): {
+  message: string
+  notConfigured: boolean
+  credentialDead: boolean
+} | null {
   if (entry === undefined || entry === null) return null
-  if (typeof entry === 'string') return { message: entry, notConfigured: false }
+  if (typeof entry === 'string') {
+    return { message: entry, notConfigured: false, credentialDead: false }
+  }
   if (typeof entry !== 'object') return null
   const error = entry.error
   if (!error) return null
-  return { message: String(error), notConfigured: entry.code === NOT_CONFIGURED_CODE }
+  return {
+    message: String(error),
+    notConfigured: entry.code === NOT_CONFIGURED_CODE,
+    credentialDead: entry.code === CREDENTIAL_DEAD_CODE,
+  }
 }
 
 /** 后端结果行 → 缓存条目（成功给 `usage`，失败给 `{error, code?}`）。
