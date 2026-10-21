@@ -111,10 +111,33 @@ pub struct FramePolicy {
 }
 
 impl FramePolicy {
-    /// 只带 model 回写、其余按默认（自定义家的转发路径用它：那家的保活形态
-    /// 没有实测过，不去动它的字节）
+    /// 只带 model 回写、其余按默认（保守形态：那家的保活形态没有实测过，
+    /// 不去动它的字节）
     pub fn with_rewrite(rewrite: Option<ModelRewrite>) -> Self {
         Self { rewrite, strip_newline_chunks: false, strip_leading_think: false }
+    }
+
+    /// 自定义家：model 回写 + **显式**的 per-provider think 剥离开关。
+    ///
+    /// ── 为什么单独一个构造器而不是改 `with_rewrite` ────────────────
+    /// `with_rewrite` 的语义是「只带 model 回写，其余按默认」——它服务
+    /// 「这家保活形态没实测过，不去动它的字节」那条既有取舍。改成带开关会
+    /// 让所有调用点都要传参，而其中多数并不需要。
+    ///
+    /// ── 为什么自定义家要能开 ──────────────────────────────────
+    /// `provider_options::is_known_provider` 认自定义家（`custom-` 前缀 +
+    /// 存储里有这条记录），所以用户能 `set("custom-xxx", "stripLeadingThink",
+    /// true)` 并拿到 `Ok(())`；转发时若不读它，就是「配了不生效且无提示」——
+    /// 比「不支持」更糟（用户以为自己开了）。要么支持、要么在 `set()` 里拒绝
+    /// 自定义家，支持更简单，也更符合「自定义上游什么都可能」的定位。
+    ///
+    /// 保活换行的丢弃仍然**恒关**：那一项的依据是 WorkBuddy / AutoClaw 两条
+    /// 上游的实测，不能替用户自配的上游猜。
+    pub fn with_rewrite_and_think(
+        rewrite: Option<ModelRewrite>,
+        strip_leading_think: bool,
+    ) -> Self {
+        Self { rewrite, strip_newline_chunks: false, strip_leading_think }
     }
 
     /// 由**能力位 × 开关**装配（转发链上唯一的生产入口，见
@@ -1018,6 +1041,44 @@ mod tests {
             feed(&mut coalescer, "data: [DONE]\n\n").trim() == "data: [DONE]",
             "acc 已清空，[DONE] 处不该再补一帧空的思考"
         );
+    }
+
+    /// 自定义家的策略构造：per-provider 的 think 开关必须真的进 `FramePolicy`。
+    ///
+    /// 回归锁定：反例（改造前）是自定义家 4 处调用点全走 `with_rewrite`，
+    /// 那个构造器硬编码 `strip_leading_think: false` —— 用户配了
+    /// `stripLeadingThink: true` 拿到 `Ok(())`，转发时却完全不生效。
+    #[test]
+    fn custom_provider_policy_honors_the_think_switch() {
+        let on = FramePolicy::with_rewrite_and_think(None, true);
+        assert!(on.strip_leading_think, "开了就必须进策略");
+        let off = FramePolicy::with_rewrite_and_think(None, false);
+        assert!(!off.strip_leading_think);
+        // 既有保守语义不变：只带 model 回写时两项改写都关
+        let conservative = FramePolicy::with_rewrite(None);
+        assert!(!conservative.strip_leading_think);
+        assert!(!conservative.strip_newline_chunks);
+        // think 开关不顺手打开保活换行的丢弃（那是另一项实测过的取舍）
+        assert!(!on.strip_newline_chunks);
+    }
+
+    /// 自定义家的开关必须真的**驱动剥离**，而不只是写进结构体字段：
+    /// 只断言 `on.strip_leading_think == true` 的话，把状态机里的读取删掉
+    /// 也照样绿。
+    #[test]
+    fn a_custom_provider_policy_actually_strips_when_the_switch_is_on() {
+        let rewrite = Some(ModelRewrite { requested: "mine".to_string() });
+        let mut on = ReasoningCoalescer::new().with_policy(
+            FramePolicy::with_rewrite_and_think(rewrite.clone(), true),
+        );
+        let out = feed(&mut on, &frame(json!({"content": "<think>x</think>answer"})));
+        assert!(out.contains(r#""content":"answer""#), "开关开着必须剥掉标签: {out}");
+        assert!(out.contains(r#""model":"mine""#), "model 回写必须同时生效: {out}");
+        let mut off = ReasoningCoalescer::new()
+            .with_policy(FramePolicy::with_rewrite_and_think(rewrite, false));
+        let out = feed(&mut off, &frame(json!({"content": "<think>x</think>answer"})));
+        assert!(out.contains("<think>"), "开关关着时标签必须原样保留: {out}");
+        assert!(out.contains(r#""model":"mine""#), "关掉剥离不影响 model 回写: {out}");
     }
 
     /// 开关关着（默认态）时，正文里的 think 标签**逐字节**原样下发。

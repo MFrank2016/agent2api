@@ -82,14 +82,40 @@ use crate::server::core::proxies::{AccountEgress, ResolvedProxy};
 use crate::server::core::providers::custom::emulation;
 use crate::server::core::upstream::connections::ConnectionGuard;
 use crate::server::core::upstream::request::{read_upstream_error, send_chat_request, TransportRequest};
-// `FramePolicy::with_rewrite(...)`：自定义家只带 model 回写，保活换行的丢弃
-// 保持关闭 —— 那一项的依据是 WorkBuddy / AutoClaw 两条上游的实测，不能替
-// 用户自配的上游猜。
+// `FramePolicy::with_rewrite_and_think(...)`：自定义家带 model 回写 + 这一家的
+// think 剥离开关；保活换行的丢弃保持关闭 —— 那一项的依据是 WorkBuddy /
+// AutoClaw 两条上游的实测，不能替用户自配的上游猜。
 use crate::server::core::upstream::sse::{FramePolicy, ModelRewrite};
 use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::core::upstream::{ForwardOutcome, ForwardStream, InFlightGuard};
 use crate::server::errors::GatewayError;
 use crate::server::logging;
+
+/// 自定义家这一轮的下发策略：model 回写 + 这一家的 think 剥离开关。
+///
+/// ── 为什么单独抽一个函数（而不是内联在两个 async 里）──────────
+/// 内联的话唯一能测的就只剩「构造函数有那个参数」—— 把调用点退回
+/// `with_rewrite` 照样绿，那正是这次评审抓到的空转形态。抽出来之后，
+/// 配置读取这一层可以被用例直接钉住（见本文件末尾的用例）。
+///
+/// `provider_options::is_known_provider` 认自定义家，所以用户在
+/// `providerOptions` 里给 `custom-xxx` 配的 `stripLeadingThink` 是**能写进去**
+/// 的；转发时不读它就是「配了不生效且无提示」，比「不支持」更糟。
+/// 默认值取全局键（`config::strip_leading_think`，缺省 false），与
+/// `upstream::provider_loop::frame_policy_of` 的口径逐字一致 —— 同一个开关
+/// 在内置家与自定义家之间不该有两种读法。
+///
+/// 保活换行的丢弃仍然恒关（`with_rewrite_and_think` 的说明）。
+fn frame_policy_of_custom(provider_id: &str, rewrite: Option<ModelRewrite>) -> FramePolicy {
+    // 每次 provider attempt 读一次（只取一次配置读锁，不克隆底稿），与
+    // `upstream::payload::send_body` 里 sanitize 那一处同一代价。
+    let strip_leading_think = crate::server::core::provider_options::is_enabled(
+        provider_id,
+        crate::server::config::KEY_STRIP_LEADING_THINK,
+        crate::server::config::strip_leading_think(),
+    );
+    FramePolicy::with_rewrite_and_think(rewrite, strip_leading_think)
+}
 
 /// 一次自定义家转发的入口（编排层的 `attempt_custom` 调用）。
 ///
@@ -298,6 +324,9 @@ pub(crate) async fn forward(
         ));
     }
 
+    // 流式与非流式两条路径用**同一个**策略：同一个请求要不要流式，剥不剥标签
+    // 不该长得不一样（见 `frame_policy_of_custom`）。
+    let policy = || frame_policy_of_custom(provider_id, rewrite.clone());
     if stream {
         // 槽位与连接计数移交给流（与无状态路径同一时序，见模块头）
         Ok(ForwardOutcome::Stream {
@@ -307,7 +336,7 @@ pub(crate) async fn forward(
                 slot.take(),
                 connections.handoff(),
                 telemetry.clone(),
-                FramePolicy::with_rewrite(rewrite),
+                policy(),
             )),
         })
     } else {
@@ -316,7 +345,7 @@ pub(crate) async fn forward(
         let aggregated = crate::server::core::upstream::aggregate::aggregate_sse_completion(
             response,
             telemetry.clone(),
-            FramePolicy::with_rewrite(rewrite),
+            policy(),
         )
         .await?;
         Ok(ForwardOutcome::Completion {
@@ -633,6 +662,9 @@ async fn forward_translated(
     // 非流式进聚合器 —— 槽位与连接计数的移交时序与 chat 分支逐字同构
     let translated =
         Box::pin(ProtocolTranslateStream::new(kind, &wire_model, response, telemetry));
+    // 与 chat 分支同一口径（见 `frame_policy_of_custom`）：翻译协议的上游同样
+    // 可能把思考塞在正文最前面，剥不剥由这一家的开关决定。
+    let policy = || frame_policy_of_custom(provider_id, rewrite.clone());
     if stream {
         Ok(ForwardOutcome::Stream {
             status,
@@ -641,14 +673,14 @@ async fn forward_translated(
                 slot.take(),
                 connections.handoff(),
                 telemetry.clone(),
-                FramePolicy::with_rewrite(rewrite),
+                policy(),
             )),
         })
     } else {
         let aggregated = crate::server::core::upstream::aggregate::aggregate_frame_stream(
             translated,
             telemetry.clone(),
-            FramePolicy::with_rewrite(rewrite),
+            policy(),
         )
         .await?;
         Ok(ForwardOutcome::Completion { body: aggregated.body })
@@ -979,4 +1011,98 @@ pub fn cooldown_model(provider_id: &str, requested: &str) -> String {
         return String::new();
     }
     custom_providers::wire_model_for(provider_id, requested).0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::config;
+    use crate::server::core::provider_options;
+
+    /// 恢复 `providerOptions`：用例中途 panic 也要执行（测试跑的是 unwind）。
+    ///
+    /// 用例写的是**进程级**配置快照，而 `config::update` 是「读整份 → 改 →
+    /// 写整份」的非原子读改写；串行用的锁是 `provider_options` 模块层那把
+    /// （写 `providerOptions` 的用例共用它）—— 自己再起一把只会「各自以为
+    /// 串行了」，实际仍在互相盖掉对方的写入。
+    struct RestoreOptions {
+        previous: Option<Value>,
+    }
+
+    impl RestoreOptions {
+        fn capture() -> Self {
+            Self {
+                previous: config::with_raw(|raw| raw.get("providerOptions").cloned()).flatten(),
+            }
+        }
+    }
+
+    impl Drop for RestoreOptions {
+        fn drop(&mut self) {
+            let value = self
+                .previous
+                .clone()
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+            let _ = config::update_raw_field("providerOptions", value);
+        }
+    }
+
+    fn ensure_snapshot() {
+        if config::with_raw(|_| ()).is_some() {
+            return;
+        }
+        let _ = config::update_raw_field("providerOptions", Value::Object(serde_json::Map::new()));
+    }
+
+    /// 回归锁定：自定义家的策略**真的读** per-provider 的 `stripLeadingThink`。
+    ///
+    /// 反例（改造前）：两个调用点都走 `with_rewrite`，那个构造器硬编码
+    /// `strip_leading_think: false` —— 用户配了开关、写侧返回 `Ok(())`，
+    /// 转发时却完全不生效，且没有任何提示。
+    ///
+    /// ── 为什么用内置 id `qoder` 测 ─────────────────────────────
+    /// 本用例锁的是**读取口径**：`frame_policy_of_custom` 必须走
+    /// `provider_options::is_enabled`，不得在自定义家这一侧另加 provider 分支。
+    /// 「某个 id 算不算认得的家」由 `provider_options::is_known_provider` 回答
+    /// （它对 `custom-` 前缀 + 存储里有记录的家同样放行），那条判据不在这里、
+    /// 也不该在这里复制一份。用内置 id 还免去在快照里造一条自定义家记录，
+    /// 少一次跨模块的读改写。
+    #[test]
+    fn the_custom_policy_reads_the_per_provider_think_switch() {
+        let _guard = provider_options::CONFIG_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = RestoreOptions::capture();
+        ensure_snapshot();
+        let key = config::KEY_STRIP_LEADING_THINK;
+
+        // ① 配 true → 策略里必须是 true（否则就是「配了不生效」）
+        provider_options::set("qoder", key, true).expect("登记过的键必须能写");
+        assert!(
+            frame_policy_of_custom("qoder", None).strip_leading_think,
+            "配了 stripLeadingThink=true，策略里必须带上"
+        );
+        // ② 配 false → 必须是 false（否则就是硬编码 true）
+        provider_options::set("qoder", key, false).expect("登记过的键必须能写");
+        assert!(
+            !frame_policy_of_custom("qoder", None).strip_leading_think,
+            "配了 false 就必须关"
+        );
+        // ③ 没配的家跟随默认（缺省 false）—— 不能凭空默认开
+        assert!(
+            !frame_policy_of_custom("trae", None).strip_leading_think,
+            "没配过的家必须走默认（关）"
+        );
+        // ④ 剥离开关不许顺手打开保活换行的丢弃（另一项实测过的取舍）
+        assert!(!frame_policy_of_custom("qoder", None).strip_newline_chunks);
+        // ⑤ model 回写照旧传下去（策略构造不许把 rewrite 弄丢）
+        let rewrite = Some(ModelRewrite { requested: "mine".to_string() });
+        assert_eq!(
+            frame_policy_of_custom("qoder", rewrite)
+                .rewrite
+                .map(|value| value.requested)
+                .as_deref(),
+            Some("mine")
+        );
+    }
 }

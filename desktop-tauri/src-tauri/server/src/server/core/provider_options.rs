@@ -45,6 +45,16 @@ fn config_key() -> &'static str {
     "providerOptions"
 }
 
+/// 测试用的进程级配置锁：**所有写 `providerOptions` 的用例共用这一把**
+/// （本模块的 `tests` 与 `providers::custom::forward` 的用例）。
+///
+/// 为什么不能各用各的：`config::update` 是「读整份 → 改 → 写整份」的**非原子**
+/// 读改写，两把互不相干的锁各自以为「串行了」，实际仍在互相盖掉对方的写入 ——
+/// 症状是「换个跑法就有一条用例读到自己没写过的值」。锁放在模块层而不是
+/// `tests` 里，是因为兄弟模块的用例要用同一个 static。
+#[cfg(test)]
+pub(crate) static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// provider 是否可识别（内置注册表或自定义家）。
 fn is_known_provider(provider_id: &str) -> bool {
     crate::server::core::providers::PROVIDERS
@@ -150,14 +160,13 @@ pub fn set(provider_id: &str, key: &str, value: bool) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::server::config::KEY_SANITIZE_FINGERPRINTS;
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
 
     /// 这四条都碰**进程级**配置快照（`config::CONFIG`），而 `config::update`
     /// 是「读整份 → 改 → 写整份」的非原子读改写：两条用例并行时，一条的写
     /// 可能被另一条「读走的旧底稿」整体盖掉。所以本模块动全局的用例串行跑
     /// （与 `config::auto_continue_tests` 的 `CONFIG_LOCK` 同一手法）。
-    static CONFIG_LOCK: Mutex<()> = Mutex::new(());
-
+    /// 锁本身在模块层（[`super::CONFIG_LOCK`]）：写同一个键的兄弟模块要共用它。
     fn hold_config() -> MutexGuard<'static, ()> {
         CONFIG_LOCK
             .lock()
