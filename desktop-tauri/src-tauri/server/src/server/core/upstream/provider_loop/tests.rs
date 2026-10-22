@@ -511,3 +511,112 @@ fn a_deterministic_404_skips_the_in_place_resend() {
         "404 的豁免不许顺手把 400 也豁免了"
     );
 }
+
+// ── 逐家开关的读取口径（`frame_policy_of`）────────────────────────────
+//
+// 回归背景：`stripNewlineKeepalive` 早就在 `provider_options::KNOWN_KEYS` 里登记，
+// 写侧返回 `Ok` 并记一条成功日志，但转发时只读全局键 —— 用户逐家配了、什么都没
+// 发生、也没有任何提示（与 7f4026be 修过的 think-tags 是同一类缺陷）。
+//
+// 这两条钉的是**读取口径**，不是「某个值等于某个常量」：
+//   - 能力位声明的家：逐家值必须盖过全局值（两个方向都测，防止只加了一个 `||`）；
+//   - 没声明能力位的家：配成 true 也不许丢帧（`declared && switch_on` 的收窄语义）。
+
+/// 用例串行跑：本组改的是进程级配置快照，与 `provider_options` 的用例共用一把锁。
+fn hold_provider_options() -> std::sync::MutexGuard<'static, ()> {
+    crate::server::core::provider_options::CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 快照未装入时补一个空的 `providerOptions`（`set()` 把「未初始化」当硬错误）。
+fn ensure_provider_options_snapshot() {
+    if crate::server::config::with_raw(|_| ()).is_some() {
+        return;
+    }
+    let _ = crate::server::config::update_raw_field(
+        "providerOptions",
+        serde_json::Value::Object(serde_json::Map::new()),
+    );
+}
+
+/// 用例结束后把 `providerOptions` 恢复原样（Drop 保证 panic 时也执行）。
+struct RestoreProviderOptions {
+    previous: Option<serde_json::Value>,
+}
+
+impl RestoreProviderOptions {
+    fn capture() -> Self {
+        Self {
+            previous: crate::server::config::with_raw(|raw| raw.get("providerOptions").cloned())
+                .flatten(),
+        }
+    }
+}
+
+impl Drop for RestoreProviderOptions {
+    fn drop(&mut self) {
+        let value = self
+            .previous
+            .clone()
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        let _ = crate::server::config::update_raw_field("providerOptions", value);
+    }
+}
+
+#[test]
+fn a_declared_provider_honours_its_own_newline_switch_over_the_global_one() {
+    let _guard = hold_provider_options();
+    let _restore = RestoreProviderOptions::capture();
+    ensure_provider_options_snapshot();
+
+    // WorkBuddy 声明了 `sse_strip_newline_chunks`（能力位），所以它是「开关真能
+    // 生效」的那一类。断言写成**相对全局默认值的差分形式**，不依赖环境变量：
+    // 逐家值 = !全局 ⇒ 策略必须 = !全局；逐家值 = 全局 ⇒ 策略必须 = 全局。
+    let adapter = adapter_for(ProviderKind::WorkBuddy);
+    assert!(
+        adapter.sse_strip_newline_chunks(),
+        "前提：WorkBuddy 必须声明能力位"
+    );
+    let provider_id = crate::server::core::providers::kind_id(adapter.kind());
+    let key = crate::server::config::KEY_STRIP_NEWLINE_KEEPALIVE;
+    let global = crate::server::config::strip_newline_keepalive();
+
+    crate::server::core::provider_options::set(provider_id, key, !global)
+        .expect("登记过的键必须能写");
+    assert_eq!(
+        frame_policy_of(adapter, "m").strip_newline_chunks,
+        !global,
+        "逐家开关必须盖过全局值（只读全局的话这里会等于 {global}）"
+    );
+
+    crate::server::core::provider_options::set(provider_id, key, global)
+        .expect("登记过的键必须能写");
+    assert_eq!(
+        frame_policy_of(adapter, "m").strip_newline_chunks,
+        global,
+        "逐家值等于全局值时也要如实装配"
+    );
+}
+
+#[test]
+fn an_undeclared_provider_cannot_expand_into_newline_stripping() {
+    let _guard = hold_provider_options();
+    let _restore = RestoreProviderOptions::capture();
+    ensure_provider_options_snapshot();
+
+    // ZCode 没声明能力位：逐家配 true 也不许开始丢帧 —— 开关只能收窄、不能扩张。
+    let adapter = adapter_for(ProviderKind::Zcode);
+    assert!(
+        !adapter.sse_strip_newline_chunks(),
+        "前提：ZCode 不声明能力位"
+    );
+    let provider_id = crate::server::core::providers::kind_id(adapter.kind());
+    let key = crate::server::config::KEY_STRIP_NEWLINE_KEEPALIVE;
+
+    crate::server::core::provider_options::set(provider_id, key, true).expect("登记过的键必须能写");
+    assert!(
+        !frame_policy_of(adapter, "m").strip_newline_chunks,
+        "没有能力位的家配了开关也不许丢帧"
+    );
+}

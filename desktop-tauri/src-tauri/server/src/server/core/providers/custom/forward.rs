@@ -106,6 +106,13 @@ use crate::server::logging;
 /// 在内置家与自定义家之间不该有两种读法。
 ///
 /// 保活换行的丢弃仍然恒关（`with_rewrite_and_think` 的说明）。
+///
+/// ── 为什么自定义家的 `stripNewlineKeepalive` 写了也不生效 ──────
+/// `provider_options::KNOWN_KEYS` 是内置家与自定义家**共用**的一张表，所以给
+/// `custom-xxx` 配这个键会写进去、返回 `Ok`。但本条路径**不读**它（也不读
+/// 全局键）：丢帧的依据只来自 WorkBuddy / AutoClaw 两家的实测，不能替用户
+/// 自配的上游猜。这一限制写在 `KNOWN_KEYS` 的文档里（读侧能力矩阵），不是
+/// 静默：那篇说明明确列了「自定义家只认 `stripLeadingThink`」。
 fn frame_policy_of_custom(provider_id: &str, rewrite: Option<ModelRewrite>) -> FramePolicy {
     // 每次 provider attempt 读一次（只取一次配置读锁，不克隆底稿），与
     // `upstream::payload::send_body` 里 sanitize 那一处同一代价。

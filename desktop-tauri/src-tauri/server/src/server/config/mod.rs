@@ -1893,6 +1893,29 @@ pub fn set_strip_newline_keepalive(enabled: bool) -> bool {
     })
 }
 
+// ─── 剥离响应开头的思考标签（stripLeadingThink）────────────
+
+/// 写入「剥离响应开头的 `<think>` 块」的**全局默认值**（`stripLeadingThink`）。
+///
+/// 与 [`set_strip_newline_keepalive`] 同一形状：写入走 `update()` 闭包，内存
+/// 快照随之刷新（下一请求立即生效，不重启）。
+///
+/// ── 为什么只写 `raw`、不同步解析字段 ───────────────────────
+/// [`strip_leading_think`] 直接从 `raw` 取这个键（它没有 `RuntimeConfig` 上的
+/// 解析字段，见那里的说明）—— 所以这里插进底稿就是全部工作，多写一个字段
+/// 反而会出现「两个真相来源」。
+///
+/// 返回 `false` 只表示**落库失败**（本次运行内仍生效），与其它 setter 同一口径。
+/// 本键只提供全局默认值：`providerOptions` 里的同名键可逐家覆盖
+/// （见 `core::provider_options::is_enabled`）。
+pub fn set_strip_leading_think(enabled: bool) -> bool {
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_STRIP_LEADING_THINK.to_string(), Value::Bool(enabled));
+    })
+}
+
 // ─── 长度截断的自动续写（autoContinue / autoContinueMaxRounds）────
 
 /// 自动续写两项的**唯一**落盘路径：`None` = 该项不动。

@@ -110,6 +110,10 @@ pub mod panel;
 pub mod pipeline;
 pub mod prompt;
 pub mod protocol;
+// 每 provider 的行为开关（`providerOptions`）的读写入口：
+// `GET/PUT /api/provider-options`。存储与读取在 `core::provider_options`，
+// 本模块只补上写侧 `set()` 一直缺失的生产调用方，见该文件模块头
+pub mod provider_options;
 pub mod proxies;
 pub mod qoder_umid;
 pub mod queue_api;
@@ -129,6 +133,9 @@ pub mod stats_api;
 pub mod storage_api;
 pub mod subscriptions;
 pub mod timeouts_api;
+// 剥离响应开头思考标签的开关（GET/PUT /api/think-strip）：与 /api/keepalive-strip
+// 同形的单开关端点，判据与执行链在 `core::middleware::think_tags`，见该文件模块头
+pub mod think_strip;
 // 派猫猫旅行（CN WorkBuddy 运营活动）：per-account 只读状态 + 手动跑一次，
 // 见该文件模块头
 pub mod travel;

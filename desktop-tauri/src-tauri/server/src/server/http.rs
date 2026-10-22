@@ -632,6 +632,26 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/keepalive-strip",
             get(api::keepalive::get_keepalive_strip).put(api::keepalive::put_keepalive_strip),
         )
+        // ── 剥离响应开头的思考标签 ──
+        // 与 /api/keepalive-strip 同形的单开关端点（GET 读 / PUT 写），挂
+        // protected：开的那一刻起，下发正文不再与上游逐字一致（开头那块
+        // <think> 被剥掉）—— 敏感度与那条同级。默认关，见
+        // config::KEY_STRIP_LEADING_THINK 的取舍说明。
+        // 逐家覆盖走 /api/provider-options（同名键），不在这条端点上。
+        .route(
+            "/api/think-strip",
+            get(api::think_strip::get_think_strip).put(api::think_strip::put_think_strip),
+        )
+        // ── 每 provider 的行为开关（providerOptions）──
+        // 形状与上面那几条单开关端点不同：它按家分组、一次只改「一家的一项」，
+        // 所以用 {providerId, key, value} 的 PUT。挂 protected：这些开关改的是
+        // 出站请求 / 下发字节（脱敏、保活帧、思考标签），敏感度同级。
+        // 认哪些键、哪些家真读它们，见 core::provider_options::KNOWN_KEYS。
+        .route(
+            "/api/provider-options",
+            get(api::provider_options::get_provider_options)
+                .put(api::provider_options::put_provider_options),
+        )
         // ── 长度截断的自动续写 ──
         // 与 /api/keepalive-strip 同一族（GET 读 / PUT 写、默认关、改的是客户端
         // 看得见的行为），比它多一项：一个布尔开关 + 一个有界整数（轮数上限）——

@@ -35,6 +35,26 @@ use crate::server::config;
 use crate::server::logging;
 
 /// 允许的开关名 —— **直接引用全局键常量**，保证与全局开关同名。
+///
+/// ── 哪些家真读哪些键（读侧能力矩阵）──────────────────────
+/// 本表是内置家与自定义家**共用**的一张白名单：写侧只校验「这个名字认识」，
+/// 不区分家。但**读取点**分两条路径，能力不同：
+///
+/// | 键 | 内置家（`PROVIDERS`） | 自定义家（`custom-*`） |
+/// | --- | --- | --- |
+/// | `sanitizeBlacklistFingerprints` | ✓ 读（`upstream::payload`） | ✓ 读（同一条 send_body） |
+/// | `stripLeadingThink` | ✓ 读（`provider_loop::frame_policy_of`） | ✓ 读（`custom::forward::frame_policy_of_custom`） |
+/// | `stripNewlineKeepalive` | ✓ 读（同 `frame_policy_of`，与能力位相与） | ✗ **不读**（见下） |
+///
+/// 自定义家不读 `stripNewlineKeepalive` 是**有意的保守取舍**：丢帧的依据只来自
+/// WorkBuddy / AutoClaw 两家的实测，不能替用户自配的上游猜（`FramePolicy::
+/// with_rewrite_and_think` 恒把 `strip_newline_chunks` 置 false）。所以给自定义家
+/// 配这个键会**存着但不生效** —— 本表仍允许写入（拒绝反而会让面板在两个家之间
+/// 表现不一致），限制写在这里而不是静默。
+///
+/// 内置家里真正声明了「丢帧」能力位的只有 WorkBuddy / AutoClaw（`sse_strip_
+/// newline_chunks`）：对其它内置家配这个键同样不生效，但**不是**本表能拦的
+/// 事（那是能力位，不是开关）。
 pub const KNOWN_KEYS: [&str; 3] = [
     crate::server::config::KEY_SANITIZE_FINGERPRINTS,
     crate::server::config::KEY_STRIP_NEWLINE_KEEPALIVE,

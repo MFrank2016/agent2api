@@ -2343,7 +2343,10 @@ fn limit_model_label(requested: &str, wire: &str) -> String {
 ///     插一帧只含换行的 content（实测口径见 `sse::is_newline_keepalive`），
 ///     **且**要把 `stripNewlineKeepalive` 开关打开（默认关，见
 ///     `config::KEY_STRIP_NEWLINE_KEEPALIVE`）—— 装配规则与两位的先后关系
-///     写在 [`super::sse::FramePolicy::assembled`]。
+///     写在 [`super::sse::FramePolicy::assembled`]。开关同样可逐家覆盖
+///     （`providerOptions` 里的同名键，见 `core::provider_options`）：能力位
+///     仍在前，逐家开关只能**收窄**、不能扩张 —— 没声明能力位的家配了也不会
+///     丢帧（`assembled` 的 `declared && switch_on`）。
 ///   - 剥离开头的 think 块（`core::middleware::think_tags`）：判定只依赖文本
 ///     本身，所以**没有能力位**，只看开关。默认值来自全局键
 ///     `config::KEY_STRIP_LEADING_THINK`（缺省 false），`providerOptions` 里的
@@ -2353,14 +2356,22 @@ fn limit_model_label(requested: &str, wire: &str) -> String {
 /// 其余 provider（以及没开开关的本两家）得到全关的 `FramePolicy`，下发帧
 /// 逐字节不变（workbuddy 那条「透传逐字节不变」的硬要求只在开关打开时让路一次）。
 fn frame_policy_of(adapter: &dyn ProviderAdapter, model: &str) -> super::sse::FramePolicy {
+    // 两家开关的读取口径**必须一致**：默认值来自全局键，`providerOptions`
+    // 里的同名键逐家覆盖（`is_enabled(provider, key, global_default)`）。
+    // 只读全局会让逐家配置变成「配了不生效且无提示」（7f4026be 修过的那一类）。
+    let provider_id = crate::server::core::providers::kind_id(adapter.kind());
     super::sse::FramePolicy::assembled(
         adapter
             .sse_model_rewrite()
             .then(|| super::sse::ModelRewrite { requested: model.to_string() }),
         adapter.sse_strip_newline_chunks(),
-        crate::server::config::strip_newline_keepalive(),
         crate::server::core::provider_options::is_enabled(
-            crate::server::core::providers::kind_id(adapter.kind()),
+            provider_id,
+            crate::server::config::KEY_STRIP_NEWLINE_KEEPALIVE,
+            crate::server::config::strip_newline_keepalive(),
+        ),
+        crate::server::core::provider_options::is_enabled(
+            provider_id,
             crate::server::config::KEY_STRIP_LEADING_THINK,
             crate::server::config::strip_leading_think(),
         ),
