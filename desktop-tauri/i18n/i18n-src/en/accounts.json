@@ -613,6 +613,7 @@
   "限额状态": "Limit status",
   "隐藏账号名（名字显示为星号）": "Hide name (shown as asterisks)",
   "需要重新登录": "Sign-in required",
+  "需重新登录": "",
   "需重登": "",
   "顺序": "Order",
   "顺序未保存：{message}": "Order not saved: {message}",

@@ -613,6 +613,7 @@
   "限额状态": "Status do limite",
   "隐藏账号名（名字显示为星号）": "Ocultar nome da conta (o nome aparece com asteriscos)",
   "需要重新登录": "Login necessário",
+  "需重新登录": "",
   "需重登": "",
   "顺序": "Ordem",
   "顺序未保存：{message}": "Ordem não salva: {message}",
