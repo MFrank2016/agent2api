@@ -3,10 +3,18 @@
 //! - `GET    /api/keys`          → `{keys: [{id,name,key,masked,enabled,createdAt,
 //!                                  allowedProviders,allowedModels}], authRequired,
 //!                                  providers, modelsByProvider}`
-//! - `POST   /api/keys`          `{name?, key?, allowedProviders?, allowedModels?}` 新增；
+//! - `POST   /api/keys`          `{name?, key?, allowedProviders?, allowedModels?,
+//!                                  quotaTokens?, quotaReset?, quotaRules?}` 新增；
 //!                               key 留空自动生成
-//! - `PATCH  /api/keys/{id}`     `{name?, enabled?, allowedProviders?, allowedModels?}`
+//! - `PATCH  /api/keys/{id}`     同上各键（除 `key`），三态语义见 `parse_*` 系列
 //! - `DELETE /api/keys/{id}`
+//!
+//! ── 配额：单条与多规则并存 ────────────────────────────────
+//! `quotaTokens` + `quotaReset` 是旧的单条形态，`quotaRules` 是新的多规则形态
+//! （最多 [`api_keys::MAX_QUOTA_RULES`] 条，**全部满足才放行**）。两者并存而不是
+//! 二选一：读侧（`key_quota::effective_rules`）在规则为空时回落到旧字段，所以
+//! 存量 Key 的配额照旧生效、界面也能继续改；规则非空时以规则为准。写入侧的校验
+//! （条数上限、`limit` 正整数、`reset` 形态）在这里做，读侧一律宽容。
 //!
 //! 写接口都返回最新列表。明文 key 随列表返回：这是本机管理界面，用户要能随时复制
 //! 某把 Key 给某个客户端；掩码只用于列表折叠展示。
@@ -214,8 +222,13 @@ fn parse_quota_reset(
     let Some(value) = object.get(key) else {
         return Ok(None);
     };
+    Ok(Some(quota_reset_value(value, key)?))
+}
+
+/// 单个 `Value` → 重置方式（`parse_quota_reset` 与规则列表共用同一口径）。
+fn quota_reset_value(value: &Value, key: &str) -> Result<api_keys::QuotaReset, Response> {
     match value {
-        Value::String(text) if text == "daily" => Ok(Some(api_keys::QuotaReset::Daily)),
+        Value::String(text) if text == "daily" => Ok(api_keys::QuotaReset::Daily),
         Value::Object(fields) => {
             let Some(seconds) = fields.get("fixed").and_then(Value::as_i64) else {
                 return Err(errors::management_error(
@@ -235,13 +248,74 @@ fn parse_quota_reset(
                     ),
                 ));
             }
-            Ok(Some(api_keys::QuotaReset::Fixed(seconds)))
+            Ok(api_keys::QuotaReset::Fixed(seconds))
         }
         _ => Err(errors::management_error(
             400,
             format!("{key} 必须是 \"daily\" 或 {{\"fixed\": 秒数}}"),
         )),
     }
+}
+
+/// 从请求体里读配额规则列表（三态，与 `parse_allowlist` 同一取舍）。
+///
+/// - 键缺失 → `None`（不动）
+/// - `null` / 空数组 → `Some(vec![])`（清空规则 → 读侧回落到旧的单条配额）
+/// - 数组 → `Some(list)`
+///
+/// ── 校验一律 400，不静默丢弃 ─────────────────────────────
+/// 与白名单同一取向：用户勾/填了一个非法值只可能是数据坏了或前端漏改，
+/// 静默丢掉会让他以为设置生效了（而配额失效的后果是「多花了钱」）。
+/// 具体三条：元素必须是对象、`limit` 必须是正整数、`reset` 必须是
+/// `"daily"` 或 `{"fixed": 秒数}`（秒数限界与 `parse_quota_reset` 相同）。
+///
+/// 超过 [`api_keys::MAX_QUOTA_RULES`] 给 400 —— 界面那边同样在 5 条时禁用
+/// 「添加」按钮，这里是对手写请求的硬闸。
+fn parse_quota_rules(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<Vec<api_keys::KeyQuotaRule>>, Response> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    let items = match value {
+        // null 与空数组同义（都是「清空规则」）—— 与 `parse_allowlist` 同一口径
+        Value::Null => return Ok(Some(Vec::new())),
+        Value::Array(items) => items,
+        _ => return Err(errors::management_error(400, format!("{key} 必须是数组"))),
+    };
+    if items.len() > api_keys::MAX_QUOTA_RULES {
+        return Err(errors::management_error(
+            400,
+            format!("{key} 最多 {} 条", api_keys::MAX_QUOTA_RULES),
+        ));
+    }
+    let mut out: Vec<api_keys::KeyQuotaRule> = Vec::with_capacity(items.len());
+    for item in items {
+        if !item.is_object() {
+            return Err(errors::management_error(
+                400,
+                format!("{key} 的元素必须是对象 {{limit, reset}}"),
+            ));
+        }
+        let limit = match item.get("limit").and_then(Value::as_i64) {
+            Some(limit) if limit > 0 => limit,
+            _ => {
+                return Err(errors::management_error(
+                    400,
+                    format!("{key} 的 limit 必须是正整数（Token 数）"),
+                ));
+            }
+        };
+        // `reset` 缺失按默认（自然日）—— 与 `quotaReset` 缺失同一口径；给了但
+        // 认不出就 400（与 `parse_quota_reset` 一致，静默夹逼会改语义）
+        let reset = match item.get("reset") {
+            None => crate::server::core::key_quota::default_reset(),
+            Some(reset) => quota_reset_value(reset, key)?,
+        };
+        out.push(api_keys::KeyQuotaRule { limit, reset });
+    }
+    Ok(Some(out))
 }
 
 fn body_object(body: &Bytes) -> Result<serde_json::Map<String, Value>, Response> {
@@ -313,13 +387,21 @@ pub async fn create_key(State(state): State<ServerState>, body: Bytes) -> Respon
         Ok(value) => value.unwrap_or_else(crate::server::core::key_quota::default_reset),
         Err(response) => return response,
     };
+    // 规则列表：没给 = 空（读侧回落到旧字段），超过 5 条已在 parse 里 400
+    let quota_rules = match parse_quota_rules(&object, "quotaRules") {
+        Ok(value) => value.unwrap_or_default(),
+        Err(response) => return response,
+    };
     match api_keys::add(
         name,
         key,
         allowed_providers,
         allowed_models,
-        quota_tokens,
-        quota_reset,
+        api_keys::QuotaSpec {
+            tokens: quota_tokens,
+            reset: quota_reset,
+            rules: quota_rules,
+        },
     ) {
         Ok(entry) => {
             // 配置变了：配额缓存的「启用中的窗口种类集合」可能变，清掉重算
@@ -361,6 +443,11 @@ pub async fn update_key(State(state): State<ServerState>, Path(id): Path<String>
         Ok(value) => value,
         Err(response) => return response,
     };
+    // 规则列表三态：键缺失 = 不动；null/[] = 清空（回落旧字段）；数组 = 设成它
+    let quota_rules = match parse_quota_rules(&object, "quotaRules") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     if let Some(false) = enabled {
         // 停用受与删除同一道约束：它同样会让「启用的 Key」归零
         if let Err(response) = guard_last_active_key(&api_keys::list(), &id, "停用") {
@@ -373,8 +460,11 @@ pub async fn update_key(State(state): State<ServerState>, Path(id): Path<String>
         enabled,
         allowed_providers,
         allowed_models,
-        quota_tokens,
-        quota_reset,
+        api_keys::QuotaPatch {
+            tokens: quota_tokens,
+            reset: quota_reset,
+            rules: quota_rules,
+        },
     ) {
         Ok(entry) => {
             // 配额上限 / 窗口可能变了：清缓存，下一个请求按新配置判定
@@ -406,5 +496,94 @@ pub async fn delete_key(State(state): State<ServerState>, Path(id): Path<String>
             ok_json(list_json(&state))
         }
         Err(message) => errors::management_error(404, message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn object_of(value: Value) -> serde_json::Map<String, Value> {
+        match value {
+            Value::Object(map) => map,
+            _ => panic!("测试用例必须是 JSON 对象"),
+        }
+    }
+
+    fn rule(limit: i64) -> Value {
+        json!({ "limit": limit, "reset": "daily" })
+    }
+
+    /// 规则条数的硬上限：6 条必须 400。
+    ///
+    /// 这是「界面禁用添加按钮」之外的**唯一硬闸** —— 手写请求绕不过它，
+    /// 否则判定路径会被一份手改配置放大成几百次查库。
+    #[test]
+    fn more_than_five_rules_is_a_400() {
+        let rules: Vec<Value> = (0..api_keys::MAX_QUOTA_RULES + 1)
+            .map(|index| rule(1000 + index as i64))
+            .collect();
+        let error = parse_quota_rules(&object_of(json!({ "quotaRules": rules })), "quotaRules")
+            .expect_err("超过上限必须报错");
+        assert_eq!(error.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// 恰好 5 条要放行（边界不许收紧）。
+    #[test]
+    fn exactly_five_rules_pass() {
+        let rules: Vec<Value> = (0..api_keys::MAX_QUOTA_RULES)
+            .map(|index| rule(1000 + index as i64))
+            .collect();
+        let parsed = parse_quota_rules(&object_of(json!({ "quotaRules": rules })), "quotaRules")
+            .expect("恰好 5 条是合法的");
+        assert_eq!(parsed.map(|rules| rules.len()), Some(api_keys::MAX_QUOTA_RULES));
+    }
+
+    /// 三态：缺键 = 不动，`null` / `[]` = 清空，数组 = 设成它。
+    #[test]
+    fn rules_are_tri_state() {
+        assert!(parse_quota_rules(&object_of(json!({})), "quotaRules")
+            .expect("缺键不报错")
+            .is_none());
+        assert_eq!(
+            parse_quota_rules(&object_of(json!({ "quotaRules": null })), "quotaRules")
+                .expect("null 是清空")
+                .map(|rules| rules.len()),
+            Some(0)
+        );
+        assert_eq!(
+            parse_quota_rules(&object_of(json!({ "quotaRules": [] })), "quotaRules")
+                .expect("空数组是清空")
+                .map(|rules| rules.len()),
+            Some(0)
+        );
+    }
+
+    /// 非法规则一律 400（不静默丢弃）：非正数上限、非对象元素、认不出的 reset。
+    #[test]
+    fn invalid_rules_are_rejected() {
+        for bad in [
+            json!({ "quotaRules": [{ "limit": 0 }] }),
+            json!({ "quotaRules": [{ "limit": -1 }] }),
+            json!({ "quotaRules": [{ "limit": 1000, "reset": "weekly" }] }),
+            json!({ "quotaRules": [1000] }),
+            json!({ "quotaRules": "daily" }),
+        ] {
+            let error = parse_quota_rules(&object_of(bad.clone()), "quotaRules")
+                .expect_err(&format!("{bad} 应当被拒绝"));
+            assert_eq!(error.status(), axum::http::StatusCode::BAD_REQUEST, "{bad}");
+        }
+    }
+
+    /// `reset` 缺省 = 自然日（与 `quotaReset` 缺省同一口径）。
+    #[test]
+    fn missing_reset_defaults_to_daily() {
+        let parsed = parse_quota_rules(
+            &object_of(json!({ "quotaRules": [{ "limit": 1000 }] })),
+            "quotaRules",
+        )
+        .expect("缺 reset 是合法的")
+        .expect("键在，结果必须是 Some");
+        assert_eq!(parsed[0].reset, api_keys::QuotaReset::Daily);
     }
 }

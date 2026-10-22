@@ -1,6 +1,7 @@
 //! 网关 API Key 列表（config.json 的 `apiKeys` 字段）。
 //!
-//! 形状：`apiKeys: [{id, name, key, enabled, createdAt, allowedProviders, allowedModels}]`。
+//! 形状：`apiKeys: [{id, name, key, enabled, createdAt, allowedProviders,
+//! allowedModels, quotaTokens, quotaReset, quotaRules}]`。
 //! 多把 Key 任一命中即通过；一把启用的都没有 → 不鉴权（网关只监听 127.0.0.1，
 //! 与旧的「未配置 apiKey」语义一致）。
 //!
@@ -48,6 +49,16 @@
 //! 「拷了库没拷密钥」的故障形态。数组结构与其余字段（id / name / enabled /
 //! createdAt / 两个白名单）**保持明文 JSON**：加密只覆盖「值本身就是凭证」的
 //! 那一个字段 —— 其余字段本来就要给人看（配置形状、界面展示）。
+//!
+//! ── 配额：单条（`quotaTokens` + `quotaReset`）与多规则（`quotaRules`）──
+//! `quotaRules` 是 `[{limit, reset}]`，最多 [`MAX_QUOTA_RULES`] 条，
+//! **全部满足才放行**（叠加约束，不是取最宽的一条）。旧的两个字段原样保留：
+//! 规则为空时读侧（`core::key_quota::effective_rules`）用它造一条，
+//! 于是存量 Key 的行为逐字不变、界面也还能改它们。**刻意不做写侧迁移**：
+//! `apiKeys` 存在配置里、没有事务可依赖，迁移写坏就等于把用户的 Key 按一个
+//! 猜出来的阈值限流；读侧兼容没有这个风险。Cost 维度**不做**（`requests` 表
+//! 没有 cost 列，做了也只是「永远为 0、永不超限」的假功能），论证见
+//! [`KeyQuotaRule`]。
 //!
 //! 三条边界，改这个文件时不要破：
 //!   1. **内存与对外形态是明文**。`ApiKeyEntry::key` 在内存里永远是明文，
@@ -130,6 +141,70 @@ impl QuotaReset {
 pub const MIN_QUOTA_PERIOD_SECONDS: i64 = 3_600;
 pub const MAX_QUOTA_PERIOD_SECONDS: i64 = 2_592_000;
 
+/// 一把 Key 的配额规则条数上限。
+///
+/// ── 为什么是 5 ──────────────────────────────────────────
+/// 规则是**叠加约束**（全部满足才放行），实际用法几乎只有「日 + 月」两层；
+/// 上限存在的意义是挡住「手改配置塞进几百条」把每次判定的遍历放大，
+/// 同时给界面一个「添加」按钮可以禁用的终点。5 条已经比任何合理用法都宽。
+pub const MAX_QUOTA_RULES: usize = 5;
+
+/// 一条 Key 配额规则（**只有 Token 维度**）。
+///
+/// ── 为什么不做 Cost 维度 ─────────────────────────────────
+/// `requests` 表只有 prompt/completion/total_tokens，**没有 cost 列**，
+/// 全仓也没有任何地方计算费用。magpie 的 Cost 限额依赖它的模型倍率表；
+/// 本项目没有这套数据，加一个没有数据源的维度只会做出「永远为 0、
+/// 永不超限」的假功能。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyQuotaRule {
+    /// 窗口内累计 Token 上限（恒 > 0）
+    pub limit: i64,
+    pub reset: QuotaReset,
+}
+
+/// 新建 Key 时的配额（`add` 的入参）。
+///
+/// 为什么包成一个类型而不是四个参数：`add` 原本已有 6 个位置参数，再加两个
+/// 就成了「谁都记不住第几个是 Token、第几个是规则」的长列表；配额这件事
+/// 本来就是一个整体，归一个名字比排参数顺序清楚。
+#[derive(Clone, Debug)]
+pub struct QuotaSpec {
+    /// 旧形态的单条上限（`None` = 无限）
+    pub tokens: Option<i64>,
+    pub reset: QuotaReset,
+    /// 新形态的规则列表（空 = 回落到 `tokens`）
+    pub rules: Vec<KeyQuotaRule>,
+}
+
+impl Default for QuotaSpec {
+    /// 不配配额（无限）：自动补 Key 那条路径用的就是它。
+    fn default() -> Self {
+        Self {
+            tokens: None,
+            reset: QuotaReset::Daily,
+            rules: Vec::new(),
+        }
+    }
+}
+
+/// 改 Key 时的配额（`update` 的入参）：每个字段 `None` = 该项不动。
+///
+/// ── 为什么 `tokens` 是双层的 ──────────────────────────────
+/// 「关掉配额」本身是一个有意义的写入（落成 `null`）：
+///   - `None`            = 不动（旧前端只发 name/enabled 时走这条）
+///   - `Some(None)`      = 改成无限
+///   - `Some(Some(n))`   = 设成 n（非正数按无限处理，与读侧同一口径）
+/// 用单层 `Option<i64>` 表达不了「改成无限」—— 那与「不动」撞成同一个值，
+/// 于是用户关不掉配额。`rules` 不需要多一层：`Some(vec![])` 就是「清空规则，
+/// 回到旧字段」这个有意义的写入。
+#[derive(Clone, Debug, Default)]
+pub struct QuotaPatch {
+    pub tokens: Option<Option<i64>>,
+    pub reset: Option<QuotaReset>,
+    pub rules: Option<Vec<KeyQuotaRule>>,
+}
+
 /// 一条 Key 记录
 #[derive(Clone, Debug)]
 pub struct ApiKeyEntry {
@@ -151,6 +226,16 @@ pub struct ApiKeyEntry {
     /// 配额的重置窗口；`quota_tokens` 为 `None` 时无意义（但仍原样存取，
     /// 用户把配额关掉再打开时不必重设窗口）。
     pub quota_reset: QuotaReset,
+    /// 配额规则列表（新形态）；**空 = 回落到旧的单条配额**。
+    ///
+    /// ── 为什么保留旧字段而不是迁移 ─────────────────────────
+    /// `apiKeys` 存在配置（kv / 旧 config.json，**不是库表**），没有事务可依赖。
+    /// 读侧兼容（空规则 → 用旧字段造一条）比写侧迁移安全：迁移一旦写坏，
+    /// 用户的 Key 会带着一个猜出来的阈值上线。
+    ///
+    /// 语义是**叠加约束**：每条都要满足（日限额 + 月限额同时生效），
+    /// 不是「取最宽的一条」。
+    pub quota_rules: Vec<KeyQuotaRule>,
     /// 这条记录的 `key` **解不开**（密钥文件被删/被换），处于降级态。
     ///
     /// 为 true 时 `key` 里放的是**原样的密文信封**（不是明文）：
@@ -234,6 +319,50 @@ fn quota_reset_from(value: Option<&Value>) -> QuotaReset {
 fn quota_tokens_from(value: Option<&Value>) -> Option<i64> {
     let raw = value?.as_i64()?;
     (raw > 0).then_some(raw)
+}
+
+/// 规则列表的落盘 / 读取形态。
+///
+/// ── 读侧为什么容错、不拒绝整条记录 ────────────────────────
+/// 与两个白名单同一条：读不出来时正确的兜底是「这条规则不存在」，
+/// 而不是让整把 Key 消失（那会让所有客户端立刻 401）。于是：
+///   - 非数组 / 元素不是对象 → 跳过该元素；
+///   - `limit` 非正数 / 非整数 → 跳过该规则（与 `quotaTokens` 的「只认正数」
+///     同一口径：0 与负数不当作「一 Token 都不许用」）；
+///   - `reset` 认不出 → 回落 `Daily`（与 `quota_reset_from` 同一口径，
+///     不夹逼）；
+///   - 超过 [`MAX_QUOTA_RULES`] 的尾巴丢掉（写侧已挡 400，这里是手改数据的
+///     兜底；丢弃比整条 Key 失效好）。
+fn quota_rules_from(value: Option<&Value>) -> Vec<KeyQuotaRule> {
+    let Some(Value::Array(items)) = value else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let limit = quota_tokens_from(item.get("limit"))?;
+            Some(KeyQuotaRule {
+                limit,
+                reset: quota_reset_from(item.get("reset")),
+            })
+        })
+        .take(MAX_QUOTA_RULES)
+        .collect()
+}
+
+/// 规则列表 → 落盘形态（**空也写成 `[]`**，与白名单同一理由：配置形状稳定）。
+fn quota_rules_value(rules: &[KeyQuotaRule]) -> Value {
+    Value::Array(
+        rules
+            .iter()
+            .map(|rule| {
+                json!({
+                    "limit": rule.limit,
+                    "reset": rule.reset.to_json(),
+                })
+            })
+            .collect(),
+    )
 }
 
 /// 「有一把网关 Key 解不开」的**进程级一次性**告警。
@@ -336,6 +465,8 @@ impl ApiKeyEntry {
             // 配额：缺失 / 脏值一律读成「无限」（见 `quota_tokens_from`）
             quota_tokens: quota_tokens_from(value.get("quotaTokens")),
             quota_reset: quota_reset_from(value.get("quotaReset")),
+            // 规则列表：旧记录没有这个键 → 空 → 读侧回落到上面那条旧配额
+            quota_rules: quota_rules_from(value.get("quotaRules")),
             key_unreadable,
         })
     }
@@ -374,6 +505,8 @@ impl ApiKeyEntry {
                 None => Value::Null,
             },
             "quotaReset": self.quota_reset.to_json(),
+            // 恒写：规则为空也要显式是 []（旧字段回落见 `quota_rules_from`）
+            "quotaRules": quota_rules_value(&self.quota_rules),
         }))
     }
 
@@ -397,6 +530,7 @@ impl ApiKeyEntry {
                 None => Value::Null,
             },
             "quotaReset": self.quota_reset.to_json(),
+            "quotaRules": quota_rules_value(&self.quota_rules),
         })
     }
 }
@@ -461,6 +595,8 @@ fn legacy_entry(raw: &Map<String, Value>) -> Option<ApiKeyEntry> {
         // 「不限制任何用量」逐字一致
         quota_tokens: None,
         quota_reset: QuotaReset::Daily,
+        // 旧字段形态也没有规则列表 —— 空 = 回落到上面那条（同样是无限）
+        quota_rules: Vec::new(),
         key_unreadable,
     })
 }
@@ -689,8 +825,7 @@ pub fn add(
     key: Option<&str>,
     allowed_providers: Vec<String>,
     allowed_models: Vec<String>,
-    quota_tokens: Option<i64>,
-    quota_reset: QuotaReset,
+    quota: QuotaSpec,
 ) -> Result<ApiKeyEntry, String> {
     let mut entries = list();
     let key = match key.map(str::trim).filter(|k| !k.is_empty()) {
@@ -715,8 +850,10 @@ pub fn add(
         allowed_providers,
         allowed_models,
         // 只接受正数（与读侧的 `quota_tokens_from` 同一口径：0 / 负数 = 无限）
-        quota_tokens: quota_tokens.filter(|tokens| *tokens > 0),
-        quota_reset,
+        quota_tokens: quota.tokens.filter(|tokens| *tokens > 0),
+        quota_reset: quota.reset,
+        // 规则条数的上限由写侧（`keys_api`）挡 400；这里是最后一道截断
+        quota_rules: quota.rules.into_iter().take(MAX_QUOTA_RULES).collect(),
         // 刚生成的 Key 当然是明文可读的，与降级态无关
         key_unreadable: false,
     };
@@ -735,21 +872,16 @@ pub fn add(
 /// 于是「在管理页改个名字」会把已有的限制静默清掉。`Option` 把这两件事分开：
 /// `None` = 不动，`Some(vec![])` = 清成不限制，`Some(list)` = 设成 list。
 ///
-/// ── 配额为什么是 `Option<Option<i64>>`（双层）────────────────────
-/// 比白名单多一层，因为「关掉配额」本身是一个有意义的写入（落成 `null`）：
-///   - `None`            = 不动（旧前端只发 name/enabled 时走这条）
-///   - `Some(None)`      = 改成无限
-///   - `Some(Some(n))`   = 设成 n（非正数按无限处理，与读侧同一口径）
-/// 用单层 `Option<i64>` 表达不了「改成无限」—— 那与「不动」撞成同一个值，
-/// 于是用户关不掉配额。
+/// ── 配额的三态在 `QuotaPatch` 里（双层见那个类型的说明）──────
+/// 规则列表的三态与白名单相同：`None` = 不动，`Some(vec![])` = 清空。
+/// `Some(list)` = 设成 list。
 pub fn update(
     id: &str,
     name: Option<&str>,
     enabled: Option<bool>,
     allowed_providers: Option<Vec<String>>,
     allowed_models: Option<Vec<String>>,
-    quota_tokens: Option<Option<i64>>,
-    quota_reset: Option<QuotaReset>,
+    quota: QuotaPatch,
 ) -> Result<ApiKeyEntry, String> {
     let mut entries = list();
     let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
@@ -767,11 +899,15 @@ pub fn update(
     if let Some(list) = allowed_models {
         entry.allowed_models = list;
     }
-    if let Some(limit) = quota_tokens {
+    if let Some(limit) = quota.tokens {
         entry.quota_tokens = limit.filter(|tokens| *tokens > 0);
     }
-    if let Some(reset) = quota_reset {
+    if let Some(reset) = quota.reset {
         entry.quota_reset = reset;
+    }
+    if let Some(rules) = quota.rules {
+        // `Some(vec![])` = 清空规则 → 读侧回落到旧的单条配额（见 `quota_rules`）
+        entry.quota_rules = rules.into_iter().take(MAX_QUOTA_RULES).collect();
     }
     let updated = entry.clone();
     save(&entries)?;
@@ -901,4 +1037,77 @@ pub fn add_intl_to_workbuddy_allowlists() -> Vec<ApiKeyEntry> {
         }
     }
     touched
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 读侧兼容：只有旧字段的 Key，规则列表必须为空（→ `effective_rules` 回落）。
+    #[test]
+    fn old_record_without_rules_reads_empty_rules() {
+        let mut raw = Map::new();
+        raw.insert(
+            KEY_API_KEYS.to_string(),
+            json!([{ "id": "k1", "key": "sk-old-key", "quotaTokens": 1000 }]),
+        );
+        let entries = entries_from(&raw);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].quota_rules.is_empty());
+        assert_eq!(entries[0].quota_tokens, Some(1000));
+    }
+
+    /// 规则列表的读侧容错：坏元素跳过、非正数跳过、认不出的 reset 回落自然日。
+    ///
+    /// 为什么要这条：`quotaRules` 是手改配置也会碰的字段。整条 Key 因为一条坏规则
+    /// 消失 = 所有客户端立刻 401，那是升级绝不该造成的结果（见模块头）。
+    #[test]
+    fn dirty_rules_are_skipped_not_fatal() {
+        let rules = quota_rules_from(Some(&json!([
+            { "limit": 1000, "reset": "daily" },
+            { "limit": 0, "reset": "daily" },
+            { "limit": -5, "reset": "daily" },
+            { "limit": "abc", "reset": "daily" },
+            { "limit": 2000, "reset": { "fixed": 90 } },
+            { "limit": 3000 },
+            "not-an-object",
+        ])));
+        assert_eq!(rules.len(), 3);
+        assert_eq!(rules[0].limit, 1000);
+        assert_eq!(rules[0].reset, QuotaReset::Daily);
+        // 越界的固定周期回落自然日（不夹逼，与 `quota_reset_from` 同一口径）
+        assert_eq!(rules[1].limit, 2000);
+        assert_eq!(rules[1].reset, QuotaReset::Daily);
+        // 缺 `reset` 同样回落自然日
+        assert_eq!(rules[2].limit, 3000);
+        assert_eq!(rules[2].reset, QuotaReset::Daily);
+    }
+
+    /// 手改配置塞进超过上限的规则：读侧截断，不让判定路径被放大。
+    #[test]
+    fn too_many_rules_are_truncated_on_read() {
+        let many: Vec<Value> = (0..MAX_QUOTA_RULES + 3)
+            .map(|index| json!({ "limit": 1000 + index as i64, "reset": "daily" }))
+            .collect();
+        let rules = quota_rules_from(Some(&Value::Array(many)));
+        assert_eq!(rules.len(), MAX_QUOTA_RULES);
+        assert_eq!(rules[0].limit, 1000);
+    }
+
+    /// 落盘形态：规则恒写成数组（空也写 `[]`，配置形状稳定），且能原样读回。
+    #[test]
+    fn rules_round_trip_through_the_stored_shape() {
+        let rules = vec![
+            KeyQuotaRule { limit: 1000, reset: QuotaReset::Daily },
+            KeyQuotaRule { limit: 2_000_000, reset: QuotaReset::Fixed(2_592_000) },
+        ];
+        let stored = quota_rules_value(&rules);
+        assert_eq!(stored.as_array().map(Vec::len), Some(2));
+        assert_eq!(quota_rules_from(Some(&stored)), rules);
+        assert_eq!(
+            quota_rules_value(&[]),
+            Value::Array(Vec::new()),
+            "空也要写成 []（与两个白名单同一取向）"
+        );
+    }
 }

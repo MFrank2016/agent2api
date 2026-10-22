@@ -39,7 +39,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::server::core::api_keys::{ApiKeyEntry, QuotaReset};
+use crate::server::core::api_keys::{ApiKeyEntry, KeyQuotaRule, QuotaReset};
 use crate::server::core::limiter;
 use crate::server::db::Db;
 
@@ -83,25 +83,92 @@ fn database() -> Option<&'static Db> {
 
 /// 某把 Key 在当前窗口内是否已经用超。
 ///
-/// `quota_tokens = None`（无限，默认）→ 恒 `false`，**不查库**：这是最常见的情形，
-/// 让「没配配额」的请求在热路径上零成本。
+/// 没配配额（规则与旧的 `quota_tokens` 都空，默认）→ 恒 `false`，**不查库**：
+/// 这是最常见的情形，让「没配配额」的请求在热路径上零成本。
 ///
 /// 判定是「已用 ≥ 上限」（含等于）：与 `limiter::token_skip_blocked` 同一口径，
 /// 达到阈值即视为用满。
+///
+/// 签名保持不变：调用点（鉴权中间件）不该知道「单条还是多条」这件事。
 pub fn exceeded(entry: &ApiKeyEntry, now_ms: i64) -> bool {
-    let Some(limit) = entry.quota_tokens else {
-        return false;
-    };
-    if limit <= 0 {
-        return false;
+    exceeded_rule(entry, now_ms).is_some()
+}
+
+/// 判定是否超限，并返回**第一条**超限的规则（`None` = 全部通过）。
+///
+/// ── 全部满足才放行 ─────────────────────────────────────────
+/// 多条规则是叠加约束（日限额 + 月限额同时生效）。「任一满足」等于只保留
+/// 最宽松的一条，让另一条形同虚设。
+///
+/// ── 「等于上限也算超」────────────────────────────────────────
+/// 既有约定（`used >= limit`）不改：前端显示的「已用 50000 / 50000」与
+/// 「被拦」必须一致。
+///
+/// ── 热路径零成本 ───────────────────────────────────────────
+/// 没配配额（规则与旧字段都空）时第一行就 `?` 掉，直接返回 `None`，
+/// 连缓存锁都不碰、也不分配 —— 这是最常见的情形，也是 `exceeded` 签名
+/// 可以保持不变（调用点不必知道单条还是多条）的底气。
+pub fn exceeded_rule(entry: &ApiKeyEntry, now_ms: i64) -> Option<KeyQuotaRule> {
+    // 新形态直接借规则表；旧形态就地造一条。**两条路都不克隆 `Vec`** ——
+    // 这是每请求都跑的热路径，`effective_rules` 的分配只留给 `fetch` /
+    // `quota_json` 那些低频调用点。
+    if !entry.quota_rules.is_empty() {
+        return exceeded_in(entry, &entry.quota_rules, now_ms);
     }
-    let used = usage_for(entry, now_ms);
-    used >= limit
+    let limit = entry.quota_tokens?;
+    if limit <= 0 {
+        return None;
+    }
+    let rule = KeyQuotaRule { limit, reset: entry.quota_reset };
+    exceeded_in(entry, std::slice::from_ref(&rule), now_ms)
+}
+
+/// 在给定的规则表里找第一条超限的（`None` = 全部通过）。
+fn exceeded_in(
+    entry: &ApiKeyEntry,
+    rules: &[KeyQuotaRule],
+    now_ms: i64,
+) -> Option<KeyQuotaRule> {
+    for rule in rules {
+        if rule.limit <= 0 {
+            continue;
+        }
+        let used = usage_for_window(entry, rule.reset.kind(), now_ms);
+        if used >= rule.limit {
+            return Some(*rule);
+        }
+    }
+    None
+}
+
+/// 有效规则：新形态优先，空则从旧字段造一条。
+///
+/// ── 为什么读侧兼容而不是写侧迁移 ─────────────────────────
+/// `apiKeys` 存在配置（kv / 旧 config.json）里，没有事务可依赖。迁移一旦写坏，
+/// 用户的 Key 会带着一个猜出来的阈值上线；读侧兼容则无论如何都读得出旧行为。
+fn effective_rules(entry: &ApiKeyEntry) -> Vec<KeyQuotaRule> {
+    if !entry.quota_rules.is_empty() {
+        return entry.quota_rules.clone();
+    }
+    match entry.quota_tokens {
+        Some(limit) => vec![KeyQuotaRule { limit, reset: entry.quota_reset }],
+        None => Vec::new(),
+    }
 }
 
 /// 某把 Key 在当前窗口内的已用 Token（拿不到证据按 0）。
+///
+/// 既有入口：读 `entry.quota_reset` 对应的窗口。行为与改造前逐字一致。
 pub fn usage_for(entry: &ApiKeyEntry, now_ms: i64) -> i64 {
-    let kind = entry.quota_reset.kind();
+    usage_for_window(entry, entry.quota_reset.kind(), now_ms)
+}
+
+/// 按**指定窗口种类**查已用量。
+///
+/// 实现 = 改造前 `usage_for` 的整个函数体，只把首行
+/// `let kind = entry.quota_reset.kind();` 去掉（kind 现在是参数）。
+/// 其余一字不改 —— 包括那段「先锁内看一眼缓存、锁外取数」的锁序注释。
+fn usage_for_window(entry: &ApiKeyEntry, kind: i64, now_ms: i64) -> i64 {
     // ── 先在锁内看一眼缓存，锁外再取数 ──────────────────────────
     // `fetch` 会读配置并查库（各取一把锁）。**不能在持有 USAGE_CACHE 时做这些**：
     // 那样锁序就成了「USAGE_CACHE → Db」，而本模块之外的任何一处若反过来
@@ -180,8 +247,12 @@ fn fetch(now_ms: i64) -> Option<CachedUsage> {
     let entries = crate::server::core::api_keys::list();
     let mut kinds: Vec<i64> = entries
         .iter()
-        .filter(|entry| entry.quota_tokens.is_some())
-        .map(|entry| entry.quota_reset.kind())
+        // **关键改动**：不再只看 `quota_tokens`，而是看**有效规则**。
+        // 旧写法会让「只有 quota_rules」的 Key 拿不到读数 → 恒 0 → 永不超限
+        // （静默无效：界面上规则看着生效了，实际一个请求都拦不住）。
+        // 走 `effective_rules` 而不是直接遍历 `quota_rules`：旧字段形态的 Key
+        // 也要收集它的窗口，否则升级后旧配额立刻失效。
+        .flat_map(|entry| effective_rules(entry).into_iter().map(|rule| rule.reset.kind()))
         .collect();
     kinds.sort_unstable();
     kinds.dedup();
@@ -299,25 +370,51 @@ impl KeyUsage {
 
 /// 某把 Key 的配额快照（Key 页的进度条读它）
 ///
+/// ── 两种读法，一个形状 ──────────────────────────────────
+/// 旧的单条字段（`limit` / `used` / `windowStart` / `reset` / `exceeded`）
+/// 描述**第一条**规则：前端的进度条与列文案照旧读它们，升级后零改动；
+/// 新的 `rules` 数组给出全部规则（每条各自的读数与是否超限），规则编辑区用它。
+/// 只读 `quota_tokens` 的写法会让规则型 Key 在 Key 页显示「无限」——
+/// 那正是这次要修的一处静默错误。
+///
 /// `limit = None` 表示无限 —— 前端据此显示「无限」而不是 0/0 的进度条。
 pub fn quota_json(entry: &ApiKeyEntry, now_ms: i64) -> serde_json::Value {
-    let Some(limit) = entry.quota_tokens else {
+    let rules = effective_rules(entry);
+    let Some(first) = rules.first() else {
         return serde_json::json!({
             "limit": serde_json::Value::Null,
             "used": 0,
             "windowStart": serde_json::Value::Null,
             "reset": entry.quota_reset.to_json(),
             "exceeded": false,
+            "rules": serde_json::Value::Array(Vec::new()),
         });
     };
-    let used = usage_for(entry, now_ms);
-    let window_start = limiter::kind_window_start(entry.quota_reset.kind(), now_ms);
+    let used = usage_for_window(entry, first.reset.kind(), now_ms);
+    let window_start = limiter::kind_window_start(first.reset.kind(), now_ms);
+    // 每条规则各自查一次读数：规则数 ≤ MAX_QUOTA_RULES（5），且同一窗口种类
+    // 复用同一份缓存，代价可忽略。
+    let rules_json: Vec<serde_json::Value> = rules
+        .iter()
+        .map(|rule| {
+            let rule_used = usage_for_window(entry, rule.reset.kind(), now_ms);
+            serde_json::json!({
+                "limit": rule.limit,
+                "used": rule_used,
+                "windowStart": limiter::kind_window_start(rule.reset.kind(), now_ms),
+                "reset": rule.reset.to_json(),
+                // 「等于上限也算超」：与 `exceeded_rule` 同一口径
+                "exceeded": rule.limit > 0 && rule_used >= rule.limit,
+            })
+        })
+        .collect();
     serde_json::json!({
-        "limit": limit,
+        "limit": first.limit,
         "used": used,
         "windowStart": window_start,
-        "reset": entry.quota_reset.to_json(),
-        "exceeded": used >= limit,
+        "reset": first.reset.to_json(),
+        "exceeded": exceeded_rule(entry, now_ms).is_some(),
+        "rules": rules_json,
     })
 }
 
@@ -331,4 +428,247 @@ pub fn invalidate() {
 /// 配额重置方式的默认值（新建 Key 时用）：自然日
 pub fn default_reset() -> QuotaReset {
     QuotaReset::Daily
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::config;
+    use crate::server::core::api_keys;
+    use serde_json::{json, Map, Value};
+    use std::sync::MutexGuard;
+
+    /// 与 `core::provider_options` 的用例共用同一把配置锁：本模块的用例也整份
+    /// 改 `apiKeys`（读整份 → 改 → 写整份），并行跑会互相盖掉对方的底稿。
+    fn lock_config() -> MutexGuard<'static, ()> {
+        crate::server::core::provider_options::CONFIG_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 用**真实读侧**（`entries_from`）造记录：`ApiKeyEntry` 有一个私有字段，
+    /// 测试里不能直接字面量构造，走 JSON 顺带把 `quotaRules` 的解析也覆盖了。
+    fn entries_of(items: Value) -> Vec<ApiKeyEntry> {
+        let mut raw = Map::new();
+        raw.insert(api_keys::KEY_API_KEYS.to_string(), items);
+        api_keys::entries_from(&raw)
+    }
+
+    fn one_entry(items: Value) -> ApiKeyEntry {
+        let mut entries = entries_of(items);
+        assert_eq!(entries.len(), 1, "测试记录必须能被读侧解析出来");
+        entries.remove(0)
+    }
+
+    fn legacy_entry(tokens: Option<i64>, reset: QuotaReset) -> ApiKeyEntry {
+        let mut object = json!({
+            "id": "k-legacy",
+            "name": "legacy",
+            "key": "sk-legacy-test-key",
+            "enabled": true,
+            "quotaReset": reset.to_json(),
+        });
+        if let Some(limit) = tokens {
+            object["quotaTokens"] = json!(limit);
+        }
+        one_entry(Value::Array(vec![object]))
+    }
+
+    /// 把给定条目写成配置里的 `apiKeys`（`fetch` 读的是配置快照），
+    /// 用例结束时把原值写回去 —— 不还原就是把「这些 Key」留给后面的用例。
+    struct RestoreKeys {
+        previous: Option<Value>,
+    }
+
+    impl RestoreKeys {
+        fn apply(items: Value) -> Self {
+            let previous = config::with_raw(|raw| raw.get(api_keys::KEY_API_KEYS).cloned())
+                .flatten();
+            let _ = config::update_raw_field(api_keys::KEY_API_KEYS, items);
+            invalidate();
+            Self { previous }
+        }
+    }
+
+    impl Drop for RestoreKeys {
+        fn drop(&mut self) {
+            let value = self.previous.take().unwrap_or(Value::Null);
+            let _ = config::update_raw_field(api_keys::KEY_API_KEYS, value);
+            invalidate();
+        }
+    }
+
+    /// 整个测试进程共用一个临时库：`key_quota::install` 是 `OnceLock`，
+    /// 一旦装入就换不掉。用例之间靠**互不相同的 key_id** 与 `invalidate()`
+    /// 隔离，不靠换库。
+    fn test_db() -> &'static Db {
+        static TEST_DB: OnceLock<Db> = OnceLock::new();
+        TEST_DB.get_or_init(|| {
+            let path = std::env::temp_dir()
+                .join(format!("agent2api-test-key-quota-{}.db", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let db = Db::open(&path).expect("临时库应当能建起来");
+            install(Some(db.clone()));
+            db
+        })
+    }
+
+    fn seed_usage(db: &Db, key_id: &str, ts: i64, tokens: i64) {
+        db.with(|conn| {
+            conn.execute(
+                "INSERT INTO requests (id, ts, model, key_id, total_tokens) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![format!("req-{key_id}-{ts}"), ts, "m", key_id, tokens],
+            )
+        })
+        .expect("库句柄应当可用")
+        .expect("应当能插入一条用量明细");
+    }
+
+    /// 当前自然日窗口里一个**远离 0 点**的时刻（避免 `ts` 落到前一天）。
+    fn midday_after(base: i64) -> i64 {
+        limiter::kind_window_start(0, base) + 3 * 3_600_000
+    }
+
+    /// 回归锁定：只有 `quotaRules`、没有 `quotaTokens` 的 Key 必须被判定。
+    ///
+    /// 反例（v1）：`fetch` 只收集 `quota_tokens.is_some()` 的窗口种类，
+    /// rule-only 的 Key 拿不到读数 → 恒 0 → 永不超限（静默无效）。
+    /// 这里种一条真实用量再断言「超限」，比断言 `None` 强：坏实现同样返回
+    /// `None`，只有「有读数才会超」能把两者分开。
+    #[test]
+    fn rules_only_key_reaches_the_database() {
+        let _guard = lock_config();
+        let db = test_db();
+        let now = midday_after(1_760_000_000_000);
+        let _keys = RestoreKeys::apply(json!([{
+            "id": "k-rules-only",
+            "name": "rules-only",
+            "key": "sk-rules-only-test",
+            "enabled": true,
+            "quotaRules": [{ "limit": 1, "reset": "daily" }],
+        }]));
+        let entry = one_entry(json!([{
+            "id": "k-rules-only",
+            "name": "rules-only",
+            "key": "sk-rules-only-test",
+            "enabled": true,
+            "quotaRules": [{ "limit": 1, "reset": "daily" }],
+        }]));
+        assert_eq!(entry.quota_tokens, None, "前提：旧字段为空");
+        seed_usage(db, "k-rules-only", now - 60_000, 5);
+        invalidate();
+        let hit = exceeded_rule(&entry, now);
+        assert!(hit.is_some(), "规则型 Key 必须真的读到库里的用量并判定超限");
+        assert_eq!(hit.map(|rule| rule.limit), Some(1));
+        assert!(exceeded(&entry, now), "签名不变的入口同样要判定");
+    }
+
+    #[test]
+    fn legacy_single_quota_becomes_one_rule() {
+        let entry = legacy_entry(Some(50_000), QuotaReset::Daily);
+        let rules = effective_rules(&entry);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].limit, 50_000);
+        assert_eq!(rules[0].reset, QuotaReset::Daily);
+    }
+
+    #[test]
+    fn legacy_single_quota_exceeded_is_unchanged() {
+        let _guard = lock_config();
+        let db = test_db();
+        let now = midday_after(1_760_100_000_000);
+        let _keys = RestoreKeys::apply(json!([{
+            "id": "k-legacy-exceeded",
+            "name": "legacy-exceeded",
+            "key": "sk-legacy-exceeded-test",
+            "enabled": true,
+            "quotaTokens": 1,
+            "quotaReset": "daily",
+        }]));
+        let entry = one_entry(json!([{
+            "id": "k-legacy-exceeded",
+            "name": "legacy-exceeded",
+            "key": "sk-legacy-exceeded-test",
+            "enabled": true,
+            "quotaTokens": 1,
+            "quotaReset": "daily",
+        }]));
+        seed_usage(db, "k-legacy-exceeded", now - 60_000, 3);
+        invalidate();
+        assert!(exceeded(&entry, now), "旧字段路径行为必须与改造前一致");
+    }
+
+    /// 多条规则是**叠加约束**：一条超、一条没超 → 返回超的那条。
+    /// 「任一满足」的实现会只保留最宽松的一条，把另一条形同虚设。
+    #[test]
+    fn all_rules_must_pass() {
+        let _guard = lock_config();
+        let db = test_db();
+        let now = midday_after(1_760_200_000_000);
+        let rules = json!([
+            { "limit": 1, "reset": "daily" },
+            { "limit": 1_000_000, "reset": { "fixed": 2_592_000 } }
+        ]);
+        let _keys = RestoreKeys::apply(json!([{
+            "id": "k-two-rules",
+            "name": "two-rules",
+            "key": "sk-two-rules-test",
+            "enabled": true,
+            "quotaRules": rules.clone(),
+        }]));
+        let entry = one_entry(json!([{
+            "id": "k-two-rules",
+            "name": "two-rules",
+            "key": "sk-two-rules-test",
+            "enabled": true,
+            "quotaRules": rules,
+        }]));
+        let effective = effective_rules(&entry);
+        assert_eq!(effective.len(), 2, "两条规则都要保留（叠加约束，不是取最宽）");
+        seed_usage(db, "k-two-rules", now - 60_000, 5);
+        invalidate();
+        let hit = exceeded_rule(&entry, now);
+        assert_eq!(
+            hit.map(|rule| rule.limit),
+            Some(1),
+            "必须返回超限的那条（日限额），不是宽松的那条"
+        );
+    }
+
+    #[test]
+    fn no_rules_means_unlimited() {
+        let entry = legacy_entry(None, QuotaReset::Daily);
+        assert!(effective_rules(&entry).is_empty(), "空规则 = 无限，热路径不查库");
+        assert!(!exceeded(&entry, crate::server::logging::now_ms()));
+    }
+
+    /// Key 页的配额快照必须认规则：只读 `quotaTokens` 时规则型 Key 会显示「无限」。
+    #[test]
+    fn quota_json_reports_rule_limits() {
+        let _guard = lock_config();
+        let db = test_db();
+        let now = midday_after(1_760_300_000_000);
+        let _keys = RestoreKeys::apply(json!([{
+            "id": "k-quota-json",
+            "name": "quota-json",
+            "key": "sk-quota-json-test",
+            "enabled": true,
+            "quotaRules": [{ "limit": 1, "reset": "daily" }],
+        }]));
+        let entry = one_entry(json!([{
+            "id": "k-quota-json",
+            "name": "quota-json",
+            "key": "sk-quota-json-test",
+            "enabled": true,
+            "quotaRules": [{ "limit": 1, "reset": "daily" }],
+        }]));
+        seed_usage(db, "k-quota-json", now - 60_000, 5);
+        invalidate();
+        let snapshot = quota_json(&entry, now);
+        assert_eq!(snapshot["limit"], json!(1), "规则的上限必须出现在快照里");
+        assert_eq!(snapshot["used"], json!(5));
+        assert_eq!(snapshot["exceeded"], json!(true));
+        assert_eq!(snapshot["rules"].as_array().map(Vec::len), Some(1));
+    }
 }

@@ -308,8 +308,7 @@ pub fn change_lan_access(app: AppHandle, enabled: bool, panel: bool) -> Result<V
             None,
             Vec::new(),
             Vec::new(),
-            None,
-            crate::server::core::api_keys::QuotaReset::Daily,
+            crate::server::core::api_keys::QuotaSpec::default(),
         )
             .map_err(|message| format!("自动创建网关 Key 失败: {message}"))?;
         crate::server::logging::log(

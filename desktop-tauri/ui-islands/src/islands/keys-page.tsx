@@ -74,6 +74,13 @@ type KeyEntry = {
   quotaTokens?: number | null
   /** 配额重置方式：`"daily"` 或 `{"fixed": 秒数}` */
   quotaReset?: string | { fixed: number }
+  /**
+   * 配额规则列表（新形态，最多 5 条，**全部满足才放行**）。
+   *
+   * 空数组 = 回落到上面那对旧字段 —— 后端读侧就是这么兼容的，所以这里不做
+   * 「把旧字段折成一条规则」的归一：那会让「用户没动过规则」被误判成「用户删过」。
+   */
+  quotaRules?: QuotaRule[]
   /** 近 7 天用量（后端 `key_quota::usage_summary` 算好） */
   usage?: KeyUsage
   /** 当前窗口的配额快照（后端 `key_quota::quota_json` 算好） */
@@ -87,12 +94,34 @@ type KeyUsage = {
   lastUsedAt?: number
 }
 
+/** 一条配额规则的落盘 / 传输形态（与后端 `KeyQuotaRule` 一一对应） */
+type QuotaRule = {
+  /** Token 上限（正整数） */
+  limit: number
+  /** `"daily"` 或 `{"fixed": 秒数}` */
+  reset: string | { fixed: number }
+}
+
+/** 快照里单条规则的读数（后端 `quota_json` 的 `rules[]`） */
+type QuotaRuleSnapshot = {
+  limit?: number
+  used?: number
+  windowStart?: number | null
+  reset?: string | { fixed: number }
+  exceeded?: boolean
+}
+
+/**
+ * 当前窗口的配额快照。`limit` / `used` / `reset` / `exceeded` 描述**第一条**规则
+ * （列表的进度条与列文案只读它们，升级后零改动）；`rules` 是全部规则。
+ */
 type QuotaSnapshot = {
   limit?: number | null
   used?: number
   windowStart?: number | null
   reset?: string | { fixed: number }
   exceeded?: boolean
+  rules?: QuotaRuleSnapshot[]
 }
 
 /**
@@ -124,6 +153,8 @@ type KeysBridge = {
     quotaTokens?: number | null
     /** 重置方式；缺省 = 后端默认（每天 0 点） */
     quotaReset?: string | { fixed: number }
+    /** 配额规则（最多 5 条；非空时优先生效） */
+    quotaRules?: QuotaRule[]
   }): Promise<KeysPayload | null | undefined>
   updateKey(
     id: string,
@@ -134,6 +165,8 @@ type KeysBridge = {
       /** 三态：缺省 = 不动，null = 改成不限量，数字 = 设成它 */
       quotaTokens?: number | null
       quotaReset?: string | { fixed: number }
+      /** 三态：缺省 = 不动，[] = 清空（回落旧字段），数组 = 设成它 */
+      quotaRules?: QuotaRule[]
     },
   ): Promise<KeysPayload | null | undefined>
   deleteKey(id: string): Promise<KeysPayload | null | undefined>
@@ -382,6 +415,29 @@ function resetText(reset: string | { fixed: number } | undefined): string {
   return t('每天 0 点重置')
 }
 
+/**
+ * 配额规则的条数上限 —— 必须与后端 `api_keys::MAX_QUOTA_RULES` 一致。
+ *
+ * 两处各有一个常量是刻意的（前端拿不到 Rust 常量），但**数值必须同源**：
+ * 后端在 `keys_api` 里对 `> 5` 给 400，前端在 5 条时禁用「添加」按钮。
+ * 前端放宽会让用户点了「添加」却保存失败；收紧则少一条合法规则。
+ */
+const MAX_QUOTA_RULES = 5
+
+/** 规则草稿：`limit` 是输入框原样字符串（见 `ruleDrafts` 的说明） */
+type RuleDraft = { limit: string; reset: string }
+
+/** 重置方式 → 下拉的取值（'daily' 或固定小时数的字符串） */
+function resetModeOf(reset: string | { fixed: number } | undefined): string {
+  if (reset && typeof reset === 'object' && typeof reset.fixed === 'number') {
+    return String(Math.max(1, Math.round(reset.fixed / 3600)))
+  }
+  return 'daily'
+}
+
+/** 「重置」下拉的选项：自然日 + 几个常用固定周期（秒数由调用方换算） */
+const RESET_OPTIONS = [1, 6, 12, 24, 168] as const
+
 /** 配额列的一行文字（无限 / 已用上限） */
 function quotaText(k: KeyEntry): string {
   const limit = k.quota?.limit
@@ -398,16 +454,28 @@ function quotaPercent(k: KeyEntry): number | null {
   return Math.min(100, Math.round((used / limit) * 100))
 }
 
-/** 配额列的悬停说明 */
+/**
+ * 配额列的悬停说明。
+ *
+ * 多规则时逐条列出（每条各自的窗口与读数）：只显示第一条会让用户以为
+ * 「日限额没超」就没事，而实际拦住他的可能是月限额 —— 那正是多规则最需要
+ * 说清的地方。单规则（含旧字段回落出来的那条）走的仍是原来那三行。
+ */
 function quotaTitle(k: KeyEntry): string {
   const limit = k.quota?.limit
   if (limit == null) return t('这把 Key 不限量（默认）')
-  const used = Number(k.quota?.used) || 0
-  const lines = [
-    t('上限：{n} Token', { n: compactTokens(limit) }),
-    t('本窗口已用：{n} Token', { n: compactTokens(used) }),
-    resetText(k.quota?.reset),
-  ]
+  const rules = k.quota?.rules ?? []
+  const lines = rules.length > 1
+    ? rules.map(rule => t('{reset}：{used} / {limit} Token', {
+      reset: resetText(rule.reset),
+      used: compactTokens(Number(rule.used) || 0),
+      limit: compactTokens(Number(rule.limit) || 0),
+    }))
+    : [
+      t('上限：{n} Token', { n: compactTokens(limit) }),
+      t('本窗口已用：{n} Token', { n: compactTokens(Number(k.quota?.used) || 0) }),
+      resetText(k.quota?.reset),
+    ]
   if (k.quota?.exceeded) lines.push(t('⚠️ 已用尽：这把 Key 的请求当前会被拒绝'))
   return lines.join('\n')
 }
@@ -540,13 +608,25 @@ function KeyModal({ target, providers, modelsByProvider, onClose, onSaved }: Key
       : '1000000'),
   )
   /** 重置方式：'daily' 或固定小时数（字符串，提交时换算成秒） */
-  const [resetMode, setResetMode] = React.useState<string>(() => {
-    const reset = target?.quotaReset
-    if (reset && typeof reset === 'object' && typeof reset.fixed === 'number') {
-      return String(Math.max(1, Math.round(reset.fixed / 3600)))
-    }
-    return 'daily'
-  })
+  const [resetMode, setResetMode] = React.useState<string>(() => resetModeOf(target?.quotaReset))
+
+  /**
+   * 配额规则草稿（最多 [`MAX_QUOTA_RULES`] 条）。
+   *
+   * ── 为什么与旧的单条输入并存 ──────────────────────────────
+   * 旧字段仍然生效（读侧：规则为空时回落到 `quotaTokens`），而界面上已经有用户
+   * 在用它。把旧输入直接删掉等于「升级即改界面」，且旧 Key 的配额会一时无处可改。
+   * 所以两者都在：规则非空时以规则为准（后端 `effective_rules` 的同一优先级），
+   * 空则旧的单条输入照旧生效 —— 界面显示与实际执行是同一套判据。
+   *
+   * `limit` 存字符串（输入框原样），提交时才解析成数字：受控数字输入框把
+   * 「用户正在输入的中间态」（空 / 只有 0）丢掉，打字体验会变得莫名其妙。
+   */
+  const [ruleDrafts, setRuleDrafts] = React.useState<RuleDraft[]>(() =>
+    (target?.quotaRules ?? []).map(rule => ({
+      limit: String(rule.limit),
+      reset: resetModeOf(rule.reset),
+    })))
 
   /**
    * 空候选的说明文案分两种：没勾提供商时是「先选提供商」，勾了却是空才是「这几家
@@ -587,6 +667,22 @@ function KeyModal({ target, providers, modelsByProvider, onClose, onSaved }: Key
     // 重置方式：'daily' 原样，数字则是「每 N 小时」→ 秒
     const quotaReset: string | { fixed: number } =
       resetMode === 'daily' ? 'daily' : { fixed: Math.max(1, Number(resetMode)) * 3600 }
+    // 规则：逐条校验（后端也会 400，但本地提示更直接）。超过上限已在「添加」
+    // 按钮处挡住，这里再截一次 —— 手改 state 也不该发出第 6 条。
+    const quotaRules: QuotaRule[] = []
+    for (const draft of ruleDrafts.slice(0, MAX_QUOTA_RULES)) {
+      const parsed = Number(draft.limit.replace(/[^0-9]/g, ''))
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        setStatus(t('每条配额规则的上限都必须大于 0'))
+        savingRef.current = false
+        setSaving(false)
+        return
+      }
+      quotaRules.push({
+        limit: parsed,
+        reset: draft.reset === 'daily' ? 'daily' : { fixed: Math.max(1, Number(draft.reset)) * 3600 },
+      })
+    }
     try {
       const api = shared().workbuddyDesktop
       if (!api) throw new Error(t('后端桥不可用'))
@@ -597,6 +693,7 @@ function KeyModal({ target, providers, modelsByProvider, onClose, onSaved }: Key
           allowedModels,
           quotaTokens,
           quotaReset,
+          quotaRules,
         })
         // 先解除守卫再关窗（旧实现同序：saving = false 在 closeModal 之前）
         stopSaving()
@@ -614,6 +711,7 @@ function KeyModal({ target, providers, modelsByProvider, onClose, onSaved }: Key
         name: name.trim(), key: trimmedKey || undefined, allowedProviders, allowedModels,
         quotaTokens,
         quotaReset,
+        quotaRules,
       })
       stopSaving()
       onSaved(next, next?.created?.id)
@@ -757,6 +855,93 @@ function KeyModal({ target, providers, modelsByProvider, onClose, onSaved }: Key
             <p>
               {t('按窗口内已完成的请求累计 Token 判定；用满后这把 Key 的请求返回 429，窗口翻页自动恢复。这是软限制 —— 正在跑的请求不计入。')}
             </p>
+            {/* ── 多规则（最多 5 条，全部满足才放行）──────────────
+                规则非空时以规则为准（后端 `effective_rules` 的同一优先级）：
+                上面的单条输入仍保留，是为了让存量 Key 的配额继续可改，而不是
+                逼用户先迁移一遍。两者都填时这里显示一句提示，避免「改了上面的
+                数字却完全不生效」这种静默困惑。 */}
+            <div className='flex flex-wrap items-center gap-2.5 text-[12.5px]'>
+              <h4 className='m-0 text-[12.5px] font-medium'>{t('配额规则（最多 {n} 条）', { n: MAX_QUOTA_RULES })}</h4>
+              <Button
+                type='button'
+                variant='outline'
+                disabled={saving || ruleDrafts.length >= MAX_QUOTA_RULES}
+                onClick={() => setRuleDrafts(drafts => (
+                  drafts.length >= MAX_QUOTA_RULES
+                    ? drafts
+                    : [...drafts, { limit: '', reset: 'daily' }]
+                ))}
+              >
+                {t('添加规则')}
+              </Button>
+            </div>
+            {ruleDrafts.length ? (
+              <div className='flex flex-col gap-2'>
+                {ruleDrafts.map((draft, index) => (
+                  <div key={index} className='flex flex-wrap items-center gap-2.5 text-[12.5px]'>
+                    <Label
+                      htmlFor={`key-quota-rule-${index}`}
+                      className='text-[12.5px] whitespace-nowrap text-subtle'
+                    >
+                      {t('上限')}
+                    </Label>
+                    <Input
+                      id={`key-quota-rule-${index}`}
+                      type='text'
+                      inputMode='numeric'
+                      className='w-32'
+                      value={draft.limit}
+                      onChange={event => {
+                        const value = event.currentTarget.value
+                        setRuleDrafts(drafts => drafts.map((item, at) => (
+                          at === index ? { ...item, limit: value } : item
+                        )))
+                      }}
+                    />
+                    <span className='text-subtle'>Token</span>
+                    <Label
+                      htmlFor={`key-quota-rule-reset-${index}`}
+                      className='text-[12.5px] whitespace-nowrap text-subtle'
+                    >
+                      {t('重置')}
+                    </Label>
+                    <select
+                      id={`key-quota-rule-reset-${index}`}
+                      className='rounded border border-border bg-transparent px-2 py-1.5 text-[12.5px]'
+                      value={draft.reset}
+                      onChange={event => {
+                        const value = event.currentTarget.value
+                        setRuleDrafts(drafts => drafts.map((item, at) => (
+                          at === index ? { ...item, reset: value } : item
+                        )))
+                      }}
+                    >
+                      <option value='daily'>{t('每天 0 点')}</option>
+                      {RESET_OPTIONS.map(hours => (
+                        <option key={hours} value={String(hours)}>
+                          {t('每 {n} 小时', { n: hours })}
+                        </option>
+                      ))}
+                    </select>
+                    <Button
+                      type='button'
+                      variant='outline'
+                      disabled={saving}
+                      onClick={() => setRuleDrafts(drafts => drafts.filter((_, at) => at !== index))}
+                    >
+                      {t('删除')}
+                    </Button>
+                  </div>
+                ))}
+                <p>
+                  {t('多条规则是叠加约束：每条都要满足（例如日限额 + 月限额同时生效）。规则非空时以上面的规则为准，旧的单条配额不再生效。')}
+                </p>
+              </div>
+            ) : (
+              <p className='text-muted-foreground'>
+                {t('未设置规则：沿用上面那条单条配额（留空即不限量）。')}
+              </p>
+            )}
           </DialogSection>
           <div className='min-h-[18px] text-[11.5px] text-muted-foreground'>{status}</div>
         </DialogBody>
