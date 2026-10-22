@@ -1175,6 +1175,27 @@ pub fn shim_js() -> &'static str {
       return call('PUT', '/api/sanitize', { sanitizeBlacklistFingerprints: enabled === true });
     },
 
+    // ── 剥离响应开头的思考标签 ──
+    // 与桌面桥（src/bridge.rs 的 getThinkStrip / saveThinkStrip）同一映射：
+    // 两边接口名与签名必须一致，界面代码零改动地跑在两边。
+    getThinkStrip: function () { return call('GET', '/api/think-strip'); },
+    saveThinkStrip: function (enabled) {
+      return call('PUT', '/api/think-strip', { stripLeadingThink: enabled === true });
+    },
+
+    // ── 每 provider 的行为开关（providerOptions）──
+    // `value` 三态：true / false 写覆盖，**null 删掉覆盖、回到跟随全局** ——
+    // 三档控件（跟随全局 / 开 / 关）靠的就是这条删除路径（见
+    // api/provider_options.rs 的 put_response）。
+    getProviderOptions: function () { return call('GET', '/api/provider-options'); },
+    saveProviderOption: function (providerId, key, value) {
+      return call('PUT', '/api/provider-options', {
+        providerId: String(providerId || ''),
+        key: String(key || ''),
+        value: (value === null || value === undefined) ? null : value === true,
+      });
+    },
+
     // ── 开发者角色兼容 ──
     // 与桌面桥（src/bridge.rs 的 getDeveloperRoleCompat / saveDeveloperRoleCompat）
     // 同一映射：两边接口名与签名必须一致，界面代码零改动地跑在两边

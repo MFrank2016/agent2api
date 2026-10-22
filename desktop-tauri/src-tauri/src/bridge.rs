@@ -680,6 +680,25 @@ const BRIDGE_JS: &str = r#"
     saveSanitize: enabled =>
       call('PUT', '/api/sanitize', { sanitizeBlacklistFingerprints: enabled === true }),
 
+    // ── 剥离响应开头的思考标签 ──
+    // 与 getSanitize / saveSanitize 同形：GET 读、PUT 写，响应体就是新状态。
+    // 与 web_shim.rs 的同名方法逐字同形（漏一侧的症状见 getCors 那段）。
+    getThinkStrip: () => call('GET', '/api/think-strip'),
+    saveThinkStrip: enabled =>
+      call('PUT', '/api/think-strip', { stripLeadingThink: enabled === true }),
+
+    // ── 每 provider 的行为开关（providerOptions）──
+    // GET 回整块 `{providerOptions: {...}}`；PUT 一次只改「一家的一项」。
+    // `value` 三态：true / false 写覆盖，**null 删掉覆盖、回到跟随全局** ——
+    // 界面的三档控件（跟随全局 / 开 / 关）靠的就是这条删除路径。
+    getProviderOptions: () => call('GET', '/api/provider-options'),
+    saveProviderOption: (providerId, key, value) =>
+      call('PUT', '/api/provider-options', {
+        providerId: String(providerId || ''),
+        key: String(key || ''),
+        value: value === null || value === undefined ? null : value === true,
+      }),
+
     // ── 开发者角色兼容开关 ──
     // 与 getSanitize / saveSanitize 同形：GET 读、PUT 写，响应体就是新状态。
     // 与 web_shim.rs 的同名方法逐字同形（漏一侧的症状见下面 getCors 那段）。

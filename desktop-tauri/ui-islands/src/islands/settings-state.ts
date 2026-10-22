@@ -84,6 +84,8 @@ export type BusyScope =
   | 'routing'
   | 'debug'
   | 'sanitize'
+  | 'thinkStrip'
+  | 'providerOptions'
   | 'developerRoleCompat'
   | 'clineHeaders'
   | 'cors'
@@ -136,6 +138,20 @@ export type DebugState = {
 }
 
 export type SanitizeState = { status: LoadStatus; on: boolean }
+
+/** 剥离响应开头思考标签的全局开关；与 SanitizeState 同形 */
+export type ThinkStripState = { status: LoadStatus; on: boolean }
+
+/**
+ * 逐家开关覆盖（`providerOptions`）：只含**显式设过**的家与键。
+ *
+ * `overrides[providerId][key]` 缺失 = 这一家这一项**跟随全局**；
+ * 存在布尔值 = 显式开 / 关。缺失与 `false` 不是一回事，界面因此必须是三档。
+ */
+export type ProviderOptionsState = {
+  status: LoadStatus
+  overrides: Record<string, Record<string, boolean>>
+}
 
 /** 开发者角色兼容开关；与 SanitizeState 同形 */
 export type DeveloperRoleCompatState = { status: LoadStatus; on: boolean }
@@ -280,6 +296,8 @@ export type SettingsSnapshot = {
   routing: RoutingState
   debug: DebugState
   sanitize: SanitizeState
+  thinkStrip: ThinkStripState
+  providerOptions: ProviderOptionsState
   developerRoleCompat: DeveloperRoleCompatState
   clineHeaders: ClineHeadersState
   cors: CorsState
@@ -360,6 +378,8 @@ const INITIAL: SettingsSnapshot = {
   captchaPool: { status: 'loading', values: null },
   debug: { status: 'loading', on: false, count: null, limit: null },
   sanitize: { status: 'loading', on: false },
+  thinkStrip: { status: 'loading', on: false },
+  providerOptions: { status: 'loading', overrides: {} },
   developerRoleCompat: { status: 'loading', on: false },
   clineHeaders: { status: 'loading', defaults: {}, overrides: {}, effective: {} },
   cors: { status: 'loading', on: false },
@@ -1334,6 +1354,127 @@ export async function saveSanitize(next: boolean): Promise<void> {
   }
 }
 
+/* ─── 剥离响应开头的思考标签（全局开关）── */
+
+export function renderThinkStrip(data?: unknown): void {
+  if (data === undefined) return
+  if (!data || typeof data !== 'object') {
+    publish({ thinkStrip: { status: 'unavailable', on: false } })
+    return
+  }
+  const record = data as Record<string, unknown>
+  publish({ thinkStrip: { status: 'ready', on: record.stripLeadingThink === true } })
+}
+
+async function loadThinkStrip(): Promise<void> {
+  try {
+    renderThinkStrip(await shared().workbuddyDesktop?.getThinkStrip())
+  } catch (error) {
+    console.warn('读取思考标签剥离设置失败:', errorMessage(error))
+    renderThinkStrip(null)
+  }
+}
+
+export async function saveThinkStrip(next: boolean): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('thinkStrip')
+  publish({ thinkStrip: { status: 'ready', on: next } })
+  try {
+    const saved = await shared().workbuddyDesktop?.saveThinkStrip(next)
+    renderThinkStrip(saved)
+    toast(next ? t('✅ 已开启剥离响应开头的思考标签') : t('已关闭剥离响应开头的思考标签'))
+  } catch (error) {
+    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
+    await loadThinkStrip() // 回滚到后端的真实值
+  } finally {
+    endBusy()
+  }
+}
+
+/* ─── 逐家开关覆盖（providerOptions）── */
+
+/**
+ * 归一化 `{providerOptions: {"<id>": {"<key>": true|false}}}`。
+ *
+ * 只收布尔值：后端 `set` 写进去的一定是布尔，别的东西（未来多出来的键）
+ * 界面认不得就不渲染 —— 宁可少一行，也不要拿它去猜一个开关的状态。
+ */
+export function renderProviderOptions(data?: unknown): void {
+  if (data === undefined) return
+  if (!data || typeof data !== 'object') {
+    publish({ providerOptions: { status: 'unavailable', overrides: {} } })
+    return
+  }
+  const record = data as Record<string, unknown>
+  publish({ providerOptions: { status: 'ready', overrides: providerOptionOverrides(record.providerOptions) } })
+}
+
+function providerOptionOverrides(raw: unknown): Record<string, Record<string, boolean>> {
+  if (!raw || typeof raw !== 'object') return {}
+  const out: Record<string, Record<string, boolean>> = {}
+  for (const [providerId, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!providerId || !value || typeof value !== 'object') continue
+    const entry: Record<string, boolean> = {}
+    for (const [key, flag] of Object.entries(value as Record<string, unknown>)) {
+      if (typeof flag === 'boolean') entry[key] = flag
+    }
+    if (Object.keys(entry).length) out[providerId] = entry
+  }
+  return out
+}
+
+async function loadProviderOptions(): Promise<void> {
+  try {
+    renderProviderOptions(await shared().workbuddyDesktop?.getProviderOptions())
+  } catch (error) {
+    console.warn('读取逐家开关覆盖失败:', errorMessage(error))
+    renderProviderOptions(null)
+  }
+}
+
+/**
+ * 写一家的一项覆盖。`value` 为 `null` = 删掉这项覆盖、回到「跟随全局」。
+ *
+ * `providerLabel` / `keyLabel` 只用于 toast 文案（界面已经有这两个展示名，
+ * 不必让状态层再维护一份 id → 名称的映射；缺省回落 id / 键名）。
+ *
+ * 与相邻开关一样是**乐观 + 失败回滚**：先把快照改掉再发请求，成功后用响应
+ * 刷新（后端回的是整块，别的家 / 别的键也一并对齐）；失败就重读后端真实值。
+ */
+export async function saveProviderOption(
+  providerId: string,
+  key: string,
+  value: boolean | null,
+  providerLabel?: string,
+  keyLabel?: string,
+): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('providerOptions')
+  const optimistic: Record<string, Record<string, boolean>> = { ...snapshot.providerOptions.overrides }
+  const entry: Record<string, boolean> = { ...(optimistic[providerId] ?? {}) }
+  if (value === null) delete entry[key]
+  else entry[key] = value
+  if (Object.keys(entry).length) optimistic[providerId] = entry
+  else delete optimistic[providerId]
+  publish({ providerOptions: { status: 'ready', overrides: optimistic } })
+  const provider = providerLabel || providerId
+  const label = keyLabel || key
+  try {
+    const saved = await shared().workbuddyDesktop?.saveProviderOption(providerId, key, value)
+    renderProviderOptions(saved)
+    toast(value === null
+      ? t('✅ {provider} 的「{key}」已回到跟随全局', { provider, key: label })
+      : value
+        ? t('✅ {provider} 的「{key}」已设为开', { provider, key: label })
+        : t('✅ {provider} 的「{key}」已设为关', { provider, key: label }))
+  } catch (error) {
+    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
+    await loadProviderOptions() // 回滚到后端的真实值
+  } finally {
+    endBusy()
+  }
+}
+
 /* ─── 开发者角色兼容（developer 角色消息归一为 system）── */
 
 export function renderDeveloperRoleCompat(data?: unknown): void {
@@ -2196,6 +2337,8 @@ export async function load(): Promise<void> {
     loadRouting(),
     loadDebug(),
     loadSanitize(),
+    loadThinkStrip(),
+    loadProviderOptions(),
     loadDeveloperRoleCompat(),
     loadClineHeaders(),
     loadCors(),
@@ -2248,6 +2391,16 @@ export async function refreshDebug(): Promise<void> {
 export async function refreshSanitize(): Promise<void> {
   await loadSanitize()
   toast(t('指纹脱敏设置已刷新'))
+}
+
+export async function refreshThinkStrip(): Promise<void> {
+  await loadThinkStrip()
+  toast(t('思考标签剥离设置已刷新'))
+}
+
+export async function refreshProviderOptions(): Promise<void> {
+  await loadProviderOptions()
+  toast(t('逐家开关覆盖已刷新'))
 }
 
 export async function refreshDeveloperRoleCompat(): Promise<void> {

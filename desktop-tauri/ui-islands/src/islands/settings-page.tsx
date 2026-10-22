@@ -108,6 +108,10 @@ import {
   saveRoutingProvider,
   saveRetryField,
   saveSanitize,
+  saveThinkStrip,
+  saveProviderOption,
+  refreshThinkStrip,
+  refreshProviderOptions,
   saveDeveloperRoleCompat,
   saveTimeoutField,
   saveToggle,
@@ -1436,6 +1440,131 @@ function RoutingStrategyPanel({ snap }: { snap: SettingsSnapshot }) {
   )
 }
 
+/* ─── 逐家开关覆盖（providerOptions）──────────────── */
+
+/**
+ * 三档取值：`inherit` = 这一家这一项**没有覆盖**，跟随全局开关。
+ *
+ * 不能压成两档 —— 「没设置」与「显式设为关」语义不同：前者随全局变化，
+ * 后者固定为关。后端 PUT 的 `value: null` 就是删掉覆盖（回到 inherit）。
+ */
+type ProviderOptionValue = 'inherit' | 'on' | 'off'
+
+/** 三档的展示文案（值必须与 ProviderOptionValue 逐字一致） */
+const PROVIDER_OPTION_STATES: ReadonlyArray<{ value: ProviderOptionValue; label: string }> = [
+  { value: 'inherit', label: t('跟随全局') },
+  { value: 'on', label: t('开') },
+  { value: 'off', label: t('关') },
+]
+
+/**
+ * 可覆盖的键。键名必须与后端 `core::provider_options::KNOWN_KEYS` 逐字一致
+ * （拼错会被后端 400 拒掉）。
+ *
+ * `custom` = 自定义提供商是否真读这一项。后端那张能力矩阵里自定义家只读
+ * 「指纹脱敏」与「剥离思考标签」，`stripNewlineKeepalive` 存着但不生效 ——
+ * 所以那一项不给自定义家渲染，免得用户配了一个永远不会起作用的开关。
+ */
+const PROVIDER_OPTION_KEYS: ReadonlyArray<{ key: string; label: string; custom: boolean }> = [
+  { key: 'sanitizeBlacklistFingerprints', label: t('指纹脱敏'), custom: true },
+  { key: 'stripLeadingThink', label: t('剥离思考标签'), custom: true },
+  { key: 'stripNewlineKeepalive', label: t('保活换行丢弃'), custom: false },
+]
+
+/**
+ * 逐家覆盖面板：每家 × 每个可覆盖键一个三档控件。
+ *
+ * 提供商清单来自三处（后端不提供「全部家」的接口，只回已配置的覆盖）：
+ *   ① 注册表全量 —— 设置页已经读过（`/api/prompt` 的 promptProviderOptions）；
+ *   ② 自定义家目录 —— providers.js 启动时拉过一份，同步可读；
+ *   ③ 覆盖表里出现过的 id —— 已删掉的自定义家留下的残留也要能看见并清掉。
+ *
+ * 默认收起（CollapsiblePanel 的 <details> 不带 open）：8 家 × 3 项摊开会把
+ * 这一页撑得很长，而它多数时候不需要动。
+ */
+function ProviderOptionsPanel({ snap }: { snap: SettingsSnapshot }) {
+  const state = snap.providerOptions
+  const busy = snap.busy === 'providerOptions'
+  const locked = state.status !== 'ready'
+  const overriddenCount = Object.keys(state.overrides).length
+
+  const providerIds = React.useMemo(() => {
+    const ids = new Set<string>()
+    for (const option of snap.prompt.options) if (option.id) ids.add(option.id)
+    for (const item of shared().wbProviders?.customList?.() ?? []) if (item.id) ids.add(item.id)
+    for (const id of Object.keys(state.overrides)) ids.add(id)
+    return [...ids].sort((a, b) => a.localeCompare(b))
+  }, [snap.prompt.options, state.overrides])
+
+  const labelOf = (id: string): string =>
+    snap.prompt.options.find(item => item.id === id)?.label
+    || shared().wbProviders?.labelOf?.(id)
+    || id
+
+  return (
+    <CollapsiblePanel
+      title={t('逐家开关覆盖')}
+      tip={TIPS.providerOptions}
+      badge={state.status === 'ready'
+        ? <StatusBadge tone='ok'>{t('{count} 家已覆盖', { count: overriddenCount })}</StatusBadge>
+        : state.status === 'unavailable'
+          ? <StatusBadge tone='bad'>{t('不可用')}</StatusBadge>
+          : <StatusBadge tone='idle'>{t('检测中…')}</StatusBadge>}
+      actions={<RefreshButton id='btn-provider-options-refresh' onClick={() => void refreshProviderOptions()} />}
+    >
+      <div className='panel-body'>
+        <div className='retention-list'>
+          {providerIds.length ? providerIds.map(id => {
+            const isCustom = id.startsWith('custom-')
+            const keys = PROVIDER_OPTION_KEYS.filter(item => !isCustom || item.custom)
+            return (
+              <React.Fragment key={id}>
+                <div className='prompt-group'>
+                  {labelOf(id)}
+                  {isCustom ? <span className='note'>{t('自定义提供商')}</span> : null}
+                </div>
+                {keys.map(item => {
+                  const override = state.overrides[id]?.[item.key]
+                  const value: ProviderOptionValue = override === undefined
+                    ? 'inherit'
+                    : override ? 'on' : 'off'
+                  return (
+                    <div className='retention-row' key={item.key}>
+                      <label>{item.label}</label>
+                      <SegmentedControl<ProviderOptionValue>
+                        aria-label={`${labelOf(id)} · ${item.label}`}
+                        options={PROVIDER_OPTION_STATES}
+                        value={value}
+                        disabled={locked || busy}
+                        // null = 删掉这项覆盖，回到跟随全局（后端 PUT 的三态语义）
+                        onValueChange={next => void saveProviderOption(
+                          id,
+                          item.key,
+                          next === 'inherit' ? null : next === 'on',
+                          labelOf(id),
+                          item.label,
+                        )}
+                      />
+                    </div>
+                  )
+                })}
+              </React.Fragment>
+            )
+          }) : (
+            <div className='hint'>{t('还没有可覆盖的提供商：注册表与自定义目录都还没读到。')}</div>
+          )}
+        </div>
+        <div className='settings-state'>
+          {state.status === 'ready'
+            ? t('已覆盖 {count} 家；未覆盖的家与键跟随全局开关。', { count: overriddenCount })
+            : state.status === 'loading' ? STATES.appLoading : STATES.providerOptionsUnavailable}
+        </div>
+        <div className='hint retention-note'>{NOTES.providerOptions}</div>
+      </div>
+    </CollapsiblePanel>
+  )
+}
+
 function GatewayPane({ snap }: { snap: SettingsSnapshot }) {
   return (
     <>
@@ -1547,6 +1676,40 @@ function GatewayPane({ snap }: { snap: SettingsSnapshot }) {
           <div className='hint retention-note'>{NOTES.sanitize}</div>
         </div>
       </section>
+
+      <section className='panel'>
+        <PanelHead
+          title={t('思考标签')}
+          badge={snap.thinkStrip.status === 'ready'
+            ? <StatusBadge tone='ok'>{t('已生效')}</StatusBadge>
+            : snap.thinkStrip.status === 'unavailable'
+              ? <StatusBadge tone='bad'>{t('不可用')}</StatusBadge>
+              : <StatusBadge tone='idle'>{t('检测中…')}</StatusBadge>}
+          actions={<RefreshButton id='btn-think-strip-refresh' onClick={() => void refreshThinkStrip()} />}
+        />
+        <div className='panel-body'>
+          <div className='settings-switches'>
+            <SwitchRow
+              id='settings-think-strip'
+              label={t('剥离思考标签')}
+              tip={TIPS.thinkStrip}
+              checked={snap.thinkStrip.on}
+              // 读到后端值之前不许切（与指纹脱敏同一口径：切了也不知道后端原本是什么，回滚也没依据）
+              disabled={snap.thinkStrip.status !== 'ready' || snap.busy === 'thinkStrip'}
+              onCheckedChange={next => void saveThinkStrip(next)}
+            />
+          </div>
+          <div className='settings-state'>
+            {snap.thinkStrip.status === 'loading'
+              ? STATES.appLoading
+              : snap.thinkStrip.status === 'unavailable'
+                ? STATES.thinkStripUnavailable
+                : snap.thinkStrip.on ? STATES.thinkStripOn : STATES.thinkStripOff}
+          </div>
+        </div>
+      </section>
+
+      <ProviderOptionsPanel snap={snap} />
 
       <section className='panel'>
         <PanelHead
