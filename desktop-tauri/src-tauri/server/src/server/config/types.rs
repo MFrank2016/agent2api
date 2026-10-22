@@ -208,6 +208,18 @@ pub const KEY_STRIP_NEWLINE_KEEPALIVE: &str = "stripNewlineKeepalive";
 /// 而上游到底会不会这么发是**按家**不同的 —— 所以真正决定开不开的是
 /// `providerOptions`（`core::provider_options::is_enabled`），本键只提供全局
 /// 默认值。键不存在 = 跟随本键（缺省 false）。
+///
+/// ── 覆盖面（重要，别以为「通用」就是每家都生效）─────────────────
+/// 本开关挂在**标准 chat SSE 下发链**上（`ReasoningCoalescer` 流式 +
+/// `CompletionAccumulator` 非流式），所以对走那条链的家全部生效。
+/// 三家**不走那条链**（它们各自有 translator / sniffer 把自己的上游格式转成
+/// chat SSE，见 `providers/{qoder,accio,codearts}`），因此本开关对它们
+/// **不生效**：
+///   - `qoder`：它自己那台机器把正文中间的标签转成 reasoning delta，
+///     开头块的处理方式不同（语义不兼容，不能套同一台状态机）；
+///   - `accio` / `codearts`：各有一条自建流，未接 think 剥离。
+/// 要覆盖这三家需要把它们接到统一的下发链上 —— 那是独立的重构，不在本开关
+/// 的范围里。设置页的提示文案必须如实说明这一点，不能让人以为「开了就全生效」。
 pub const KEY_STRIP_LEADING_THINK: &str = "stripLeadingThink";
 
 /// 机器人校验开关的键（config.json 键，ALTCHA proof-of-work，见 `server::altcha`）。
