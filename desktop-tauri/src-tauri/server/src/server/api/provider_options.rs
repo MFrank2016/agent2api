@@ -72,12 +72,20 @@ fn put_response(body: &[u8]) -> Response {
     let Some(key) = object.get("key").and_then(Value::as_str) else {
         return errors::management_error(400, "缺少 key（字符串）");
     };
-    let Some(value) = object.get("value").and_then(Value::as_bool) else {
-        return errors::management_error(400, "缺少 value（true 或 false）");
+    // `value` 三态：true / false / **null**。
+    //   - true / false：写一项覆盖；
+    //   - null：**删掉**这项覆盖，回到「跟随全局默认」。
+    // 三态是必须的：「没设置」与「显式设为 false」语义不同（前者跟随全局），
+    // 只支持 true/false 的话用户一旦覆盖过就再也回不到跟随。
+    let value = object.get("value");
+    let outcome = match value {
+        Some(Value::Bool(flag)) => provider_options::set(provider_id, key, *flag),
+        Some(Value::Null) => provider_options::remove(provider_id, key),
+        _ => return errors::management_error(400, "缺少 value（true / false / null）"),
     };
-    // `set` 的报错文案就是接口契约（未知键会列出允许的键、未知家会点名 id），
+    // `set` / `remove` 的报错文案就是接口契约（未知键会列出允许的键），
     // 所以原样透给 400，不在这一层另写一份判据。
-    if let Err(message) = provider_options::set(provider_id, key, value) {
+    if let Err(message) = outcome {
         return errors::management_error(400, message);
     }
     ok_json(state_json())
@@ -273,5 +281,49 @@ mod tests {
                 "文案 {message:?} 必须说清缺什么（期望包含 {expected:?}）"
             );
         }
+    }
+
+    /// 回归锁定：`value: null` 必须**删掉**覆盖，回到「跟随全局」。
+    ///
+    /// 反例（改造前）：只支持 true/false，用户一旦覆盖过就再也回不到跟随 ——
+    /// 界面只能做两态，而两态会把「跟随」静默变成「显式关」。
+    #[tokio::test]
+    async fn null_value_removes_the_override() {
+        let _guard = hold_config();
+        let _restore = RestoreOptions::capture();
+        ensure_snapshot();
+        let key = config::KEY_STRIP_LEADING_THINK;
+
+        // 先覆盖成 false（与默认 true 不同，便于区分「跟随」与「显式关」）
+        put_response(
+            json!({ "providerId": "qoder", "key": key, "value": false })
+                .to_string()
+                .as_bytes(),
+        );
+        assert_eq!(provider_options::get("qoder", key), Some(false));
+
+        // 删除 → 读侧回到「没设置」，于是 is_enabled 用 default
+        let response = put_response(
+            json!({ "providerId": "qoder", "key": key, "value": Value::Null })
+                .to_string()
+                .as_bytes(),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            provider_options::get("qoder", key),
+            None,
+            "删除后必须读不到（= 跟随全局）"
+        );
+        assert!(
+            provider_options::is_enabled("qoder", key, true),
+            "删除后必须回到 default，而不是继续用删除前的 false"
+        );
+
+        // 一家一项都不剩时，这一家的空对象也要清掉
+        let body = json_of(ok_json(state_json())).await;
+        assert!(
+            body.pointer("/data/providerOptions/qoder").is_none(),
+            "空对象不该留在配置里: {body}"
+        );
     }
 }

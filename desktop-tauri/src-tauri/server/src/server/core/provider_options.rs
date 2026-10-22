@@ -176,6 +176,53 @@ pub fn set(provider_id: &str, key: &str, value: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// 删掉一家的一项覆盖 —— **回到「跟随全局默认」**。
+///
+/// ── 为什么必须有这个入口 ──────────────────────────────────
+/// 「没设置」与「显式设为 false」是两种不同的语义：前者跟随全局开关，后者
+/// 无论全局怎么改都固定为关。只有 `set()` 时，用户一旦覆盖过就**再也回不到
+/// 跟随全局**（界面只能做两态，而两态会把「跟随」静默变成「显式关」）。
+///
+/// 删到一家一项都不剩时，连同这一家的空对象一起清掉：`providerOptions` 里
+/// 留着 `{"workbuddy": {}}` 没有语义，只会让界面以为这家有覆盖。
+pub fn remove(provider_id: &str, key: &str) -> Result<(), String> {
+    if !KNOWN_KEYS.contains(&key) {
+        return Err(format!(
+            "未知的 provider 开关 `{key}`（允许: {}）",
+            KNOWN_KEYS.join(" / ")
+        ));
+    }
+    if provider_id.trim().is_empty() {
+        return Err("provider id 不能为空".to_string());
+    }
+    // 删侧不校验 provider 是否注册：已删的自定义家留下的残留也要能被清掉，
+    // 否则那条死配置永远删不掉（读侧本来就会忽略它）。
+    let Some(options) = config::with_raw(|raw| raw.get(config_key()).cloned()) else {
+        return Err("配置尚未初始化，无法删除 provider 开关".to_string());
+    };
+    let mut options = options.unwrap_or_else(|| Value::Object(Map::new()));
+    let Some(options_map) = options.as_object_mut() else {
+        return Err("providerOptions 不是对象".to_string());
+    };
+    let mut emptied = false;
+    if let Some(entry) = options_map.get_mut(provider_id).and_then(Value::as_object_mut) {
+        entry.remove(key);
+        emptied = entry.is_empty();
+    }
+    if emptied {
+        options_map.remove(provider_id);
+    }
+    let saved = config::update_raw_field(config_key(), options);
+    logging::log(
+        "[Config]",
+        &format!(
+            "provider 开关 {provider_id}.{key} 已删除（回到跟随全局）{}",
+            if saved { "" } else { "（落库失败，本次运行内仍生效）" }
+        ),
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
