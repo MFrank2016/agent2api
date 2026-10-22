@@ -436,7 +436,10 @@ function resetModeOf(reset: string | { fixed: number } | undefined): string {
 }
 
 /** 「重置」下拉的选项：自然日 + 几个常用固定周期（秒数由调用方换算） */
-const RESET_OPTIONS = [1, 6, 12, 24, 168] as const
+// 720 小时（30 天）是后端的固定周期上限（`MAX_QUOTA_PERIOD_SECONDS`），
+// 也是「日限额 + 月限额」这个主用例要的那一档 —— 少了它，用户没法在
+// 界面上建出计划里举的那个例子。
+const RESET_OPTIONS = [1, 6, 12, 24, 168, 720] as const
 
 /** 配额列的一行文字（无限 / 已用上限） */
 function quotaText(k: KeyEntry): string {
@@ -922,6 +925,12 @@ function KeyModal({ target, providers, modelsByProvider, onClose, onSaved }: Key
                           {t('每 {n} 小时', { n: hours })}
                         </option>
                       ))}
+                      {/* API 建的非常规窗口（不在上表里）：补一项，否则下拉显示空白 */}
+                      {draft.reset !== 'daily' && !RESET_OPTIONS.includes(Number(draft.reset) as never) && (
+                        <option value={draft.reset}>
+                          {t('每 {n} 小时', { n: draft.reset })}
+                        </option>
+                      )}
                     </select>
                     <Button
                       type='button'
