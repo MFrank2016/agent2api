@@ -494,13 +494,19 @@ mod tests {
         let mock = Mock::spawn(vec![]).await;
         let credential = credential();
         let mut options = SessionOptions::new(&mock.base, &credential, "en-us");
-        options.interval = Duration::from_millis(40);
+        // ── 余量必须留足（本用例曾是有名的偶发失败）─────────────────
+        // 旧写法 40ms 间隔 / 150ms 睡眠：理论 3.75 次、断言 ≥3，容错只有
+        // 0.75 次 —— 定时器与调度抖动一次就掉到 2 次。改成 20ms / 200ms
+        // （理论 10 次、断言 ≥4），容错 6 次，抖动不再能把用例打红。
+        // 断言仍要「多次」而不是「≥1」：只发一次心跳就停会让「续期」这条
+        // 判据失去意义（首帧 busy 本来就发过一次）。
+        options.interval = Duration::from_millis(20);
         let session = ChatSession::begin(options).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         session.stop().await;
         let calls = mock.calls();
         let busy_count = calls.iter().filter(|(status, _)| status == "busy").count();
-        assert!(busy_count >= 3, "40ms 间隔 150ms 内至少应续期 2-3 次，实际 {busy_count}");
+        assert!(busy_count >= 4, "20ms 间隔 200ms 内应续期多次（理论 10 次），实际 {busy_count}");
         assert_eq!("idle", calls.last().unwrap().0, "最后一个是 idle");
         // idle 之后绝不能再有 busy（迟到的 busy 会把会话重新激活）
         assert_eq!(0, mock.seen_busy_after_idle.load(Ordering::SeqCst));
