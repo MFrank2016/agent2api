@@ -264,27 +264,13 @@ fn frames_for_deltas(translator: &mut Translator, deltas: &[Delta]) -> Option<St
         )));
     }
     for delta in deltas {
-        let payload = match delta {
-            Delta::Content(text) => json!({ "content": text }),
-            Delta::Reasoning(text) => json!({ "reasoning_content": text }),
-            Delta::ToolCall { index, id, name, arguments } => {
-                let mut function = serde_json::Map::new();
-                if let Some(name) = name {
-                    function.insert("name".to_string(), Value::String(name.clone()));
-                }
-                if let Some(arguments) = arguments {
-                    function.insert("arguments".to_string(), Value::String(arguments.clone()));
-                }
-                let mut call = serde_json::Map::new();
-                call.insert("index".to_string(), json!(index));
-                if let Some(id) = id {
-                    call.insert("id".to_string(), Value::String(id.clone()));
-                    call.insert("type".to_string(), Value::String("function".to_string()));
-                }
-                call.insert("function".to_string(), Value::Object(function));
-                json!({ "tool_calls": [Value::Object(call)] })
-            }
-        };
+        // think 过滤：`delta_json_filtered` 会改写 Content（开头块被剥掉），
+        // 整帧被吃掉时返回 Null —— 那一帧不发。
+        // 过滤只碰 Content；Reasoning / ToolCall 原样走（见该函数的说明）。
+        let payload = translator.delta_json_filtered(delta);
+        if payload.is_null() {
+            continue;
+        }
         out.push_str(&stream::sse_frame(&chunk_frame(translator, payload, Value::Null)));
     }
     (!out.is_empty()).then_some(out)

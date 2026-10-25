@@ -538,7 +538,15 @@ impl ProviderAdapter for QoderAdapter {
                     }
                 }
 
-                let translator = Translator::new(response_id(), plan.model_name.clone(), plan.thinking);
+                // 剥离开头 think 块：per-provider 覆盖全局（默认关）。
+                // `kind_id(self.kind())` 让 Qoder 国内版 / 国际版各自认自己的开关。
+                let strip_think = crate::server::core::provider_options::is_enabled(
+                    crate::server::core::providers::kind_id(self.kind()),
+                    crate::server::config::KEY_STRIP_LEADING_THINK,
+                    crate::server::config::strip_leading_think(),
+                );
+                let translator = Translator::new(response_id(), plan.model_name.clone(), plan.thinking)
+                    .with_think_strip(strip_think);
                 // 限额记账的素材：流式分支的收尾发生在 handler 返回之后，那时
                 // 这里的局部变量都还在（被 move 进后台任务），所以先把要用的
                 // 那份句柄与标识克隆好（store 是 Arc 句柄，clone 很便宜）

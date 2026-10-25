@@ -390,7 +390,14 @@ impl ProviderAdapter for AccioAdapter {
                 return Err(error);
             }
 
-            let translator = chat::Translator::new(chat::response_id(), plan.model_name.clone());
+            // 剥离开头 think 块：per-provider 覆盖全局（默认关）。
+            let strip_think = crate::server::core::provider_options::is_enabled(
+                crate::server::core::providers::kind_id(self.kind()),
+                crate::server::config::KEY_STRIP_LEADING_THINK,
+                crate::server::config::strip_leading_think(),
+            );
+            let translator = chat::Translator::new(chat::response_id(), plan.model_name.clone())
+                .with_think_strip(strip_think);
             let limit = chat::LimitContext {
                 store: store.clone(),
                 account_id: account_id.clone(),

@@ -405,6 +405,17 @@ pub struct Translator {
     /// 吐出去 —— 跨分片的标签拆解就永远不会生效，而这正是它存在的全部理由。
     /// None = 该模型不支持思考，正文不作拆解（此时尖括号是用户内容）。
     parser: Option<stream::ThinkingParser>,
+    /// 剥离响应**开头**的 `<think>…</think>` 块（`stripLeadingThink`）。
+    ///
+    /// ── 为什么与 `parser` 并列、而不是复用 parser ──────────────
+    /// `parser` 把**正文中间**的标签拆成 reasoning delta（任意位置、按模型能力
+    /// 开关）；本字段只处理**开头**那一块、把标签整个扔掉。两者语义不同：
+    /// 一个有 `<think>` 的正文经 parser 会变成 reasoning + 正文两段，经本
+    /// 过滤器则会连标签带内容一起丢掉。**同时开启时 parser 先跑**（它决定
+    /// 内容归属），本过滤器只看它吐出来的 `Content` 段。
+    ///
+    /// None = 该家没开这个开关（默认），此时行为与接入前逐字一致。
+    think_filter: Option<crate::server::core::middleware::think_tags::LeadingThinkFilter>,
     /// usage 取最后一次出现
     pub usage: Option<Value>,
     /// finish_reason 取最后一次非空
@@ -452,12 +463,56 @@ impl Translator {
             } else {
                 None
             },
+            // 默认不开：调用方用 `with_think_strip` 显式启用。
+            think_filter: None,
             usage: None,
             finish_reason: None,
             content: String::new(),
             reasoning: String::new(),
             chunk_count: 0,
         }
+    }
+
+    /// 启用「剥离开头 think 块」（`stripLeadingThink`，per-provider 开关）。
+    ///
+    /// 由转发路径按 `providerOptions` 的判定结果调用一次；不调用 = 保持接入前
+    /// 的行为（逐字透传）。跨 chunk 的尾巴状态由 `Translator` 自己长驻 ——
+    /// 与 `parser` 同一理由（见该字段的说明）。
+    pub fn with_think_strip(mut self, enabled: bool) -> Self {
+        self.think_filter = enabled.then(
+            crate::server::core::middleware::think_tags::LeadingThinkFilter::default,
+        );
+        self
+    }
+
+    /// 把一条 delta 变成**已过 think 过滤**的 JSON（流式下发的唯一出口）。
+    ///
+    /// ── 为什么过滤放在这里，而不是 delta 的产生点 ─────────────────
+    /// `TranslatedDelta::Content` 在 `consume` 里有三处构造点（正文增量、
+    /// 整段正文、拆解器吐出的正文段）。在三处各过滤一遍意味着三份跨 chunk
+    /// 状态 —— 而「`<thi` 与 `nk>` 分两片到达」的尾巴必须**共用同一份**
+    /// 缓冲，否则每处都会把半截标签当正文吐出去。
+    /// 集中到这一个出口后，状态只有 `think_filter` 一份。
+    ///
+    /// ── 只过滤 Content ────────────────────────────────────────
+    /// `Reasoning` 是模型自己的思考通道（Qoder 的拆解器把中间标签送到那里），
+    /// 剥离开头块是「正文里混进了思考」的补救，与 reasoning 通道无关。
+    /// 工具调用同理（`arguments` 里的尖括号是用户/模型的内容）。
+    pub fn delta_json_filtered(&mut self, delta: &TranslatedDelta) -> Value {
+        let filtered;
+        let delta = match (delta, self.think_filter.as_mut()) {
+            (TranslatedDelta::Content(text), Some(filter)) => {
+                let kept = filter.push(text);
+                // 整段被吃掉（开头块还在缓冲里 / 剥完没有剩余）：这一帧不发。
+                if kept.is_empty() {
+                    return Value::Null;
+                }
+                filtered = TranslatedDelta::Content(kept);
+                &filtered
+            }
+            _ => delta,
+        };
+        delta_json(delta)
     }
 
     /// 一个上游 chunk → 若干个「面向客户端的 delta」。
@@ -825,4 +880,50 @@ pub async fn account_context(
     let (record, _) = super::refresh::snapshot(store, region, account_id)?;
     let proxy = super::auth::account_proxy(&record)?;
     Ok(AccountContext { credentials, proxy })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归锁定：`stripLeadingThink` 打开时，正文开头的 `<think>` 块必须剥掉；
+    /// 关着时逐字保留。
+    ///
+    /// 反例（接入前）：Qoder 走自己的 translator，绕过 `ReasoningCoalescer`，
+    /// 这个开关对它**完全不生效** —— 配了也没有任何提示。
+    #[test]
+    fn think_strip_applies_to_content_deltas() {
+        let mut on = Translator::new("r1".into(), "glm-5".into(), false).with_think_strip(true);
+        // 整块在一个 delta 里
+        let payload = on.delta_json_filtered(&TranslatedDelta::Content(
+            "<think>x</think>answer".into(),
+        ));
+        assert_eq!(payload["content"], "answer", "开关开着必须剥掉标签");
+
+        let mut off = Translator::new("r2".into(), "glm-5".into(), false).with_think_strip(false);
+        let payload = off.delta_json_filtered(&TranslatedDelta::Content(
+            "<think>x</think>answer".into(),
+        ));
+        assert_eq!(payload["content"], "<think>x</think>answer", "关着时逐字保留");
+    }
+
+    /// 跨 delta：`<thi` 与 `nk>x</think>answer` 分两片到达，不能漏半截标签。
+    #[test]
+    fn think_strip_survives_a_tag_split_across_deltas() {
+        let mut t = Translator::new("r3".into(), "glm-5".into(), false).with_think_strip(true);
+        let first = t.delta_json_filtered(&TranslatedDelta::Content("<thi".into()));
+        assert!(first.is_null(), "半截标签不能下发: {first}");
+        let second = t.delta_json_filtered(&TranslatedDelta::Content("nk>x</think>answer".into()));
+        assert_eq!(second["content"], "answer", "剥完标签后正文完整");
+    }
+
+    /// 正文中间的标签不动（那是用户内容），reasoning 通道不受影响。
+    #[test]
+    fn think_strip_leaves_inner_tags_and_reasoning_alone() {
+        let mut t = Translator::new("r4".into(), "glm-5".into(), false).with_think_strip(true);
+        let payload = t.delta_json_filtered(&TranslatedDelta::Content("see <think>y</think>".into()));
+        assert_eq!(payload["content"], "see <think>y</think>", "中间标签属于用户内容");
+        let reasoning = t.delta_json_filtered(&TranslatedDelta::Reasoning("<think>z</think>".into()));
+        assert_eq!(reasoning["reasoning_content"], "<think>z</think>", "reasoning 通道不剥");
+    }
 }

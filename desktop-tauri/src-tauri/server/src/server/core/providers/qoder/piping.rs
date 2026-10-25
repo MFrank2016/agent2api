@@ -178,7 +178,12 @@ async fn emit_chunk(
         }
     }
     for delta in &deltas {
-        let frame = translator.chunk_frame(chat::delta_json(delta), None);
+        // 过滤后可能是 Null（整帧被 think 剥离吃掉）——那一帧不发。
+        let payload = translator.delta_json_filtered(delta);
+        if payload.is_null() {
+            continue;
+        }
+        let frame = translator.chunk_frame(payload, None);
         if send_frame(sender, &frame).await.is_err() {
             return false;
         }
@@ -316,7 +321,11 @@ pub(super) async fn drive_stream(
         logging::log("[Qoder]", &format!("❌ {message}"));
         // 失败前先把拆解器缓冲里已确定的内容冲刷出去（用户已经看到的部分不丢）
         for delta in translator.finish() {
-            let frame = translator.chunk_frame(chat::delta_json(&delta), None);
+            let payload = translator.delta_json_filtered(&delta);
+            if payload.is_null() {
+                continue;
+            }
+            let frame = translator.chunk_frame(payload, None);
             if send_frame(&sender, &frame).await.is_err() {
                 return;
             }
@@ -337,7 +346,11 @@ pub(super) async fn drive_stream(
     // 正常收尾：先把拆解器的缓冲冲刷出来，再发 finish 帧
     // （工具调用已按 delta 逐片下发，这里不重复补）
     for delta in translator.finish() {
-        let frame = translator.chunk_frame(chat::delta_json(&delta), None);
+        let payload = translator.delta_json_filtered(&delta);
+        if payload.is_null() {
+            continue;
+        }
+        let frame = translator.chunk_frame(payload, None);
         if send_frame(&sender, &frame).await.is_err() {
             return;
         }

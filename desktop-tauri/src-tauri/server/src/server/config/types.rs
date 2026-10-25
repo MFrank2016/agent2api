@@ -209,17 +209,20 @@ pub const KEY_STRIP_NEWLINE_KEEPALIVE: &str = "stripNewlineKeepalive";
 /// `providerOptions`（`core::provider_options::is_enabled`），本键只提供全局
 /// 默认值。键不存在 = 跟随本键（缺省 false）。
 ///
-/// ── 覆盖面（重要，别以为「通用」就是每家都生效）─────────────────
-/// 本开关挂在**标准 chat SSE 下发链**上（`ReasoningCoalescer` 流式 +
-/// `CompletionAccumulator` 非流式），所以对走那条链的家全部生效。
-/// 三家**不走那条链**（它们各自有 translator / sniffer 把自己的上游格式转成
-/// chat SSE，见 `providers/{qoder,accio,codearts}`），因此本开关对它们
-/// **不生效**：
-///   - `qoder`：它自己那台机器把正文中间的标签转成 reasoning delta，
-///     开头块的处理方式不同（语义不兼容，不能套同一台状态机）；
-///   - `accio` / `codearts`：各有一条自建流，未接 think 剥离。
-/// 要覆盖这三家需要把它们接到统一的下发链上 —— 那是独立的重构，不在本开关
-/// 的范围里。设置页的提示文案必须如实说明这一点，不能让人以为「开了就全生效」。
+/// ── 覆盖面：所有内置家与自定义家都已接通 ────────────────────
+/// 两层实现，语义相同（都复用 `core::middleware::think_tags` 的
+/// `LeadingThinkFilter`，跨帧安全）：
+///   - **标准下发链**（`ReasoningCoalescer` 流式 + `CompletionAccumulator`
+///     非流式）：绝大多数内置家与自定义家走这条；
+///   - **自建 translator / sniffer 的三家**（`qoder` / `accio` / `codearts`）：
+///     它们不经过标准链，各自在自己的唯一出口处接了一次 ——
+///     qoder/accio 在 delta→JSON 的那一步（`delta_json_filtered`），
+///     codearts 在字节级的 `StreamFixer`（`ThinkRestorer`）。
+/// 因此「开了就全生效」现在是成立的。三家自建流的实现见各自模块里
+/// `think_strip` / `with_think_strip` 的说明。
+///
+/// **只剥正文**：`reasoning_content` 通道（模型自己的思考）与工具调用的
+/// `arguments` 一律不动 —— 那不是「正文里混进了思考」这个问题的目标。
 pub const KEY_STRIP_LEADING_THINK: &str = "stripLeadingThink";
 
 /// 机器人校验开关的键（config.json 键，ALTCHA proof-of-work，见 `server::altcha`）。

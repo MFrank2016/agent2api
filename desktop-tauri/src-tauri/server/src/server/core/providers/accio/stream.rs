@@ -264,6 +264,12 @@ pub struct Translator {
     reasoning: String,
     /// 收到过任何工具调用（决定收尾的 finish_reason 是 tool_calls 还是 stop）
     saw_tool_call: bool,
+    /// 剥离响应**开头**的 `<think>…</think>` 块（`stripLeadingThink`）。
+    ///
+    /// 与 Qoder 的 `Translator::think_filter` 同一语义与同一理由：Accio 也走
+    /// 自己的 translator，绕过 `ReasoningCoalescer`，所以那个开关必须在这里
+    /// 单独接一次。None = 没开（默认），行为与接入前逐字一致。
+    think_filter: Option<crate::server::core::middleware::think_tags::LeadingThinkFilter>,
 }
 
 impl Translator {
@@ -279,6 +285,59 @@ impl Translator {
             content: String::new(),
             reasoning: String::new(),
             saw_tool_call: false,
+            think_filter: None,
+        }
+    }
+
+    /// 启用「剥离开头 think 块」（`stripLeadingThink`，per-provider 开关）。
+    pub fn with_think_strip(mut self, enabled: bool) -> Self {
+        self.think_filter = enabled.then(
+            crate::server::core::middleware::think_tags::LeadingThinkFilter::default,
+        );
+        self
+    }
+
+    /// 把一条 delta 变成**已过 think 过滤**的 JSON（流式下发的唯一出口）。
+    ///
+    /// 只过滤 `Content`：`Reasoning` 是模型自己的思考通道，工具调用的
+    /// `arguments` 是用户/模型内容 —— 剥离开头块与它们无关。
+    /// 返回 `Value::Null` = 整帧被吃掉（开头块还在缓冲里，或剥完没剩内容）。
+    pub fn delta_json_filtered(&mut self, delta: &Delta) -> Value {
+        let filtered;
+        let delta = match (delta, self.think_filter.as_mut()) {
+            (Delta::Content(text), Some(filter)) => {
+                let kept = filter.push(text);
+                if kept.is_empty() {
+                    return Value::Null;
+                }
+                filtered = Delta::Content(kept);
+                &filtered
+            }
+            _ => delta,
+        };
+        match delta {
+            Delta::Content(text) => serde_json::json!({ "content": text }),
+            Delta::Reasoning(text) => serde_json::json!({ "reasoning_content": text }),
+            Delta::ToolCall { index, id, name, arguments } => {
+                let mut function = serde_json::Map::new();
+                if let Some(name) = name {
+                    function.insert("name".to_string(), serde_json::Value::String(name.clone()));
+                }
+                if let Some(arguments) = arguments {
+                    function.insert(
+                        "arguments".to_string(),
+                        serde_json::Value::String(arguments.clone()),
+                    );
+                }
+                let mut call = serde_json::Map::new();
+                call.insert("index".to_string(), serde_json::Value::from(*index));
+                if let Some(id) = id {
+                    call.insert("id".to_string(), serde_json::Value::String(id.clone()));
+                }
+                call.insert("type".to_string(), serde_json::Value::String("function".to_string()));
+                call.insert("function".to_string(), serde_json::Value::Object(function));
+                serde_json::json!({ "tool_calls": [serde_json::Value::Object(call)] })
+            }
         }
     }
 
@@ -437,5 +496,51 @@ impl Translator {
 
     pub fn usage(&self) -> Option<Value> {
         self.usage.clone()
+    }
+}
+
+#[cfg(test)]
+mod think_strip_tests {
+    use super::*;
+
+    /// 回归锁定：`stripLeadingThink` 打开时，Content delta 开头的 `<think>` 块
+    /// 必须剥掉；关着时逐字保留。
+    ///
+    /// 反例（接入前）：Accio 走自己的 translator，绕过 `ReasoningCoalescer`，
+    /// 这个开关对它完全不生效 —— 配了也没有任何提示。
+    #[test]
+    fn think_strip_applies_to_content_deltas() {
+        let mut on = Translator::new("r1".into(), "glm-5".into()).with_think_strip(true);
+        let payload = on.delta_json_filtered(&Delta::Content("<think>x</think>answer".into()));
+        assert_eq!(payload["content"], "answer", "开关开着必须剥掉标签");
+
+        let mut off = Translator::new("r2".into(), "glm-5".into()).with_think_strip(false);
+        let payload = off.delta_json_filtered(&Delta::Content("<think>x</think>answer".into()));
+        assert_eq!(payload["content"], "<think>x</think>answer", "关着时逐字保留");
+    }
+
+    /// 跨 delta：`<thi` 与 `nk>x</think>answer` 分两片到达，不能漏半截标签。
+    #[test]
+    fn think_strip_survives_a_tag_split_across_deltas() {
+        let mut t = Translator::new("r3".into(), "glm-5".into()).with_think_strip(true);
+        let first = t.delta_json_filtered(&Delta::Content("<thi".into()));
+        assert!(first.is_null(), "半截标签不能下发: {first}");
+        let second = t.delta_json_filtered(&Delta::Content("nk>x</think>answer".into()));
+        assert_eq!(second["content"], "answer", "剥完标签后正文完整");
+    }
+
+    /// reasoning 与工具调用不受影响（只有正文的开头块是目标）。
+    #[test]
+    fn think_strip_leaves_reasoning_and_tools_alone() {
+        let mut t = Translator::new("r4".into(), "glm-5".into()).with_think_strip(true);
+        let reasoning = t.delta_json_filtered(&Delta::Reasoning("<think>z</think>".into()));
+        assert_eq!(reasoning["reasoning_content"], "<think>z</think>", "reasoning 通道不剥");
+        let call = t.delta_json_filtered(&Delta::ToolCall {
+            index: 0,
+            id: Some("c1".into()),
+            name: Some("f".into()),
+            arguments: Some("{}".into()),
+        });
+        assert_eq!(call["tool_calls"][0]["type"], "function");
     }
 }

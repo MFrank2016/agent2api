@@ -389,7 +389,14 @@ impl ProviderAdapter for CodeArtsAdapter {
             let sniff_telemetry = telemetry.clone();
             // 改过函数名才需要还原响应里的名字；没改过（绝大多数请求）时这个 fixer
             // 全程 idle，一个字节都不碰，走的还是下面那条原样透传
-            let mut fixer = tool_names::StreamFixer::new(restorer);
+            // 剥离开头 think 块：per-provider 覆盖全局（默认关）。
+            // 与改名共用 `StreamFixer` 的事件边界（见 `ThinkRestorer` 的说明）。
+            let strip_think = crate::server::core::provider_options::is_enabled(
+                crate::server::core::providers::kind_id(self.kind()),
+                crate::server::config::KEY_STRIP_LEADING_THINK,
+                crate::server::config::strip_leading_think(),
+            );
+            let mut fixer = tool_names::StreamFixer::new(restorer).with_think_strip(strip_think);
             crate::spawn_task(async move {
                 use futures::StreamExt;
                 let mut sniffer = chat::UsageSniffer::default();

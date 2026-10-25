@@ -211,35 +211,145 @@ impl Restorer {
     }
 }
 
+impl ThinkRestorer {
+    /// 一个 SSE 事件的字节 → 剥离开头 think 块之后的字节。
+    ///
+    /// ── 什么时候必须重新序列化 ──────────────────────────────────
+    /// 只在**真的改动了 content** 时才重新序列化（与 `Restorer::rewrite_event`
+    /// 同一纪律）：重新序列化会吃掉上游的空白形状，而 `[DONE]`、心跳、
+    /// 纯 reasoning 帧本来与我们无关。开头块处理完之后 `filter` 内部已置
+    /// done，`push` 原样返回，这条路径从此零改动。
+    ///
+    /// ── 一次事件里有多条 choice 时 ──────────────────────────────
+    /// 逐条按序过同一个 filter。OpenAI 的 `n>1` 场景下各 choice 是独立的
+    /// 候选，理论上各有自己的开头块；本项目不主动产生多 choice，上游也
+    /// 基本只回一条 —— 用同一个 filter 是「按到达顺序剥一次」的近似，
+    /// 已在注释里写明这个边界。
+    fn rewrite_event(&mut self, event: &[u8]) -> Vec<u8> {
+        let text = String::from_utf8_lossy(event);
+        // 快速排除：没有 content 的帧（reasoning / tool_calls / usage / [DONE]）
+        if !text.contains("\"content\"") {
+            return event.to_vec();
+        }
+        let mut out = Vec::with_capacity(event.len());
+        let mut touched = false;
+        for line in text.split_inclusive('\n') {
+            let body = line.trim_end_matches(['\r', '\n']);
+            let trailing = &line[body.len()..];
+            let Some(payload) = body.strip_prefix("data:") else {
+                out.extend_from_slice(line.as_bytes());
+                continue;
+            };
+            let spaces = payload.len() - payload.trim_start().len();
+            let value_text = payload.trim_start();
+            let rewritten = value_text.parse::<Value>().ok().and_then(|mut value| {
+                let mut changed = false;
+                if let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) {
+                    for choice in choices {
+                        // 先取一份不可变引用读当前值，再写回：`get_mut` 拿到的是
+                        // `&mut Value`，而 `as_str` 要 `&Value`（借用冲突）。
+                        let Some(content) = choice
+                            .get("delta")
+                            .and_then(|delta| delta.get("content"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                        else {
+                            continue;
+                        };
+                        let kept = self.filter.push(&content);
+                        if kept != content {
+                            changed = true;
+                        }
+                        if let Some(delta) = choice.get_mut("delta").and_then(Value::as_object_mut) {
+                            delta.insert("content".to_string(), Value::String(kept));
+                        }
+                    }
+                }
+                changed.then_some(value)
+            });
+            match rewritten {
+                Some(value) => {
+                    out.extend_from_slice(b"data:");
+                    out.extend(std::iter::repeat_n(b' ', spaces));
+                    out.extend_from_slice(value.to_string().as_bytes());
+                    out.extend_from_slice(trailing.as_bytes());
+                    touched = true;
+                }
+                None => out.extend_from_slice(line.as_bytes()),
+            }
+        }
+        if touched { out } else { event.to_vec() }
+    }
+}
+
 /// 把 [`Restorer`] 挂到一条流上的成帧缓冲。
 ///
 /// 上游的 SSE 事件以空行收尾，但一次读到的字节可能停在事件中间 —— 那时必须攥着等下一片，
 /// 否则改名会看漏半条 JSON。没有 restorer 时**完全不缓冲**（原样返回借来的字节）。
 pub struct StreamFixer {
     restorer: Option<Restorer>,
+    /// 剥离开头的 `<think>…</think>` 块（`stripLeadingThink`）。
+    ///
+    /// ── 为什么与 `restorer` 并列、而不是塞进它 ──────────────────
+    /// `Restorer` 是**无状态**的（每帧独立改名），本过滤器要**跨帧**留尾巴
+    /// （`<thi` + `nk>` 分两片到达）。状态类型不同，合并会让 `Restorer`
+    /// 从 `&self` 变成 `&mut self`，牵动它现有的全部调用点。
+    ///
+    /// ── 为什么在事件边界上做 ────────────────────────────────────
+    /// 与改名同理：一次读到的字节可能停在事件中间。按 SSE 事件切分后，
+    /// `data:` 行的 JSON 才能安全解析、改写、重新序列化。
+    think: Option<ThinkRestorer>,
     pending: Vec<u8>,
+}
+
+/// 剥离开头 think 块的字节级重写器（见 [`StreamFixer::think`]）。
+///
+/// 只改 `choices[].delta.content`，且**只在开头块还没处理完时**介入；
+/// 一旦开头块剥完（或确认没有），后续事件原样返回 —— 默认路径零改动。
+pub struct ThinkRestorer {
+    filter: crate::server::core::middleware::think_tags::LeadingThinkFilter,
 }
 
 impl StreamFixer {
     pub fn new(restorer: Option<Restorer>) -> Self {
-        Self { restorer, pending: Vec::new() }
+        Self { restorer, think: None, pending: Vec::new() }
+    }
+
+    /// 启用「剥离开头 think 块」。
+    pub fn with_think_strip(mut self, enabled: bool) -> Self {
+        self.think = enabled.then(|| ThinkRestorer {
+            filter: crate::server::core::middleware::think_tags::LeadingThinkFilter::default(),
+        });
+        self
     }
 
     /// 有没有活要干。`true` 时调用方可以照旧逐字节透传，不必走 [`Self::push`]。
     pub fn idle(&self) -> bool {
-        self.restorer.is_none()
+        self.restorer.is_none() && self.think.is_none()
     }
 
     /// 吃进一段字节，返回现在可以发出去的那部分。
+    ///
+    /// 两类重写器**都在事件边界上**工作：改名（无状态）与 think 剥离
+    /// （跨帧有状态）。两者都关时原样借出字节（零拷贝，与接入前一致）。
     pub fn push<'a>(&mut self, bytes: &'a [u8]) -> Cow<'a, [u8]> {
-        let Some(restorer) = self.restorer.as_ref() else {
+        if self.idle() {
             return Cow::Borrowed(bytes);
-        };
+        }
         self.pending.extend_from_slice(bytes);
         let mut out = Vec::new();
         while let Some(edge) = find_event_end(&self.pending) {
             let event: Vec<u8> = self.pending.drain(..edge).collect();
-            out.extend(restorer.rewrite_event(&event));
+            // 顺序：先改名（它只在命中 tool_calls 时才重新序列化），
+            // 再剥 think（它只看 delta.content）。两步互不影响。
+            let renamed = match self.restorer.as_ref() {
+                Some(restorer) => restorer.rewrite_event(&event),
+                None => event,
+            };
+            out.extend(match self.think.as_mut() {
+                Some(think) => think.rewrite_event(&renamed),
+                None => renamed,
+            });
         }
         if self.pending.len() > MAX_EVENT_BYTES {
             // 一帧长到没边（或上游不用空行收尾）：原样放行，别攥着
@@ -467,6 +577,53 @@ mod name_limit {
             } else {
                 assert_eq!(name, &sent[index], "到线的名字不许被改");
             }
+        }
+    }
+
+    /// 回归锁定：`stripLeadingThink` 打开时，SSE 事件里的开头 `<think>` 块
+    /// 必须剥掉；关着时逐字节保留。
+    ///
+    /// 反例（接入前）：CodeArts 走自己的字节级透传 + `StreamFixer`，绕过
+    /// `ReasoningCoalescer`，这个开关对它完全不生效。
+    #[test]
+    fn think_strip_rewrites_the_content_of_a_stream_event() {
+        let event = b"data: {\"choices\":[{\"delta\":{\"content\":\"<think>x</think>answer\"}}]}\n\n";
+        let mut on = StreamFixer::new(None).with_think_strip(true);
+        let out = on.push(event);
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("\"answer\""), "开关开着必须剥掉标签: {text}");
+        assert!(!text.contains("<think>"), "标签不能残留: {text}");
+
+        let mut off = StreamFixer::new(None).with_think_strip(false);
+        assert_eq!(
+            off.push(event).as_ref(),
+            event,
+            "关着时必须逐字节透传（含上游的空白形状）"
+        );
+    }
+
+    /// 跨事件：标签被切在两个 SSE 事件里，不能漏半截。
+    #[test]
+    fn think_strip_survives_a_tag_split_across_events() {
+        let first = b"data: {\"choices\":[{\"delta\":{\"content\":\"<thi\"}}]}\n\n";
+        let second = b"data: {\"choices\":[{\"delta\":{\"content\":\"nk>x</think>answer\"}}]}\n\n";
+        let mut fixer = StreamFixer::new(None).with_think_strip(true);
+        let out1 = String::from_utf8_lossy(&fixer.push(first)).to_string();
+        assert!(!out1.contains("<thi"), "半截标签不能下发: {out1}");
+        let out2 = String::from_utf8_lossy(&fixer.push(second)).to_string();
+        assert!(out2.contains("\"answer\""), "剥完标签后正文完整: {out2}");
+        assert!(!out2.contains("</think>"), "闭标签不能残留: {out2}");
+    }
+
+    /// 没有 content 的帧（reasoning / usage / [DONE]）一律原样。
+    #[test]
+    fn think_strip_leaves_non_content_frames_alone() {
+        let mut fixer = StreamFixer::new(None).with_think_strip(true);
+        for event in [
+            &b"data: [DONE]\n\n"[..],
+            &b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"<think>z</think>\"}}]}\n\n"[..],
+        ] {
+            assert_eq!(fixer.push(event).as_ref(), event, "非 content 帧必须逐字节原样");
         }
     }
 }
