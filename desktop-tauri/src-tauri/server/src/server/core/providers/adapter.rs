@@ -1200,6 +1200,10 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // （见 `chatglm/mod.rs` 与 `protocol::chatglm_stream` 的模块头）。
         // 它是本项目**唯一**「访客免登录即可用」的一家（`guest/access` 换证）。
         ProviderKind::Chatglm => &super::chatglm::CHATGLM_ADAPTER,
+        // Tabbit 的两个地区是两个 provider、两个实例（同一份实现按地区参数化，
+        // 见 `tabbit::region::Region` 与 `tabbit::adapter` 的模块头）。
+        ProviderKind::Tabbit => &super::tabbit::adapter::TABBIT_ADAPTER,
+        ProviderKind::TabbitIntl => &super::tabbit::adapter::TABBIT_INTL_ADAPTER,
     }
 }
 
@@ -1309,6 +1313,11 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // 且有远程目录（`operation/detail?tag=available_models`）—— 必须在
         // 列表里，否则目录刷新循环不会问它（与 Trae / Loomy / Kuku 同一理由）。
         ProviderKind::Chatglm,
+        // Tabbit 的两个地区各算一家：适配器已接线（账号 / 目录 / 会话转发 /
+        // 余额 / 网页登录），且有远程目录（`GET /proxy/v1/model_config/models`）
+        // —— 必须在列表里，否则目录刷新循环不会问它。
+        ProviderKind::Tabbit,
+        ProviderKind::TabbitIntl,
     ]
 }
 

@@ -23,7 +23,7 @@ Agent2API brings the signed-in accounts of several AI desktop clients together b
 ## ✨ Key Features
 
 - 🔌 **OpenAI-compatible** — point your client at the gateway with a custom `base_url`; Chat, Responses and Messages protocols are all supported
-- 🏪 **20 built-in providers (27 editions)** — WorkBuddy, Raccoon, CatPaw, Qoder, Trae and more work out of the box, plus custom providers via passthrough
+- 🏪 **22 built-in providers (29 editions)** — WorkBuddy, Raccoon, CatPaw, Qoder, Trae and more work out of the box, plus custom providers via passthrough
 - 🔁 **Credentials that renew themselves** — tokens refresh before they expire, near-expiry ones can be renewed in bulk, and the model catalog stays current
 - 🪂 **Multi-account rotation** — accounts queue by priority, a 429 moves on to the next account, and rate-limited accounts are skipped instead of stalling
 - 🛡️ **Egress proxies** — give each account its own exit IP; outbound fingerprints imitate the official clients
@@ -81,11 +81,14 @@ Reverse-proxy capabilities at a glance (✓ supported · ✗ not supported · �
 | Zhipu Qingyan | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Nous | ✓ | ✓ | ✓ | — | — | — |
 | LobsterAI | ✓ | ✓ | ✓ | ✓ | ✓ | — |
+| Tabbit (CN / Intl) | ✓ | ✗ | ✓ | ✓ | — | — |
 | Custom providers | ✓ | — | ✓ | — | — | — |
 
 > Note: in Model list, ✓ means automatic online fetching is supported (some platforms also keep a built-in static table as a fallback); ZCode only has a built-in static table. ✗ in Token auto-refresh means the platform has no usable refresh flow (the account keeps working while its credentials are valid).
 >
 > **Zhipu Qingyan** is the only provider here that supports a **guest mode**: no sign-in required — one click gets you a credential that works for chat right away (the free quota is issued by the upstream per device). The catch is that a guest account has no points system — the "Balance" / "Sign-in" / "Claim" columns above, plus the **task center's newbie and daily tasks**, apply only to **signed-in accounts** (paste a token or import the desktop client sign-in state); guests are skipped honestly.
+
+> **Tabbit**: text-only chat, no tool calling; the Cookie/JWT expires in about 7 days with no refresh endpoint; premium models require the account to be set as the default browser and `defaultBrowser: true` in the pasted JSON; the international edition needs a proxy from mainland China.
 
 `/v1/chat/completions`, `/v1/responses`, `/v1/messages` (incl. `count_tokens`) and `/v1/models` behave identically for every platform; model mapping, the global priority queue, 429 fallback, egress proxying, outbound fingerprint redaction and request reporting apply to all platforms alike.
 

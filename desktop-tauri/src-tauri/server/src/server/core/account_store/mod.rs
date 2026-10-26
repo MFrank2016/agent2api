@@ -128,6 +128,7 @@ pub mod store_crud;
 pub mod store_order;
 pub mod store_util;
 pub mod store_view;
+pub mod tabbit_accounts;
 pub mod trae_accounts;
 pub mod workbuddy_import;
 pub mod zcode_accounts;

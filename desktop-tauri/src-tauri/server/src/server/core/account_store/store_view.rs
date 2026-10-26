@@ -389,6 +389,13 @@ impl AccountStore {
             // tokenTail / tokenExpireAt（续期是否在工作可被肉眼校验，见
             // `orcaterm_accounts.rs`）
             self.to_orcaterm_public_account(record)
+        } else if record.provider() == super::tabbit_accounts::TABBIT_PROVIDER_ID
+            || record.provider() == super::tabbit_accounts::TABBIT_INTL_PROVIDER_ID
+        {
+            // Tabbit 两个地区（`tabbit` / `tabbit-intl`）共用这一份公开形态：
+            // 字段两地完全一致（uid / loginName / tokenTail），差别只在站点域名
+            // （那是转发与凭证层的事）
+            self.to_tabbit_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)

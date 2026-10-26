@@ -171,6 +171,11 @@ pub mod qoder;
 pub mod raccoon;
 pub mod refresh_flight;
 pub mod router;
+/// 有状态 provider（Tabbit 等）共用的跨请求会话设施。
+pub mod stateful_session;
+/// Tabbit（浏览器 AI 助手）：粘贴 Cookie / 网页登录 + HMAC 签名 + 建会话 → SSE。
+/// 国内版（`tabbit`）/ 国际版（`tabbit-intl`）是两家 provider，同一份实现按地区参数化。
+pub mod tabbit;
 /// Trae（字节 AI IDE）。适配实现在 `trae/`：登录 / 凭据 / 目录 / 会话式转发
 /// 已接通（只支持国内 SOLO 通道；国际版是另一套协议，将来另立 kind），见
 /// `trae/mod.rs` 的模块头。
@@ -543,6 +548,12 @@ pub enum ProviderKind {
     /// 智谱清言这一家只有 `chatglm.cn` 一个站点（测试域 `test.chatglm.cn`
     /// 是**环境**不是地区，靠 `CHATGLM_BASE_URL` 覆盖即可）。
     Chatglm,
+    /// Tabbit **国内版**（`tabbit`）：粘贴 Cookie / 网页登录 + HMAC 签名 +
+    /// 建会话 → SSE；`is_stateful()` 为 true（会话是请求内的）。
+    Tabbit,
+    /// Tabbit **国际版**（`tabbit-intl`，`web.tabbit.ai`）：同一套协议、不同站点。
+    /// 国内网络直连固定 403，账号未显式配代理时跟随系统代理。
+    TabbitIntl,
 }
 
 /// 一个提供商的静态元数据。
@@ -651,6 +662,9 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // 大面积同名 —— 靠末位让同名模型优先归已有各家（那些是开放平台账号，
     // 配额与稳定性都比本家的消费级网页端好）。
     ProviderMeta { id: "chatglm", label: "智谱清言" },
+    // Tabbit 两个地区相邻排列（国内版在前），排在末尾（新家按约定追加在末尾）。
+    ProviderMeta { id: "tabbit", label: "Tabbit 国内版" },
+    ProviderMeta { id: "tabbit-intl", label: "Tabbit 国际版" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -738,6 +752,8 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "lobsterai" => Some(ProviderKind::LobsterAi),
         "orcaterm" => Some(ProviderKind::OrcaTerm),
         "chatglm" => Some(ProviderKind::Chatglm),
+        "tabbit" => Some(ProviderKind::Tabbit),
+        "tabbit-intl" => Some(ProviderKind::TabbitIntl),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -783,6 +799,8 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::LobsterAi => "lobsterai",
         ProviderKind::OrcaTerm => "orcaterm",
         ProviderKind::Chatglm => "chatglm",
+        ProviderKind::Tabbit => "tabbit",
+        ProviderKind::TabbitIntl => "tabbit-intl",
     }
 }
 

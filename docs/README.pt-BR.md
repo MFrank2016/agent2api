@@ -23,7 +23,7 @@ O Agent2API reúne as contas já conectadas de vários clientes de IA em um úni
 ## ✨ Principais recursos
 
 - 🔌 **Compatível com OpenAI** — aponte o `base_url` do seu cliente para o gateway: Chat, Responses e Messages são todos suportados
-- 🏪 **20 provedores integrados (27 edições)** — WorkBuddy, Raccoon, CatPaw, Qoder, Trae e outros funcionam de imediato, além de provedores personalizados via passthrough
+- 🏪 **22 provedores integrados (29 edições)** — WorkBuddy, Raccoon, CatPaw, Qoder, Trae e outros funcionam de imediato, além de provedores personalizados via passthrough
 - 🔁 **Credenciais que se renovam sozinhas** — tokens são renovados antes de expirar, os próximos do vencimento podem ser atualizados em lote e o catálogo de modelos se mantém atual
 - 🪂 **Rotação de várias contas** — contas entram na fila por prioridade, um 429 passa para a próxima e contas em cooldown são puladas sem espera
 - 🛡️ **Proxies de saída** — cada conta pode ter seu próprio IP de saída; o fingerprint enviado imita o cliente oficial
@@ -81,11 +81,14 @@ Panorama dos recursos de proxy reverso por plataforma (✓ suportado · ✗ não
 | Zhipu Qingyan | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Nous | ✓ | ✓ | ✓ | — | — | — |
 | LobsterAI | ✓ | ✓ | ✓ | ✓ | ✓ | — |
+| Tabbit (China / global) | ✓ | ✗ | ✓ | ✓ | — | — |
 | Provedores personalizados | ✓ | — | ✓ | — | — | — |
 
 > Nota: em Lista de modelos, ✓ significa busca automática online (algumas plataformas também mantêm uma tabela estática interna como fallback); o ZCode tem apenas a tabela estática interna. ✗ em Renovação automática do token significa que a plataforma não tem um fluxo de renovação disponível (a conta continua funcionando enquanto as credenciais forem válidas). O check-in do Qoder é somente na versão da China.
 >
 > O **Zhipu Qingyan** é o único provedor aqui que suporta um **modo visitante**: sem login — um clique obtém uma credencial que já funciona para conversar (a cota gratuita é emitida pela origem por dispositivo). A contrapartida é que uma conta de visitante não tem sistema de pontos — as colunas "Saldo" / "Check-in" / "Resgate" acima, além das **tarefas de novato e diárias do centro de tarefas**, valem apenas para **contas conectadas** (cole um token ou importe o estado de login do cliente desktop); visitantes são ignorados de forma transparente.
+
+> **Tabbit**: apenas conversa de texto, sem chamadas de ferramentas; o Cookie/JWT expira em cerca de 7 dias sem endpoint de renovação; modelos premium exigem a conta definida como navegador padrão e `defaultBrowser: true` no JSON colado; a edição internacional precisa de proxy na China continental.
 
 `/v1/chat/completions`, `/v1/responses`, `/v1/messages` (incl. `count_tokens`) e `/v1/models` funcionam igual para todas as plataformas; mapeamento de modelos, fila global de prioridade, fallback em 429, proxy de saída, mascaramento de impressão digital de saída e relatórios de requisições valem para todas as plataformas.
 
