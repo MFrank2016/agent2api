@@ -4,7 +4,7 @@
 - 分支：`migrate/plugin-arch`
 - 基线：合并提交 `ecc3aded`（父提交 `413b92c4` + `6f47f7f8`）
 - 环境：rustc 1.99.0、Node v26.8.1、Linux
-- 结论：**9 PASS / 1 FAIL / 1 BLOCKED**（逐项见下表；FAIL 为插件流式 think 剥离回归）
+- 结论：**10 PASS / 1 BLOCKED**（逐项见下表；原 FAIL 的插件流式 think 剥离已由 Task 7.3a 修复）
 
 ## 总表
 
@@ -12,7 +12,7 @@
 | ---: | --- | --- | --- |
 | 1 | 代理轮换：每请求换 IP、失败换号、`no_reuse` | PASS（代码路径 + 单测；未做真实出口 IP 实测） | `core/proxy_rotate.rs:200`、`account_store/store.rs:723`、`egress.rs:274-282`、`upstream/provider_loop.rs:287,2238-2295`；`egress_rotation` 2 条单测通过 |
 | 2 | TLS 指纹：网关 + 插件出站一致 | PASS | 网关 `egress.rs:232` 与插件 `crates/providers/src/egress.rs:142` 同一 `AGENT2API_TLS_EMULATION` 档位、同样只搬 TLS/HTTP1/HTTP2 选项；`egress::tests::emulation_does_not_inject_browser_headers` 通过；`docs/tls-fingerprint.md` 有真实 JA4/H2 实测 |
-| 3 | think 剥离：Qoder / Accio / CodeArts | **FAIL（插件流式路径）**；非流式 PASS | 网关通用剥离与单测通过；但插件流式 `plugin_host/rpc.rs:1331` 直接返回 `RpcStream`，`plugin_host/stream.rs` 只嗅探 usage；插件仓库无 `LeadingThinkFilter` / `with_think_strip`（`rg` 无命中），Accio / CodeArts 无开头 think 过滤，Qoder 仅把标签拆成 reasoning |
+| 3 | think 剥离：Qoder / Accio / CodeArts | PASS（流式 + 非流式） | 网关在插件流式路径按 `stripLeadingThink` 套 `LeadingThinkStream`（`plugin_host/rpc.rs:1299-1357`、`plugin_host/stream.rs:132-215`）；非流式继续走 `assembled_for_plugin`；`plugin_stream_strips_leading_think_before_visible_text` / `..._split_across_chunks` 通过，网关全量 400 passed |
 | 4 | 逐家开关：三态 + TOML 注释保留 | PASS（TOML 为代码路径验证，无专门回归测试） | `core/provider_options.rs:93,107,132,194`、`api/provider_options.rs:168,291`、`core/agents/toml_editing.rs:13-69`；相关 11 条单测通过 |
 | 5 | Key 配额：多规则、30 天档、非常规窗口 | PASS | `key_quota::tests::all_rules_must_pass`（daily + `fixed:2592000`）、`api_keys::tests::rules_round_trip_through_the_stored_shape`、`dirty_rules_are_skipped_not_fatal`；网关全量通过 |
 | 6 | 首字节保活：chat / responses / messages | PASS | `api/keepalive.rs` 4 条单测通过；`api/chat.rs:242`、`api/protocol.rs:268`（responses）、`api/protocol.rs:499`（messages）三入口均接 `keepalive::race` + `KeepAliveStream` |
@@ -51,9 +51,9 @@ server::core::egress_rotation::tests::least_latency_prefers_the_fast_member_afte
 
 未单独对插件进程做 peet.ws 实测，但插件与网关的 `apply_emulation` 代码逐字同构。
 
-## 3. think 剥离（FAIL）
+## 3. think 剥离（PASS，Task 7.3a 修复 R41）
 
-通过的部分：
+网关通用剥离（非流式）：
 
 ```text
 server::core::middleware::think_tags::tests::strip_only_affects_leading_block ... ok
@@ -63,16 +63,21 @@ server::core::upstream::sse::tests::a_plugin_without_the_capability_still_uses_c
 server::api::think_strip::tests::put_then_get_round_trips_the_switch ... ok
 ```
 
-缺口（插件流式）：
+插件流式路径（原缺口，已修复）：
 
-- `core/plugin_host/rpc.rs:1304` 只在**非流式**聚合路径用 `FramePolicy::assembled(... strip_leading_think ...)`。
-- `core/plugin_host/rpc.rs:1331` 流式直接 `ForwardOutcome::Stream { stream: Box::new(source) }`；`core/plugin_host/stream.rs` 的 `RpcStream` 只做背压与 usage 嗅探，没有 think 过滤。
-- 插件仓库 `/tmp/Agent2Providers` 中 `rg "LeadingThinkFilter|with_think_strip"` **无命中**：
-  - Qoder `providers/qoder/stream.rs:205` 的 `ThinkingParser` 把正文标签拆成 reasoning，不是「剥掉开头块」；
-  - Accio `providers/accio/stream.rs` 只有 reasoning 聚合，无标签过滤；
-  - CodeArts `providers/codearts/chat.rs` 只有历史 reasoning 清理，无开头 think 过滤。
+- `core/plugin_host/rpc.rs:1299-1318` 把 `providerOptions.stripLeadingThink`（逐家覆盖全局键）抽成一个开关，流式与非流式共用。
+- `core/plugin_host/rpc.rs:1341-1357` 流式分支在开关打开时用 `LeadingThinkStream` 包住 `RpcStream`；关着时原样下发，字节与接入前一致。
+- `core/plugin_host/stream.rs:132-215` 的 `LeadingThinkStream` 复用核心 `ReasoningCoalescer` 的 SSE 逐行解析与 `LeadingThinkFilter`，但显式关闭 reasoning 增量合并，避免开启剥离时顺带改变插件的 reasoning 分帧。
+- 插件仓库当前没有 `LeadingThinkFilter` / `with_think_strip`，因此**不会二次剥离**；插件协议也没有 `capabilities.think_strip`，所有插件都按「未申报」处理。等协议加上该能力位后，流式分支应改为 `strip_leading_think && !capabilities.think_strip`，与 `FramePolicy::assembled_for_plugin` 的 R21 语义对齐（迁移说明已写在两处代码注释里）。
 
-因此 `stripLeadingThink` 对 Qoder / Accio / CodeArts 的**流式**响应不再生效；非流式（网关聚合）仍生效。这不是账号阻塞问题，静态代码路径即可复现。
+回归用例：
+
+```text
+server::core::plugin_host::stream::tests::plugin_stream_strips_leading_think_before_visible_text ... ok
+server::core::plugin_host::stream::tests::plugin_stream_strips_leading_think_split_across_chunks ... ok
+```
+
+两条用例分别覆盖单帧 `<think>secret</think>visible` 与跨 chunk `<thi` + `nk>...`；断言拼接后的正文以 `visible` 开头、且无标签残留。
 
 ## 4. 逐家开关三态 + TOML 注释保留
 
@@ -235,7 +240,7 @@ node scripts/verify-plugin-host.mjs \
 
 ## 风险与建议
 
-1. **P0 回归：插件流式 think 剥离失效**。建议在插件侧为 Qoder / Accio / CodeArts 接 `LeadingThinkFilter`，或在网关 `RpcStream` 上按 `providerOptions.stripLeadingThink` 做字节级过滤；补三家流式回归用例。
+1. ~~P0 回归：插件流式 think 剥离失效~~ **已修复（Task 7.3a）**：网关在插件流式路径按 `stripLeadingThink` 套 `LeadingThinkStream`，并补两条回归用例；后续等插件协议支持 `capabilities.think_strip` 时切换为能力位判断，避免二次剥离。
 2. 代理轮换缺真实双出口 IP 实测；建议发布验收补 mock 代理端到端。
 3. TOML 注释保留只有代码路径证据，无专门回归用例。
 4. Tabbit / Nous / LobsterAI / Trae 的真实登录与转发仍缺账号；发布前需在有账号环境复验。

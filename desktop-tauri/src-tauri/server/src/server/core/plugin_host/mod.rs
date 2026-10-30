@@ -111,7 +111,7 @@ pub fn clear_providers() {
     rpc_cache::clear_all();
 }
 
-pub(crate) use stream::RpcStream;
+pub(crate) use stream::{LeadingThinkStream, RpcStream};
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};

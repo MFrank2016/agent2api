@@ -336,6 +336,9 @@ pub struct ReasoningCoalescer {
     strip_newline_chunks: bool,
     /// 剥离开头 think 块（见 `core::middleware::think_tags`）。默认关。
     strip_leading_think: bool,
+    /// 合并 `reasoning_content` 增量（默认开）。插件流式路径只借用本状态机的
+    /// 开头 think 剥离，不想顺带改变插件的 reasoning 分帧，所以可关掉。
+    coalesce_reasoning: bool,
     /// 开头 think 块的跨帧状态（只在 `strip_leading_think` 打开时被使用）
     think_filter: LeadingThinkFilter,
 }
@@ -356,6 +359,7 @@ impl ReasoningCoalescer {
             rewrite: None,
             strip_newline_chunks: false,
             strip_leading_think: false,
+            coalesce_reasoning: true,
             think_filter: LeadingThinkFilter::default(),
         }
     }
@@ -371,6 +375,15 @@ impl ReasoningCoalescer {
         self.rewrite = policy.rewrite;
         self.strip_newline_chunks = policy.strip_newline_chunks;
         self.strip_leading_think = policy.strip_leading_think && !policy.think_strip;
+        self
+    }
+
+    /// 关闭 reasoning 增量合并（只保留其它帧策略）。
+    ///
+    /// 插件流式路径（R41）只借用本状态机的开头 think 剥离；插件原本是逐帧
+    /// 透传，不能被顺带改成 60 字合并粒度。
+    pub fn without_reasoning_coalescing(mut self) -> Self {
+        self.coalesce_reasoning = false;
         self
     }
 
@@ -516,7 +529,8 @@ impl ReasoningCoalescer {
         // 于是这一帧被整帧吞掉、连 `[DONE]` 处的冲刷都补不回来。
         // 客户端因此永远等不到 stop reason（Qoder 直接判 incomplete_stream
         // 且因「已吐过 tool_call 参数」拒绝重试）：见 `carries_terminal_signal`。
-        if reasoning.is_some() && !other_delta && !carries_terminal_signal(&chunk) {
+        // `coalesce_reasoning` 关掉时（插件流式路径）reasoning 帧原样透传。
+        if self.coalesce_reasoning && reasoning.is_some() && !other_delta && !carries_terminal_signal(&chunk) {
             if let Some(text) = reasoning {
                 self.acc.push_str(&text);
             }

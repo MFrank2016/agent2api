@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use agent2api_provider_protocol as proto;
 use axum::http::HeaderMap;
+use bytes::Bytes;
 use serde_json::Value;
 
 use crate::server::core::account_store::AccountStore;
@@ -1295,13 +1296,25 @@ impl RpcAdapter {
             telemetry.clone(),
         );
 
+        // 非流式与流式共用同一个开关：`providerOptions.stripLeadingThink` 逐家
+        // 覆盖全局键。插件协议目前没有 `capabilities.think_strip`，所以所有
+        // 插件都按「未申报」处理，由网关统一剥离（见下面的迁移说明）。
+        let strip_leading_think = crate::server::core::provider_options::is_enabled(
+            self.id,
+            crate::server::config::KEY_STRIP_LEADING_THINK,
+            crate::server::config::strip_leading_think(),
+        );
+
         // ── 非流式：网关把帧聚合掉（插件恒按 stream:true 推）───────────
         // 客户端要不要流式是**网关**的事：非流式时网关自己聚合（与内置家
         // 同一份 `aggregate_frame_stream`）。插件作者因此只写一条路径，
         // 不必再实现一份「聚合成本」—— 两份规则迟早分叉，而症状是
         // 「流式与非流式的正文不一样」，极难排查。
         if !stream {
-            let policy = crate::server::core::upstream::sse::FramePolicy::assembled(
+            // 用 `assembled_for_plugin` 而不是 `assembled`：`think_strip` 目前
+            // 恒为 false（协议无此能力位），但装配入口已经预留了「插件已剥过
+            // 就不再剥」的 R21 语义。
+            let policy = crate::server::core::upstream::sse::FramePolicy::assembled_for_plugin(
                 self.capabilities
                     .sse_model_rewrite
                     .then(|| crate::server::core::upstream::sse::ModelRewrite {
@@ -1309,11 +1322,8 @@ impl RpcAdapter {
                     }),
                 self.capabilities.sse_strip_newline_chunks,
                 crate::server::config::strip_newline_keepalive(),
-                crate::server::core::provider_options::is_enabled(
-                    self.id,
-                    crate::server::config::KEY_STRIP_LEADING_THINK,
-                    crate::server::config::strip_leading_think(),
-                ),
+                strip_leading_think,
+                false,
             );
             let aggregated = crate::server::core::upstream::aggregate::aggregate_frame_stream(
                 Box::pin(source),
@@ -1328,7 +1338,22 @@ impl RpcAdapter {
             };
         }
 
-        Ok(ForwardOutcome::Stream { status, stream: Box::new(source) })
+        // ── 流式：R41 回归修复 ─────────────────────────────────────
+        // 插件流式路径原先直接把 `RpcStream` 交给客户端，绕过了核心的
+        // `LeadingThinkFilter`（非流式走聚合器所以不受影响）。开关打开时
+        // 在这里套上跨帧剥离；关着时原样下发，字节与接入前一致。
+        //
+        // 迁移说明：协议目前没有 `capabilities.think_strip`，所有插件都按
+        // 「未申报」处理。等插件协议加上该能力位后，这里要改成
+        // `strip_leading_think && !capabilities.think_strip`，否则插件已剥过
+        // 的正文会被二次剥离（与 `assembled_for_plugin` 的 R21 语义对齐）。
+        let stream: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin> =
+            if strip_leading_think {
+                Box::new(super::LeadingThinkStream::new(source))
+            } else {
+                Box::new(source)
+            };
+        Ok(ForwardOutcome::Stream { status, stream })
     }
 }
 

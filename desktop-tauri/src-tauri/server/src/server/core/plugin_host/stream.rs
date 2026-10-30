@@ -30,6 +30,7 @@ use serde_json::{json, Value};
 
 use agent2api_provider_protocol as proto;
 
+use crate::server::core::upstream::sse::{FramePolicy, ReasoningCoalescer};
 use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::logging;
 
@@ -125,6 +126,90 @@ impl UsageSniffer {
         let Ok(chunk) = serde_json::from_slice::<Value>(&self.data) else { return };
         if let Some(usage) = chunk.get("usage").filter(|value| value.is_object()) {
             telemetry.report_usage(usage);
+        }
+    }
+}
+
+/// 给插件 SSE 字节流套上「剥离开头 think 块」的跨帧过滤器（R41）。
+///
+/// 插件流式路径原本直接把 `RpcStream` 的字节交给客户端，绕过了核心的
+/// `LeadingThinkFilter`；非流式路径走聚合器所以不受影响。这里复用
+/// [`ReasoningCoalescer`] 的 SSE 逐行解析与跨帧剥离，但**关掉 reasoning
+/// 增量合并**——插件原本逐帧透传，不能因为开 `stripLeadingThink` 就顺带
+/// 改变 reasoning 的分帧粒度。
+///
+/// 只在 `stripLeadingThink` 打开时套这一层；关着时 `RpcStream` 原样下发，
+/// 与接入前逐字节一致。
+///
+/// ── 未来能力位 ────────────────────────────────────────────
+/// 目前协议没有 `capabilities.think_strip`，所以所有插件都按「未申报」处理，
+/// 由网关统一剥离。等协议加上该能力位后，这里应改成
+/// `strip_leading_think && !capabilities.think_strip`，避免插件已剥过时二次
+/// 剥离（与 `FramePolicy::assembled_for_plugin` 的 R21 语义一致）。
+pub(crate) struct LeadingThinkStream<S> {
+    inner: S,
+    coalescer: ReasoningCoalescer,
+    pending: VecDeque<Bytes>,
+    upstream_done: bool,
+    pending_error: Option<std::io::Error>,
+}
+
+impl<S> LeadingThinkStream<S> {
+    pub(crate) fn new(inner: S) -> Self {
+        Self {
+            inner,
+            coalescer: ReasoningCoalescer::new()
+                .without_reasoning_coalescing()
+                .with_policy(FramePolicy {
+                    strip_leading_think: true,
+                    ..FramePolicy::default()
+                }),
+            pending: VecDeque::new(),
+            upstream_done: false,
+            pending_error: None,
+        }
+    }
+}
+
+impl<S> Stream for LeadingThinkStream<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        loop {
+            if let Some(frame) = this.pending.pop_front() {
+                return Poll::Ready(Some(Ok(frame)));
+            }
+            if let Some(error) = this.pending_error.take() {
+                return Poll::Ready(Some(Err(error)));
+            }
+            if this.upstream_done {
+                return Poll::Ready(None);
+            }
+            match Pin::new(&mut this.inner).poll_next(context) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    this.upstream_done = true;
+                    for frame in this.coalescer.finish() {
+                        this.pending.push_back(frame);
+                    }
+                }
+                Poll::Ready(Some(Ok(bytes))) => {
+                    for frame in this.coalescer.push(&bytes) {
+                        this.pending.push_back(frame);
+                    }
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    this.upstream_done = true;
+                    for frame in this.coalescer.finish() {
+                        this.pending.push_back(frame);
+                    }
+                    this.pending_error = Some(error);
+                }
+            }
         }
     }
 }
@@ -269,5 +354,83 @@ impl Drop for RpcStream {
             let id = self.id;
             tokio::spawn(async move { host.abort(id).await });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+    use serde_json::json;
+
+    fn sse(delta: Value) -> String {
+        format!(
+            "data: {}\n\n",
+            json!({
+                "id": "c1",
+                "model": "m",
+                "created": 1,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
+            })
+        )
+    }
+
+    fn content_of(frame: &str) -> Option<String> {
+        let data = frame.strip_prefix("data: ")?.trim();
+        let value: Value = serde_json::from_str(data).ok()?;
+        value
+            .get("choices")?
+            .get(0)?
+            .get("delta")?
+            .get("content")?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    async fn collect(
+        stream: LeadingThinkStream<impl Stream<Item = Result<Bytes, std::io::Error>> + Unpin>,
+    ) -> String {
+        let mut out = String::new();
+        let mut stream = stream;
+        while let Some(item) = stream.next().await {
+            out.push_str(&String::from_utf8_lossy(&item.expect("插件流不应报错")));
+        }
+        out
+    }
+
+    fn contents(frames: &str) -> String {
+        frames.split("\n\n").filter_map(content_of).collect()
+    }
+
+    /// R41 回归：插件流式路径必须剥掉开头的 think 块。
+    #[tokio::test]
+    async fn plugin_stream_strips_leading_think_before_visible_text() {
+        let input = vec![
+            Ok::<_, std::io::Error>(Bytes::from(sse(
+                json!({ "content": "<think>secret</think>visible" }),
+            ))),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        let out = collect(LeadingThinkStream::new(futures::stream::iter(input))).await;
+        let text = contents(&out);
+        assert_eq!(text, "visible", "开头 think 块必须被剥掉: {out}");
+        assert!(text.starts_with("visible"));
+        assert!(!out.contains("<think>"), "不能有标签残留: {out}");
+    }
+
+    /// 跨帧：标签被拆到两个 chunk 里也必须剥干净（半截标签不能漏出去）。
+    #[tokio::test]
+    async fn plugin_stream_strips_leading_think_split_across_chunks() {
+        let input = vec![
+            Ok::<_, std::io::Error>(Bytes::from(sse(json!({ "content": "<thi" })))),
+            Ok(Bytes::from(sse(
+                json!({ "content": "nk>secret</think>visible" }),
+            ))),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        let out = collect(LeadingThinkStream::new(futures::stream::iter(input))).await;
+        let text = contents(&out);
+        assert_eq!(text, "visible", "跨帧标签也必须剥干净: {out}");
+        assert!(!out.contains("<thi"), "半截标签不能漏出去: {out}");
     }
 }
