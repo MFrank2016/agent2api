@@ -83,6 +83,16 @@ RUN mkdir -p src-tauri/server/src/bin src-tauri/src \
 RUN /build/cargo-build.sh
 
 COPY desktop-tauri/src-tauri/server/src src-tauri/server/src
+# ── 为什么构建阶段也要 ui/ ──────────────────────────────────
+# `server/src/server/api/plugin_theme.rs` 用 `include_str!` /
+# `include_bytes!` 把几份静态资源编进二进制（宿主设计令牌、组件库产物、
+# 提供商图标），路径是相对该源码文件往上五层 —— 即 `desktop-tauri/ui/`。
+# 只 COPY `server/src` 时那些文件不存在，编译直接失败：
+#   error: couldn't read `.../ui/css/tokens.css`: No such file or directory
+#
+# 放在这一层而不是桩依赖层：这些文件与源码一起变，缓存失效的时机一致；
+# 放进桩层会让「只改了一行 Rust」也把整棵依赖树重编一遍。
+COPY desktop-tauri/ui ui
 RUN cd src-tauri \
     && find server/src -type f -exec touch {} + \
     && /build/cargo-build.sh
@@ -120,8 +130,16 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
+# 非 root 运行：自更新要在 /usr/local/bin 与 /app 下创建暂存/备份并原子改名，
+# 所以这些运行时路径必须归 65532 所有；/data 预建好，命名卷初始化时会继承
+# 这个属主（bind mount 则要求宿主目录同属主）。
+RUN groupadd --gid 65532 agent2api \
+    && useradd --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin agent2api \
+    && mkdir -p /data
+
 COPY --from=builder /build/agent2api-server /usr/local/bin/agent2api-server
 COPY desktop-tauri/ui /app/ui
+RUN chown -R 65532:65532 /app /usr/local/bin /data
 
 # 容器内的默认形态：全网卡监听 + 数据落卷 + 自托管面板。
 # 鉴权：面板需要管理员（登录页注册或 env 预置）；未配置任何 API Key 时
@@ -130,8 +148,9 @@ COPY desktop-tauri/ui /app/ui
 # AGENT2API_SELF_UPDATE：允许面板在容器内原地更新 —— 校验 sha256 后替换
 # /usr/local/bin 下的可执行文件与 /app/ui 下的界面文件，再让进程优雅退出、
 # 由 restart 策略拉起**同一个容器**（可写层保留，刚换上去的版本随之生效）。
-# 容器以 root 运行、可写层可写，这条路才成立；裸机 / systemd 部署不要设这个
-# 变量（那里退出进程等于把服务停掉，见 core/update/selfupdate.rs 的模块头）。
+# 镜像以非 root（65532:65532）运行，/usr/local/bin 与 /app 已归该用户所有，
+# 可写层里的暂存与原子改名因此成立；裸机 / systemd 部署不要设这个变量（那里
+# 退出进程等于把服务停掉，见 core/update/selfupdate.rs 的模块头）。
 # 想关掉容器内的更新入口（例如自行管理镜像版本），把它设成 0 即可。
 ENV AGENT2API_HOST=0.0.0.0 \
     AGENT2API_PROXY_HOME=/data \
@@ -143,4 +162,5 @@ EXPOSE 3065
 WORKDIR /app
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${AGENT2API_PROXY_PORT:-3065}/health" || exit 1
+USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/agent2api-server"]

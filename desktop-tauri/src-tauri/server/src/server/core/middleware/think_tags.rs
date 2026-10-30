@@ -1,10 +1,10 @@
 //! 剥离响应**开头**的思考标签块（对标 magpie 的 `think-tags` 插件 `strip` 模式）。
 //!
 //! ── 与 Qoder 那台机器的区别（不要混淆）──────────────────────
-//! `providers::qoder::stream` 的机器把**正文中间**的 `<think>` 转成 reasoning
-//! delta（`THINK_TAGS` 四组标签、任意位置）。本模块只处理**开头**那一块：
-//! 上游把思考内容整个塞在正文最前面、而客户端不认标签时，把它剥掉。
-//! 两者语义不同，不要互相替代。
+//! Qoder 适配器（迁移后已在插件侧）的机器把**正文中间**的 `<think>` 转成
+//! reasoning delta（[`THINK_TAGS`] 四组标签、任意位置）。本模块只处理
+//! **开头**那一块：上游把思考内容整个塞在正文最前面、而客户端不认标签时，
+//! 把它剥掉。两者语义不同，不要互相替代。
 //!
 //! ── 为什么要跨帧状态 ──────────────────────────────────────
 //! SSE 帧边界与标签边界无关：`<thi` 与 `nk>` 可能落在两帧里。逐帧剥离会
@@ -14,7 +14,17 @@
 //! 首帧若不是标签开头（也不是任何标签的**前缀**），就置 `done` 并原样返回
 //! —— 不能为了等可能的标签而缓冲正文（那会给所有正常响应加延迟）。
 
-use crate::server::core::providers::qoder::protocol::THINK_TAGS;
+/// 思考内容可能包裹在这些标签里（原 Qoder 适配器的 `THINK_TAGS`）。
+///
+/// 这四组标签是**协议事实**，不是某一家 provider 的私有实现；插件迁移后
+/// `providers/qoder` 目录已删除，所以常量留在核心通用剥离模块里，避免
+/// 依赖已经被移走的模块。
+pub const THINK_TAGS: &[(&str, &str)] = &[
+    ("<thinking>", "</thinking>"),
+    ("<think>", "</think>"),
+    ("<reasoning>", "</reasoning>"),
+    ("<thought>", "</thought>"),
+];
 
 /// 剥离文本**开头**的 think 块。返回 (清理后文本, 是否命中)。
 ///
@@ -113,7 +123,7 @@ mod tests {
 
     #[test]
     fn strip_handles_all_four_tag_pairs() {
-        // Qoder 的 THINK_TAGS 有 4 组（qoder/protocol.rs:41），不是只有 <think>
+        // 四组标签都要认（见 [`THINK_TAGS`]），不是只有 <think>
         for (open, close) in [
             ("<thinking>", "</thinking>"),
             ("<think>", "</think>"),

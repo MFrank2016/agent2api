@@ -51,6 +51,15 @@ use super::{account_id, compare_by_priority, priority_key, provider_of, usable_c
 ///
 /// `as_str()` 是配置与接口响应里的字符串形态，也是前端下拉的取值 ——
 /// 三处只有一套名字（与 `core::prompt::PromptMode` 同一手法）。
+///
+/// ── 与上游 / Task 3.3 策略名的对照 ─────────────────────────
+/// 上游 `RouteStrategy` 的三档在本仓按能力拆进下面七档：
+///   - `Order`    → `Priority`（`priority`，默认，逐字一致）
+///   - `Rotate`   → `GlobalRoundRobin`（`global-round-robin`；Task 别名 `round_robin`，整表轮转）
+///   - `Provider` → `RoundRobin`（`round-robin`；Task 别名 `provider`，家内轮询）
+///   - `Lru`      → `LeastRecentlyUsed`（`least-recently-used` / 别名 `lru`）
+/// 其余 `LeastConnections` / `BalanceWeighted` / `PriorityWeighted` 为本仓扩展，
+/// Task 别名分别是 `least_connections` / `balance_weighted` / `priority_weighted`。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RoutingStrategy {
     /// 优先级优先（**默认**）：`(优先级, 加入时间)` 取首位 —— 与改造前逐字相同
@@ -65,6 +74,9 @@ pub enum RoutingStrategy {
     /// 最近最少使用：上次被选中最早者优先，并列按优先级
     LeastRecentlyUsed,
     /// 余额加权：平滑加权轮询，权重 = 账号剩余余额
+    ///
+    /// **fork extension（R19）**：上游已移除 `balance-weighted`，本仓保留为
+    /// 本地扩展；删除它会改变已有配置的选路结果，故只标记不删。
     BalanceWeighted,
     /// 优先级加权：平滑加权轮询，权重 = 优先级数字的单调递减函数（同级等权）
     PriorityWeighted,
@@ -98,8 +110,26 @@ impl RoutingStrategy {
     /// 解析配置值：大小写不敏感 + 去首尾空白（与 `PromptMode::parse` 同一口径）。
     /// 认不出（含空串）给 `None`，由调用方决定是回落 `priority` 还是报 400。
     pub fn parse(text: &str) -> Option<Self> {
-        let normalized = text.trim().to_ascii_lowercase();
-        Self::ALL.into_iter().find(|strategy| strategy.as_str() == normalized)
+        // 大小写不敏感 + 去首尾空白；Task 3.3 的 canonical id 用 `_`，
+        // 旧 id 用 `-`，两套都要认。
+        let trimmed = text.trim().to_ascii_lowercase();
+        match trimmed.as_str() {
+            // Task 3.3 canonical 别名（`round_robin` 是**整表**轮转）。
+            "round_robin" => Some(Self::GlobalRoundRobin),
+            "provider" => Some(Self::RoundRobin),
+            "lru" => Some(Self::LeastRecentlyUsed),
+            // 上游旧字符串（`order` / `rotate` / `usage`）继续可用。
+            "order" => Some(Self::Priority),
+            "rotate" => Some(Self::GlobalRoundRobin),
+            "usage" => Some(Self::BalanceWeighted),
+            _ => {
+                // `least_connections` 等 snake_case 别名按 `-` 归一后走 ALL。
+                let normalized = trimmed.replace('_', "-");
+                Self::ALL
+                    .into_iter()
+                    .find(|strategy| strategy.as_str() == normalized)
+            }
+        }
     }
 
     /// 读侧口径的配置值 → 策略：在 [`Self::parse`] 之上兼容上游 v3.0.2 的旧字符串

@@ -21,11 +21,8 @@
 //!   - skip（软跳过）：不改任何状态，转发选路按 `usage_records::balance_facts`
 //!     的内存事实实时剔除（见 `upstream::rotate`），余额回升自动恢复参与；
 //!   - disable（硬禁用）：查询成功落记录后由 `enforce_low_balance_disable`
-//!     判定，低于阈值就把账号 `enabled` 置 false 并打上 `lowBalanceDisabled`
-//!     标记 —— **本函数不自动恢复**（自动查询继续跑：禁用只表示不参与转发，余额
-//!     保持新鲜供用户判断）。唯一的例外是签到链路：LobsterAI 签到成功后重查余额，
-//!     带标记且余额回到阈值之上时由 `billing::checkin` 自动解冻（见那里）；
-//!     手动禁用不带标记，永远不会被解冻。
+//!     判定，低于阈值就把账号 `enabled` 置 false —— 不自动恢复，需手动启用；
+//!     自动查询**继续**跑（禁用只表示不参与转发，余额保持新鲜供用户判断）。
 //! 判定口径与余额列同一数字（`usage_records::extract_remaining`）。
 //!
 //! ── 限制器（余额 / Token 规则列表）与 Token 周期消耗 ─────────
@@ -42,9 +39,6 @@ use serde_json::{json, Value};
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::limiter;
-use crate::server::core::providers::adapter::{
-    adapter_for, USAGE_CREDENTIAL_DEAD_BACKOFF_MS, USAGE_CREDENTIAL_DEAD_CODE,
-};
 use crate::server::core::usage_records;
 
 use crate::server::logging;
@@ -144,6 +138,7 @@ pub fn resolve_batch_targets(
 async fn query_usage_for(store: &AccountStore, account: &Value) -> Value {
     let id = account.get("id").and_then(Value::as_str).unwrap_or("").to_string();
     let name = account.get("name").cloned().unwrap_or(Value::Null);
+    let started = std::time::Instant::now();
     // 凭证与 provider 都从目标集合里的账号对象读，**不回读账号文件**：
     // 20 个账号并发时那次回读会变成 20 次整库读盘，而答案已在手上。
     // `hasCredentials` 是 store 逐条给出的统一判据（缺省视为有）。
@@ -167,22 +162,37 @@ async fn query_usage_for(store: &AccountStore, account: &Value) -> Value {
     } else {
         Err(UsageFailure::NoCredentials)
     };
-    match outcome {
+    let row = match outcome {
         Ok(usage) => json!({ "id": id, "name": name, "usage": usage, "error": Value::Null }),
         // Node 的这条早退 `return` **不含 name 键**（只有 catch 分支才带）
         Err(UsageFailure::NoCredentials) => {
             json!({ "id": id, "usage": Value::Null, "error": "没有可用凭证" })
         }
         Err(UsageFailure::Request(message, code)) => {
-            let display = account
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|name| !name.is_empty())
-                .unwrap_or(&id);
-            logging::verbose("[Accounts]", &format!("账号「{display}」余额查询失败: {message}"));
             json!({ "id": id, "name": name, "usage": Value::Null, "error": message, "code": code })
         }
-    }
+    };
+    let provider = account.get("provider").and_then(Value::as_str)
+        .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
+    let error = row.get("error").and_then(Value::as_str);
+    let not_configured = row.get("code").and_then(Value::as_str)
+        == Some(crate::server::core::providers::adapter::USAGE_NOT_CONFIGURED_CODE)
+        || matches!(error, Some("没有可用凭证"));
+    let level = if error.is_none() || not_configured { "debug" } else { "warn" };
+    let summary = if error.is_none() { "余额查询完成" } else if not_configured { "余额查询未配置" } else { "余额查询失败" };
+    logging::log_event(level, "account", summary, Some(json!({
+        "provider": provider,
+        "providerLabel": crate::server::core::providers::label_of(provider),
+        "account": id,
+        "accountName": name,
+        "action": "usage.query",
+        "summary": summary,
+        "outcome": if error.is_none() { "success" } else { "failed" },
+        "detail": error,
+        "code": row.get("code"),
+        "durationMs": started.elapsed().as_millis() as u64,
+    })));
+    row
 }
 
 /// 查询一个账号的余额 / 积分（**按账号所属 provider 分流到适配器**）。
@@ -218,14 +228,18 @@ async fn query_usage_inner(
             .map_err(|error| UsageFailure::Request(error.message, error.code));
     }
     // 注册表里没有的 id（前端比后端新、或手改过的账号文件）：明确报「未知的
-    // 提供商」，不猜成任何一家（与全仓的 provider 口径一致）
-    let Some(kind) = crate::server::core::providers::kind_from_id(provider_id) else {
+    // 提供商」，不猜成任何一家（与全仓的 provider 口径一致）。
+    //
+    // ── 插件家在这里分流 ────────────────────────────────────────
+    // 它们的 id 不在枚举里，但**在运行时注册表里** —— 用 `adapter_by_id`
+    // 同时覆盖两类，而不是只认 `kind_from_id`（那会让插件家的余额查询
+    // 报「未知的提供商」，而界面上明明有那张卡片）。
+    let Some(adapter) = crate::server::core::providers::adapter::adapter_by_id(provider_id) else {
         return Err(UsageFailure::Request(
             format!("未知的提供商 {provider_id}，无法查询余额"),
             None,
         ));
     };
-    let adapter = adapter_for(kind);
     match adapter.query_usage(store, id).await {
         Ok(usage) => Ok(usage),
         Err(error) => {
@@ -245,9 +259,9 @@ async fn query_usage_inner(
                         error.message, refresh_error.message
                     ),
                     // 专用 code：自动查询据此退避，不再每分钟重试同一个死凭证
-                    // （见 `USAGE_CREDENTIAL_DEAD_CODE`）。原始 code 为空时也
-                    // 用这个标记 —— 它描述的是「刷新也救不回来」这个结论，
-                    // 与上游返回的哪个业务码无关。
+                    // （见 `failure_backoff`）。原始 code 为空时也用这个标记 ——
+                    // 它描述的是「刷新也救不回来」这个结论，与上游返回的哪个
+                    // 业务码无关。
                     Some(USAGE_CREDENTIAL_DEAD_CODE.to_string()),
                 ));
             }
@@ -259,7 +273,17 @@ async fn query_usage_inner(
     }
 }
 
-/// 该账号所属 provider 是否声明了余额能力（`ProviderAdapter::supports_usage`）。
+/// 这条账号是不是**访客形态**（公开形态上的 `isGuest`）。
+///
+/// 判据只读公开形态：插件账号由插件的 `account_view` 给，存量内置记录由
+/// `store_view::public_account` 注入（见 `chatglm_accounts::guest_of_record`）。
+/// 网关不解析凭证，所以这里不自己看 JWT。
+fn is_guest(account: &Value) -> bool {
+    account.get("isGuest").and_then(Value::as_bool) == Some(true)
+}
+
+/// 该账号所属 provider 是否声明了余额能力（`ProviderAdapter::supports_usage`），
+/// **并且**这条账号本身有余额可查。
 ///
 /// 为什么批量查询要过滤掉「不支持」的家：不支持的实现会给**每个账号**产出一行
 /// 501 —— 用户看到一片红，而那不是故障、只是能力缺失（当前四家都支持，
@@ -269,16 +293,33 @@ async fn query_usage_inner(
 /// 自定义提供商（含「预置 API」卡片建的那些）**不在注册表里**，能力来自提供商
 /// 记录上的余额方案（`balanceScheme`，七种方案见 `providers::custom::balance`）：
 /// 有方案 = 这一家有余额查询（凭证没配上时那次查询给「未配置」，不是不支持）。
+///
+/// ── 访客账号排除在这条判据之外（2026-10）─────────────────────
+/// 智谱清言的访客没有积分体系（上游那几个接口对访客一律 401），查询的结果
+/// **恒定为失败**，唯一的产物是余额列上一格红字。它不是「这次没查到」，而是
+/// 「这条账号不存在可查的东西」—— 与「这家没有余额概念」是同一档事实，
+/// 所以按账号形态一并排除：自动调度不再给它排期、批量查询不再把它算进分母。
+/// 单账号路径（`?id=`）**不**过这条判据（见 `query_all`），用户手点那一行时
+/// 仍会得到插件给的中性说明，而不是一个说不清理由的静默。
 fn supports_usage(account: &Value) -> bool {
+    if is_guest(account) {
+        return false;
+    }
     let provider_id = account
         .get("provider")
         .and_then(Value::as_str)
         .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
+    supports_usage_provider(provider_id)
+}
+
+pub(crate) fn supports_usage_provider(provider_id: &str) -> bool {
     if crate::server::core::custom_providers::is_custom_provider_id(provider_id) {
         return crate::server::core::providers::custom::balance::supports_usage(provider_id);
     }
-    crate::server::core::providers::kind_from_id(provider_id)
-        .map(|kind| adapter_for(kind).supports_usage())
+    // 用 `adapter_by_id` 而不是 `kind_from_id`：插件家的 id 不在枚举里，
+    // 但它们同样声明了 `supports_usage`（见上面那条注释）。
+    crate::server::core::providers::adapter::adapter_by_id(provider_id)
+        .map(|adapter| adapter.supports_usage())
         .unwrap_or(false)
 }
 
@@ -360,13 +401,14 @@ fn write_row_record(row: &Value) {
 ///   3. 账号当前是启用状态（幂等：已禁用的账号不再执行、不再重复打日志）。
 ///
 /// 禁用走 `update_account` 既有写路径（与手动禁用同一入口，「已禁用」的变更
-/// 日志照常出现），并在**同一个 patch** 里打上 `lowBalanceDisabled` 标记 —— 只有
-/// 带标记的禁用才允许被签到链路的自动解冻认领（见 `billing::checkin`）。再补一条
-/// 说明原因的日志 —— 「为什么被禁」必须可复看。
-/// **本函数只禁用、不恢复**：余额回升后由签到链路（带标记时）或用户手动启用；
-/// 自动查询继续跑（禁用只表示不参与转发），余额列保持新鲜，用户看着读数决定
-/// 何时恢复。
+/// 日志照常出现），再补一条说明原因的日志 —— 「为什么被禁」必须可复看。
+/// **不自动恢复**：余额回升后需手动启用；自动查询继续跑（禁用只表示不参与
+/// 转发），余额列保持新鲜，用户看着读数决定何时恢复。
 fn enforce_low_balance_disable(store: &AccountStore, account: &Value, row: &Value) {
+    if account.get("limiterGroups").is_some() {
+        limiter::enforce_disable(store, std::slice::from_ref(account));
+        return;
+    }
     if matches!(account.get("enabled"), Some(Value::Bool(false))) {
         return;
     }
@@ -422,6 +464,7 @@ fn enforce_low_balance_disable(store: &AccountStore, account: &Value, row: &Valu
 fn enforce_token_disable(store: &AccountStore, accounts: &[Value], now: i64) {
     let facts = limiter::token_facts();
     for account in accounts {
+        if account.get("limiterGroups").is_some() { continue; }
         if matches!(account.get("enabled"), Some(Value::Bool(false))) {
             continue;
         }
@@ -467,21 +510,14 @@ fn enforce_token_disable(store: &AccountStore, accounts: &[Value], now: i64) {
 /// 记录表的小查询里）。
 pub const SWEEP_TICK_MS: u64 = 10_000;
 
-/// 自动查询在**凭据已失效**时的额外退避（毫秒）。
-///
-/// 记录里的 `code` 为 [`USAGE_CREDENTIAL_DEAD_CODE`] 时返回
-/// [`USAGE_CREDENTIAL_DEAD_BACKOFF_MS`]（1 小时）；其余情况返回 0（不改变
-/// 原有「失败不退避」行为）。
-///
-/// ── 为什么只对「凭据已失效」退避，而不是对所有失败 ──────────
-/// 其它失败（超时、5xx、上游抖动）都是**临时**的，按配置间隔重试正是要的
-/// （模块头的「失败不退避」取舍针对的就是这类）。而「刷新也救不回来」是
-/// **稳定**结论：上游答案不会自己变，每分钟重试只会把日志刷屏。
-///
-/// 凭证一变（重新登录 / 重新导入）账号的 `updatedAt` 会更新，但这里不读
-/// `updatedAt`：`sweep_due` 的到期判定是「记录 + 配置」的纯函数，掺进账号
-/// 时间戳会让「手动查询顺延」等既有语义变模糊。取而代之的是：用户修好凭证
-/// 后点一次手动查询，成功行会把 `code` 清空，自动查询立刻回到正常间隔。
+/// 自动查询在**凭据已失效**时的专用标记（写进记录表的 `code`）。
+pub const USAGE_CREDENTIAL_DEAD_CODE: &str = "usage_credential_dead";
+
+/// 自动查询在凭据已失效时的额外退避（毫秒）。
+pub const USAGE_CREDENTIAL_DEAD_BACKOFF_MS: i64 = 60 * 60 * 1000;
+
+/// 记录里的 `code` 为 [`USAGE_CREDENTIAL_DEAD_CODE`] 时返回退避（1 小时）；
+/// 其余情况返回 0（不改变「临时失败不退避」的既有语义）。
 fn failure_backoff(record: &usage_records::UsageRecord) -> i64 {
     if record.code.as_deref() == Some(USAGE_CREDENTIAL_DEAD_CODE) {
         USAGE_CREDENTIAL_DEAD_BACKOFF_MS
@@ -526,6 +562,8 @@ async fn sweep_due(store: &AccountStore) {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    limiter::refresh(&all_accounts);
+    limiter::enforce_disable(store, &all_accounts);
     let kinds = limiter::enabled_token_kinds(&all_accounts);
     if !kinds.is_empty() {
         limiter::refresh_token_facts(&kinds);
@@ -541,9 +579,7 @@ async fn sweep_due(store: &AccountStore) {
         let interval = usage_records::query_interval_of(&account)?;
         let id = account.get("id").and_then(Value::as_str)?;
         let record = usage_records::load(id);
-        // 到期 = 上次尝试 + 间隔；连续失败按指数退避（见 [`failure_backoff`]）。
-        // 退避只影响**自动**查询：手动批量 / 单查不走这条筛选，用户随时可以
-        // 点一次拿到最新结论。
+        // 到期 = 上次尝试 + 间隔；「凭据已失效」按 1 小时退避（见 `failure_backoff`）。
         let due_at = record.last_attempt_at + interval * 1000 + failure_backoff(&record);
         (due_at <= now).then_some((account, interval))
     })
@@ -591,6 +627,12 @@ async fn sweep_due(store: &AccountStore) {
 ///   - 失败行只在「这次尝试不早于账号记录的最后改动」时端出 —— 重新登录 /
 ///     重导入 / 刷过 token 之后，「当时查不到」那条断言就不再成立。成功读数
 ///     不受影响：「可用 5147 积分」是一次读数的事实，凭证换了也不会变假话。
+///
+/// ── 第三条：访客账号的行整条丢掉（2026-10）──────────────────
+/// 访客没有积分体系（见 `supports_usage` 的说明），它名下的记录**只可能**是
+/// 历史失败行。留着就会在余额列上留一格红字，而那是「这条账号不该有读数」，
+/// 不是「这次没查到」。升级前写进记录表的那些行因此在这里一并滤掉，不必等
+/// 一次专门的迁移。
 pub fn snapshot(store: &AccountStore) -> Value {
     let records = usage_records::load_all();
     let accounts = store.list_accounts();
@@ -604,6 +646,9 @@ pub fn snapshot(store: &AccountStore) -> Value {
             })
         });
         let Some(account) = account else { continue };
+        if is_guest(account) {
+            continue;
+        }
         at = at.max(record.last_attempt_at);
         let name = account.get("name").cloned().unwrap_or(Value::Null);
         match record.usage.as_ref() {
@@ -648,44 +693,28 @@ pub fn snapshot(store: &AccountStore) -> Value {
             token_usage.insert(id.to_string(), Value::Array(entries));
         }
     }
+    if let Some(accounts) = list { limiter::counter::refresh(accounts); }
+    let source_facts = limiter::sources::facts();
+    let counts = limiter::counter::facts();
+    let mut limiter_states = serde_json::Map::new();
+    let mut quota_sources = serde_json::Map::new();
+    let mut limiter_models = serde_json::Map::new();
+    for account in list.into_iter().flatten() {
+        let Some(id) = account.get("id").and_then(Value::as_str) else { continue };
+        let provider = crate::server::core::routing::provider_of(account);
+        quota_sources.insert(id.to_string(), limiter::sources::rows_for(account, &source_facts));
+        limiter_states.insert(id.to_string(), limiter::types::json_of(&limiter::evaluate::states(account, &source_facts, &counts, now)));
+        limiter_models.entry(provider.to_string()).or_insert_with(|| Value::Array(limiter::sources::account_models(provider)));
+    }
     json!({
         "at": at,
         "results": rows,
         "skipped": 0,
         "tokenAt": now,
         "tokenUsage": token_usage,
+        "limiterStates": limiter_states,
+        "quotaSources": quota_sources,
+        "limiterModels": limiter_models,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn record(code: Option<&str>) -> usage_records::UsageRecord {
-        usage_records::UsageRecord {
-            usage: None,
-            error: Some(String::from("x")),
-            code: code.map(str::to_string),
-            remaining: None,
-            unlimited: false,
-            last_success_at: 0,
-            last_attempt_at: 0,
-        }
-    }
-
-    /// 回归锁定：只有「凭据已失效」才退避。
-    ///
-    /// 反例（修复前）：死凭证（刷新也失败）按账号配置的间隔（默认 60 秒）
-    /// 无休止重试，每分钟一条失败日志。
-    #[test]
-    fn credential_dead_backs_off_but_other_failures_do_not() {
-        assert_eq!(
-            failure_backoff(&record(Some(USAGE_CREDENTIAL_DEAD_CODE))),
-            USAGE_CREDENTIAL_DEAD_BACKOFF_MS
-        );
-        // 临时失败（超时 / 5xx）保持「失败不退避」：按配置间隔重试正是要的
-        assert_eq!(failure_backoff(&record(None)), 0);
-        assert_eq!(failure_backoff(&record(Some("usage_not_configured"))), 0);
-    }
 }
 

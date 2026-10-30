@@ -264,13 +264,14 @@ fn pool_references(
     references
 }
 
-/// 池列表的响应体：`{items, clash, groups}`。
+/// 池列表的响应体：`{items, clash, groups, kernelInstalled}`。
 ///
 /// 每个条目注入 `usedBy`（引用它的账号）—— 删除确认框要用它提示
-/// 「有 N 个账号正在使用」；`clash` 是实时快照，前端据此显示「Clash 是否可用 /
+/// 「有 N 个账号正在使用」；`usedByServices` 单列服务用途（update / kernelDownload），
+/// 不能把更新线路计入账号数量；`clash` 是实时快照，前端据此显示「Clash 是否可用 /
 /// 有几个出口」；`groups` 是去重后的分组摘要（`[{name, count}]`，按名称升序），
 /// 供（后续的）分组下拉框渲染。所有写操作也返回这份（与模型管理页的写接口同约定：
-/// 前端就地替换）。
+/// 前端就地替换），并在删除确认中提示账号与服务线路的影响。
 ///
 /// 订阅条目另外注入 `orphan`（所属订阅已不存在——数据被外部工具清掉、
 /// 或旧版进程误删存储键的场景）：孤儿条目在界面上允许**手动删除**清理，
@@ -278,6 +279,7 @@ fn pool_references(
 fn pool_payload(state: &ServerState) -> Value {
     let items_all = proxy_pool::list();
     let references = pool_references(state, &items_all);
+    let service_references = proxy_pool::usage::service_references();
     let live_subscriptions = crate::server::core::subscriptions::ids();
     let items: Vec<Value> = items_all
         .iter()
@@ -289,6 +291,11 @@ fn pool_payload(state: &ServerState) -> Value {
                 .and_then(|id| references.get(id))
                 .cloned()
                 .unwrap_or_default();
+            let services = service_references
+                .iter()
+                .filter(|(_, proxy_id)| item.get("id").and_then(Value::as_str) == Some(proxy_id.as_str()))
+                .map(|(service, _)| Value::String((*service).to_string()))
+                .collect();
             let orphan = item.get("source").and_then(Value::as_str) == Some("subscription")
                 && item
                     .get("providerId")
@@ -297,6 +304,7 @@ fn pool_payload(state: &ServerState) -> Value {
                     .unwrap_or(true);
             if let Some(object) = item.as_object_mut() {
                 object.insert("usedBy".to_string(), Value::Array(used));
+                object.insert("usedByServices".to_string(), Value::Array(services));
                 object.insert("orphan".to_string(), Value::Bool(orphan));
             }
             item
@@ -316,6 +324,10 @@ fn pool_payload(state: &ServerState) -> Value {
         "items": items,
         "clash": crate::server::core::proxies::clash_proxy_options(),
         "groups": groups,
+        // 内核装没装：订阅节点「没有端口」的**首要**成因就是它（没内核就没有
+        // 监听器）。下游两处都要用 —— 网络代理页的地址列与账号页的代理下拉，
+        // 后者拿不到订阅接口的快照，所以由池列表一起带出去。
+        "kernelInstalled": sub_kernel::installed(),
     })
 }
 
@@ -439,7 +451,7 @@ pub async fn pool_remove(state: &ServerState, body: &Bytes) -> Response {
 ///   · 禁用 → 缺口是「端口还开着但已不该开」（禁用 / 失去引用），请求内核
 ///     重建配置（新配置里没有这条监听器，进程重启即端口关闭），端口由重启后
 ///     的节点同步写回 null；
-///   · 启用 → 缺口是「启用 ∧ 被账号引用 ∧ 没有端口」，走补建链路。
+///   · 启用 → 缺口是「启用 ∧ 被账号或服务线路引用 ∧ 没有端口」，走补建链路。
 /// 两个方向都走同一个对账入口（`reconcile_listeners`，与账号保存收尾同一条
 /// 路），没缺口就不投重启命令 —— 重复点击 / 反复开关都不会排出一串多余的重建。
 ///
@@ -492,7 +504,7 @@ fn listener_flow(state: &ServerState, id: &str, change: &proxy_pool::EnabledChan
         if !sub_kernel::installed() {
             return "none";
         }
-        let pool_ids = state.store().referenced_pool_ids();
+        let pool_ids = proxy_pool::usage::referenced_pool_ids(Some(state.store()));
         let borrowed: std::collections::HashSet<&str> =
             pool_ids.iter().map(String::as_str).collect();
         if !proxy_pool::needs_listener(id, &borrowed) {
@@ -654,7 +666,7 @@ pub async fn settings_save(body: &Bytes) -> Response {
 /// 监听器对账：把「该开的监听器」与「池里条目的端口状态」收敛一致
 /// （lazy listeners 的**双向**触发点）。
 ///
-/// 该开的集合 `wanted` = **账号引用 ∩ 启用中的订阅节点**
+/// 该开的集合 `wanted` = **账号或服务线路引用 ∩ 启用中的订阅节点**
 /// （`proxy_pool::listener_node_keys`，与内核侧 `allocate_listeners` 同口径
 /// —— 口径不一致会出现「这里说没缺口、内核却不建」这类谁也解释不清的状态）。
 /// 两个方向的缺口各检测各的：
@@ -669,7 +681,8 @@ pub async fn settings_save(body: &Bytes) -> Response {
 /// 调用方：
 ///   · 账号写操作收尾（`api::accounts` 的 add / update / 批量 / 删除）——
 ///     引用变化后补缺与回收；
-///   · `pool_enable`（启用 / 禁用一条订阅节点后的联动）。
+///   · `pool_enable`（启用 / 禁用一条订阅节点后的联动）；
+///   · 更新出网线路保存后（新增引用补建，旧线路失去全部引用则回收）。
 ///
 /// 手动关闭闩置位时只记日志不投命令：用户刚按过「关闭内核」，保存引用不能
 /// 把它悄悄带起来 —— 「启动内核」重建时同样按 wanted 全量分配，缺口自然收敛。
@@ -678,7 +691,7 @@ pub async fn settings_save(body: &Bytes) -> Response {
 /// 列表即可。同步版（投命令是 mpsc send，无需 await）—— 账号写操作收尾在
 /// 持锁路径的边缘调用它，不想为它包一层 spawn。
 pub fn reconcile_listeners(state: &ServerState) -> bool {
-    let pool_ids = state.store().referenced_pool_ids();
+    let pool_ids = proxy_pool::usage::referenced_pool_ids(Some(state.store()));
     let borrowed: std::collections::HashSet<&str> =
         pool_ids.iter().map(String::as_str).collect();
     let wanted = proxy_pool::listener_node_keys(&borrowed);

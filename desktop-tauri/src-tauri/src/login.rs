@@ -599,18 +599,17 @@ const RACCOON_CALLBACK_PATH: &str = "/callback";
 /// 那两家的登录链路是固定的几个站点（腾讯系 / 商汤系 + 各自的验证码托管方），
 /// 能列全；白名单在这里是免费的额外一层约束，就不放弃。
 ///
-/// ── AutoClaw 国际版为什么不设限（本次新增，务必读）─────────────
+/// ── AutoClaw 国际版为什么不设限（务必读）───────────────────
 /// 它的登录页与身份提供方都不在我们的名单里（Zai 的授权页、Google 的
 /// `accounts.google.com`），而**更要紧的是回调落在本机**：授权完成后浏览器会
 /// **顶层导航到 `http://localhost:<登记端口>/auth/callback-zai|google`**
-/// （z.ai 的白名单只认官方客户端那四个端口，见
-/// `providers::autoclaw::callback_server`）。
-/// 那个 loopback 地址一旦被白名单拦下，症状是「用户明明登录成功、网关却永远
+/// （z.ai 的白名单只认官方客户端那四个端口）。
+/// 那个 loopback 地址一旦被白名单拦下，症状是「用户明明登录成功、插件却永远
 /// 等不到授权码」—— 与 [`is_login_callback`] 注释里警告过的那类静默故障同形，
 /// 而这次连回调识别都救不了它：回调本身就是一次普通 HTTP 导航，
 /// 没有任何「非本机协议」的特征可供识别，只能在白名单这一层放行。
-/// （[`autoclaw_callback_forward`] 会把这类导航改成访问网关自己，因此那一步
-/// 也不能被白名单挡住 —— 它同样发生在放行之后。）
+/// （那个端口由**插件**绑定并收下回调，壳侧不参与 —— 见插件
+/// `autoclaw/callback_server.rs`。因此它必须被放行到这里。）
 fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
     match provider {
         "raccoon" => Some(RACCOON_ALLOWED_HOSTS),
@@ -664,10 +663,6 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // Nous（Nous Research Portal）同样不设限：OAuth 设备码流程把用户带到官方
         // 的 verification_uri，主机由上游给、不可穷举（与 Qoder / ZCode / Cline 同一
         // 情形）；落进默认分支会拿到 WorkBuddy 的白名单 → 授权窗口白屏。
-        // LobsterAI（有道龙虾，NetEase Youdao）同样不设限：网页登录打开官方登录页，
-        // 用户在浏览器里完成短信 + 滑块验证，回调落**网关自己的** loopback 端口；
-        // 主机不可穷举（短信 / 滑块链路），落进默认分支会拿到 WorkBuddy 的白名单
-        // → 登录窗口白屏。
         //
         // OrcaTerm（腾讯云遨驰终端）同样不设限：登录窗口开在官方 OAuth 授权页
         // （`orcaterm.com/oauth/authorize`），它会 302 到 `open.weixin.qq.com`
@@ -675,9 +670,22 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // `localhost.weixin.qq.com` 的轮询 —— 主机不可穷举。**显式列出**
         // （落进默认分支会拿到 WorkBuddy 的白名单 → 授权页白屏，日志里什么也
         // 看不出）。
+        //
+        // AtomCode 同样不设限：授权页由代理给出（`acs.atomgit.com/auth/login`
+        // 换来的 `login_url`，实际落在 AtomGit 的账号站点上），之后会按用户选的
+        // 登录方式继续跳不可穷举的主机。**不用回本机** —— 凭证由网关**轮询代理**
+        // 取回（`auth/check` → `auth/token`，见 `providers::atomcode::oauth` 的
+        // 模块头），所以这里没有 loopback 回调要放行；但「不设限」仍是必须显式
+        // 写出的选择。
+        //
+        // LobsterAI 不设限，而且这一条**必须是 None**：它的授权页完成后会
+        // **302 回本机**（`http://127.0.0.1:<网关端口>/auth/callback`），那次
+        // 导航一旦被白名单拦下，症状就是用户明明授权成功、网关永远等不到码，
+        // 而日志里什么都看不出（与 CodeArts / Trae 的 loopback 回调同一情形）。
+        // 授权页本身在 `lobsterai.youdao.com`，沿途还可能有微信登录的第三方主机。
         "catpaw" | "qoder" | "qoder-intl" | "cline-free" | "cline-pass" | "autoclaw"
         | "autoclaw-intl" | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae"
-        | "kuku" | "antigravity" | "officeace" | "nous" | "lobsterai" | "orcaterm" => None,
+        | "kuku" | "antigravity" | "officeace" | "orcaterm" | "atomcode" | "lobsterai" | "nous" => None,
         // WorkBuddy 的两个地区共用这一张表（表里 `workbuddy.ai` 那一行就是国际站
         // 的登录域）。**显式列出**而不是靠下面的默认分支：上面那条警告要求
         // 「新 provider 落到默认分支」必须是有意的选择，写出来才看得出是选过的
@@ -761,74 +769,6 @@ fn is_login_callback(url: &url::Url, provider: &str) -> bool {
     url.scheme() == RACCOON_CALLBACK_SCHEME && host_matches && url.path() == RACCOON_CALLBACK_PATH
 }
 
-/// AutoClaw OAuth 的回调：命中时返回**网关自己的**回调地址（把这次导航改道过去）。
-///
-/// ── 为什么内嵌窗口要拦这一手（issue #11 的兜底）───────────────
-/// z.ai 的 redirect_uri 白名单只认官方客户端登记过的那四个 loopback 端口
-/// （`18432 / 19654 / 19723 / 53699`，见
-/// `providers::autoclaw::callback_server` 的模块头），因此网关交给上游的
-/// `navigate_uri` 也必须是那四个端口之一 —— 但那个端口**不一定归我们**：
-/// 官方 AutoClaw 客户端一启动就把四个全绑了，回调会被它接走，网关永远等不到
-/// 授权码（表现是「登录完成了，界面一直转圈到 5 分钟超时」）。
-///
-/// 内嵌窗口是我们自己的窗口，可以在**请求发出之前**把这次跳转截下来、改成
-/// 访问网关自己的回调路由（授权码由我们换），与谁占着那个端口无关。
-/// 抢到端口的那一轮同样会走这里：只是少一次 302 直达，结果一致。
-///
-/// ── 口径（宽进严出，宁可不拦也别拦错）───────────────────────
-/// 只认「http + localhost/127.0.0.1 + 四个登记端口之一 + 两个已知回调路径」，
-/// 并且**跳过网关自己的端口** —— 用户完全可以把网关端口设成 18432，那时
-/// 回调本来就落在我们身上，再改道就成了自我循环（拦下 → 跳同一个地址 → 拦下）。
-fn autoclaw_callback_forward(url: &url::Url) -> Option<String> {
-    if url.scheme() != "http" {
-        return None;
-    }
-    let host = url.host_str()?.to_ascii_lowercase();
-    if host != "localhost" && host != "127.0.0.1" {
-        return None;
-    }
-    let port = url.port_or_known_default()?;
-    if port == crate::gateway::proxy_port() {
-        return None;
-    }
-    if !agent2api_server::server::core::providers::autoclaw::callback_server::REGISTERED_CALLBACK_PORTS
-        .contains(&port)
-    {
-        return None;
-    }
-    let path = url.path();
-    if path != "/auth/callback-zai" && path != "/auth/callback-google" {
-        return None;
-    }
-    let query = url
-        .query()
-        .map(|value| format!("?{value}"))
-        .unwrap_or_default();
-    Some(format!(
-        "http://localhost:{}{path}{query}",
-        crate::gateway::proxy_port()
-    ))
-}
-
-/// 把登录窗口导航到改道后的地址（[`autoclaw_callback_forward`] 的落地点）。
-///
-/// 用 `navigate` 而不是 `eval("location.href=…")`：前者是壳侧直接下发导航，
-/// 不依赖页面上下文还能不能执行脚本（授权页是第三方的，不该假设它允许我们
-/// 在里面跑 JS）。窗口在异步任务里可能已经被用户关掉，因此取不到就当无事发生。
-fn navigate_login_window(app: &AppHandle, label: &str, target: &str) {
-    let Some(window) = app.get_webview_window(label) else {
-        return;
-    };
-    match url::Url::parse(target) {
-        Ok(parsed) => {
-            if let Err(error) = window.navigate(parsed) {
-                eprintln!("[login] AutoClaw 回调改道失败: {error}");
-            }
-        }
-        Err(error) => eprintln!("[login] AutoClaw 回调改道地址无效（{target}）: {error}"),
-    }
-}
-
 /// 归一化前端传来的 provider id（缺省 workbuddy，只认这五家）。
 ///
 /// ── 为什么 Cline 只列「网页登录」这一条路 ─────────────────────
@@ -874,6 +814,14 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // `http://127.0.0.1:<网关端口>/oauth/callback` 落回网关自己，所以窗口
         // **必须允许**导航到本机端口（见下面 allowed_hosts 的同一条）。
         "codearts" => Ok("codearts"),
+        // LobsterAI（网易有道「有道龙虾」）：授权地址由**后端适配器**现拼
+        // （门户的 hash 路由 + `redirect_uri` 指向网关自己那个 loopback 端口，
+        // 见 `providers::lobsterai::oauth::build_authorize_url`），壳侧只负责
+        // 开窗口与轮询 —— 与 CodeArts 同一条路。它的回调落在
+        // `http://127.0.0.1:<网关端口>/auth/callback`（**裸路径**，理由见
+        // `http.rs` 那条路由的注释），所以窗口**必须允许**导航到本机端口，
+        // 见下面 allowed_hosts 的同一条。
+        "lobsterai" => Ok("lobsterai"),
         // Trae（SOLO CN）：授权地址由**后端**问上游 guidance 拼（PKCE + 回调 URL），
         // 壳侧只负责开窗口与轮询 —— 与 ZCode 同一条路。特别地，它的回调落在
         // `http://127.0.0.1:<随机端口>/authorize`（网关自己监听的那台 loopback，
@@ -903,15 +851,22 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // 由**后端适配器**问上游拿，壳侧只负责开窗口与轮询，与 Qoder / ZCode / Cline
         // 的设备授权同一条路（授权结果由服务端记录，不依赖窗口捕获回调）。
         "nous" => Ok("nous"),
-        // LobsterAI（有道龙虾，NetEase Youdao）：网页登录的授权地址由**后端适配器**
-        // 现拼（官方登录页 + loopback 回调），壳侧只负责开窗口与轮询 —— 与 CatPaw /
-        // Accio 同一条路。粘贴 accessToken / refreshToken 不走这里（走 POST /api/accounts）。
-        "lobsterai" => Ok("lobsterai"),
         // OrcaTerm（腾讯云遨驰终端）：地址由**后端适配器**返回（官方 OAuth 授权页，
         // 它会 302 到微信二维码），壳侧负责开窗口并把回调
         // `orcaterm://oauth_callback?session_id=…` 交回网关换令牌
         // （见 `start_orcaterm` 与 `providers/orcaterm/login.rs` 的模块头）。
         "orcaterm" => Ok("orcaterm"),
+        // AtomCode（AtomGit / GitCode）：授权地址由**后端适配器**向代理现取
+        // （`providers::atomcode::oauth`），壳侧只负责开窗口与轮询 —— 与
+        // ZCode / OfficeAce 同一条路。它的授权回调由代理自己在
+        // `acs.atomgit.com/callback` 终结、**永远不回到本机**，授权结果由网关
+        // 轮询代理判定（`auth/check` → `auth/token`），所以窗口最后停在代理页上
+        // 也不影响登录判定，壳侧既不用捕获自定义协议也不用转交回调。
+        //
+        // **这一条不能少**：前端（`add-account-configs.ts` 的 ATOMCODE）早就把
+        // 「网页登录」按钮画出来了，缺了它点下去就是
+        // 「登录失败：不支持网页登录的提供商：atomcode」。
+        "atomcode" => Ok("atomcode"),
         other => Err(format!("不支持网页登录的提供商：{other}")),
     }
 }
@@ -1233,9 +1188,10 @@ pub async fn start(
         "officeace" => "OfficeAce 果办",
         // Nous 只有一家（OAuth 设备码一条链，没有地区/版本概念），品牌名里不需要地区
         "nous" => "Nous",
-        // LobsterAI 只有一家（粘贴令牌 + 网页登录两条来源，没有地区/版本概念），
-        // 品牌名里不需要地区
         "lobsterai" => "LobsterAI",
+        // AtomCode 只有一家（AtomGit / GitCode 的编码 Agent，没有地区/版本概念），
+        // 品牌名里不需要地区
+        "atomcode" => "AtomCode",
         _ => "WorkBuddy",
     };
     // 窗口标题：Cline 两家的池、ZCode 两家的地区、CodeArts / Trae / OfficeAce
@@ -1244,7 +1200,7 @@ pub async fn start(
     let title = if matches!(
         provider,
         "cline-free" | "cline-pass" | "zcode" | "zcode-intl" | "codearts" | "trae" | "qoder"
-        | "qoder-intl" | "antigravity" | "officeace" | "nous" | "lobsterai"
+        | "qoder-intl" | "antigravity" | "officeace" | "lobsterai" | "atomcode" | "nous"
     ) {
         format!("登录 {provider_label} 账号")
     } else {
@@ -1683,12 +1639,6 @@ async fn run_embedded(
     let state_for_nav = login_state_owned.clone();
     let seen_for_window = callback_seen.clone();
     let state_for_window = login_state_owned.clone();
-    // 回调改道用（见 `autoclaw_callback_forward`）：导航拦截的闭包拿不到窗口
-    // 本身（窗口还在构建中），只能带着 app 与 label，等真要改道时再取。
-    let app_for_forward = app.clone();
-    let label_for_forward = window_label.clone();
-    let app_for_window = app.clone();
-    let label_for_window = window_label.clone();
 
     let window = WebviewWindowBuilder::new(app, &window_label, WebviewUrl::External(url))
         .data_directory(profile.path().to_path_buf())
@@ -1734,19 +1684,12 @@ async fn run_embedded(
         // 「非法导航」拦掉 —— 拦掉的动作与「捕获回调」在 WebView2 眼里完全相同，
         // 症状是用户明明登录成功、网关却永远等不到 code。
         //
-        // ── AutoClaw 的回调为什么先「改道」（本次修正）────────────
-        // 它的回调落在 z.ai 登记的那四个端口上，那几个端口可能被官方客户端
-        // 占着（回调会被它接走）。这里在请求发出前把导航改到网关自己的回调
-        // 路由 —— 理由与口径见 `autoclaw_callback_forward`。
+        // ── AutoClaw 的回调为什么不在这里拦（拆家后）─────────────────
+        // 它的回调落在 z.ai 登记的那四个端口上，**由插件自己绑定并收下**
+        // （插件 `autoclaw/callback_server.rs`）。壳侧不能再截：截走之后插件
+        // 永远收不到授权码（那条链的回调不经过网关）。因此这里只做普通导航
+        // 白名单判定 —— 四个登记端口对 autoclaw 不设限（见 `allowed_hosts`）。
         .on_navigation(move |url| {
-            if let Some(target) = autoclaw_callback_forward(url) {
-                let app = app_for_forward.clone();
-                let label = label_for_forward.clone();
-                tauri::async_runtime::spawn(async move {
-                    navigate_login_window(&app, &label, &target);
-                });
-                return false;
-            }
             if is_login_callback(url, provider) {
                 // 返回 false 即阻止这次导航（否则 WebView2 会把它交给系统：
                 // 本机没注册 office-raccoon:// 时是一个错误页）。
@@ -1776,8 +1719,8 @@ async fn run_embedded(
         //     （wry 在没有 handler 时对每个 NewWindowRequested 都 SetHandled(true)），
         //     所以这不是「放开弹窗」，只是把回调那一种从被静默丢弃变成被接住。
         //
-        // AutoClaw 的改道同样先判（它走的是顶层 302，正常不该落到这里；但授权页
-        // 若改用 window.open 打开回调，没有这一支就会「登录成功却毫无反应」）。
+        // AutoClaw 的回调由插件自己收（同上），这里不再改道：顶层导航与
+        // window.open 两种形态都会自然落到插件的监听端口上。
         //
         // KukuAI 主站例外：它的「登录」按钮可能以弹窗打开 passport 登录页。
         // 一律 Deny 会让用户点登录毫无反应 —— 这里**放行**（弹窗与主窗口
@@ -1786,14 +1729,6 @@ async fn run_embedded(
         .on_new_window(move |url, _features| {
             if provider == "kuku" {
                 return tauri::webview::NewWindowResponse::Allow;
-            }
-            if let Some(target) = autoclaw_callback_forward(&url) {
-                let app = app_for_window.clone();
-                let label = label_for_window.clone();
-                tauri::async_runtime::spawn(async move {
-                    navigate_login_window(&app, &label, &target);
-                });
-                return tauri::webview::NewWindowResponse::Deny;
             }
             if is_login_callback(&url, provider) && !seen_for_window.swap(true, Ordering::SeqCst) {
                 let login_state = state_for_window.clone();

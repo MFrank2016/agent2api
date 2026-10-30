@@ -84,6 +84,12 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // （core::agents）。零散状态，与 desktopSettings 同一类。
     "agentProfiles",
     "priorityScope",
+    // 侧边栏布局（core::sidebar_layout）：整份「分组 / 顺序 / 显隐」JSON 一个键。
+    // 从前只存浏览器 localStorage，而桌面壳与网页端是两个 origin、localStorage
+    // 隔离 —— 于是「在 WebUI 里隐藏的菜单，客户端照旧显示」。落库后两端读同一份。
+    // 属于「其它零散状态」：配置写入绝不能动它（否则用户改一次 API Key
+    // 侧边栏就退回默认布局）。
+    "sidebarLayout",
     // 事件日志的下一个 id 水位（logs_store::sql）
     "logsNextId",
     // 整份桌面设置 JSON（壳侧 settings）—— 一个键而不是拆成三个：
@@ -170,12 +176,6 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 页「订阅管理」维护的订阅链接，内核（sub_kernel）拉起时从 api 层拿启用
     // 清单。与 proxyPool 同类零散状态：不是配置项，配置写入绝不能动它。
     "subscriptions",
-    // OfficeAce 模型可用性探测的结论（core::providers::officeace::probe）：
-    // 整份 `{unavailable:[…], probedAt, account}` 一个键。探测「目录里列着、这个
-    // 号实际打不通」的模型（上游回 81004/81009），结论由 `advertise_models` 用来
-    // 默认隐藏它们。属于「其它零散状态」——不是配置项，配置写入绝不能动它
-    // （否则每次改配置都让隐藏集合清零、客户端又照着一个一个试）。
-    "officeaceModelProbe",
     // models.dev 模型元数据的刷新结果（core::model_meta::snapshot）：整份
     // 「上次成功拉到的精简索引」一个键（文件形态与内嵌快照逐字相同，生成口径见
     // `scripts/sync-modelsdev.mjs`）。**不是**配置项 —— 配置写入绝不能动它，
@@ -183,6 +183,16 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 与上面的 `modelCatalogCache` 是两码事：那个存各家上游的**模型清单**，
     // 这个存模型的**元数据**（能力位 / 思考档位），刷新链路与失效语义各不同。
     "modelsDevCatalog",
+    // 云同步的配置与同步状态（core::cloud_sync）：整份
+    // `{provider, webdav:{…}, s3:{…}, syncPassword(信封), enabled, autoSync,
+    //   remoteRoot, profile, status:{lastSyncAt, lastSnapshotId, …}}` 一个键。
+    //
+    // 为什么是保留键而不是配置项：它含**远端凭据**（WebDAV 密码 / S3 Secret
+    // Access Key 的密文信封）与同步密码信封，属于「其它零散状态」一类；
+    // 更关键的是**它自己不能被云同步上传** —— 否则等于把远端凭据再传到远端，
+    // 换机时还会被旧凭据覆盖。保留键的身份让 `cloud_sync::snapshot` 的键筛选
+    // 天然排除它，不必再维护一份「别同步这个键」的清单。
+    "cloudSync",
 ];
 
 /// 这个键是否属于「其它零散状态」（即不归网关配置管）。
@@ -320,32 +330,26 @@ pub fn is_reserved(key: &str) -> bool {
 /// 理由与 `kv` 表同一取向：读写单元天然是「一整个会话」，逐条存只会让每次保存
 /// 变成 N 次写入 + 一次事务，而没有任何一处需要「按单条消息查」。
 ///
-/// ── v17：requests 补网关 Key 身份（`key_id` / `key_name`）────────
-/// 见 [`V17_SCHEMA`]。明细记下「这次请求是哪把网关 Key 发的」，供 Key 页的
-/// 用量列与 Key 级配额判定读。
+/// ── v17～v20：上游的限额事件 / 来源统计 / 助手图片 / 原始报文截断 ──
+/// 这一段在合并时以**上游 schema v20 为基线**：v17 建 `account_limiter_events`
+/// （把旧 `requests` 行回填成限额事件），v18 给 `requests` 补 `api_key_id` /
+/// `api_key_name` / `api_key_source` 与 `request_daily` 的来源统计列，
+/// v19 建助手图片表，v20 给 `request_raw` 补截断标记。
 ///
-/// **为什么是 v17 而不是 v16**：本仓的 v16 已经被上游的「AI 助手对话会话」
-/// （`assistant_sessions`）占用；这条 Key 身份迁移来自另一条 fork 线，那边
-/// 的 v16 指的是它。两边的 16 不是同一件事，合到一起时必须给后来者重新编号
-/// —— 否则已升到 v16 的库会被判成「已是最新」而跳过建列，`requests` 缺
-/// `key_id` 后配额判定与用量查询会在运行时直接报错。
+/// ── v21：网关 Key 配额落位（本 fork）────────────────────────
+/// 本 fork 原有的「网关 Key 身份」迁移曾占用 v17（`key_id` / `key_name`），
+/// 与上游 v17 撞号。合并时**不重放那两个列名**：身份统一落到上游 v18 已经
+/// 建好的 `api_key_id` / `api_key_name` / `api_key_source` 上，v21 只做两件事：
 ///
-/// 为什么是 id + name 两列而不是只存 id：与 `account_id` / `account_name`
-/// 完全同构 —— Key 可以改名，身份只认 id（改名不该把它拆成两行），但 Key
-/// 被删除后明细的寿命长于配置，报表仍要显示一个可读的名字而不是一串 id。
+///   · 把 fork 线存量库里的 `key_id` / `key_name` **映射回填**到 `api_key_*`
+///     （`api_key_source = 'key'`）—— 数据不丢，列名不重复；
+///   · 为停在 fork v17 的库补建上游 v17 的 `account_limiter_events`（该库跳过了
+///     上游 v17 分支），并清掉已被 v18 索引取代的 `idx_requests_key_ts`。
 ///
-/// 为什么空串表示「没有 Key」：免鉴权模式、环境变量 Key（
-/// `WORKBUDDY_PROXY_API_KEY`，没有列表记录）、面板内部发起的 AI 助手与模型
-/// 测试，这四种情形都没有可归属的 Key。收敛成同一个值之后，消费点不必分四路
-/// 判断 —— 与 `provider` / `account_id` 的既有空串口径一致。
-///
-/// 为什么索引是 `(key_id, ts)` 而不是只 `key_id`：配额判定要
-/// `WHERE key_id = ? AND ts >= ?`，Key 用量同理；只有 key_id 的话区间条件
-/// 退化成过滤。与 v9 给 `account_id` 建索引同一理由。
-///
-/// **历史数据不回填**：v17 之前的明细根本没记过 Key 身份，无从推断 ——
-/// 按「不猜值」的既有纪律，旧行一律落在空串（未知 Key）组。
-pub const SCHEMA_VERSION: i64 = 17;
+/// 配额规则本身仍存在配置（`apiKeys` 的 `quotaRules`），不建库表：见
+/// `core::api_keys` / `core::key_quota`。请求统计里的 `api_key_source`
+/// 由 v18 提供，v21 不再加列。
+pub const SCHEMA_VERSION: i64 = 21;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -498,16 +502,8 @@ CREATE TABLE IF NOT EXISTS request_daily (
 -- 而头部哪怕没有也应该是 `'{}'`（前端按对象读）。
 -- 为什么体用 TEXT 而不用 BLOB：里面是 SSE 文本 / JSON 文本，存 TEXT 才能在
 -- `sqlite3` 命令行里直接看（排障场景这是主要用法）。
--- truncated 标记「体被单条上限截断过」（见 debug_traffic::MAX_ENTRY_BYTES），
--- 缺了它前端会把半截响应当完整响应展示。
--- size 是该条**落库后实际占用的字节数**（截断后的三份 JSON 文本 + 两份可空
--- 文本 + 身份字段的长度合计，见 `debug_traffic::sql::payload_bytes`），供两道闸
--- 的字节统计用（`SUM(size)` 与 MAX_TOTAL_BYTES 比较）。
--- 它**不是**「未截断前的原始大小」：闸门守的是「这张表实际占多大」，用截断后的
--- 体积才对得上。这一行原先按「将来可能存原始大小」的设想写成「未截断前」，与
--- 实现不符 —— 改造前的 entry_size 也是截断后体积（原版 record 先 truncate 再算
--- size），所以现在的口径是承接既有实现、不是本次改造新定的。将来真需要原始
--- 大小就**另加一列**（在截断前记一笔），不要复用 size。
+-- truncated 保留历史报文的截断标记；新采集的正文不截断。
+-- size 是完整报文落库后的文本字节合计，不含 SQLite 页与行开销。
 -- 索引只有 ts：调试报文按时间倒序翻页是唯一的批量读法，其余都按主键 id 取。
 CREATE TABLE IF NOT EXISTS debug_traffic (
   id               TEXT PRIMARY KEY,
@@ -578,21 +574,17 @@ ALTER TABLE requests ADD COLUMN sensitive_hits TEXT NOT NULL DEFAULT '[]';
 /// 版本 3：`request_raw` 表 —— 请求/响应的**下游侧**原始正文（预览对话功能的地基）。
 ///
 /// ── 它和 debug_traffic 表是什么关系 ──────────────────────────
-/// `debug_traffic`（调试报文）是调试模式的**上游侧**报文（头部脱敏、
-/// 有全局字节闸）；本表是**下游侧**正文（客户端发来的请求体 + 网关下发的
-/// 响应体），供请求日志的「预览对话」弹窗用。两表按同一个 `id`（请求关联 id）
-/// 各存各的，谁也不依赖谁。
+/// `debug_traffic` 保存头部脱敏后的完整上游报文；本表保存完整下游正文，
+/// 供请求日志的「预览对话」使用。两表按同一个请求 id 关联，独立读写。
 ///
 /// ── 采集条件：与调试模式同一个开关（v13 起）───────────────────
 /// 正文**只在调试模式开启时采集**（对齐 OmniProxy 的口径：不开调试模式就不
-/// 保存任何原始正文）—— 关着时连截断转换都不做，采集路径零开销。v13 之前的
+/// 保存任何原始正文）—— 关着时不复制正文，采集路径零开销。v13 之前的
 /// 版本是无条件采集的，那批历史正文已由 v13 一次清空（见 [`SCHEMA_VERSION`]）。
 ///
 /// ── 为什么独立成表而不是给 requests 加两列 ────────────────────
-/// 正文是大字段（两侧各 128 KiB 上限），明细列表的每次分页都要取
-/// `REQUEST_COLUMNS` —— 混进主表会让「只看列表」的请求反复搬运几百 KB 的
-/// TEXT。独立表后主查询零开销，按 id 取详情时才 join 进来；请求日志列表页
-/// 也不需要改任何 SQL（OmniProxy 的 request_log_raw 副表同此取舍）。
+/// 正文是完整大字段，不能混入明细列表的每次分页查询。
+/// 独立表后只在用户查看详情时读取正文。
 ///
 /// ── 为什么 id 直接当主键 ────────────────────────────────────
 /// 一条请求只有一份「下游视角」的正文，天然一对一（与 requests 表的 id
@@ -884,16 +876,65 @@ CREATE TABLE IF NOT EXISTS assistant_sessions (
 CREATE INDEX IF NOT EXISTS idx_assistant_sessions_updated ON assistant_sessions(updated_at DESC);
 ";
 
-/// 版本 17：requests 补网关 Key 身份两列 + 索引（schema v17）。
+/// 版本 17：限额事件表（上游 v17）。
 ///
-/// 与 v12 同一形态（既有表加列，幂等靠版本号）；索引那条与 v15 同形态
-/// （`CREATE INDEX IF NOT EXISTS`）。来历与取舍见 [`SCHEMA_VERSION`] 的 v17 段。
+/// 把「按账号 / 渠道 / 模型」的 Token 周期消耗从 `requests` 明细里抽成一张
+/// 独立事件表，限额判定读它。旧库在此一次性回填（`INSERT OR IGNORE`，
+/// 以 `legacy:<row_id>` 作幂等键）。
 const V17_SCHEMA: &str = "
--- ── requests 补网关 Key 身份（schema v17）─────────────────────
-ALTER TABLE requests ADD COLUMN key_id TEXT NOT NULL DEFAULT '';
-ALTER TABLE requests ADD COLUMN key_name TEXT NOT NULL DEFAULT '';
--- ── Key 维度的区间扫描索引（配额判定 + 用量查询）───────────────
-CREATE INDEX IF NOT EXISTS idx_requests_key_ts ON requests(key_id, ts);
+CREATE TABLE IF NOT EXISTS account_limiter_events (
+  row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  account_id TEXT NOT NULL,
+  model TEXT NOT NULL DEFAULT '',
+  channel TEXT NOT NULL DEFAULT '',
+  ts INTEGER NOT NULL,
+  tokens INTEGER NOT NULL DEFAULT 0,
+  requests INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_limiter_events_account_time ON account_limiter_events(account_id, ts, channel);
+INSERT OR IGNORE INTO account_limiter_events (id, account_id, model, ts, tokens, requests)
+SELECT 'legacy:' || row_id, account_id,
+       CASE WHEN upstream_model != '' THEN upstream_model ELSE model END,
+       ts, MAX(total_tokens, 0), 1
+FROM requests WHERE account_id != '' AND status != 0 AND attempts > 0;
+";
+
+/// 版本 21：fork 线 Key 身份归并到上游 `api_key_*`（schema v21）。
+///
+/// 见 [`SCHEMA_VERSION`] 的 v21 段。可重复执行：建表 / 建索引用
+/// `IF NOT EXISTS`，回填用 `WHERE ... = ''`，旧索引用 `DROP INDEX IF EXISTS`。
+const V21_SCHEMA: &str = "
+-- ── 补建上游 v17 的限额事件表（停在 fork v17 的库跳过了该分支）──
+CREATE TABLE IF NOT EXISTS account_limiter_events (
+  row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  account_id TEXT NOT NULL,
+  model TEXT NOT NULL DEFAULT '',
+  channel TEXT NOT NULL DEFAULT '',
+  ts INTEGER NOT NULL,
+  tokens INTEGER NOT NULL DEFAULT 0,
+  requests INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_limiter_events_account_time ON account_limiter_events(account_id, ts, channel);
+INSERT OR IGNORE INTO account_limiter_events (id, account_id, model, ts, tokens, requests)
+SELECT 'legacy:' || row_id, account_id,
+       CASE WHEN upstream_model != '' THEN upstream_model ELSE model END,
+       ts, MAX(total_tokens, 0), 1
+FROM requests WHERE account_id != '' AND status != 0 AND attempts > 0;
+-- ── fork 线旧索引已被 v18 的 idx_requests_api_key_ts 取代 ──
+DROP INDEX IF EXISTS idx_requests_key_ts;
+";
+
+/// v21 的**条件回填**：仅当 `requests` 还带 fork 线的 `key_id` 列时执行。
+///
+/// 上游线（v17～v20）根本没有这两列，直接跑这条 SQL 会报 `no such column`；
+/// 是否执行由 [`migrate_v21`] 先查 `pragma_table_info` 决定。
+const V21_LEGACY_KEY_BACKFILL: &str = "
+UPDATE requests SET api_key_id = key_id, api_key_source = 'key'
+WHERE api_key_id = '' AND key_id != '';
+UPDATE requests SET api_key_name = key_name
+WHERE api_key_name = '' AND key_name != '';
 ";
 
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
@@ -1062,10 +1103,115 @@ fn apply_version(
         // v16：assistant_sessions 助手对话会话表（见 V16_SCHEMA 与
         // SCHEMA_VERSION 的 v16 段）。新表用 CREATE IF NOT EXISTS，幂等。
         16 => conn.execute_batch(V16_SCHEMA),
-        // v17：requests 补网关 Key 身份两列 + 索引（见 V17_SCHEMA 与
-        // SCHEMA_VERSION 的 v17 段）。ALTER TABLE ADD COLUMN 不能重复跑，
-        // 幂等靠版本号（与 v12 同口径）。
         17 => conn.execute_batch(V17_SCHEMA),
+        18 => conn.execute_batch(include_str!("schema_source_stats.sql")),
+        19 => conn.execute_batch(include_str!("schema_assistant_images.sql")),
+        20 => conn.execute_batch(include_str!("schema_debug_raw.sql")),
+        // v21：fork 线 Key 身份映射到 api_key_*（见 V21_SCHEMA 与
+        // SCHEMA_VERSION 的 v21 段）。列是否存在要查 pragma_table_info，
+        // 所以这一段不是一条静态 batch。
+        21 => migrate_v21(conn),
         _ => Ok(()),
+    }
+}
+
+/// v21 的实际动作：先跑无条件部分（补建上游 v17 表、清旧索引），再在
+/// `requests` 仍带 fork 线 `key_id` 列时做映射回填。
+///
+/// 列是否存在必须用 `pragma_table_info` 查 —— SQLite 没有 `ADD COLUMN IF
+/// NOT EXISTS`，也没有「列存在才 UPDATE」的 DDL 语法；把条件留在 Rust 侧
+/// 才能让上游线与 fork 线共用同一个版本号。
+fn migrate_v21(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(V21_SCHEMA)?;
+    let legacy_key_column: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('requests') WHERE name = 'key_id'",
+        [],
+        |row| row.get(0),
+    )?;
+    if legacy_key_column > 0 {
+        conn.execute_batch(V21_LEGACY_KEY_BACKFILL)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v20 存量库的最小形态：上游 v18 已建好 `api_key_*` 列，但 fork 线留下的
+    /// `key_id` / `key_name` 里还躺着 3 把 Key 的身份。v21 只该做映射回填。
+    ///
+    /// 实际承载 Key 身份的表是 `requests`（没有单独的 `keys` 表）——
+    /// 每行一次请求，`key_id` / `key_name` 是那次请求命中的 Key 快照。
+    fn open_v20_fixture() -> Connection {
+        let conn = Connection::open_in_memory().expect("内存库应当能建起来");
+        conn.execute_batch(
+            "CREATE TABLE requests (
+                row_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                id             TEXT NOT NULL,
+                ts             INTEGER NOT NULL DEFAULT 0,
+                model          TEXT NOT NULL DEFAULT '',
+                upstream_model TEXT NOT NULL DEFAULT '',
+                account_id     TEXT NOT NULL DEFAULT '',
+                status         INTEGER NOT NULL DEFAULT 0,
+                attempts       INTEGER NOT NULL DEFAULT 1,
+                total_tokens   INTEGER NOT NULL DEFAULT 0,
+                key_id         TEXT NOT NULL DEFAULT '',
+                key_name       TEXT NOT NULL DEFAULT '',
+                api_key_id     TEXT NOT NULL DEFAULT '',
+                api_key_name   TEXT NOT NULL DEFAULT '',
+                api_key_source TEXT NOT NULL DEFAULT ''
+            );
+            INSERT INTO requests (id, key_id, key_name) VALUES
+                ('r1', 'k-1', 'Key One'),
+                ('r2', 'k-2', 'Key Two'),
+                ('r3', 'k-3', 'Key Three');
+            PRAGMA user_version = 20;",
+        )
+        .expect("v20 fixture 应当能建起来");
+        conn
+    }
+
+    #[test]
+    fn migrates_v20_to_v21_without_losing_keys() {
+        let conn = open_v20_fixture();
+        migrate(&conn).expect("v20 → v21 迁移应当成功");
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("user_version 应当可读");
+        assert_eq!(version, 21);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))
+            .expect("明细行数应当可读");
+        assert_eq!(count, 3, "迁移不能丢任何一行 Key 明细");
+
+        let mut statement = conn
+            .prepare(
+                "SELECT key_id, api_key_id, key_name, api_key_name, api_key_source \
+                 FROM requests ORDER BY id",
+            )
+            .expect("回填结果应当可查");
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .expect("回填结果应当可读")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("回填结果应当可收集");
+
+        assert_eq!(rows.len(), 3);
+        for (key_id, api_key_id, key_name, api_key_name, api_key_source) in rows {
+            assert_eq!(api_key_id, key_id, "api_key_id 必须由 key_id 映射而来");
+            assert_eq!(api_key_name, key_name, "api_key_name 必须由 key_name 映射而来");
+            assert_eq!(api_key_source, "key", "回填行的来源必须是 key");
+        }
     }
 }

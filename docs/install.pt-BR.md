@@ -12,6 +12,7 @@ Depois de instalar, qualquer forma é gerenciada pelo **painel no navegador** (c
 - [Desktop (Windows / macOS / Linux)](#desktop-windows--macos--linux)
 - [Servidor (Windows / Linux, sem interface)](#servidor-windows--linux-sem-interface)
 - [Docker](#docker)
+- [Plugins (extensões de provedores)](#plugins-extensões-de-provedores)
 - [Verificação e conexão do cliente](#verificação-e-conexão-do-cliente)
 - [Acesso pela rede local](#acesso-pela-rede-local)
 - [Celular](#celular)
@@ -151,11 +152,15 @@ No Linux coloque-as em `/etc/agent2api/agent2api.env`; no Windows edite a chave 
 
 ## Docker
 
+Tags da imagem: `latest` acompanha a versão estável mais recente, enquanto `beta` acompanha a pré-versão beta mais recente. Use uma versão completa, como `3.3.0-beta.3`, para fixá-la. Para usar beta, troque `aimodcc/agent2api:latest` por `aimodcc/agent2api:beta` no comando ou na configuração do Compose abaixo; atualize com `docker compose pull && docker compose up -d`. Versões beta não alteram `latest`, e builds manuais de desenvolvimento atualizam apenas `dev`.
+
 ```bash
 docker run -d --name agent2api --restart unless-stopped \
   -p 3065:3065 -v ./data:/data \
   aimodcc/agent2api:latest
 ```
+
+A imagem roda como o usuário não-root `65532:65532`; crie o diretório de dados e entregue-o a esse UID antes do primeiro start: `mkdir -p data && sudo chown -R 65532:65532 data`.
 
 Abra `http://<host>:3065` no navegador: a primeira visita guia o **cadastro do administrador**; depois de entrar, crie uma API key na página "Gateway Keys" para os clientes — `http://<host>:3065/v1` é o endpoint compatível com OpenAI (sem nenhuma chave ele recusa o encaminhamento). Todo o estado (banco SQLite / configuração / logs) fica em um único volume `./data`.
 
@@ -183,9 +188,11 @@ Variáveis de ambiente (todas opcionais):
 | `AGENT2API_ALLOW_NO_KEY` | `1` desativa o fail-closed (serve `/v1` mesmo sem chave configurada — só para redes internas) |
 | `AGENT2API_CAPTCHA_ENABLED` | Widget de verificação humana na tela de login: `1` ativado (padrão), `0` desativado |
 | `AGENT2API_SELF_UPDATE` | Ponto de atualização dentro do contêiner: `1` ativado por padrão (o painel oferece "Baixar e atualizar"); `0` desativa e deixa apenas a atualização manual |
-| `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | Avançado: aponte "verificar atualizações / baixar atualizações" para a sua própria fonte. O primeiro troca o repositório (por padrão segue o upstream `Agent2API/agent2api`; em fork, sobrescreva), o segundo troca a raiz da API (padrão `https://api.github.com`; deve devolver um JSON de release no formato do GitHub). Com uma fonte própria configurada, a lista de permissões de download passa a aceitar, além disso, apenas **o próprio host dessa fonte** (o esquema segue a fonte: uma fonte `http://` também permite download em texto puro — só para ensaios locais / espelhos internos) |
+| `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | Avançado: aponte "verificar atualizações / baixar atualizações" para a sua própria fonte. O primeiro troca o repositório (por padrão segue o upstream `aimod-cc/Agent2API`; em fork, sobrescreva), o segundo troca a raiz da API (padrão `https://api.github.com`; deve devolver um JSON de release no formato do GitHub). Com uma fonte própria configurada, a lista de permissões de download passa a aceitar, além disso, apenas **o próprio host dessa fonte** (o esquema segue a fonte: uma fonte `http://` também permite download em texto puro — só para ensaios locais / espelhos internos) |
 
-Compilar a partir do código: clone o repositório e rode `docker compose up -d --build` (a imagem contém apenas o gateway e o painel, sem toolchain Rust).
+Compilar a partir do código: crie primeiro a rede externa do Caddy e então compile e inicie — `docker network create caddy_caddy_net 2>/dev/null || true`, depois `docker compose up -d --build` (a imagem contém apenas o gateway e o painel, sem toolchain Rust).
+
+O `docker-compose.yml` incluído no repositório é endurecido para uma implantação local atrás do Caddy: a porta fica vinculada só ao loopback (`127.0.0.1:3065:3065`; o Caddy faz proxy reverso para o contêiner `agent2api` pela rede externa `caddy_caddy_net`, que precisa ser criada antes — veja acima), `no-new-privileges` fica ativado e `mem_limit: 1g` é definido. A própria imagem roda como o usuário não-root `65532:65532`, e `/usr/local/bin`, `/app` e `/data` pertencem a esse UID, então o "Baixar e atualizar" dentro do contêiner ainda consegue substituir o executável e a interface (`AGENT2API_SELF_UPDATE=1`); o `./data` montado por bind precisa pertencer a 65532, senão o app não consegue gravar o banco. Builds a partir do código usam `CARGO_BUILD_JOBS=2` por padrão (cada unidade de codegen do Rust pode chegar a centenas de MB até ~1 GB no pico); reduza mais em hosts com pouca memória, ou aumente com `--build-arg CARGO_BUILD_JOBS=N`. A forma `docker run` acima também é non-root 65532 — faça o chown do diretório de dados antes de iniciar.
 
 **Diferenças de recursos no painel web** (decorrem de "não haver cliente de desktop local"): login pela web (WorkBuddy / Qoder / Cline), código por SMS e credenciais coladas funcionam plenamente; logins pela web que exigem callback nesta máquina (AutoClaw / CatPaw / Accio / CodeArts / Trae) e a "importação do estado de login local" não estão disponíveis — use credenciais coladas. Com o desktop e a opção de expor o painel ativadas, abrir no navegador mostra as mesmas diferenças: uma interface, um conjunto de regras.
 
@@ -196,6 +203,20 @@ A página "Atualização de software" do painel consegue baixar e aplicar atuali
 O mesmo `agent2api-server-linux-<arch>.tar.gz` também é o pacote de instalação do [servidor Linux](#linux-systemd): os itens `agent2api-server` e `ui/` são exatamente o que a cadeia de atualização lê pelo nome, e ele ainda traz `install.sh` / `agent2api.service` / `agent2api.env.example`. A cadeia de atualização lê apenas os dois primeiros (o resto é descartado — veja `selfupdate::extract_bundle`), então um artefato serve aos dois propósitos: extrair e substituir dentro do contêiner, extrair e rodar `install.sh` em máquina física.
 
 Atenção ao custo: depois de uma atualização interna, a tag da imagem e a versão realmente em execução **divergem** (`docker inspect` continua mostrando a tag antiga), e `docker compose pull && up -d` recria o contêiner na versão embutida na imagem. Se você quer versões fixas, deixe esse caminho desativado.
+
+## Plugins (extensões de provedores)
+
+O aplicativo contém apenas o gateway e o painel. Login, requisições de modelo, manutenção de credenciais, saldo e check-in de cada provedor ficam em pacotes de plugins separados, baixados por plataforma e atualizados independentemente do aplicativo principal.
+
+1. Abra a página **Plugins** no painel e clique em **Atualizar catálogo** para carregar a lista instalável.
+2. Em **Plugins disponíveis**, escolha o pacote oficial da sua plataforma e clique em **Instalar**. Você também pode baixar o zip correspondente à sua plataforma e usar **Instalar pacote de plugins** no canto superior direito para instalar localmente.
+3. Após a instalação, ative o pacote e os provedores necessários em **Plugins instalados**; o provedor passa a aparecer na página de contas.
+4. Para atualizar, clique em **Verificar atualizações** ou em **Atualizar** no cartão do plugin. O pacote é baixado e verificado novamente, entra em vigor imediatamente e os dados das contas não são afetados.
+5. Para desinstalar, clique em **Desinstalar** no cartão do plugin. O provedor deixa de encaminhar, mas os dados das contas são mantidos e reaparecem após a reinstalação.
+
+Os pacotes de plugins vêm do índice do repositório oficial de plugins [Agent2plugin/Agent2plugin](https://github.com/Agent2plugin/Agent2plugin); os zips são baixados das Releases dele (`Agent2Builder/agent2api-providers-releases`). Os pacotes oficiais são assinados com ed25519 (chave `official-2026`): um pacote cuja assinatura é validada aparece como **assinado**; pacotes sem assinatura ainda podem ser instalados, mas são sinalizados em amarelo; pacotes com assinatura inválida são recusados; pacotes oficiais marcados como **assinatura obrigatória** não aceitam versões sem assinatura. Instalação offline: baixe em uma máquina com internet o zip correspondente à plataforma do gateway, copie-o para o computador e use **Instalar pacote de plugins** para instalá-lo localmente — a instalação faz apenas a verificação local de sha256 e da versão do protocolo, sem precisar de rede.
+
+A plataforma do plugin deve corresponder à plataforma de execução do gateway (desktop Windows / macOS / Linux, servidor Linux, contêiner Docker). O app móvel apenas gerencia remotamente os plugins do gateway conectado; ele não os instala no celular.
 
 ## Verificação e conexão do cliente
 
@@ -233,21 +254,22 @@ Os instaladores de desktop (Windows / macOS) já incluem a pasta `ui/` do painel
 
 ## Celular
 
-Há duas formas — escolha a que precisar:
+Há três formas — escolha a que precisar:
 
 | Forma | Como instalar | Indicada para |
 | --- | --- | --- |
-| **Navegador / PWA** | Abra `/m` no navegador do celular; opcionalmente "Adicionar à tela inicial" | Consulta rápida, sem instalar nada |
+| **Navegador / PWA** | Abra `/m` no navegador do celular; opcionalmente "Adicionar à tela inicial" | Consulta rápida, sem instalar nada, opção mais simples no iPhone |
 | **APK Android** | Instale `Agent2API-<versão>.apk` | Ícone na tela inicial, tela cheia, vários servidores |
+| **IPA iOS** | Instale `Agent2API-<versão>.ipa` (não assinado — você reassina) | Ícone na tela inicial, tela cheia |
 
-As duas rodam o mesmo código de interface. A diferença é quem serve a página: o PWA é servido pelo gateway (então "também expor o painel de gerenciamento web" precisa estar ligado), enquanto o APK leva a interface dentro do pacote (então consegue abrir a interface offline e não precisa dessa opção).
+As três rodam o mesmo código de interface. A diferença é quem serve a página: o PWA é servido pelo gateway (então "também expor o painel de gerenciamento web" precisa estar ligado), enquanto o APK / IPA levam a interface dentro do pacote (então conseguem abrir a interface offline e não precisam dessa opção).
 
 ### Pré-requisitos (por forma)
 
 **Desktop (Windows / macOS / Linux)**: as duas opções precisam estar ligadas; uma sem a outra não funciona.
 
 1. "Configurações → Geral → Acesso pela rede local" — permite que dispositivos da rede acessem o gateway. O fluxo de ativação pede o registro de um administrador do painel e cria automaticamente uma chave chamada "padrão".
-2. "Configurações → Geral → Acesso pela rede local → também expor o painel de gerenciamento web" — serve a pasta estática `ui/`. **Necessária para a forma navegador / PWA** (`/m` é servido pelo gateway, então retorna 404 enquanto esta opção estiver desligada). **O APK não precisa dela** (a interface está no pacote), mas ainda precisa da opção 1 — sem ela o gateway escuta apenas em `127.0.0.1` e o celular não alcança.
+2. "Configurações → Geral → Acesso pela rede local → também expor o painel de gerenciamento web" — serve a pasta estática `ui/`. **Necessária para a forma navegador / PWA** (`/m` é servido pelo gateway, então retorna 404 enquanto esta opção estiver desligada). **O APK / IPA não precisam dela** (a interface está no pacote), mas ainda precisam da opção 1 — sem ela o gateway escuta apenas em `127.0.0.1` e o celular não alcança.
 
 Ambas exigem reinício para valer.
 
@@ -265,17 +287,36 @@ A primeira visita redireciona para a página de login; entre com o administrador
 
 Na primeira execução aparece uma tela "Servidores". São três passos:
 
-1. Toque em "Adicionar" e informe o `IP:porta` do gateway (por exemplo `192.168.1.23:3065`; a porta padrão é 3065);
+1. Toque em "Adicionar" e informe o `IP ou domínio:porta` do gateway (por exemplo `192.168.1.23:3065`). O protocolo pode ser `http://` ou `https://` (http é assumido se omitido); sem porta, http usa 3065 e https usa a 443 padrão;
 2. Toque em "Conectar e salvar" — ele testa o gateway antes, então endereço errado ou gateway sem acesso pela rede local são reportados ali mesmo;
 3. Aparece a página de login. Informe a conta de administrador e a senha deste gateway (se ainda não houver administrador, vira "Criar conta de administrador").
 
-**Vários servidores**: toque em "Adicionar" de novo. Cada servidor guarda o próprio login — trocar não exige entrar de novo, e voltar também não. O ponto de entrada é "Configurações → Servidores"; toque em uma linha para trocar.
+**Vários servidores**: toque em "Adicionar" de novo. Cada servidor guarda o próprio login — trocar não exige entrar de novo, e voltar também não. O ponto de entrada é "Configurações → Servidores"; toque em uma linha para trocar. **A página de login também tem "Trocar de servidor"**, então depois de sair da conta (ou ser desconectado) você não precisa entrar de novo só para chegar a essa lista.
 
 **Limitações conhecidas do APK**:
 
-- Apenas Android. O iOS exige uma conta Apple Developer para assinar, ou instalação pelo Xcode (assinaturas de sideload expiram em 7 dias).
-- Fala com endereços `http://` da rede local em texto claro. O risco é "interceptável na mesma rede local"; o gateway em si continua exigindo login de administrador. Para eliminar, configure TLS no gateway e informe um endereço `https://` (a análise é a mesma, apenas não prefixa `http`).
+- Sem esquema, usa um endereço `http://` de rede local em texto claro. O risco é "interceptável na mesma rede local"; o gateway em si continua exigindo login de administrador. Para eliminar isso, configure TLS no gateway (um proxy reverso ou túnel serve) e informe um endereço `https://` — o esquema é preservado como digitado, e um certificado inválido faz o teste de conexão falhar na hora.
 - A interface segue a versão do APK, não a do gateway. Se uma atualização do gateway adicionar telas novas, é preciso um APK mais novo para vê-las; mudanças apenas de dados não são afetadas.
+
+### Instalar o IPA (iOS)
+
+O `Agent2API-<versão>.ipa` do Release é **não assinado por padrão** — a Apple não permite que desenvolvedores distribuam apps instaláveis livremente, então um pacote não assinado precisa ser reassinado uma vez com o seu Apple ID. Três caminhos:
+
+| Caminho | Requer | Validade |
+| --- | --- | --- |
+| **AltStore / SideStore / Sideloadly** | Um computador (na primeira vez) + Apple ID gratuito | 7 dias, depois reassinar |
+| **Apple Developer Program** | US$ 99/ano, certificado e perfil de provisionamento próprios | 1 ano |
+| **App Store / TestFlight** | US$ 99/ano + revisão | Longo prazo |
+
+Para fazer sideload: arraste o `.ipa` para o AltStore (ou SideStore), reassine com seu Apple ID e instale. Contas gratuitas têm limite de 3 apps simultâneos e exigem reassinatura a cada 7 dias.
+
+**Se você só quer consultar o gateway pelo iPhone, basta abrir `/m` no Safari e "Adicionar à tela inicial"** — não precisa do IPA e evita a reassinatura.
+
+**Limitações conhecidas do IPA**:
+
+- **Atualização dentro do app só abre um link**: o iOS não permite que um app baixe e instale código executável, então "Atualização de software" nas configurações mostra um botão "Baixar" que abre a página do Release, em vez de baixar como no Android. A forma PWA atualiza pelo Service Worker — basta recarregar.
+- Gateways `http://` em texto claro: o `Info.plist` já relaxa o ATS e declara o uso de rede local. Na primeira conexão o sistema pede "permitir acesso à rede local" — é obrigatório aceitar, senão toda requisição falha sem explicação visível.
+- O resto é igual ao APK: a interface segue a versão do pacote e o esquema padrão é http.
 
 ### Adicionar à tela inicial (navegador / PWA)
 

@@ -67,6 +67,13 @@
 //! 只剥**开头**那一块，正文中间的标签一律不动（那是用户内容）。默认关，关着
 //! 时帧的字节与接入前逐字一致。判据、跨帧语义与「为什么不能缓冲正常响应」
 //! 见那个模块的模块头。
+//!
+//! ── 插件已经剥过时不得二次剥离（R21）──────────────────────
+//! 插件 provider 可以在自己的流里先剥掉开头的 think 块，并在握手时申报
+//! `capabilities.think_strip = true`。此时核心通用路径必须**关掉**这一层，
+//! 否则会对已经清理过的正文再跑一遍前缀状态机（正文若恰好以 `<think>` 开头
+//! 就会被误吞）。装配入口是 [`FramePolicy::assembled_for_plugin`]；内置家与
+//! 自定义家没有这个能力位，仍按 `stripLeadingThink` 开关执行。
 
 use std::sync::Arc;
 
@@ -108,13 +115,24 @@ pub struct FramePolicy {
     /// 剥离响应**开头**的 `<think>…</think>` 块（见
     /// `core::middleware::think_tags`）。默认关：关着时下发字节与接入前逐字一致。
     pub strip_leading_think: bool,
+    /// 插件是否声明了 `capabilities.think_strip`。
+    ///
+    /// 为真表示插件已经在下发前剥过开头的 think 块，核心通用路径不能再剥
+    /// （见模块头与 [`FramePolicy::assembled_for_plugin`]）。内置家与自定义家
+    /// 恒为 false。
+    pub think_strip: bool,
 }
 
 impl FramePolicy {
     /// 只带 model 回写、其余按默认（保守形态：那家的保活形态没有实测过，
     /// 不去动它的字节）
     pub fn with_rewrite(rewrite: Option<ModelRewrite>) -> Self {
-        Self { rewrite, strip_newline_chunks: false, strip_leading_think: false }
+        Self {
+            rewrite,
+            strip_newline_chunks: false,
+            strip_leading_think: false,
+            think_strip: false,
+        }
     }
 
     /// 自定义家：model 回写 + **显式**的 per-provider think 剥离开关。
@@ -137,7 +155,12 @@ impl FramePolicy {
         rewrite: Option<ModelRewrite>,
         strip_leading_think: bool,
     ) -> Self {
-        Self { rewrite, strip_newline_chunks: false, strip_leading_think }
+        Self {
+            rewrite,
+            strip_newline_chunks: false,
+            strip_leading_think,
+            think_strip: false,
+        }
     }
 
     /// 由**能力位 × 开关**装配（转发链上唯一的生产入口，见
@@ -154,17 +177,50 @@ impl FramePolicy {
     /// 真·单独成片的那个换行 —— 少一个换行的外观损失换掉整屏断句，值不值由
     /// 用户判，所以判权留在面板 / 环境变量上，而不是编译期替他决定。
     ///
-    /// `strip_leading_think` 与前两项不同：它**没有能力位**。开头 think 块的
-    /// 判定只依赖文本本身（与哪家上游无关），所以只有「开不开」这一道闸，
-    /// 由 `providerOptions` 逐家覆盖全局键 `config::KEY_STRIP_LEADING_THINK`
-    /// （缺省 false，见 `frame_policy_of`）。默认关时下发字节与接入前逐字一致。
+    /// `strip_leading_think` 与前两项不同：它**没有内置家的能力位**。开头
+    /// think 块的判定只依赖文本本身（与哪家上游无关），所以只有「开不开」
+    /// 这一道闸，由 `providerOptions` 逐家覆盖全局键
+    /// `config::KEY_STRIP_LEADING_THINK`（缺省 false，见 `frame_policy_of`）。
+    /// 默认关时下发字节与接入前逐字一致。插件路径若申报了
+    /// `capabilities.think_strip`，走 [`FramePolicy::assembled_for_plugin`]，
+    /// 由那里把核心侧这一层关掉（R21：不二次剥离）。
     pub fn assembled(
         rewrite: Option<ModelRewrite>,
         declared: bool,
         switch_on: bool,
         strip_leading_think: bool,
     ) -> Self {
-        Self { rewrite, strip_newline_chunks: declared && switch_on, strip_leading_think }
+        Self {
+            rewrite,
+            strip_newline_chunks: declared && switch_on,
+            strip_leading_think,
+            think_strip: false,
+        }
+    }
+
+    /// 插件路径的装配入口：`think_strip` 是握手带回的
+    /// `capabilities.think_strip`。
+    ///
+    /// 插件声明了能力位就表示它已经在自己那条流里剥过开头的 think 块；核心
+    /// 通用路径必须**关掉**，否则同一块内容会被剥两次（第二次剥的是插件
+    /// 保留下来、恰好以标签开头的正文）。没申报的插件与内置家同口径：
+    /// `strip_leading_think` 开关决定核心是否剥离。
+    ///
+    /// `declared` / `switch_on` 仍按 [`Self::assembled`] 的规则装配保活换行
+    /// 丢弃；`think_strip` 只影响开头 think 块这一项，不扩张任何别的改写。
+    pub fn assembled_for_plugin(
+        rewrite: Option<ModelRewrite>,
+        declared: bool,
+        switch_on: bool,
+        strip_leading_think: bool,
+        think_strip: bool,
+    ) -> Self {
+        Self {
+            rewrite,
+            strip_newline_chunks: declared && switch_on,
+            strip_leading_think: strip_leading_think && !think_strip,
+            think_strip,
+        }
     }
 }
 
@@ -314,7 +370,7 @@ impl ReasoningCoalescer {
     pub fn with_policy(mut self, policy: FramePolicy) -> Self {
         self.rewrite = policy.rewrite;
         self.strip_newline_chunks = policy.strip_newline_chunks;
-        self.strip_leading_think = policy.strip_leading_think;
+        self.strip_leading_think = policy.strip_leading_think && !policy.think_strip;
         self
     }
 
@@ -1087,6 +1143,40 @@ mod tests {
         let stream = frame(json!({"content": "<think>x</think>answer"}));
         let mut coalescer = ReasoningCoalescer::new();
         assert_eq!(feed(&mut coalescer, &stream), stream, "默认态必须逐字透传");
+    }
+
+    /// R21：插件申报了 `capabilities.think_strip` 时，核心通用路径不得二次剥离。
+    ///
+    /// 反例（去掉 `assembled_for_plugin` 里的 `&& !think_strip`）：开关开着、
+    /// 插件又已经剥过，正文里恰好以 `<think>` 开头的普通内容会被核心当成
+    /// 标签块吞掉。
+    #[test]
+    fn a_plugin_that_declares_think_strip_is_not_stripped_again() {
+        let policy = FramePolicy::assembled_for_plugin(None, false, false, true, true);
+        assert!(policy.think_strip, "插件声明的能力位要留在策略里");
+        assert!(!policy.strip_leading_think, "插件已剥过，核心必须关掉这一层");
+        let mut coalescer = ReasoningCoalescer::new().with_policy(policy);
+        let input = frame(json!({"content": "<think>kept by plugin</think>answer"}));
+        assert_eq!(
+            feed(&mut coalescer, &input),
+            input,
+            "插件申报 think_strip 后，核心必须逐字透传: {input}"
+        );
+    }
+
+    /// 没申报 `capabilities.think_strip` 的插件仍走核心通用剥离（开关打开时）。
+    #[test]
+    fn a_plugin_without_the_capability_still_uses_core_stripping() {
+        let policy = FramePolicy::assembled_for_plugin(None, false, false, true, false);
+        assert!(!policy.think_strip);
+        assert!(policy.strip_leading_think, "没申报能力位就按开关执行");
+        let mut coalescer = ReasoningCoalescer::new().with_policy(policy);
+        let out = feed(
+            &mut coalescer,
+            &frame(json!({"content": "<think>x</think>answer"})),
+        );
+        assert!(out.contains(r#""content":"answer""#), "核心应剥掉开头块: {out}");
+        assert!(!out.contains("<think>"), "标签不能残留: {out}");
     }
 
     /// 流式路径的开头标签剥离，且跨帧（`<thi` + `nk>`）不残留半截标签。

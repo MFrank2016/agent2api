@@ -788,7 +788,7 @@ impl Continuation {
     /// 流式：把多轮拼成**一条**下游流。
     ///
     /// 形态与仓里既有的「流还活着时做异步事」一致（后台任务喂 mpsc，主路径返回
-    /// `ReceiverStream`，见 `providers::kuku::chat` 等处的同一写法）—— 手工在
+    /// `ReceiverStream`，见已迁出的 kuku provider `chat` 等处的同一写法）—— 手工在
     /// `poll_next` 里 poll 一个 future 只有 `cancellation::CancellableStream` 一处先例，
     /// 而它不需要在轮次之间换掉整条上游流。
     ///

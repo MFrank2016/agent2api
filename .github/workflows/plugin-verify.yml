@@ -1,0 +1,186 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+name: plugin-verify
+
+# 校验插件宿主与网关的协议契约（gateway + plugin + frontend 三条 CI 里的 plugin 那条）。
+#
+# ── 为什么要单独一道闸 ────────────────────────────────────────
+# 网关仓库不含任何 provider 实现：`agent2api-providers` 二进制由公有插件仓库
+# `ProvidersPlugin/Agent2Providers` 产出。本工作流按 `server/Cargo.toml` 里引用的
+# 契约 tag 检出该仓库、原生编译 `agent2api-providers`，再用
+# `scripts/verify-plugin-host.mjs` 跑协议端到端（握手 / 能力位 / 流式 / 背压 /
+# 取消 / 崩溃恢复）。网关与插件任一侧改了协议，这里都会红。
+#
+# ── 平台矩阵 ──────────────────────────────────────────────────
+# 与插件仓库的打包矩阵对齐，五个平台各原生编译一次（不做交叉编译）：
+#   linux-x64 / linux-arm64 / macos-arm64 / macos-x64 / windows-x64
+# 协议本身与平台无关，但「同一份二进制在五个平台都能起来」是发布前提，
+# 因此这里按平台各跑一遍，而不是只在 Linux 上跑。
+#
+# ── 凭据 ──────────────────────────────────────────────────────
+#   · 插件仓库当前是**公有**仓库，检出不需要额外凭据（`github.token` 只读即可）。
+#   · 若将来插件仓库转为私有：在仓库 secrets 里配置 `PLUGIN_REPO_TOKEN`
+#     （对该仓库有 contents:read 权限），下面的 checkout 会自动改用它。
+#   · gitleaks 对**组织**账号需要 `GITLEAKS_LICENSE` secret；个人账号可留空。
+#     这里只引用 secret 名，不写入任何密钥值。
+
+on:
+  push:
+    branches: [main, beta]
+  pull_request:
+    branches: [main, beta]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PLUGIN_REPO: ProvidersPlugin/Agent2Providers
+
+jobs:
+  # ── 协议验证（五平台矩阵）────────────────────────────────────
+  verify:
+    name: verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-latest
+          - macos-15-intel
+          - windows-latest
+    steps:
+      - name: 检出网关
+        uses: actions/checkout@v7
+
+      # 契约 tag 从 server/Cargo.toml 读，避免工作流里再写一份版本号后漂移
+      - name: 解析契约 tag
+        id: contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$(grep -oE 'agent2api-provider-protocol = \{ git = "[^"]+", tag = "[^"]+"' \
+                   desktop-tauri/src-tauri/server/Cargo.toml \
+                 | sed -E 's/.*tag = "([^"]+)".*/\1/')"
+          [[ -n "$tag" ]] || { echo "::error::无法从 server/Cargo.toml 解析契约 tag"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "插件仓库 $PLUGIN_REPO @ $tag"
+
+      - name: 检出插件仓库
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PLUGIN_REPO }}
+          ref: ${{ steps.contract.outputs.tag }}
+          path: agent2api-providers
+          # 公有仓库走默认 github.token；私有化后改用 secrets.PLUGIN_REPO_TOKEN
+          token: ${{ secrets.PLUGIN_REPO_TOKEN || github.token }}
+
+      - name: 安装 Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # BoringSSL（wreq 的 TLS 后端）构建依赖，与 build.yml 的同款说明
+      - name: 安装 BoringSSL 构建依赖（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake nasm libclang-dev pkg-config
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+
+      - name: 安装 BoringSSL 构建依赖（macOS）
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake nasm llvm
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+
+      - name: 配置 BoringSSL 构建依赖（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake --version
+          nasm -v
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: 缓存 Rust 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: agent2api-providers -> target
+
+      # 产物统一落到网关仓库根的 target/release，下面的 --exe 路径才固定
+      - name: 编译插件宿主
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: cargo build --release --manifest-path agent2api-providers/Cargo.toml -p agent2api-providers
+
+      - name: 验证插件协议（Linux / macOS）
+        if: runner.os != 'Windows'
+        run: node scripts/verify-plugin-host.mjs --exe target/release/agent2api-providers
+
+      - name: 验证插件协议（Windows）
+        if: runner.os == 'Windows'
+        shell: bash
+        run: node scripts/verify-plugin-host.mjs --exe target/release/agent2api-providers.exe
+
+  # ── 密钥扫描 / 许可证头（与仓库现有许可约定一致）──────────────
+  hygiene:
+    name: secret scanning / license header
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: 密钥扫描
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 组织账号需要；个人账号留空即可。只引用 secret 名，不写密钥值。
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+      - name: 许可证头校验
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 1) 许可证文件与 Cargo 声明必须是 AGPL-3.0（与根 package.json 一致）
+          grep -q "GNU AFFERO GENERAL PUBLIC LICENSE" LICENSE \
+            || { echo "::error file=LICENSE::LICENSE 不是 AGPL-3.0"; exit 1; }
+          grep -q 'license = "AGPL-3.0-only"' desktop-tauri/src-tauri/server/Cargo.toml \
+            || { echo "::error::server/Cargo.toml 的 license 不是 AGPL-3.0-only"; exit 1; }
+
+          # 2) 本任务范围内的 CI 工作流必须带 SPDX 头
+          #    （仓库存量源码没有统一 SPDX 头，全仓强制会整片报红，故只约束 CI 文件）
+          missing=0
+          for f in \
+            .github/workflows/build.yml \
+            .github/workflows/frontend-artifacts.yml \
+            .github/workflows/plugin-verify.yml
+          do
+            if ! grep -q "SPDX-License-Identifier: AGPL-3.0-only" "$f"; then
+              echo "::error file=$f::缺少 SPDX 许可证头"
+              missing=1
+            fi
+          done
+
+          # 3) 源码里不得残留旧 MIT 授权文本（迁移前是 MIT + 使用声明）
+          #    排除本工作流自身（下面的字面量会自匹配）、LICENSE 与锁文件。
+          #    `|| true`：git grep 无匹配时退出 1，这里要的是「无匹配 = 通过」。
+          legacy_mit="$(git grep -l "Permission is hereby granted, free of charge" -- \
+               ':!.github/workflows/plugin-verify.yml' ':!LICENSE' ':!*.lock' || true)"
+          if [ -n "$legacy_mit" ]; then
+            echo "$legacy_mit"
+            echo "::error::源码中残留旧 MIT 授权文本"
+            exit 1
+          fi
+
+          exit "$missing"
