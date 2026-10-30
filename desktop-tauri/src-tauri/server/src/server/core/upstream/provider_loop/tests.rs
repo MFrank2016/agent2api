@@ -189,6 +189,7 @@ fn stateful_quota_bookkeeping_ignores_non_quota_classes() {
 }
 
 #[test]
+#[ignore = "reason: plugin-owned behavior — CodeArts daily-pool classification (InferHub.4291.200 → QuotaLimited with the next Beijing midnight) lives in the agent2api-providers plugin; the gateway unit suite only sees MissingPluginAdapter. Bookkeeping of a supplied QuotaLimited.reset_at is still covered by stateful_quota_bookkeeping_keeps_the_adapter_reset_at."]
 fn codearts_daily_pool_envelope_cools_to_the_boundary_instead_of_ten_minutes() {
     use crate::server::errors::GatewayError;
 
@@ -431,19 +432,94 @@ impl Drop for RestoreProviderOptions {
     }
 }
 
+/// 迁移后的测试替身：只声明网关侧要读的那一项能力位。
+///
+/// `adapter_for` 现在对任何 kind 都返回 `MissingPluginAdapter`（真实现全在
+/// `agent2api-providers` 插件里）。下面两条用例钉的是**网关读取口径**
+/// （能力位 && 逐家开关），与哪家实现无关，所以用一个最小替身声明能力位，
+/// 而不是把内置实现搬回网关。
+struct CapabilityTestAdapter {
+    kind: ProviderKind,
+    strip_newline_chunks: bool,
+}
+
+impl ProviderAdapter for CapabilityTestAdapter {
+    fn kind(&self) -> ProviderKind {
+        self.kind
+    }
+
+    fn list_models(&self) -> Vec<Value> {
+        Vec::new()
+    }
+
+    fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass {
+        UpstreamErrorClass::Fatal {
+            status,
+            message: error_body.to_string(),
+            upstream_code: None,
+        }
+    }
+
+    fn build_chat_request(
+        &self,
+        _account: &Value,
+        _body: &Value,
+        _client_headers: &axum::http::HeaderMap,
+    ) -> Result<crate::server::core::providers::adapter::ChatRequestPlan, GatewayError> {
+        Err(GatewayError::with_status(501, "测试替身不构造上游请求"))
+    }
+
+    fn sse_strip_newline_chunks(&self) -> bool {
+        self.strip_newline_chunks
+    }
+
+    fn ensure_access_token<'a>(
+        &'a self,
+        _store: &'a crate::server::core::account_store::AccountStore,
+        _account_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async move { Err(GatewayError::with_status(501, "测试替身不取凭证")) })
+    }
+
+    fn refresh_models<'a>(
+        &'a self,
+        _store: &'a crate::server::core::account_store::AccountStore,
+        _account_id: &'a str,
+        _force: bool,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = crate::server::core::providers::adapter::ModelRefreshOutcome,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            crate::server::core::providers::adapter::ModelRefreshOutcome::failed(
+                "测试替身不刷新模型目录",
+            )
+        })
+    }
+}
+
 #[test]
 fn a_declared_provider_honours_its_own_newline_switch_over_the_global_one() {
     let _guard = hold_provider_options();
     let _restore = RestoreProviderOptions::capture();
     ensure_provider_options_snapshot();
 
-    // WorkBuddy 声明了 `sse_strip_newline_chunks`（能力位），所以它是「开关真能
+    // 用替身声明 `sse_strip_newline_chunks`（能力位），模拟插件家「开关真能
     // 生效」的那一类。断言写成**相对全局默认值的差分形式**，不依赖环境变量：
     // 逐家值 = !全局 ⇒ 策略必须 = !全局；逐家值 = 全局 ⇒ 策略必须 = 全局。
-    let adapter = adapter_for(ProviderKind::WorkBuddy);
+    let adapter = CapabilityTestAdapter {
+        kind: ProviderKind::WorkBuddy,
+        strip_newline_chunks: true,
+    };
     assert!(
         adapter.sse_strip_newline_chunks(),
-        "前提：WorkBuddy 必须声明能力位"
+        "前提：替身声明了能力位"
     );
     let provider_id = crate::server::core::providers::kind_id(adapter.kind());
     let key = crate::server::config::KEY_STRIP_NEWLINE_KEEPALIVE;
@@ -452,7 +528,7 @@ fn a_declared_provider_honours_its_own_newline_switch_over_the_global_one() {
     crate::server::core::provider_options::set(provider_id, key, !global)
         .expect("登记过的键必须能写");
     assert_eq!(
-        frame_policy_of(adapter, "m").strip_newline_chunks,
+        frame_policy_of(&adapter, "m").strip_newline_chunks,
         !global,
         "逐家开关必须盖过全局值（只读全局的话这里会等于 {global}）"
     );
@@ -460,7 +536,7 @@ fn a_declared_provider_honours_its_own_newline_switch_over_the_global_one() {
     crate::server::core::provider_options::set(provider_id, key, global)
         .expect("登记过的键必须能写");
     assert_eq!(
-        frame_policy_of(adapter, "m").strip_newline_chunks,
+        frame_policy_of(&adapter, "m").strip_newline_chunks,
         global,
         "逐家值等于全局值时也要如实装配"
     );
