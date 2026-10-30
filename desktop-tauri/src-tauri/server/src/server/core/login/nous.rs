@@ -30,7 +30,7 @@ impl LoginService {
     /// 发起 Nous Portal 设备码登录。
     pub fn start_nous_login(&self) -> Result<LoginTaskHandle, String> {
         let info = resolve_edition(None);
-        let handle = self.new_handle_for_provider(info, kind_id(ProviderKind::Nous));
+        let handle = self.new_handle_for_provider(info.id, kind_id(ProviderKind::Nous));
         // 本地关联串（上游 device_code 要到 start 之后才有，见模块头）
         let state = format!("nous-{}", logging::now_ms());
         handle.update(|task| {

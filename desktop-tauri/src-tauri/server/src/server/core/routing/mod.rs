@@ -424,15 +424,21 @@ pub fn account_id(account: &Value) -> Option<&str> {
         .filter(|id| !id.is_empty())
 }
 
-/// 账号展示名：`account.name || account.id`（Node 的 blocked 列表用这个兜底）
+/// 账号展示名：`displayName`（统一展示名，见 `store_view::display_name_of`）
+/// → `name` → id（快照缺 `displayName` 时按旧口径回落）
 pub fn account_name(account: &Value, id: &str) -> String {
-    match account.get("name") {
-        Some(value) if js_truthy(value) => match value.as_str() {
-            Some(text) => text.to_string(),
-            None => value.to_string(),
-        },
-        _ => id.to_string(),
-    }
+    account
+        .get("displayName")
+        .filter(|value| js_truthy(value))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            account.get("name").filter(|value| js_truthy(value)).and_then(|value| match value {
+                Value::String(text) => Some(text.to_string()),
+                other => Some(other.to_string()),
+            })
+        })
+        .unwrap_or_else(|| id.to_string())
 }
 
 /// 从 store 快照 `{ currentAccountId, accounts: [...] }` 取账号数组。
@@ -448,10 +454,14 @@ pub fn accounts_of(snapshot: &Value) -> Vec<Value> {
 
 /// 选路排序键：`(归一后的优先级, 加入时间)`。策略层也要按同一把尺子给
 /// 账号排序 / 求「组内最优先」的那个，所以键的构造必须只有一处。
+///
+/// `routingPriority` 是 `routing_scope` 给候选快照打的**投影位次**（路由
+/// 覆盖生效时才有）；它优先于账号库里的 `priority`，其余情况仍按 `priority`
+/// —— 无投影时与本地原实现逐字一致。
 fn priority_key(account: &Value) -> (i64, i64) {
     (
         normalize_priority(
-            account.get("priority"),
+            account.get("routingPriority").or_else(|| account.get("priority")),
             crate::server::core::account_store::priority::DEFAULT_PRIORITY,
         ),
         js_number(account.get("addedAt").unwrap_or(&Value::Null)).unwrap_or(0.0) as i64,
@@ -670,15 +680,15 @@ pub fn plan_route(
         ordered.push(account.clone());
     }
 
-    // 基础序（策略）→ 粘性 → 稳定修饰：没沉底的在前 → 没休息的在前 → 没熔断的在前
+    // 基础序（策略）→ 稳定修饰：没沉底的在前 → 没休息的在前 → 没熔断的在前
     //
-    // 粘性放在**基础序之后**：策略排序会重排整张表，先插队会被它冲掉。
-    // 粘性命中的可用账号提到最前（它可用，请求就会走它 —— 排序必须如实反映）。
-    //
-    // 三个稳定修饰**跨策略**生效：垫底（Sink）解决的是「每次回到第 1 位再撞一次
+    // 三个修饰**跨策略**生效：垫底（Sink）解决的是「每次回到第 1 位再撞一次
     // 429」，退避解决的是「反复失败反复撞」—— 它们在优先级策略下同样成立；
     // 若只对轮询生效，默认策略下这两个开关就是摆设。稳定排序保证
     // 同档内的先后仍由策略的基础序决定（优先级下 = 位次）。
+    //
+    // 粘性放在**基础序之后**：策略排序会重排整张表，先插队会被它冲掉。
+    // 粘性命中的可用账号提到最前（它可用，请求就会走它 —— 排序必须如实反映）。
     let mut arranged = base_order(&ordered, counts, now, meta);
     let mut sticky_hit = false;
     if let Some(hit) = meta.sticky_account {
@@ -706,6 +716,23 @@ pub fn plan_route(
             .unwrap_or(false)
     });
 
+    // 每个位次「前面出现过的家是不是全是它自己家」—— 家内轮询（`RoundRobin`）
+    // 的原因句要用：排在第 2 位的若是**同一家的下一个账号**（家 A = a1/a2、
+    // 家 B = b1），前面并没有「优先级更高的家」，它是家内轮流的正常位次。
+    // 此前那句一律写「等前面的轮完或失败才到它」，与排序事实不符。
+    let prefix_is_same_family: Vec<bool> = {
+        let mut seen: Vec<String> = Vec::new();
+        let mut flags = Vec::with_capacity(arranged.len());
+        for account in &arranged {
+            let provider = provider_of(account).to_string();
+            flags.push(seen.iter().all(|name| *name == provider));
+            if !seen.iter().any(|name| *name == provider) {
+                seen.push(provider);
+            }
+        }
+        flags
+    };
+
     let ordered_entries: Vec<PlanEntry> = arranged
         .into_iter()
         .enumerate()
@@ -713,7 +740,13 @@ pub fn plan_route(
             let id = account_id(&account).unwrap_or("").to_string();
             let position = index + 1;
             let mut reason = if sticky_hit && Some(id.as_str()) == meta.sticky_account {
-                "会话粘住：这个会话上一轮是它答的，本轮继续用它".to_string()
+                // 「继续用它」只在它**真的**排在队首时才说（置顶之后还有三层
+                // 稳定修饰，粘住的账号若正在垫底 / 休息 / 熔断，会被推回队尾）。
+                if position == 1 {
+                    "会话粘住：这个会话上一轮是它答的，本轮继续用它".to_string()
+                } else {
+                    format!("会话粘住，但它当前排在第 {position} 位（正在让位于下面的状态）")
+                }
             } else {
                 match meta.strategies.resolve(provider_of(&account)) {
                     RoutingStrategy::Priority => {
@@ -726,6 +759,8 @@ pub fn plan_route(
                     RoutingStrategy::RoundRobin => {
                         if position == 1 {
                             "本轮轮到它：轮询下每条请求换下一位".to_string()
+                        } else if prefix_is_same_family[index] {
+                            format!("排在第 {position} 位：同一家内轮流，轮到它才上")
                         } else {
                             format!("排在第 {position} 位：等前面的轮完或失败才到它")
                         }
@@ -741,7 +776,9 @@ pub fn plan_route(
                 }
             };
             if meta.sunk.contains_key(&id) {
-                reason.push_str("；曾还有额度时被 429（垫底中，轮一圈才回来）");
+                // 垫底现在有 30 分钟寿命（`route_state::SINK_TTL_MS`），
+                // 不再是「轮一圈才回来」（那是上游原实现，垫底永不失效时的说法）。
+                reason.push_str("；曾还有额度时被 429（垫底中，30 分钟后自动回到队列）");
             }
             if let Some(until) = meta.resting.get(&id) {
                 reason.push_str(&format!("；转发失败休息至 {}", clock_text(*until, now)));

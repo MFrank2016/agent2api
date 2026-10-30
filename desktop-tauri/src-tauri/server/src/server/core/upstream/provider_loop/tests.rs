@@ -1,10 +1,7 @@
 use super::*;
-use crate::server::core::providers::zcode::adapter::{ZCODE_ADAPTER, ZCODE_INTL_ADAPTER};
 use crate::server::core::upstream::usage::RequestTelemetry;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-
-const QUOTA_BODY: &str = r#"{"code":1005,"msg":"exceed quota limit","logid":"test-request"}"#;
 
 async fn mock_upstream(
     status: u16,
@@ -47,155 +44,20 @@ async fn mock_upstream(
     )
 }
 
-#[tokio::test]
-async fn zcode_http_200_quota_json_is_classified_before_streaming_without_resend() {
-    for adapter in [&ZCODE_ADAPTER, &ZCODE_INTL_ADAPTER] {
-        let (transport, hits, task) =
-            mock_upstream(200, "application/json; charset=utf-8", QUOTA_BODY).await;
-        let mut budget = RetryBudget::new(3);
-        let capture = crate::server::core::debug_traffic::TrafficCapture::begin("quota-test");
-        let result = send_with_retry(
-            adapter,
-            &transport,
-            &mut budget,
-            Some(&capture),
-            &RequestTelemetry::new(),
-            false,
-        )
-        .await;
-        task.abort();
-        let failure = match result {
-            Err(failure) => failure,
-            Ok(_) => panic!("HTTP 200 quota envelope must not enter the success stream"),
-        };
-        assert!(matches!(
-            failure.class,
-            UpstreamErrorClass::QuotaLimited {
-                status: 429,
-                upstream_code: Some(1005),
-                reset_at: None,
-                ..
-            }
-        ));
-        assert_eq!(failure.error.status_code, 429);
-        assert_eq!(failure.error.upstream_code, Some(1005));
-        assert!(failure.error.message.contains("exceed quota limit"));
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
-        assert_eq!(budget.remaining, 3);
-        assert_eq!(capture.captured_body(), QUOTA_BODY);
-    }
-}
-
-#[test]
-fn zcode_header_detection_handles_mime_parameters_without_requiring_sse_headers() {
-    use axum::http::{header::CONTENT_TYPE, HeaderMap, HeaderValue};
-    for (mime, expected) in [
-        (None, false),
-        (Some("application/json"), true),
-        (Some("Application/JSON; charset=utf-8"), true),
-        (Some("text/event-stream; charset=utf-8"), false),
-        (Some("application/octet-stream"), false),
-    ] {
-        let mut headers = HeaderMap::new();
-        if let Some(mime) = mime {
-            headers.insert(CONTENT_TYPE, HeaderValue::from_static(mime));
-        }
-        assert_eq!(ZCODE_ADAPTER.is_error_response(200, &headers), expected);
-        assert!(ZCODE_ADAPTER.is_error_response(401, &headers));
-        assert!(ZCODE_ADAPTER.is_error_response(429, &headers));
-    }
-}
-
-#[tokio::test]
-async fn zcode_http_auth_and_quota_errors_keep_their_status() {
-    for (status, body) in [(401, ""), (429, r#"{"msg":"rate limited"}"#)] {
-        let (transport, _, task) = mock_upstream(status, "application/json", body).await;
-        let result = send_with_retry(
-            &ZCODE_ADAPTER,
-            &transport,
-            &mut RetryBudget::new(0),
-            None,
-            &RequestTelemetry::new(),
-            false,
-        )
-        .await;
-        task.abort();
-        let failure = match result {
-            Err(failure) => failure,
-            Ok(_) => panic!("HTTP error must not be accepted"),
-        };
-        assert_eq!(failure.error.status_code, i32::from(status));
-        if status == 401 {
-            assert!(matches!(
-                failure.class,
-                UpstreamErrorClass::TokenExpired { .. }
-            ));
-        } else {
-            assert!(matches!(
-                failure.class,
-                UpstreamErrorClass::QuotaLimited { .. }
-            ));
-        }
-    }
-}
-
-#[tokio::test]
-async fn zcode_unknown_or_malformed_success_json_returns_an_error() {
-    for body in [r#"{"code":9999,"msg":"unexpected rejection"}"#, "not json"] {
-        let (transport, _, task) = mock_upstream(200, "application/json", body).await;
-        let result = send_with_retry(
-            &ZCODE_ADAPTER,
-            &transport,
-            &mut RetryBudget::new(0),
-            None,
-            &RequestTelemetry::new(),
-            false,
-        )
-        .await;
-        task.abort();
-        let failure = match result {
-            Err(failure) => failure,
-            Ok(_) => panic!("non-SSE ZCode response must not be accepted"),
-        };
-        assert_eq!(failure.error.status_code, 502);
-        assert!(failure.error.message.contains(if body == "not json" {
-            "not json"
-        } else {
-            "unexpected rejection"
-        }));
-    }
-}
-
-#[tokio::test]
-async fn zcode_success_sse_and_other_providers_json_remain_unconsumed() {
-    let sse = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\"}}\n\n";
-    let cases: [(&dyn ProviderAdapter, &str, &str); 2] = [
-        (&ZCODE_ADAPTER, "text/event-stream", sse),
-        (
-            adapter_for(ProviderKind::WorkBuddy),
-            "application/json",
-            QUOTA_BODY,
-        ),
-    ];
-    for (adapter, content_type, body) in cases {
-        let (transport, _, task) = mock_upstream(200, content_type, body).await;
-        let result = send_with_retry(
-            adapter,
-            &transport,
-            &mut RetryBudget::new(0),
-            None,
-            &RequestTelemetry::new(),
-            false,
-        )
-        .await;
-        task.abort();
-        let response = match result {
-            Ok(response) => response,
-            Err(failure) => panic!("valid response rejected: {}", failure.error.message),
-        };
-        assert_eq!(response.text().await.unwrap(), body);
-    }
-}
+// ── ZCode 的响应判定与错误分类（测试随实现搬到插件）────────────────────────
+//
+// 这里原有五条用例钉的是 ZCode 适配器的两件事：
+//   · `is_error_response`：HTTP 200 + `application/json` 是**业务拒绝**而不是
+//     SSE 正文（`1005 exceed quota limit` 走 200 回来），网关必须先读错误体；
+//   · `classify_error`：401 → TokenExpired、429 / 业务码 1005 → QuotaLimited。
+//
+// 这两条判据都跟着 ZCode 的实现搬到 `agent2api-providers` 了，因此用例也一起
+// 搬走 —— 留在网关只会编译不过（`ZCODE_ADAPTER` 已不存在）。插件侧的同名用例
+// 在 `zcode::mod` 的 `classify` 附近。
+//
+// 顺带说明**为什么这段注释留着**：`provider_loop` 的「HTTP 200 也可能是错误」
+// 与「401/429 各自的动作」这两条**编排层**语义没有变，下面几条用例
+// （会话式路径的限额记账）仍在验证它们。
 
 // ── 会话式路径的限额记账（`mark_conversation_limited`）──────────────────────
 //
@@ -327,6 +189,7 @@ fn stateful_quota_bookkeeping_ignores_non_quota_classes() {
 }
 
 #[test]
+#[ignore = "reason: plugin-owned behavior — CodeArts daily-pool classification (InferHub.4291.200 → QuotaLimited with the next Beijing midnight) lives in the agent2api-providers plugin; the gateway unit suite only sees MissingPluginAdapter. Bookkeeping of a supplied QuotaLimited.reset_at is still covered by stateful_quota_bookkeeping_keeps_the_adapter_reset_at."]
 fn codearts_daily_pool_envelope_cools_to_the_boundary_instead_of_ten_minutes() {
     use crate::server::errors::GatewayError;
 
@@ -461,13 +324,18 @@ async fn a_real_413_response_is_sent_once_and_handed_back() {
         mock_upstream(413, "application/json; charset=utf-8", APIG_TOO_LARGE_BODY).await;
     let mut budget = RetryBudget::new(3);
     let capture = crate::server::core::debug_traffic::TrafficCapture::begin("payload-too-large");
+    // 适配器只提供「怎么判上游错误」这一半；413 的处置在**编排层**
+    // （`transport::RetryBudget` + `fallback_retry_advice`），因此随便挑一个
+    // 内置家即可。原先这里用 ZCode 的实例，它随实现搬到插件了 —— 换成本家
+    // 走得通的 WorkBuddy，断言的仍是同一处语义。
     let result = send_with_retry(
-        &ZCODE_ADAPTER,
+        adapter_for(ProviderKind::WorkBuddy),
         &transport,
         &mut budget,
         Some(&capture),
-        &RequestTelemetry::new(),
+        &std::sync::Arc::new(RequestTelemetry::new()),
         false,
+        None,
     )
     .await;
     task.abort();
@@ -564,19 +432,94 @@ impl Drop for RestoreProviderOptions {
     }
 }
 
+/// 迁移后的测试替身：只声明网关侧要读的那一项能力位。
+///
+/// `adapter_for` 现在对任何 kind 都返回 `MissingPluginAdapter`（真实现全在
+/// `agent2api-providers` 插件里）。下面两条用例钉的是**网关读取口径**
+/// （能力位 && 逐家开关），与哪家实现无关，所以用一个最小替身声明能力位，
+/// 而不是把内置实现搬回网关。
+struct CapabilityTestAdapter {
+    kind: ProviderKind,
+    strip_newline_chunks: bool,
+}
+
+impl ProviderAdapter for CapabilityTestAdapter {
+    fn kind(&self) -> ProviderKind {
+        self.kind
+    }
+
+    fn list_models(&self) -> Vec<Value> {
+        Vec::new()
+    }
+
+    fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass {
+        UpstreamErrorClass::Fatal {
+            status,
+            message: error_body.to_string(),
+            upstream_code: None,
+        }
+    }
+
+    fn build_chat_request(
+        &self,
+        _account: &Value,
+        _body: &Value,
+        _client_headers: &axum::http::HeaderMap,
+    ) -> Result<crate::server::core::providers::adapter::ChatRequestPlan, GatewayError> {
+        Err(GatewayError::with_status(501, "测试替身不构造上游请求"))
+    }
+
+    fn sse_strip_newline_chunks(&self) -> bool {
+        self.strip_newline_chunks
+    }
+
+    fn ensure_access_token<'a>(
+        &'a self,
+        _store: &'a crate::server::core::account_store::AccountStore,
+        _account_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async move { Err(GatewayError::with_status(501, "测试替身不取凭证")) })
+    }
+
+    fn refresh_models<'a>(
+        &'a self,
+        _store: &'a crate::server::core::account_store::AccountStore,
+        _account_id: &'a str,
+        _force: bool,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = crate::server::core::providers::adapter::ModelRefreshOutcome,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            crate::server::core::providers::adapter::ModelRefreshOutcome::failed(
+                "测试替身不刷新模型目录",
+            )
+        })
+    }
+}
+
 #[test]
 fn a_declared_provider_honours_its_own_newline_switch_over_the_global_one() {
     let _guard = hold_provider_options();
     let _restore = RestoreProviderOptions::capture();
     ensure_provider_options_snapshot();
 
-    // WorkBuddy 声明了 `sse_strip_newline_chunks`（能力位），所以它是「开关真能
+    // 用替身声明 `sse_strip_newline_chunks`（能力位），模拟插件家「开关真能
     // 生效」的那一类。断言写成**相对全局默认值的差分形式**，不依赖环境变量：
     // 逐家值 = !全局 ⇒ 策略必须 = !全局；逐家值 = 全局 ⇒ 策略必须 = 全局。
-    let adapter = adapter_for(ProviderKind::WorkBuddy);
+    let adapter = CapabilityTestAdapter {
+        kind: ProviderKind::WorkBuddy,
+        strip_newline_chunks: true,
+    };
     assert!(
         adapter.sse_strip_newline_chunks(),
-        "前提：WorkBuddy 必须声明能力位"
+        "前提：替身声明了能力位"
     );
     let provider_id = crate::server::core::providers::kind_id(adapter.kind());
     let key = crate::server::config::KEY_STRIP_NEWLINE_KEEPALIVE;
@@ -585,7 +528,7 @@ fn a_declared_provider_honours_its_own_newline_switch_over_the_global_one() {
     crate::server::core::provider_options::set(provider_id, key, !global)
         .expect("登记过的键必须能写");
     assert_eq!(
-        frame_policy_of(adapter, "m").strip_newline_chunks,
+        frame_policy_of(&adapter, "m").strip_newline_chunks,
         !global,
         "逐家开关必须盖过全局值（只读全局的话这里会等于 {global}）"
     );
@@ -593,7 +536,7 @@ fn a_declared_provider_honours_its_own_newline_switch_over_the_global_one() {
     crate::server::core::provider_options::set(provider_id, key, global)
         .expect("登记过的键必须能写");
     assert_eq!(
-        frame_policy_of(adapter, "m").strip_newline_chunks,
+        frame_policy_of(&adapter, "m").strip_newline_chunks,
         global,
         "逐家值等于全局值时也要如实装配"
     );

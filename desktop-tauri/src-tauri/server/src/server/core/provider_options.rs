@@ -75,12 +75,18 @@ fn config_key() -> &'static str {
 #[cfg(test)]
 pub(crate) static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// provider 是否可识别（内置注册表或自定义家）。
+/// provider 是否可识别（内置注册表 / 自定义家 / 已装入的插件家）。
+///
+/// 插件家的身份由插件宿主回答（R24）：网关覆盖层对已装入的插件家同样
+/// 生效，**不要求**插件先声明 `capabilities` / `settings` —— 那些声明
+/// 延后到插件侧（3.1b/5.x）。内置 id 走前面的注册表短路，不会为每个
+/// 请求去抢插件注册表的锁。
 fn is_known_provider(provider_id: &str) -> bool {
     crate::server::core::providers::PROVIDERS
         .iter()
         .any(|meta| meta.id == provider_id)
         || crate::server::core::custom_providers::is_custom_provider_id(provider_id)
+        || crate::server::core::plugin_host::serves_provider(provider_id)
 }
 
 /// 读一个 provider 的某个开关。`None` = 没设置过（调用方用 default）。
@@ -426,5 +432,32 @@ mod tests {
             None,
             "被拒绝的写入不许在配置里留下任何痕迹"
         );
+    }
+
+    /// `value:null` 的存储侧契约：删掉覆盖 = 回到「跟随全局」。
+    ///
+    /// 三态（跟随 / 显式开 / 显式关）里只有前两态能由 `set` 表达；
+    /// 少了 `remove`，用户一旦覆盖过就再也回不到跟随全局。
+    #[test]
+    fn null_removes_provider_override() {
+        let _guard = hold_config();
+        let _restore = RestoreOptions::capture();
+        ensure_snapshot();
+        let key = crate::server::config::KEY_STRIP_LEADING_THINK;
+        set("qoder", key, true).expect("写入应当成功");
+        assert_eq!(get("qoder", key), Some(true));
+
+        remove("qoder", key).expect("删除应当成功");
+        assert_eq!(get("qoder", key), None, "删除后必须读不到（= 跟随全局）");
+        assert!(!is_enabled("qoder", key, false));
+        let follows_default = is_enabled("qoder", key, true);
+        assert!(follows_default, "删除后必须走调用方的 default");
+        // 一家一项都不剩时，这一家的空对象也要清掉。
+        let entry_gone = config::with_raw(|raw| {
+            raw.get(config_key())
+                .and_then(|options| options.get("qoder"))
+                .is_none()
+        });
+        assert_eq!(entry_gone, Some(true), "空对象不该留在配置里");
     }
 }

@@ -12,6 +12,7 @@ Every form is managed from the **browser panel** afterwards (accounts, gateway k
 - [Desktop (Windows / macOS / Linux)](#desktop-windows--macos--linux)
 - [Server (Windows / Linux, headless)](#server-windows--linux-headless)
 - [Docker](#docker)
+- [Plugins (provider extensions)](#plugins-provider-extensions)
 - [Verification and client setup](#verification-and-client-setup)
 - [LAN access](#lan-access)
 - [Mobile](#mobile)
@@ -151,11 +152,15 @@ On Linux put them in `/etc/agent2api/agent2api.env`; on Windows edit the service
 
 ## Docker
 
+Image tags: `latest` follows the latest stable release, while `beta` follows the latest beta prerelease. Use a full version such as `3.3.0-beta.3` to pin a version. To use beta, replace `aimodcc/agent2api:latest` with `aimodcc/agent2api:beta` in the command or Compose configuration below; update with `docker compose pull && docker compose up -d`. Beta releases never move `latest`, and manual development builds only update `dev`.
+
 ```bash
 docker run -d --name agent2api --restart unless-stopped \
   -p 3065:3065 -v ./data:/data \
   aimodcc/agent2api:latest
 ```
+
+The image runs as the non-root user `65532:65532`; create the data directory and hand it to that UID before the first start: `mkdir -p data && sudo chown -R 65532:65532 data`.
 
 Open `http://<host>:3065` in a browser — the first visit walks you through **registering the admin account**; log in and create an API key in the "Gateway Keys" page for your clients — `http://<host>:3065/v1` is the OpenAI-compatible endpoint (it refuses to forward until the first key exists). All state (SQLite database / config / logs) lives in the `./data` volume.
 
@@ -183,9 +188,11 @@ Environment variables (all optional):
 | `AGENT2API_ALLOW_NO_KEY` | Set to `1` to serve `/v1` without any key — private networks only |
 | `AGENT2API_CAPTCHA_ENABLED` | Login-page human verification widget: `1` enabled (default), `0` disabled |
 | `AGENT2API_SELF_UPDATE` | In-container update entry: `1` enabled by default (the panel offers "Download and update"); set `0` to upgrade manually only |
-| `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | Advanced: point update checks/downloads at your own source. The first swaps the repository (defaults to the upstream `Agent2API/agent2api`; forks should override it), the second swaps the API root (default `https://api.github.com`, must return a GitHub-shaped release JSON). With a custom source set, the download allowlist additionally admits only **that source's own host** (scheme follows the source: an `http://` source also allows plaintext downloads — for local drills / internal mirrors only) |
+| `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | Advanced: point update checks/downloads at your own source. The first swaps the repository (defaults to the upstream `aimod-cc/Agent2API`; forks should override it), the second swaps the API root (default `https://api.github.com`, must return a GitHub-shaped release JSON). With a custom source set, the download allowlist additionally admits only **that source's own host** (scheme follows the source: an `http://` source also allows plaintext downloads — for local drills / internal mirrors only) |
 
-Build from source: clone the repo and run `docker compose up -d --build` (the image contains only the gateway and the panel, no Rust toolchain).
+Build from source: create the Caddy external network first, then build and start — `docker network create caddy_caddy_net 2>/dev/null || true`, then `docker compose up -d --build` (the image contains only the gateway and the panel, no Rust toolchain).
+
+The bundled `docker-compose.yml` is hardened for a host-local deployment behind Caddy: the port is bound to loopback only (`127.0.0.1:3065:3065`; Caddy reverse-proxies to the `agent2api` container over the external `caddy_caddy_net` network, which must be created first — see above), `no-new-privileges` is enabled and `mem_limit: 1g` is set. The image itself runs as the non-root user `65532:65532`, and `/usr/local/bin`, `/app` and `/data` are owned by that UID, so in-container "Download and update" can still replace the executable and the UI (`AGENT2API_SELF_UPDATE=1`); the bind-mounted `./data` must belong to 65532 or the app cannot write its database. Source builds default to `CARGO_BUILD_JOBS=2` because each Rust codegen unit can peak at hundreds of MB up to ~1 GB; lower it further on memory-constrained hosts, or raise it with `--build-arg CARGO_BUILD_JOBS=N`. The `docker run` form above is also non-root 65532 — chown the data directory before starting.
 
 **Web panel capability notes** (these stem from having no local desktop client): web login (WorkBuddy / Qoder / Cline), SMS codes and pasted credentials work fully; web logins that need a callback on this machine (AutoClaw / CatPaw / Accio / CodeArts / Trae) and "import desktop login state" are unavailable — use pasted credentials instead. A desktop app with "expose the web management panel" turned on shows the same differences in a browser: one interface, one set of rules.
 
@@ -196,6 +203,20 @@ The panel's "Software update" page can download and apply updates from inside th
 The same `agent2api-server-linux-<arch>.tar.gz` is also the installer package for the [Linux server](#linux-systemd): its `agent2api-server` and `ui/` entries are exactly what the update chain reads by name, and it additionally ships `install.sh` / `agent2api.service` / `agent2api.env.example`. The update chain only reads the first two (the rest are discarded — see `selfupdate::extract_bundle`), so one artifact serves both purposes: unpack and replace inside a container, unpack and run `install.sh` on a bare-metal host.
 
 Be aware of the trade-off: after an in-container update the image tag and the version actually running **drift apart** (`docker inspect` still reports the old tag), and `docker compose pull && up -d` rebuilds the container back to the version baked into the image. If you want pinned versions, leave this entry point off.
+
+## Plugins (provider extensions)
+
+The application itself only contains the gateway and panel. Each provider's sign-in, model requests, credential maintenance, balance and check-in capabilities live in separate plugin packs, which are downloaded per platform and upgraded independently of the main application.
+
+1. Open the **Plugins** page in the panel and click **Refresh catalog** to load the installable list.
+2. Under **Available plugins**, pick the official pack for your platform and click **Install**. You can also download the zip matching your platform and use **Install plugin pack** in the top-right corner to install it locally.
+3. After installation, enable the pack and the providers you need under **Installed plugins**; the provider then appears on the Accounts page.
+4. To update, click **Check for updates** or **Update** on the plugin card. The pack is downloaded and verified again, takes effect immediately, and your account data is untouched.
+5. To uninstall, click **Uninstall** on the plugin card. The provider stops forwarding, but account data is kept and reappears after reinstalling.
+
+Plugin packs come from the official plugin repository index at [Agent2plugin/Agent2plugin](https://github.com/Agent2plugin/Agent2plugin); the zip files themselves are downloaded from its Releases (`Agent2Builder/agent2api-providers-releases`). Official packs are signed with ed25519 (key `official-2026`): a pack whose signature verifies is shown as **signed**; unsigned packs can still be installed but are flagged in yellow; a pack with an invalid signature is rejected outright, and official packs marked **signature required** do not accept unsigned builds. For offline installation, download the zip matching the gateway platform on a machine with internet access, copy it over, and use **Install plugin pack** to install it locally — the install only performs a local sha256 and protocol-version check and needs no network.
+
+The plugin platform must match the gateway's runtime platform (Windows / macOS / Linux desktop, Linux server, Docker container). The mobile app only manages plugins on the connected gateway; it does not install them on the phone.
 
 ## Verification and client setup
 
@@ -233,21 +254,22 @@ The desktop installers (Windows / macOS) already ship the web panel's `ui/` fold
 
 ## Mobile
 
-There are two forms — pick what you need:
+There are three forms — pick what you need:
 
 | Form | How to install | Good for |
 | --- | --- | --- |
-| **Browser / PWA** | Open `/m` in a phone browser; optionally "Add to Home Screen" | Quick look, nothing to install |
+| **Browser / PWA** | Open `/m` in a phone browser; optionally "Add to Home Screen" | Quick look, nothing to install, the easiest option on iPhone |
 | **Android APK** | Install `Agent2API-<version>.apk` | Home-screen icon, full screen, multiple servers |
+| **iOS IPA** | Install `Agent2API-<version>.ipa` (unsigned — you re-sign it) | Home-screen icon, full screen |
 
-Both forms run the same UI code. The difference is who serves the page: the PWA is served by the gateway (so "also expose the web management panel" must be on), while the APK ships the UI inside the package (so it can start the UI offline and does not need that switch).
+All three run the same UI code. The difference is who serves the page: the PWA is served by the gateway (so "also expose the web management panel" must be on), while the APK / IPA ship the UI inside the package (so they can start the UI offline and do not need that switch).
 
 ### Prerequisites (by form)
 
 **Desktop (Windows / macOS / Linux)**: both switches, one without the other will not work.
 
 1. "Settings → General → LAN access" — lets devices on the LAN reach the gateway. The enable flow asks you to register a panel administrator first and adds a key named "default" automatically.
-2. "Settings → General → LAN access → also expose the web management panel" — serves the `ui/` static folder. **Required for the browser / PWA form** (`/m` is served by the gateway, so it returns 404 while this switch is off). **The APK does not need it** (the UI is inside the package), but it still needs switch 1 — otherwise the gateway only listens on `127.0.0.1` and the phone cannot reach it.
+2. "Settings → General → LAN access → also expose the web management panel" — serves the `ui/` static folder. **Required for the browser / PWA form** (`/m` is served by the gateway, so it returns 404 while this switch is off). **The APK / IPA do not need it** (the UI is inside the package), but they still need switch 1 — otherwise the gateway only listens on `127.0.0.1` and the phone cannot reach it.
 
 Both require a restart to take effect.
 
@@ -265,17 +287,36 @@ The first visit redirects to the login page; sign in with the panel administrato
 
 On first launch you get a "Servers" screen. Three steps:
 
-1. Tap "Add" and enter the gateway's `IP:port` (e.g. `192.168.1.23:3065`; the port defaults to 3065);
+1. Tap "Add" and enter the gateway's `IP or domain:port` (e.g. `192.168.1.23:3065`). The scheme may be `http://` or `https://` (http is assumed if omitted); without a port, http gets 3065 and https uses the standard 443;
 2. Tap "Connect & save" — it probes the gateway first, so a wrong address or a gateway without LAN access is reported right there;
 3. A login page appears. Enter this gateway's administrator account and password (if none exists yet, it becomes "Create admin account").
 
-**Multiple servers**: tap "Add" again. Each server keeps its own sign-in — switching over does not require signing in again, and neither does switching back. The entry point is "Settings → Servers"; tap a row to switch to it.
+**Multiple servers**: tap "Add" again. Each server keeps its own sign-in — switching over does not require signing in again, and neither does switching back. The entry point is "Settings → Servers"; tap a row to switch to it. **The login page also has a "Switch server" link**, so after signing out (or being signed out) you don't have to log in first just to reach that list.
 
 **Known limitations of the APK**:
 
-- Android only. iOS requires an Apple Developer account for signing, or installing via Xcode yourself (sideloaded signatures expire after 7 days).
-- It talks to `http://` LAN addresses in cleartext. The risk is "sniffable on the same LAN"; the gateway itself still requires administrator login. To remove it, give the gateway TLS and enter an `https://` address (the parsing is the same, it just will not prepend `http`).
+- Without a scheme it uses a cleartext `http://` LAN address. The risk is "sniffable on the same LAN"; the gateway itself still requires administrator login. To remove it, give the gateway TLS (a reverse proxy or tunnel works) and enter an `https://` address — the scheme is preserved as typed, and an invalid certificate makes the probe fail immediately.
 - The UI follows the APK version, not the gateway. If a gateway upgrade adds new screens, you need a newer APK to see them; pure data changes are unaffected.
+
+### Install the IPA (iOS)
+
+`Agent2API-<version>.ipa` in the Release is **unsigned by default** — Apple does not let developers hand out installable apps freely, so an unsigned package has to be re-signed once with your own Apple ID. Three routes:
+
+| Route | Requires | Validity |
+| --- | --- | --- |
+| **AltStore / SideStore / Sideloadly** | A computer (first time) + a free Apple ID | 7 days, re-sign afterwards |
+| **Apple Developer Program** | $99/year, your own certificate and provisioning profile | 1 year |
+| **App Store / TestFlight** | $99/year + review | Long term |
+
+To sideload: drop the `.ipa` into AltStore (or SideStore), re-sign with your Apple ID, install. Free accounts are capped at 3 apps at a time and must be re-signed every 7 days.
+
+**If you only want to check the gateway from an iPhone, just open `/m` in Safari and "Add to Home Screen"** — no IPA needed. It looks nearly identical to a native app and saves you the re-signing chore.
+
+**Known limitations of the IPA**:
+
+- **In-app updates can only link out**: iOS does not allow an app to download and install executable code, so "Software update" in settings shows a "Get it" button that opens the Release page instead of downloading like Android does. The PWA form updates through the Service Worker — just refresh.
+- Cleartext `http://` gateways: `Info.plist` already relaxes ATS and declares the local-network usage. The first connection triggers an "allow local network" prompt — you must accept it, otherwise every request fails with no visible explanation.
+- Everything else matches the APK: the UI follows the package version, and http is the default scheme.
 
 ### Add to home screen (browser / PWA)
 
@@ -288,7 +329,7 @@ Opening it from the home screen icon lands directly on the mobile home page. Whe
 
 When a new version is available, a "Restart & update" bar floats at the bottom: after a gateway upgrade the new UI is already downloaded, and one tap switches to it (ignoring it is fine too — it takes effect on the next open).
 
-> **Why no native app or store package**: the mobile UI always talks to a gateway running on **another machine** (the gateway needs to read that machine's client logins and write its config files — it cannot run on a phone). It is fundamentally "remote access to an HTTP service", and the browser is the right carrier: same-origin auth, no install, and it upgrades together with the gateway. The PWA form adds full screen and a home-screen icon, so it feels like a native app.
+> **Why no store package**: the mobile UI always talks to a gateway running on **another machine** (the gateway needs to read that machine's client logins and write its config files — it cannot run on a phone). It is fundamentally "remote access to an HTTP service", and the browser is the right carrier: same-origin auth, no install, and it upgrades together with the gateway. The PWA form adds full screen and a home-screen icon, so it feels like a native app; the APK / IPA package that same UI to get a standalone icon and an offline shell.
 >
 > **Service Worker (offline shell) only works over `https` or `localhost`**: LAN access uses `http://<IP>`, where browsers do not provide SW, so the mobile UI will not open while offline. That is a browser security restriction, not a missing feature — in normal use the gateway is online, so it does not matter.
 

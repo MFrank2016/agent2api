@@ -10,7 +10,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::server::core::endpoints::{resolve_edition, user_agent_for_edition};
+use crate::server::core::endpoints::user_agent_for_edition;
 
 // ─── 请求描述 ───────────────────────────────────────────────
 
@@ -319,15 +319,10 @@ pub(super) fn build_headers(
 /// 运营活动接口需要的客户端白名单头（getActivityBanner 专用）；
 /// 按账号版本区分身份 —— 国际版与国内版的 productName / 版本号不同。
 pub(super) fn whitelist_headers(session: &Value) -> Vec<(String, String)> {
+    // 客户端身份头（X-IDE-* / X-Product）属于上游客户端知识，已随实现搬到
+    // 提供商插件；网关侧保留的旅行 / 计费调用只带一个稳定的 UA。
     let edition = session.get("edition").and_then(Value::as_str);
-    let info = resolve_edition(edition);
-    vec![
-        ("User-Agent".to_string(), user_agent_for_edition(edition)),
-        ("X-IDE-Type".to_string(), info.ua_platform.to_string()),
-        ("X-IDE-Name".to_string(), info.product_name.to_string()),
-        ("X-IDE-Version".to_string(), info.client_version.to_string()),
-        ("X-Product".to_string(), info.product_name.to_string()),
-    ]
+    vec![("User-Agent".to_string(), user_agent_for_edition(edition))]
 }
 
 // ─── 工具函数 ───────────────────────────────────────────────

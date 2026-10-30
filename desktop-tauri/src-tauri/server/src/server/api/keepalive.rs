@@ -341,7 +341,7 @@ mod tests {
             model: "test-model".to_string(),
             client_model: String::new(),
             client_reasoning: String::new(),
-            client: String::new(),
+            source: Default::default(),
             status: 200,
             raw_request: None,
             raw_response: None,

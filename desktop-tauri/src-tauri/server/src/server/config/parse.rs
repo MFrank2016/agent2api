@@ -109,7 +109,7 @@ pub(super) fn env_auto_continue_max_rounds() -> Option<i64> {
 ///
 /// 参数是「环境变量的值」而不是自己去读进程环境：判据要能被单测钉住。
 /// `std::env::set_var` 在同一进程里全局可见，并发用例互相踩（本仓的同类取舍见
-/// `core::providers::trae::forward::forward_at` 的注释），所以「缺失」由调用方
+/// trae provider 迁出前 `forward_at` 的注释），所以「缺失」由调用方
 /// 传 `None` 表达，测试不必碰真环境。
 pub(super) fn switch_on_from_env_text(raw: Option<&str>) -> bool {
     matches!(
@@ -166,7 +166,7 @@ pub(super) fn bounded_int_option(map: &Map<String, Value>, key: &str, min: i64, 
 /// 以为「设置生效了」，回默认值至少与用户在设置页看到的不一致时好排查。
 /// 走接口写入的值在各自的 PUT 处理器里已按同一范围校验过（那里是 400 报错）。
 ///
-/// 接受 `30.0` 这种整值浮点（与 `parse_days` 同一口径）：JSON 里
+/// 接受 `30.0` 这种整值浮点（与 `parse_retention_value` 同一口径）：JSON 里
 /// `30` 与 `30.0` 都是合法数字，为后者回落到默认值会显得莫名其妙
 /// （用户手改文件时把 30 写成 30.0 是完全可能的事）。
 pub(super) fn bounded_int_field(map: &Map<String, Value>, key: &str, default: i64, min: i64, max: i64) -> i64 {
@@ -187,12 +187,26 @@ pub(super) fn days_field(map: &Map<String, Value>, key: &str, default: i64) -> i
     bounded_int_field(map, key, default, RETENTION_MIN_DAYS, RETENTION_MAX_DAYS)
 }
 
-/// 由原始 JSON 解析三档保留天数（缺字段各自用默认值）
+/// 缺失或非法的保留设置各自回落到默认值。
 pub(super) fn retention_from(map: &Map<String, Value>) -> RetentionSettings {
     let defaults = RetentionSettings::default();
     RetentionSettings {
         log_days: days_field(map, KEY_LOG_RETENTION_DAYS, defaults.log_days),
+        log_count: bounded_int_field(
+            map,
+            KEY_LOG_RETENTION_COUNT,
+            defaults.log_count,
+            RETENTION_MIN_COUNT,
+            RETENTION_MAX_COUNT,
+        ),
         request_days: days_field(map, KEY_REQUEST_RETENTION_DAYS, defaults.request_days),
+        request_count: bounded_int_field(
+            map,
+            KEY_REQUEST_RETENTION_COUNT,
+            defaults.request_count,
+            RETENTION_MIN_COUNT,
+            RETENTION_MAX_COUNT,
+        ),
         daily_days: days_field(map, KEY_DAILY_RETENTION_DAYS, defaults.daily_days),
     }
 }
@@ -730,7 +744,7 @@ mod tests {
     //!
     //! ── 为什么这些用例都不碰进程环境 ────────────────────────
     //! `std::env::set_var` 在同一进程里全局可见，并行用例互相踩（同类取舍见
-    //! `core::providers::trae::forward::forward_at` 的注释），而本模块里
+    //! trae provider 迁出前 `forward_at` 的注释），而本模块里
     //! 「没设环境变量」是有明确表达的输入 —— `None`。所以三段判据都被抽成
     //! 吃参数的纯函数（[`switch_on_from_env_text`] / [`bounded_int_from_env_text`] /
     //! [`resolve_auto_continue`] / [`resolve_rounds`]），`env_*` 只是把它们接到

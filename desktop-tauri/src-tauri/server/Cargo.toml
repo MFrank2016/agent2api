@@ -1,14 +1,14 @@
 [package]
 name = "agent2api-server"
-version = "3.1.0"
-description = "Agent2API 网关本体 — 多提供商本地网关（桌面端与 headless 服务器共用）"
+version = "3.3.0-beta.4"
+description = "Agent2API 网关本体 — AI 路由网关与 Agent 客户端接管（桌面端与 headless 服务器共用）"
 authors = ["Agent2API"]
 edition = "2021"
 # MSRV 与桌面 crate 保持一致（rusqlite 0.40 → libsqlite3-sys 0.38 声明 1.88）
 rust-version = "1.88"
-license-file = "../../../LICENSE"
-repository = "https://github.com/Agent2API/agent2api"
-homepage = "https://github.com/Agent2API/agent2api"
+license = "AGPL-3.0-only"
+repository = "https://github.com/aimod-cc/Agent2API"
+homepage = "https://github.com/aimod-cc/Agent2API"
 
 # 关掉 bin 自动发现：`src/bin/service.rs` 其实是 `agent2api-server.rs` 的**模块**
 # （那边写着 `#[cfg(windows)] pub mod service;`），但 Cargo 会把 `src/bin/*.rs`
@@ -53,19 +53,37 @@ serde_json = "1"
 # （容器 stop 的优雅停机路径）；process 供 Qoder 国际版签到的 UMID 组件
 # 子进程调用（providers/qoder/risk.rs，runtime-info 的 stdout 要异步读）
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util", "fs", "signal", "process"] }
+# 提供商插件协议：网关与插件包共同编译的线上类型（契约）。
+# 刻意只有 serde/base64 —— 它要能被第三方插件作者直接依赖，不能拖进网关的
+# 依赖树（见该 crate 的 Cargo.toml 注释）。
+#
+# ── 契约库从插件仓库按 tag 引用 ─────────────────────────────
+# 契约库随插件仓库独立（ProvidersPlugin/Agent2Providers），不再走本地路径。
+# 改协议时：在插件仓库改 → 打新 tag → 更新下面这行。
+#
+# 本地联调（同时改网关与契约库）：在**仓库根**的 `.cargo/config.toml` 里加
+# ```toml
+# [patch."https://github.com/ProvidersPlugin/Agent2Providers"]
+# agent2api-provider-protocol = { path = "../Agent2Providers/crates/provider-protocol" }
+# ```
+# 不要改这一行 —— 那会让干净 clone 的构建依赖某个人的磁盘布局。
+agent2api-provider-protocol = { git = "https://github.com/ProvidersPlugin/Agent2Providers", tag = "v0.2.1" }
 # Qoder 国际版签到的 UMID 组件安装（providers/qoder/risk.rs）：官方 qodercli
 # npm 包是 .tgz（gzip + tar），解出内嵌的 runtime-info 二进制。flate2 已在
 # 依赖树里（image 拉的），声明出来直接复用；tar 解析手写（几十行，见 risk.rs）
 flate2 = "1"
 url = "2"
-axum = "0.8"
-# 出站请求：wreq（reqwest 的分支）—— BoringSSL + 可编程 TLS / HTTP2 指纹。
+axum = { version = "0.8", features = ["multipart"] }
+# 提供商出站请求：wreq（reqwest 的分支）—— BoringSSL + 可编程 TLS / HTTP2 指纹。
 # 选它而不是 reqwest 的唯一理由：上游开始按 JA3 / JA4 与 HTTP2 指纹做风控，
 # rustls 默认栈没有可编程的 ClientHello，补不了这一层（见 docs/tls-fingerprint.md）。
 # `system-proxy` 保留原有的系统代理匹配；显式出口仍显式关闭自动探测。
 # 构建前置：cmake + nasm + libclang（BoringSSL 的构建依赖，见 docs/install.md）。
 wreq = { version = "6.0.0-rc.31", default-features = false, features = ["tokio-rt", "webpki-roots", "json", "stream", "socks", "system-proxy", "gzip", "brotli", "charset", "form"] }
 wreq-util = "3.0.0-rc.14"
+# 非提供商出站（云同步 / 更新下载 / 插件包安装）仍用 reqwest + rustls（纯 Rust，
+# 不依赖系统 openssl）+ socks5 出网代理。
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks", "system-proxy"] }
 # MonkeyCode 会话转发的 WebSocket 任务流（providers/monkeycode/stream.rs）：
 # 上游是 `wss://…/api/v1/users/tasks/stream`。这条链路**仍走 rustls**：
 # wreq 的 BoringSSL 只管 HTTP，tokio-tungstenite 用 rustls + webpki-roots，
@@ -80,15 +98,10 @@ sha2 = "0.10"
 sha1 = "0.10"
 # 「从其他工具导入」：解析 cc-switch 里 Codex 供应商的 config.toml 字符串
 # （提取激活 model_provider 的 base_url，见 core/import_ccswitch.rs）
-# preserve_order：Agent 页写回 Codex 的 config.toml 时要保住用户原有的键序，
-# 否则每写一次就把整份文件重排一遍（注释仍会丢，写前有备份可回退）
 toml = { version = "0.9", features = ["preserve_order"] }
-# 保留注释与格式地改写 TOML（Codex 的 config.toml 是用户手写的）。
-# `toml`（既有）是「解析成值树」，本 crate 是「带 trivia 的语法树」。
-# **版本必须是 0.25**：该版本已由 `proc-macro-crate` 引入并在 Cargo.lock 中，
-# 提为直接依赖不新增版本树。`toml 0.9.12` 本身已不用 `toml_edit`
-# （它用 toml_parser / toml_writer），所以钉 0.22 会新增第四个版本 —— 不要。
-toml_edit = "0.25"
+# 客户端配置必须保留未修改部分的注释与排版。
+toml_edit = "=0.25.13"
+jsonc-parser = { version = "=0.33.1", features = ["cst", "serde_json"] }
 # ALTCHA 机器人校验的 challenge 签名（HMAC-SHA256，见 server/altcha.rs）
 hmac = "0.12"
 chrono = "0.4"
@@ -134,6 +147,12 @@ bcrypt = "0.15"
 # 截图里解出订阅链接。rqrr 是纯 Rust 的 QR 解码器，配已有的 image 依赖用
 # （to_luma8 转灰度后 detect_grids），不新增图片解码栈。
 rqrr = "0.11"
+# 提供商插件包的安装（core/plugin_host/install.rs）：用户拿到的是各平台的 zip，
+# 网关负责解包 + 校验清单 + 落进版本目录。只开 `deflate`（绝大多数打包工具
+# 用的就是它），不引 bzip2 / zstd 那几套压缩后端 —— 插件包是自家脚本产出的，
+# 压缩方式可控。
+zip = { version = "2", default-features = false, features = ["deflate"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["fast", "std"] }
 
 # AutoClaw 凭证解密的 DPAPI（providers/autoclaw/crypto.rs）。仅 Windows
 # 目标生效；其它平台该适配器的「导入桌面端登录态」是桩实现。
@@ -144,6 +163,10 @@ windows = { version = "0.61", features = [
     # 枚举注册表卸载项定位客户端安装目录
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
+    # 内核进程管理（core/sub_kernel/runtime.rs）：OpenProcess / TerminateProcess
+    # / QueryFullProcessImageNameW 取代 spawn taskkill（理由见 kill_by_pid 的
+    # 说明）。Foundation 由 Win32 父特性自动带上（CloseHandle 在它里面）。
+    "Win32_System_Threading",
 ] }
 # Windows 服务形态（bin/service.rs）：`--service` 参数下把进程交给 SCM
 # （StartServiceCtrlDispatcherW + 控制事件回调 + 状态上报）。

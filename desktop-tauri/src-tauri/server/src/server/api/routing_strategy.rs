@@ -419,4 +419,24 @@ mod tests {
             assert!(item.get("label").and_then(Value::as_str).is_some_and(|label| !label.is_empty()));
         }
     }
+
+    #[test]
+    fn all_seven_strategies_validate_and_accept_task_aliases() {
+        assert_eq!(RoutingStrategy::ALL.len(), 7);
+        for strategy in RoutingStrategy::ALL {
+            assert_eq!(RoutingStrategy::parse(strategy.as_str()), Some(strategy));
+        }
+        // Task 3.3 canonical 别名：`round_robin` 是**整表**轮转，
+        // `provider` 才是家内轮询（与本地旧 id 的语义分开）。
+        assert_eq!(RoutingStrategy::parse("lru"), Some(RoutingStrategy::LeastRecentlyUsed));
+        assert_eq!(RoutingStrategy::parse("provider"), Some(RoutingStrategy::RoundRobin));
+        assert_eq!(RoutingStrategy::parse("round_robin"), Some(RoutingStrategy::GlobalRoundRobin));
+        assert_eq!(RoutingStrategy::parse("least_connections"), Some(RoutingStrategy::LeastConnections));
+        assert_eq!(RoutingStrategy::parse("balance_weighted"), Some(RoutingStrategy::BalanceWeighted));
+        assert_eq!(RoutingStrategy::parse("priority_weighted"), Some(RoutingStrategy::PriorityWeighted));
+        // 旧 id / 上游旧字符串继续可用。
+        assert_eq!(RoutingStrategy::parse("round-robin"), Some(RoutingStrategy::RoundRobin));
+        assert_eq!(RoutingStrategy::parse("global-round-robin"), Some(RoutingStrategy::GlobalRoundRobin));
+        assert_eq!(RoutingStrategy::parse("rotate"), Some(RoutingStrategy::GlobalRoundRobin));
+    }
 }

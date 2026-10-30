@@ -76,6 +76,7 @@ pub async fn chat_completions(
     // axum 对 `Option<Extension<T>>` 有专门实现：取不到就是 `None`，不会像
     // 裸 `Extension<T>` 那样直接拒绝请求（那会把整个免鉴权模式打回 500）。
     key_scope: Option<Extension<crate::server::core::key_scope::KeyScope>>,
+    key_identity: Option<Extension<crate::server::request_stats::ApiKeyIdentity>>,
     body: Bytes,
 ) -> Response {
     let scope = key_scope.map(|Extension(scope)| scope);
@@ -83,21 +84,12 @@ pub async fn chat_completions(
     let started_at = logging::now_ms();
     // 请求来源客户端（UA 识别，见 `core::client`）：在 headers 被 move 进转发层
     // 之前先判好，早失败路径与收尾记账共用同一个值
-    let client = crate::server::core::client::classify(&pipeline::user_agent_of(&headers));
+    let request_source = pipeline::request_source(&headers, key_identity);
     // ① body 必须是 JSON 对象（数组/标量/null 都算非法）
     let parsed = serde_json::from_slice::<Value>(&body).ok();
     let Some(mut payload) = parsed.filter(Value::is_object) else {
         let error = GatewayError::bad_request("请求体必须是 JSON 对象");
-        record_early_failure(
-            &state,
-            started_at,
-            "",
-            "",
-            &client,
-            scope.as_ref().map_or("", |scope| scope.key_id()),
-            scope.as_ref().map_or("", |scope| scope.key_name()),
-            &error,
-        );
+        record_early_failure(&state, started_at, "", "", &request_source, &error);
         return error.payload_response();
     };
     // ② messages 必须是数组
@@ -109,16 +101,7 @@ pub async fn chat_completions(
         let error = GatewayError::bad_request("缺少 messages 数组");
         let model = model_field_text(&payload);
         let reasoning = pipeline::client_reasoning_of(&payload);
-        record_early_failure(
-            &state,
-            started_at,
-            &model,
-            &reasoning,
-            &client,
-            scope.as_ref().map_or("", |scope| scope.key_id()),
-            scope.as_ref().map_or("", |scope| scope.key_name()),
-            &error,
-        );
+        record_early_failure(&state, started_at, &model, &reasoning, &request_source, &error);
         return error.payload_response();
     }
 
@@ -151,9 +134,7 @@ pub async fn chat_completions(
                 started_at,
                 &model_field_text(&payload),
                 &client_reasoning,
-                &client,
-                scope.as_ref().map_or("", |scope| scope.key_id()),
-                scope.as_ref().map_or("", |scope| scope.key_name()),
+                &request_source,
                 &error,
             );
             return error.payload_response();
@@ -192,9 +173,7 @@ pub async fn chat_completions(
             &requested_model,
             &client_model,
             &client_reasoning,
-            &client,
-            scope.as_ref().map_or("", |scope| scope.key_id()),
-            scope.as_ref().map_or("", |scope| scope.key_name()),
+            &request_source,
             // 真实流量：不是模型测试（见 `RecordContext::is_test`）
             false,
         );
@@ -287,7 +266,7 @@ pub async fn chat_completions(
                     raw_response: None,
                     is_test: false,
                     // 来源客户端：入口判好带进来（见 `RecordContext::client`）
-                    client: client.clone(),
+                    source: request_source.clone(),
                 };
                 let stream = keepalive::KeepAliveStream::new(
                     forward,
@@ -330,7 +309,7 @@ pub async fn chat_completions(
                 // 转发主链路：不是模型测试（见 `RecordContext::is_test`）
                 is_test: false,
                 // 来源客户端：入口判好带进来（见 `RecordContext::client`）
-                client: client.clone(),
+                source: request_source.clone(),
             };
             // 收尾帧特征取 Chat 的：客户端读到 `data: [DONE]` 就停是常态写法，
             // 那时连接会被立刻关掉、`Drop` 不会被拉到 EOF（见 `RecordingStream`）
@@ -371,7 +350,7 @@ pub async fn chat_completions(
                     // 转发主链路：不是模型测试
                     is_test: false,
                     // 来源客户端：入口判好带进来
-                    client: client.clone(),
+                    source: request_source.clone(),
                 },
                 None,
             );
@@ -405,7 +384,7 @@ pub async fn chat_completions(
                     // 转发主链路：不是模型测试
                     is_test: false,
                     // 来源客户端：入口判好带进来
-                    client: client.clone(),
+                    source: request_source.clone(),
                 },
                 Some(message),
             );
@@ -650,7 +629,7 @@ mod tests {
             model: "test-model".to_string(),
             client_model: String::new(),
             client_reasoning: String::new(),
-            client: String::new(),
+            source: Default::default(),
             status: 200,
             raw_request: None,
             raw_response: None,

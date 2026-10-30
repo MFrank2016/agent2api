@@ -1,4 +1,4 @@
-//! 网关 Key 的**用量查询与配额判定**（schema v16）。
+//! 网关 Key 的**用量查询与配额判定**（schema v21，Key 身份列 `api_key_id`）。
 //!
 //! ── 这个模块解决什么问题 ─────────────────────────────────────
 //! 网关可以有多把 Key（`core::api_keys` 的 `apiKeys` 列表），但改造前
@@ -59,7 +59,7 @@ pub const USAGE_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 static DB: OnceLock<Option<Db>> = OnceLock::new();
 
-/// 缓存槽：`(抓取时刻, 窗口种类 → (窗口起点, key_id → 已用 Token))`
+/// 缓存槽：`(抓取时刻, 窗口种类 → (窗口起点, api_key_id → 已用 Token))`
 ///
 /// 键是窗口种类而不是 Key：同一次抓取要覆盖所有「启用的 Key 用到的全部窗口」，
 /// 一张表按种类分组存下，判定时按 Key 自己的种类取对应那一组。
@@ -68,7 +68,7 @@ static USAGE_CACHE: Mutex<Option<CachedUsage>> = Mutex::new(None);
 struct CachedUsage {
     /// 抓取时刻（毫秒）：TTL 判据
     fetched_at: i64,
-    /// 窗口种类 → (该种类的窗口起点, key_id → 已用 Token)
+    /// 窗口种类 → (该种类的窗口起点, api_key_id → 已用 Token)
     by_kind: HashMap<i64, (i64, HashMap<String, i64>)>,
 }
 
@@ -237,7 +237,7 @@ fn cached_lookup(cache: Option<&CachedUsage>, kind: i64, key_id: &str, now_ms: i
 /// ── 为什么一条 SQL 覆盖所有种类 ────────────────────────────
 /// 每个种类对应一个窗口起点，理想写法是每个种类一条查询。但实际配置里
 /// 种类极少（绝大多数 Key 用默认的「自然日」，即种类 0），一条
-/// `GROUP BY key_id` 加一个「最早窗口起点」的下界就能覆盖全部：
+/// `GROUP BY api_key_id` 加一个「最早窗口起点」的下界就能覆盖全部：
 /// 取所有种类里**最早的**窗口起点作为 `ts >=` 的下界，读回来的行在 Rust 侧
 /// 按各自的窗口起点再筛一次。多读一点行，换一次查询 —— 窗口最长 30 天，
 /// 与 5 秒的缓存周期相比，多读的量可以忽略。
@@ -271,8 +271,8 @@ fn fetch(now_ms: i64) -> Option<CachedUsage> {
     let lower_bound = windows.iter().map(|(_, start)| *start).min()?;
     let rows = db.with(|conn| {
         let Ok(mut statement) = conn.prepare(
-            "SELECT key_id, ts, total_tokens FROM requests \
-             WHERE key_id != '' AND ts >= ?1",
+            "SELECT api_key_id, ts, total_tokens FROM requests \
+             WHERE api_key_source = 'key' AND api_key_id != '' AND ts >= ?1",
         ) else {
             return None;
         };
@@ -310,21 +310,22 @@ fn fetch(now_ms: i64) -> Option<CachedUsage> {
 
 /// Key 页的用量汇总：近 [`USAGE_WINDOW_MS`] 的请求数 / Token / 最近使用时刻。
 ///
-/// 返回 `key_id → KeyUsage`。与配额判定**分开**：那边看的是「当前窗口」，
+/// 返回 `api_key_id → KeyUsage`。与配额判定**分开**：那边看的是「当前窗口」，
 /// 这边看的是「近 7 天」，两个区间不同、也不必共享缓存。
 ///
-/// 直接从明细聚合（`GROUP BY key_id`），走 `idx_requests_key_ts`。**包含测试
-/// 流量**：模型测试的 `key_id` 恒为空串，自然被 `key_id != ''` 排除。
+/// 直接从明细聚合（`GROUP BY api_key_id`），走 `idx_requests_api_key_ts`。**包含测试
+/// 流量**：模型测试的 `api_key_id` 恒为空串，自然被 `api_key_id != ''` 排除。
 pub fn usage_summary(now_ms: i64) -> HashMap<String, KeyUsage> {
     let Some(db) = database() else { return HashMap::new() };
     let since = now_ms - USAGE_WINDOW_MS;
     let rows = db.with(|conn| {
         let Ok(mut statement) = conn.prepare(
-            "SELECT key_id, COUNT(*), \
+            "SELECT api_key_id, COUNT(*), \
                     COALESCE(SUM(total_tokens), 0), \
                     COALESCE(SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END), 0), \
                     COALESCE(MAX(ts), 0) \
-             FROM requests WHERE key_id != '' AND ts >= ?1 GROUP BY key_id",
+             FROM requests WHERE api_key_source = 'key' AND api_key_id != '' \
+             AND ts >= ?1 GROUP BY api_key_id",
         ) else {
             return None;
         };
@@ -499,7 +500,7 @@ mod tests {
     }
 
     /// 整个测试进程共用一个临时库：`key_quota::install` 是 `OnceLock`，
-    /// 一旦装入就换不掉。用例之间靠**互不相同的 key_id** 与 `invalidate()`
+    /// 一旦装入就换不掉。用例之间靠**互不相同的 api_key_id** 与 `invalidate()`
     /// 隔离，不靠换库。
     fn test_db() -> &'static Db {
         static TEST_DB: OnceLock<Db> = OnceLock::new();
@@ -516,8 +517,8 @@ mod tests {
     fn seed_usage(db: &Db, key_id: &str, ts: i64, tokens: i64) {
         db.with(|conn| {
             conn.execute(
-                "INSERT INTO requests (id, ts, model, key_id, total_tokens) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO requests (id, ts, model, api_key_id, api_key_source, total_tokens) \
+                 VALUES (?1, ?2, ?3, ?4, 'key', ?5)",
                 rusqlite::params![format!("req-{key_id}-{ts}"), ts, "m", key_id, tokens],
             )
         })

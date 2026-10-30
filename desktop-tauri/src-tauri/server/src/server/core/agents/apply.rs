@@ -1,907 +1,317 @@
-//! 客户端配置文件的**读取与写入**（`core::agents` 的落地层）。
-//!
-//! ── 两种写入策略（对应 `ClientDef::multi`）──────────────────
-//!   · 单配置（`apply_single`）：把选中那套的 baseUrl / key / model 写进
-//!     客户端文件里**属于它的那几个键**，其余键原样保留。写前把原文件备份到
-//!     `~/.agent2api/agent-backups/<client>-<时间戳>.<ext>`，切回去时按备份
-//!     逐字还原。
-//!   · 多配置（`apply_multi`）：只改 `enabled` 与默认项。**不新增、不删除、
-//!     不重排**客户端自己的条目 —— 我们只翻转它已有的开关。
-//!
-//! ── 为什么单配置要「只改那几个键」而不是整份重写 ─────────────
-//! 这些文件里有大量用户自己的设置（权限、主题、插件…），整份重写等于把它们
-//! 抹掉。cc-switch 与 magpie 都是「只改该改的那一个键」，这里照同一条原则：
-//! 读进来 → 改指定路径 → 写回去。
-//!
-//! ── 注释：TOML 保留，JSONC 仍会丢（如实告知）───────────────
-//! TOML（Codex）走 `set_toml_path`：`toml_edit` 的带 trivia 语法树，只动
-//! 目标键，注释 / 键序 / 行尾注释全保留。JSON / JSONC 仍是
-//! 「解析成值树 → 改键 → 重新序列化」，**注释会丢**（键序在
-//! `preserve_order` 下保住）—— JSONC 的 `preview` 在检测到原文件有
-//! 注释时返回 `warnings`，界面照实显示；写前有备份，可按备份还原。
-//!
-//! ── 硬约束 ──────────────────────────────────────────────
-//! release 是 `panic=abort`：零 unwrap/expect/panic。写文件走「临时文件 +
-//! 原子 rename」，中途失败不会留下半截文件。
-
-use std::path::{Path, PathBuf};
-
 use serde_json::{json, Value};
+use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
-use super::{sibling_env_path, ClientDef, ConfigFormat, Profile};
+use super::{
+    backups, clients,
+    files::{self, Change},
+    preview, ClientDef, Profile,
+};
 
-/* ─── 读 ─────────────────────────────────────── */
-
-/// 读客户端配置文件原文。文件不存在返回 `Ok(None)`（不是错误 —— 未安装的正常态）。
-pub fn read_text(path: &Path) -> Result<Option<String>, String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("读取 {} 失败: {error}", path.display())),
-    }
+fn mutation_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// 把原文解析成 JSON（JSONC 会先剥注释与尾逗号）。
-pub fn parse_json_like(format: ConfigFormat, text: &str) -> Result<Value, String> {
-    let cleaned = if matches!(format, ConfigFormat::Jsonc) {
-        strip_jsonc(text)
-    } else {
-        text.to_string()
-    };
-    if cleaned.trim().is_empty() {
-        return Ok(json!({}));
+pub fn apply(
+    def: &ClientDef,
+    path: &Path,
+    profile: &Profile,
+    operation: &str,
+    token: &str,
+    port: u16,
+) -> Result<Value, String> {
+    let _guard = mutation_lock()
+        .lock()
+        .map_err(|_| "客户端配置写入锁不可用")?;
+    if token.is_empty() {
+        return Err("应用前必须生成预览并确认".into());
     }
-    serde_json::from_str::<Value>(&cleaned).map_err(|error| format!("配置文件不是合法 JSON: {error}"))
+    let plan = clients::plan(def, path, profile, operation, port)?;
+    preview::verify(&plan, def.id, token)?;
+    let changes: Vec<_> = plan
+        .changes
+        .iter()
+        .filter(|change| !change.unchanged())
+        .cloned()
+        .collect();
+    if changes.is_empty() {
+        return Ok(json!({ "changed": false, "verified": true, "clientId": def.id }));
+    }
+    for change in &changes {
+        change.check()?;
+    }
+    backups::ensure_no_pending(def.id, path)?;
+    let mut backup = backups::prepare(def.id, path, &plan)?;
+    if let Err(error) = commit(&changes) {
+        if changes
+            .iter()
+            .all(|change| files::read(&change.target).is_ok_and(|bytes| bytes == change.before))
+        {
+            backup.phase = "rolled_back".into();
+        }
+        let metadata = backups::write(&backup);
+        return Err(format!(
+            "{error}{}",
+            metadata
+                .err()
+                .map(|e| format!("；备份状态保存失败: {e}"))
+                .unwrap_or_default()
+        ));
+    }
+    if let Err(error) = verify_bytes(&changes) {
+        let rollback = rollback(&changes);
+        if rollback.is_ok() {
+            backup.phase = "rolled_back".into();
+            let _ = backups::write(&backup);
+        }
+        return Err(format!(
+            "{error}{}",
+            rollback
+                .err()
+                .map(|e| format!("；自动回滚失败: {e}"))
+                .unwrap_or_default()
+        ));
+    }
+    backup.phase = "committed".into();
+    if let Err(error) = backups::write(&backup) {
+        let recovery = rollback(&changes);
+        return Err(format!(
+            "保存应用记录失败: {error}{}",
+            recovery
+                .err()
+                .map(|e| format!("；自动回滚失败: {e}"))
+                .unwrap_or_default()
+        ));
+    }
+    Ok(
+        json!({ "changed": true, "verified": true, "clientId": def.id, "profileId": profile.id, "backupId": backup.id, "needsRestart": def.needs_restart }),
+    )
 }
 
-/// 把原文解析成 TOML 的 JSON 表示（顶层必须是表）。
-pub fn parse_toml(text: &str) -> Result<Value, String> {
-    if text.trim().is_empty() {
-        return Ok(json!({}));
-    }
-    let table = toml::from_str::<toml::Table>(text)
-        .map_err(|error| format!("配置文件不是合法 TOML: {error}"))?;
-    serde_json::to_value(table).map_err(|error| format!("TOML 转 JSON 失败: {error}"))
-}
-
-/// 剥掉 JSONC 的注释与尾逗号。
-///
-/// 手写而不是引 crate：这里只需要「能解析」这一个能力，而 JSONC 的注释规则
-/// 在字符串外才生效 —— 一条状态机足够，且不必为它加一个依赖（项目里没有
-/// json5 / jsonc-parser）。
-pub fn strip_jsonc(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-
-    while let Some(ch) = chars.next() {
-        if in_string {
-            out.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
+fn verify_bytes(changes: &[Change]) -> Result<(), String> {
+    for change in changes {
+        if files::target(&change.path)? != change.target
+            || files::read(&change.target)? != change.after
+        {
+            return Err(format!("写入后校验 {} 失败", change.path.display()));
         }
-        match ch {
-            '"' => {
-                in_string = true;
-                out.push(ch);
-            }
-            '/' => match chars.peek() {
-                Some('/') => {
-                    // 行注释：吃到换行为止（换行本身保留，行号不变）
-                    for next in chars.by_ref() {
-                        if next == '\n' {
-                            out.push('\n');
-                            break;
-                        }
-                    }
-                }
-                Some('*') => {
-                    chars.next();
-                    let mut prev = '\0';
-                    for next in chars.by_ref() {
-                        if prev == '*' && next == '/' {
-                            break;
-                        }
-                        prev = next;
-                    }
-                }
-                _ => out.push(ch),
-            },
-            _ => out.push(ch),
-        }
-    }
-    strip_trailing_commas(&out)
-}
-
-/// 去掉 `,}` 与 `,]` 里的逗号（JSONC 允许尾逗号）。
-fn strip_trailing_commas(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut in_string = false;
-    let mut escaped = false;
-    let chars: Vec<char> = text.chars().collect();
-
-    for (index, ch) in chars.iter().enumerate() {
-        let ch = *ch;
-        if in_string {
-            out.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        if ch == '"' {
-            in_string = true;
-            out.push(ch);
-            continue;
-        }
-        if ch == ',' {
-            // 往后看第一个非空白字符
-            let mut next = index + 1;
-            while next < chars.len() && chars[next].is_whitespace() {
-                next += 1;
-            }
-            if next < chars.len() && (chars[next] == '}' || chars[next] == ']') {
-                continue;
-            }
-        }
-        out.push(ch);
-    }
-    out
-}
-
-/* ─── 写：单配置 ──────────────────────────────── */
-
-/// 单配置客户端的「要写哪几个键」。
-///
-/// 返回 `(路径, 值)` 列表，路径是点分形式（`env.ANTHROPIC_BASE_URL`）。
-/// 不同客户端要改的键不同，这里按客户端 id 逐个列出 —— 这份表就是
-/// 「接管一个客户端」这件事的全部技术内容。
-fn single_targets(def: &ClientDef, profile: &Profile) -> Vec<(String, Value)> {
-    let base = profile.base_url.trim().to_string();
-    let model = profile.model.trim().to_string();
-    let key = gateway_key();
-    let effort = if profile.effort.trim().is_empty() {
-        "default".to_string()
-    } else {
-        profile.effort.trim().to_string()
-    };
-
-    match def.id {
-        // Claude Code：settings.json 的 env 段
-        "claude-code" => vec![
-            ("env.ANTHROPIC_BASE_URL".into(), json!(base)),
-            ("env.ANTHROPIC_AUTH_TOKEN".into(), json!(key)),
-            ("env.ANTHROPIC_MODEL".into(), json!(model)),
-        ],
-        // Codex：config.toml 顶层 model / model_provider + 一个 provider 段
-        "codex" => vec![
-            ("model".into(), json!(model)),
-            ("model_provider".into(), json!("agent2api")),
-            ("model_providers.agent2api.name".into(), json!("Agent2API")),
-            ("model_providers.agent2api.base_url".into(), json!(base)),
-            (
-                "model_providers.agent2api.wire_api".into(),
-                json!(if profile.protocol == "responses" { "responses" } else { "chat" }),
-            ),
-            ("model_providers.agent2api.env_key".into(), json!("AGENT2API_KEY")),
-        ],
-        // Gemini CLI：settings.json 的 model 段 + .env 两条（.env 单独处理）
-        "gemini-cli" => vec![("model.name".into(), json!(model))],
-        // WorkBuddy：models.json 里我们自己的 provider 条目
-        "workbuddy" => vec![
-            ("defaultModel".into(), json!(model)),
-            ("providers".into(), json!([{
-                "id": "agent2api",
-                "baseUrl": base,
-                "apiKey": key,
-                "models": [model],
-            }])),
-        ],
-        // Qoder：自定义提供商一节
-        "qoder" => vec![
-            ("customProvider.name".into(), json!("Agent2API")),
-            ("customProvider.baseUrl".into(), json!(base)),
-            ("customProvider.apiKey".into(), json!(key)),
-        ],
-        // Cursor CLI：只有 model 与 baseUrl 两个字段
-        "cursor-cli" => vec![
-            ("model".into(), json!(model)),
-            ("baseUrl".into(), json!(base)),
-        ],
-        // Cline：OpenAI Compatible 那一档
-        "cline" => vec![
-            ("openAiBaseUrl".into(), json!(base)),
-            ("openAiApiKey".into(), json!(key)),
-            ("openAiModelId".into(), json!(model)),
-        ],
-        // OpenCode：自定义 provider 一节 + 顶层默认模型（`<provider>/<model>`）。
-        // models 里必须带上这个模型，否则 `/models` 列表里看不到它。
-        "opencode" => vec![
-            ("provider.agent2api.name".into(), json!("Agent2API")),
-            ("provider.agent2api.npm".into(), json!("@ai-sdk/openai-compatible")),
-            ("provider.agent2api.options.baseURL".into(), json!(base)),
-            ("provider.agent2api.options.apiKey".into(), json!(key)),
-            (
-                format!("provider.agent2api.models.{model}").into(),
-                json!({ "name": model }),
-            ),
-            ("model".into(), json!(format!("agent2api/{model}"))),
-        ],
-        // Zed：OpenAI 兼容 provider + 默认模型。Zed 的 api_key 不进 settings.json
-        // （它存在系统钥匙串 / 环境变量里），所以这里只写地址与模型。
-        "zed" => vec![
-            (
-                "language_models.openai_compatible.agent2api.api_url".into(),
-                json!(base),
-            ),
-            (
-                "language_models.openai_compatible.agent2api.available_models".into(),
-                json!([{ "name": model, "display_name": model }]),
-            ),
-            (
-                "agent.default_model".into(),
-                json!({ "provider": "agent2api", "model": model }),
-            ),
-        ],
-        // 其余（Kimi Code / Crush 等）：通用的一组键
-        _ => vec![
-            ("provider.base_url".into(), json!(base)),
-            ("provider.api_key".into(), json!(key)),
-            ("model".into(), json!(model)),
-            ("effort".into(), json!(effort)),
-        ],
-    }
-}
-
-/// 写进客户端的那把 key：本机网关的固定占位值。
-///
-/// 不用真实网关 Key 是刻意的：客户端配置是明文文件、会被同步/备份/贴到别处，
-/// 而网关的鉴权靠「网关 Key」页那套独立管理。这里给一个可识别的固定串，
-/// 网关侧对 `127.0.0.1` 的请求本就放行（默认只监听本机）。
-fn gateway_key() -> String {
-    "sk-agent2api-local".to_string()
-}
-
-/// 按点分路径写入（中间对象不存在就建）。
-fn set_path(root: &mut Value, path: &str, value: Value) {
-    let parts: Vec<&str> = path.split('.').collect();
-    let mut cursor = root;
-    for (index, part) in parts.iter().enumerate() {
-        let last = index + 1 == parts.len();
-        if last {
-            if let Some(object) = cursor.as_object_mut() {
-                object.insert((*part).to_string(), value);
-            }
-            return;
-        }
-        if !cursor.is_object() {
-            *cursor = json!({});
-        }
-        let Some(object) = cursor.as_object_mut() else {
-            return;
-        };
-        cursor = object
-            .entry((*part).to_string())
-            .or_insert_with(|| json!({}));
-    }
-}
-
-/// 按点分路径写入一个 TOML 值，**保留注释、键序与格式**。
-///
-/// ── 与既有 `toml::to_string_pretty` 的分工 ────────────────────
-/// 那条路径是「解析成 `toml::Table` → 改键 → 整体序列化」，注释在解析阶段
-/// 就丢了。本函数用 `toml_edit`（带 trivia 的语法树），只动目标键那一处。
-///
-/// ── 路径形态：支持单段与多段 ──────────────────────────────────
-/// Codex 的 targets 里既有顶层单段键（`model` / `model_provider`），也有
-/// 三段键（`model_providers.agent2api.base_url`）。用 `split('.')` 逐段走，
-/// 不要 `rsplit_once('.')` —— 后者对单段路径直接报错。
-///
-/// ── 缺表时**创建**而不是报错 ──────────────────────────────────
-/// 与既有 `set_path`（apply.rs:288-296）同一语义：首次接管一个只有
-/// `model` 的 config.toml 时，`[model_providers.agent2api]` 段必须被建出来。
-/// 报错会让「第一次切换」必然失败。
-pub fn set_toml_path(text: &str, dotted: &str, value: &Value) -> Result<String, String> {
-    let mut document = text
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|error| format!("解析 TOML 失败: {error}"))?;
-    let segments: Vec<&str> = dotted.split('.').collect();
-    if segments.iter().any(|segment| segment.is_empty()) {
-        return Err(format!("路径含空段: {dotted}"));
-    }
-    let mut table = document.as_table_mut();
-    for segment in &segments[..segments.len() - 1] {
-        if !table.contains_key(segment) {
-            // 新建的中间表标成 implicit：只包含子表时不出 `[model_providers]`
-            // 这种空段头（`[model_providers.agent2api]` 一个就够）。
-            let mut created = toml_edit::Table::new();
-            created.set_implicit(true);
-            table.insert(segment, toml_edit::Item::Table(created));
-        }
-        // inline table（`a = { b = 1 }`）要**原地转成标准表**再下钻。
-        // 旧的 `toml::from_str` 路径本来就会把 inline table 归一成标准表，
-        // 这里报错等于让这些用户以前能切换、现在不能 —— 是回归。
-        // TOML 1.0 规定 inline table 内不能有注释，所以转换不丢 trivia。
-        if table.get(segment).is_some_and(toml_edit::Item::is_inline_table) {
-            // 键的 decor 会原样带进段头方括号：inline table 的键后面是
-            // 「空格 + `=`」，搬过来就成了 `[model_providers ]`。只清后缀，
-            // **保留前缀** —— 前缀里是键前的注释与换行。
-            if let Some(mut key) = table.key_mut(segment) {
-                key.leaf_decor_mut().set_suffix("");
-            }
-            let item = table
-                .get_mut(segment)
-                .ok_or_else(|| format!("TOML 里没有段 `{segment}`（路径: {dotted}）"))?;
-            let mut converted = std::mem::replace(item, toml_edit::Item::None)
-                .into_table()
-                .map_err(|_| format!("TOML 里 `{segment}` 不是表（路径: {dotted}）"))?;
-            converted.decor_mut().clear();
-            *item = toml_edit::Item::Table(converted);
-        }
-        table = table
-            .get_mut(segment)
-            .and_then(|item| item.as_table_mut())
-            .ok_or_else(|| format!("TOML 里 `{segment}` 不是表（路径: {dotted}）"))?;
-    }
-    let key = segments[segments.len() - 1];
-    let item = json_to_toml_item(value)?;
-    match table.get_mut(key) {
-        // 键已存在：**原地换值**，不动 key 的 decor。
-        // 不能用 `Table::insert` —— 它对已存在的键会调 `key.fmt()`，
-        // 而键前面的注释（`# 实验性设置，别动`）就存在 key 的 leaf decor 里，
-        // 一 fmt 就丢。
-        Some(existing) if existing.is_value() => {
-            let previous = existing.clone();
-            *existing = item;
-            if let (Some(old), Some(new)) = (previous.as_value(), existing.as_value_mut()) {
-                // 行尾注释是**值的 decor**（`base_url = "..."  # 旧地址`），
-                // 新值自带的是默认 decor，不抄过来就丢。
-                *new.decor_mut() = old.decor().clone();
-            }
-        }
-        // 键不存在：新增（decor 用默认值）。
-        _ => {
-            table.insert(key, item);
-        }
-    }
-    Ok(document.to_string())
-}
-
-/// JSON 值 → TOML 值。只支持本项目实际会写的标量。
-fn json_to_toml_item(value: &Value) -> Result<toml_edit::Item, String> {
-    Ok(match value {
-        Value::String(text) => toml_edit::value(text.clone()),
-        Value::Bool(flag) => toml_edit::value(*flag),
-        Value::Number(number) => {
-            if let Some(int) = number.as_i64() {
-                toml_edit::value(int)
-            } else if let Some(float) = number.as_f64() {
-                toml_edit::value(float)
-            } else {
-                return Err(format!("TOML 无法表示的数字: {number}"));
-            }
-        }
-        Value::Array(_) | Value::Object(_) => {
-            return Err("本项目不写复合 TOML 值（数组 / 表），遇到即报错".to_string())
-        }
-        Value::Null => return Err("TOML 没有 null".to_string()),
-    })
-}
-
-/// 渲染单配置客户端写完之后的样子（`apply_single` 与 `preview` 共用）。
-///
-/// TOML 走 `set_toml_path`（带 trivia 的语法树）：注释、键序、行尾注释
-/// 全部保留，逐路径串行写入 —— 每次调用拿上一轮的文本当输入。
-/// 其余格式（JSON / JSONC / JsonEnv）仍走旧的值树路径，注释仍会丢。
-pub fn render_single(def: &ClientDef, original: &str, profile: &Profile) -> Result<String, String> {
-    let targets = single_targets(def, profile);
-    match def.format {
-        ConfigFormat::Toml => {
-            // 逐个路径写入带 trivia 的语法树，注释与键序保留。
-            let mut text = original.to_string();
-            for (key, item) in &targets {
-                text = set_toml_path(&text, key, item)?;
-            }
-            Ok(text)
-        }
-        _ => {
-            let mut value = parse_json_like(def.format, original)?;
-            for (key, item) in &targets {
-                set_path(&mut value, key, item.clone());
-            }
-            Ok(serde_json::to_string_pretty(&value)
-                .map_err(|error| format!("生成 JSON 失败: {error}"))?
-                + "\n")
-        }
-    }
-}
-
-/// 单配置写入：读原文 → 渲染 → 原子写回。
-pub fn apply_single(def: &ClientDef, path: &Path, profile: &Profile) -> Result<(), String> {
-    let original = read_text(path)?.unwrap_or_default();
-    let rendered = render_single(def, &original, profile)?;
-
-    write_atomic(path, &rendered)?;
-
-    // Gemini CLI 的 .env 是第二份文件：地址与 key 在那里
-    if matches!(def.format, ConfigFormat::JsonEnv) {
-        let env_path = sibling_env_path(&path.to_path_buf());
-        let previous = read_text(&env_path)?.unwrap_or_default();
-        write_atomic(&env_path, &merge_env(&previous, &profile.base_url.trim().to_string()))?;
     }
     Ok(())
 }
 
-/// 改写 `.env`：只替换我们那两个键，其它行（含注释与用户自己的变量）原样留下。
-///
-/// 早先这里是整份重写成两行 —— 用户写在同一个 `.env` 里的 `HTTP_PROXY` 之类
-/// 会被静默抹掉，代价太大。现在按行扫：命中我们的键就替换、没有就补在末尾，
-/// 其余行逐字保留。
-fn merge_env(original: &str, base_url: &str) -> String {
-    const OUR_KEYS: [&str; 2] = ["GOOGLE_GEMINI_BASE_URL", "GEMINI_API_KEY"];
-    let key_value = |key: &str| -> String {
-        match key {
-            "GOOGLE_GEMINI_BASE_URL" => base_url.to_string(),
-            _ => gateway_key(),
-        }
-    };
-
-    let mut out = String::with_capacity(original.len() + 96);
-    let mut seen = [false, false];
-    for line in original.lines() {
-        let trimmed = line.trim_start();
-        let matched = OUR_KEYS.iter().position(|key| {
-            trimmed
-                .strip_prefix(key)
-                .map(|rest| rest.trim_start().starts_with('='))
-                .unwrap_or(false)
-        });
-        match matched {
-            Some(index) => {
-                seen[index] = true;
-                out.push_str(&format!("{}={}\n", OUR_KEYS[index], key_value(OUR_KEYS[index])));
+fn commit(changes: &[Change]) -> Result<(), String> {
+    let mut staged = Vec::new();
+    for change in changes {
+        if let Some(bytes) = &change.after {
+            match files::stage(&change.target, bytes) {
+                Ok(path) => staged.push(Some(path)),
+                Err(error) => {
+                    for path in staged.into_iter().flatten() {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    return Err(error);
+                }
             }
-            None => {
-                out.push_str(line);
-                out.push('\n');
+        } else {
+            staged.push(None);
+        }
+    }
+    let result = (|| {
+        for change in changes {
+            change.check().map_err(|error| (error, Vec::new()))?;
+        }
+        let mut written = Vec::new();
+        for (index, change) in changes.iter().enumerate() {
+            if let Err(error) = change.check() {
+                return Err((error, written));
             }
-        }
-    }
-    for (index, key) in OUR_KEYS.iter().enumerate() {
-        if !seen[index] {
-            out.push_str(&format!("{key}={}\n", key_value(key)));
-        }
-    }
-    out
-}
-
-/* ─── 写：多配置 ──────────────────────────────── */
-
-/// 多配置写入：只翻转 `enabled` 与默认项，**不动其它条目**。
-///
-/// 当前支持 ZCode 的 `provider_config.json` 形状：
-/// `{ config: { providerOrder: [...], providerConfigRules: { providerRules: [...] } } }`
-/// 每条 `providerRule` 有 `providerId` / `providerName` / `enabled` / `config`。
-/// 我们的每套 Profile 对应其中一条（`id` 即 `providerId`）。
-///
-/// 找不到对应条目时**跳过而不是新增**：新增一条 provider 需要完整的上游
-/// 配置（group / access / api / modelOrder），猜错会让客户端启动失败。
-/// 缺的那条由用户在客户端里自己建，我们只管开关。
-pub fn apply_multi(def: &ClientDef, path: &Path, profiles: &[Profile]) -> Result<(), String> {
-    let original = read_text(path)?.unwrap_or_default();
-    if original.trim().is_empty() {
-        return Err(format!(
-            "{} 还不存在或为空；先在客户端里建好配置，再回来接管",
-            path.display()
-        ));
-    }
-    let mut value = parse_json_like(def.format, &original)?;
-
-    let mut changed = 0usize;
-    if let Some(rules) = value
-        .pointer_mut("/config/providerConfigRules/providerRules")
-        .and_then(Value::as_array_mut)
-    {
-        for rule in rules.iter_mut() {
-            let Some(object) = rule.as_object_mut() else { continue };
-            let id = object
-                .get("providerId")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let Some(profile) = profiles.iter().find(|item| item.id == id) else {
-                continue;
+            let result = match &staged[index] {
+                Some(temp) => files::replace(temp, &change.target),
+                None => {
+                    if change.before.is_some() {
+                        std::fs::remove_file(&change.target)
+                            .map_err(|e| format!("移除新建配置失败: {e}"))
+                    } else {
+                        Ok(())
+                    }
+                }
             };
-            object.insert("enabled".into(), json!(profile.enabled));
-            changed += 1;
+            // rename 后的目录同步也可能失败，此时文件已经变了，同样需要回滚。
+            if result.is_ok() || files::read(&change.target).ok().flatten() == change.after {
+                written.push(change.clone());
+            }
+            if let Err(error) = result {
+                return Err((error, written));
+            }
+        }
+        Ok(())
+    })();
+    for temp in staged.into_iter().flatten() {
+        let _ = std::fs::remove_file(temp);
+    }
+    match result {
+        Ok(()) => Ok(()),
+        Err((error, written)) => {
+            let recovery = rollback(&written);
+            Err(format!(
+                "{error}{}",
+                recovery
+                    .err()
+                    .map(|e| format!("；自动回滚失败: {e}，请保留事务备份并手动恢复"))
+                    .unwrap_or_else(|| "；本次变更已回滚".into())
+            ))
         }
     }
-    if changed == 0 {
-        return Err(format!(
-            "{} 里没有找到我们的配置条目；先在客户端里建一条，或重新检测",
-            path.display()
-        ));
-    }
-
-    let text = serde_json::to_string_pretty(&value)
-        .map_err(|error| format!("生成 JSON 失败: {error}"))?
-        + "\n";
-    write_atomic(path, &text)
 }
 
-/* ─── 写入预览 ────────────────────────────────── */
-
-/// 生成「写完之后这个文件长什么样」的预览（不落盘）。
-///
-/// 返回 `{ path, text, changed: [行号…] }`：前端按行渲染，改动行高亮。
-/// 行号从 1 开始。做不到精确 diff（只改了几个键，却要给出整份文件），
-/// 所以按「哪几行里出现了我们写的值」判定改动行 —— 够用且不会骗人。
-pub fn preview(def: &ClientDef, path: &Path, profile: &Profile) -> Result<Value, String> {
-    let original = read_text(path)?.unwrap_or_default();
-
-    if def.multi {
-        let profiles = super::load_client(def.id);
-        // 多配置的预览：拿当前磁盘内容按「只改 enabled」模拟一遍
-        let mut value = if original.trim().is_empty() {
-            json!({})
-        } else {
-            parse_json_like(def.format, &original)?
+fn rollback(changes: &[Change]) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for change in changes.iter().rev() {
+        let current = files::read(&change.target)?;
+        if current == change.before {
+            continue;
+        }
+        if current != change.after {
+            errors.push(format!(
+                "{} 已被其他程序修改，未覆盖",
+                change.path.display()
+            ));
+            continue;
+        }
+        let result = match &change.before {
+            Some(bytes) => files::write_atomic(&change.target, bytes),
+            None => std::fs::remove_file(&change.target)
+                .map_err(|e| format!("移除 {} 失败: {e}", change.path.display())),
         };
-        if let Some(rules) = value
-            .pointer_mut("/config/providerConfigRules/providerRules")
-            .and_then(Value::as_array_mut)
+        if let Err(error) = result {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("；"))
+    }
+}
+
+pub fn restore_preview(def: &ClientDef, path: &Path, disconnect: bool) -> Result<Value, String> {
+    let (changes, _) = backups::restore_changes(def.id, path, disconnect)?;
+    let pending = backups::list(def.id, path)?
+        .iter()
+        .any(|backup| backup.phase == "restore_prepared");
+    let mut warnings =
+        vec!["仅当目标文件仍与上次应用结果一致时恢复；不会覆盖其他程序的新修改。".into()];
+    if pending {
+        warnings.push("上次恢复未完整结束；本次先撤回未完成的恢复，原应用备份仍保留。完成后可再次撤销上次应用。".into());
+    }
+    let plan = clients::Plan {
+        changes,
+        profile: Profile {
+            id: "restore".into(),
+            ..Default::default()
+        },
+        operation: if disconnect { "disconnect" } else { "restore" }.into(),
+        warnings,
+    };
+    preview::create_restore(def.id, &plan)
+}
+
+pub fn restore(
+    def: &ClientDef,
+    path: &Path,
+    disconnect: bool,
+    token: &str,
+) -> Result<Value, String> {
+    let _guard = mutation_lock()
+        .lock()
+        .map_err(|_| "客户端配置写入锁不可用")?;
+    let (changes, ids) = backups::restore_changes(def.id, path, disconnect)?;
+    let plan = clients::Plan {
+        changes: changes.clone(),
+        profile: Profile {
+            id: "restore".into(),
+            ..Default::default()
+        },
+        operation: if disconnect { "disconnect" } else { "restore" }.into(),
+        warnings: Vec::new(),
+    };
+    preview::verify(&plan, def.id, token)?;
+    let pending = backups::list(def.id, path)?
+        .into_iter()
+        .rev()
+        .find(|backup| backup.phase == "restore_prepared");
+    if let Some(mut pending) = pending {
+        commit(&changes)?;
+        if let Err(error) = verify_bytes(&changes) {
+            let _ = rollback(&changes);
+            return Err(error);
+        }
+        pending.phase = "rolled_back".into();
+        if let Err(error) = backups::write(&pending) {
+            let _ = rollback(&changes);
+            return Err(error);
+        }
+        return Ok(json!({ "clientId": def.id, "verified": true, "recovered": true }));
+    }
+    let mut journal = backups::prepare_restore(def.id, path, &plan, ids)?;
+    if let Err(error) = commit(&changes) {
+        if changes
+            .iter()
+            .all(|change| files::read(&change.target).is_ok_and(|bytes| bytes == change.before))
         {
-            for rule in rules.iter_mut() {
-                let Some(object) = rule.as_object_mut() else { continue };
-                let id = object
-                    .get("providerId")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                if let Some(item) = profiles.iter().find(|entry| entry.id == id) {
-                    object.insert("enabled".into(), json!(item.enabled));
-                }
-            }
+            journal.phase = "rolled_back".into();
+            let _ = backups::write(&journal);
         }
-        let text = serde_json::to_string_pretty(&value).unwrap_or_default() + "\n";
-        let (changed, added) = diff_line_numbers(&original, &text);
-        return Ok(json!({
-            "path": path.display().to_string(),
-            "text": text,
-            "changed": changed,
-            "added": added,
-            "warnings": comment_warnings(def.format, &original),
-        }));
+        return Err(error);
     }
-
-    // 与 `apply_single` 同一渲染函数：预览说什么，落盘就是什么。
-    let rendered = render_single(def, &original, profile)?;
-    let (changed, added) = diff_line_numbers(&original, &rendered);
-    Ok(json!({
-        "path": path.display().to_string(),
-        "text": rendered,
-        "changed": changed,
-        "added": added,
-        "warnings": comment_warnings(def.format, &original),
-    }))
-}
-
-/// 原文件里有多少注释、会不会被清掉 —— 写进预览的 `warnings`。
-///
-/// 只有 JSONC 会丢注释：TOML 走 `set_toml_path`（带 trivia），JsonEnv 走
-/// `merge_env`，都不需要告警。JSONC 仍是「解析成值树再序列化」，与其让
-/// 用户写完才发现，不如在预览里当场说清楚（写前有备份，可按备份还原）。
-fn comment_warnings(format: ConfigFormat, original: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    match format {
-        ConfigFormat::Json => {}
-        ConfigFormat::Jsonc => {
-            let count = count_jsonc_comments(original);
-            if count > 0 {
-                out.push(format!(
-                    "原文件里有 {count} 处注释；写入会清掉它们（键与其它设置保留，写前有备份）"
-                ));
-            }
+    if let Err(error) = verify_bytes(&changes) {
+        let recovery = rollback(&changes);
+        if recovery.is_ok() {
+            journal.phase = "rolled_back".into();
+            let _ = backups::write(&journal);
         }
-        ConfigFormat::Toml => {
-            // TOML 走 `set_toml_path`，注释与键序都保住了 —— 不再告警。
-        }
-        ConfigFormat::JsonEnv => {
-            // .env 走 merge_env：只替换我们那两个键，其它行原样保留 ——
-            // 这里不需要告警。真正会丢注释的是同目录的 settings.json（JSON，
-            // 本来就没有注释），也不用提。
-        }
-    }
-    out
-}
-
-/// 数 JSONC 里的注释块（`//` 与 `/* */`），跳过字符串内部。
-fn count_jsonc_comments(text: &str) -> usize {
-    let mut count = 0;
-    let mut chars = text.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-    while let Some(ch) = chars.next() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '/' => match chars.peek() {
-                Some('/') => {
-                    count += 1;
-                    for next in chars.by_ref() {
-                        if next == '\n' {
-                            break;
-                        }
-                    }
-                }
-                Some('*') => {
-                    count += 1;
-                    chars.next();
-                    let mut prev = '\0';
-                    for next in chars.by_ref() {
-                        if prev == '*' && next == '/' {
-                            break;
-                        }
-                        prev = next;
-                    }
-                }
-                _ => {}
-            },
-            _ => {}
-        }
-    }
-    count
-}
-
-/// 逐行比较，返回 `(改动的行号, 新增的行号)`（都从 1 起）。
-///
-/// 「改动」= 同一位置上内容变了；「新增」= 这一行在旧文本里根本找不到。
-/// 两者会重叠（行数不同时，改动行也一定不在旧集合里），前端按「先新增、
-/// 后改动」的顺序取色，重叠时以新增为准。
-///
-/// 用最简单的近似而不是 LCS：配置文件通常只改几行，两边行数相同就按位置比，
-/// 不同则把「新文本里在旧文本中找不到的行」都算改动。宁可多亮一行，不可少亮。
-fn diff_line_numbers(before: &str, after: &str) -> (Vec<usize>, Vec<usize>) {
-    let old_lines: Vec<&str> = before.lines().collect();
-    let new_lines: Vec<&str> = after.lines().collect();
-    let same_length = old_lines.len() == new_lines.len();
-    let old_set: std::collections::HashSet<&str> = old_lines.iter().copied().collect();
-
-    let mut changed = Vec::new();
-    let mut added = Vec::new();
-    for (index, line) in new_lines.iter().enumerate() {
-        let number = index + 1;
-        if !old_set.contains(line) {
-            added.push(number);
-        }
-        let is_changed = if same_length {
-            old_lines.get(index).map(|old| old != line).unwrap_or(true)
-        } else {
-            !old_set.contains(line)
-        };
-        if is_changed {
-            changed.push(number);
-        }
-    }
-    (changed, added)
-}
-
-/* ─── 原子写 ──────────────────────────────────── */
-
-/// 临时文件 + rename：中途失败不会留下半截配置。
-///
-/// 目录不存在时先建（`~/.gemini/` 这类可能整个不存在）。
-pub fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("创建目录 {} 失败: {error}", parent.display()))?;
-        }
-    }
-    let temp = path.with_extension(format!(
-        "{}.tmp",
-        path.extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("tmp")
-    ));
-    std::fs::write(&temp, text).map_err(|error| format!("写临时文件失败: {error}"))?;
-    std::fs::rename(&temp, path).map_err(|error| {
-        let _ = std::fs::remove_file(&temp);
-        format!("替换 {} 失败: {error}", path.display())
-    })
-}
-
-/* ─── 备份 ────────────────────────────────────── */
-
-/// 备份目录：`~/.agent2api/agent-backups`。
-fn backup_dir() -> Option<PathBuf> {
-    super::home_dir().map(|home| home.join(".agent2api").join("agent-backups"))
-}
-
-/// 把客户端原文件备份一份，返回备份路径（原文件不存在时返回 None）。
-pub fn backup(client_id: &str, path: &Path) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let dir = backup_dir()?;
-    std::fs::create_dir_all(&dir).ok()?;
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|value| value.as_millis())
-        .unwrap_or(0);
-    let ext = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("bak");
-    let target = dir.join(format!("{client_id}-{stamp}.{ext}"));
-    std::fs::write(&target, text).ok()?;
-    Some(target)
-}
-
-/// 最近一次备份的路径（切回「官方」时按它还原用）。
-pub fn latest_backup(client_id: &str) -> Option<PathBuf> {
-    let dir = backup_dir()?;
-    let entries = std::fs::read_dir(&dir).ok()?;
-    let mut best: Option<(u128, PathBuf)> = None;
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let Some(rest) = name.strip_prefix(&format!("{client_id}-")) else {
-            continue;
-        };
-        let stamp_text = rest.split('.').next().unwrap_or("");
-        let Ok(stamp) = stamp_text.parse::<u128>() else { continue };
-        let path = entry.path();
-        if best.as_ref().map(|(value, _)| stamp > *value).unwrap_or(true) {
-            best = Some((stamp, path));
-        }
-    }
-    best.map(|(_, path)| path)
-}
-
-/// 按最近一次备份还原（没有备份时返回可读错误）。
-pub fn restore_latest(client_id: &str, target: &Path) -> Result<PathBuf, String> {
-    let source = latest_backup(client_id)
-        .ok_or_else(|| "没有找到这个客户端的备份；无法还原".to_string())?;
-    let text = std::fs::read_to_string(&source)
-        .map_err(|error| format!("读备份 {} 失败: {error}", source.display()))?;
-    write_atomic(target, &text)?;
-    Ok(source)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn set_toml_path_handles_single_segment() {
-        // Codex 的 targets 里有顶层单段键（`model` / `model_provider`）。
-        // v1 计划用 rsplit_once('.') 要求至少两段 → 对单段直接报错。
-        let updated = set_toml_path("model = \"old\"\n", "model", &json!("new"))
-            .expect("单段键必须支持");
-        assert!(updated.contains("model = \"new\""));
-    }
-
-    #[test]
-    fn set_toml_path_creates_missing_tables() {
-        // 既有 set_path 会沿路径创建中间对象（apply.rs:288-296）。
-        // 首次接管一个只有 model 的 config.toml 时，provider 段必须被建出来，
-        // 否则用户第一次切换就失败。
-        let updated = set_toml_path(
-            "model = \"gpt-5\"\n",
-            "model_providers.agent2api.base_url",
-            &json!("http://127.0.0.1:3065/v1"),
-        )
-        .expect("缺表时必须创建，不是报错");
-        assert!(updated.contains("[model_providers.agent2api]"));
-        assert!(updated.contains("base_url = \"http://127.0.0.1:3065/v1\""));
-    }
-
-    #[test]
-    fn set_toml_path_preserves_comments_and_order() {
-        let original = r#"# 我的 Codex 配置
-model = "gpt-5"
-
-# 实验性设置，别动
-[model_providers.agent2api]
-base_url = "http://old/v1"   # 旧地址
-env_key = "OLD"
-"#;
-        let updated = set_toml_path(
-            original,
-            "model_providers.agent2api.base_url",
-            &json!("http://127.0.0.1:3065/v1"),
-        )
-        .expect("应当写入成功");
-        assert!(updated.contains("# 我的 Codex 配置"), "顶层注释必须保留");
-        assert!(updated.contains("# 实验性设置，别动"), "段注释必须保留");
-        assert!(updated.contains("# 旧地址"), "行尾注释必须保留");
-        assert!(updated.contains("http://127.0.0.1:3065/v1"));
-        assert!(!updated.contains("http://old/v1"));
-        let model_pos = updated.find("model = \"gpt-5\"").expect("model 行还在");
-        let provider_pos = updated.find("[model_providers.agent2api]").expect("段还在");
-        assert!(model_pos < provider_pos, "键序必须保持");
-    }
-
-    #[test]
-    fn set_toml_path_handles_inline_table_root() {
-        // 旧的 `toml::from_str` 路径会把 inline table 归一成标准表，
-        // 这些用户以前能切换；`toml_edit` 遍历报错就是回归。
-        let original = "model_providers = { agent2api = { base_url = \"http://old\" } }\n";
-        let updated = set_toml_path(
-            original,
-            "model_providers.agent2api.base_url",
-            &json!("http://new"),
-        )
-        .expect("inline table 必须被转换而不是报错");
-        assert!(updated.contains("http://new"));
-        assert!(!updated.contains("http://old"));
-    }
-
-    #[test]
-    fn set_toml_path_handles_inline_table_nested() {
-        // 嵌套形态：段内某个键是 inline table。
-        let original = "[model_providers]\nagent2api = { base_url = \"http://old\" }\n";
-        let updated = set_toml_path(
-            original,
-            "model_providers.agent2api.base_url",
-            &json!("http://new"),
-        )
-        .expect("嵌套 inline table 必须被转换而不是报错");
-        assert!(updated.contains("http://new"));
-    }
-
-    #[test]
-    fn preview_matches_applied_output() {
-        // 回归锁定：预览与**落盘文件**必须是同一份渲染结果。
-        // 必须真的调用 preview 与 apply_single 两条路径 —— 都调 render_single
-        // 等于 f(x)==f(x)，把 preview 换回旧实现时测试照样绿。
-        let original = "# keep me\nmodel = \"old\"\n";
-        let def = crate::server::core::agents::find("codex").expect("codex 必须在注册表");
-        // `Profile` 没有 `Default`：用 serde 补默认字段（其余字段都带 `#[serde(default)]`）。
-        let profile: Profile = serde_json::from_value(json!({
-            "id": "test",
-            "name": "test",
-            "kind": "gateway",
-            "protocol": "responses",
-            "baseUrl": "http://127.0.0.1:3065/v1",
-            "model": "gpt-5",
-        }))
-        .expect("测试配置应当能反序列化");
-
-        let path = std::env::temp_dir().join(format!(
-            "agent2api-preview-test-{}.toml",
-            std::process::id()
+        return Err(format!(
+            "{error}{}",
+            recovery
+                .err()
+                .map(|error| format!("；自动回滚失败: {error}"))
+                .unwrap_or_default()
         ));
-        std::fs::write(&path, original).expect("写临时文件应当成功");
-
-        let previewed = preview(def, &path, &profile).expect("预览应当成功");
-        apply_single(def, &path, &profile).expect("落盘应当成功");
-        let applied = std::fs::read_to_string(&path).expect("读回应当成功");
-        let _ = std::fs::remove_file(&path);
-
-        assert!(applied.contains("# keep me"), "落盘必须保留注释");
-        assert_eq!(
-            previewed["text"].as_str().unwrap_or(""),
-            applied,
-            "预览与落盘必须逐字一致"
-        );
     }
+    journal.phase = "restore_committed".into();
+    if let Err(error) = backups::write(&journal) {
+        let recovery = rollback(&changes);
+        if recovery.is_ok() {
+            journal.phase = "rolled_back".into();
+            let _ = backups::write(&journal);
+        }
+        return Err(format!(
+            "恢复记录保存失败: {error}{}",
+            recovery
+                .err()
+                .map(|error| format!("；自动回滚失败: {error}"))
+                .unwrap_or_default()
+        ));
+    }
+    Ok(json!({ "clientId": def.id, "verified": true, "disconnected": disconnect }))
+}
+
+pub fn applied_status(client: &str, path: &Path) -> Result<Value, String> {
+    let backups = backups::list(client, path)?;
+    let Some(last) = backups.iter().rev().find(|b| {
+        matches!(
+            b.phase.as_str(),
+            "committed" | "prepared" | "restore_prepared"
+        )
+    }) else {
+        return Ok(json!({ "canUndo": false, "canDisconnect": false }));
+    };
+    let unchanged = last.files.iter().all(|file| {
+        files::read(&file.target)
+            .is_ok_and(|bytes| backups::hash(bytes.as_deref()) == file.after_hash)
+    });
+    Ok(
+        json!({ "canUndo": true, "canDisconnect": last.gateway && last.baseline.is_some(), "modifiedExternally": !unchanged, "pendingRecovery": matches!(last.phase.as_str(), "prepared" | "restore_prepared"), "backupId": last.id, "appliedAt": last.created_at }),
+    )
 }
