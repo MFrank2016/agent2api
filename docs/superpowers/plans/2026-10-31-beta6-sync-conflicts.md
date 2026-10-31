@@ -96,7 +96,7 @@
 - scripts/release.sh
 
 ## 分组
-- A: i18n JSON 22 + ui/i18n JS 37
+- A: i18n JSON 22 + ui/i18n JS 38
 - B: ui-islands 8 + ui/islands bundle
 - C: server 15
 - D: Dockerfile / release.sh / release-flow skill
