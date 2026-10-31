@@ -88,7 +88,7 @@ class Gateway {
   async init() {
     return this.call("init", {
       env: {
-        data_dir: "",
+        data_dir: process.env.AGENT2API_PLUGIN_DATA_DIR || "/tmp/agent2api-parity-data",
         host_version: "parity",
         target: "x86_64-pc-windows-msvc",
         proxy: "",
