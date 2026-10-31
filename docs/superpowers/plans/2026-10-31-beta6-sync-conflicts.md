@@ -1,0 +1,102 @@
+# Beta.6 同步冲突台账
+
+- Base: beta `a0524052`
+- Upstream: `upstream/beta` `bd36938d`
+- Merge: `--no-commit --no-ff`
+- 冲突文件: 88
+
+## 文件清单
+- .agents/skills/release-flow/SKILL.md
+- desktop-tauri/i18n/i18n-src/en/accounts.json
+- desktop-tauri/i18n/i18n-src/en/checkin.json
+- desktop-tauri/i18n/i18n-src/en/keys.json
+- desktop-tauri/i18n/i18n-src/en/proxies.json
+- desktop-tauri/i18n/i18n-src/en/settings.json
+- desktop-tauri/i18n/i18n-src/ja/accounts.json
+- desktop-tauri/i18n/i18n-src/ja/keys.json
+- desktop-tauri/i18n/i18n-src/ja/proxies.json
+- desktop-tauri/i18n/i18n-src/ja/settings.json
+- desktop-tauri/i18n/i18n-src/ko/accounts.json
+- desktop-tauri/i18n/i18n-src/ko/checkin.json
+- desktop-tauri/i18n/i18n-src/ko/keys.json
+- desktop-tauri/i18n/i18n-src/ko/proxies.json
+- desktop-tauri/i18n/i18n-src/ko/settings.json
+- desktop-tauri/i18n/i18n-src/pt-BR/accounts.json
+- desktop-tauri/i18n/i18n-src/pt-BR/checkin.json
+- desktop-tauri/i18n/i18n-src/pt-BR/keys.json
+- desktop-tauri/i18n/i18n-src/pt-BR/proxies.json
+- desktop-tauri/i18n/i18n-src/pt-BR/settings.json
+- desktop-tauri/i18n/i18n-src/zh-Hant/accounts.json
+- desktop-tauri/i18n/i18n-src/zh-Hant/keys.json
+- desktop-tauri/i18n/i18n-src/zh-Hant/proxies.json
+- desktop-tauri/src-tauri/Cargo.lock
+- desktop-tauri/src-tauri/server/src/server/api/keys_api.rs
+- desktop-tauri/src-tauri/server/src/server/api/proxies.rs
+- desktop-tauri/src-tauri/server/src/server/api/routing_api.rs
+- desktop-tauri/src-tauri/server/src/server/core/account_store/store.rs
+- desktop-tauri/src-tauri/server/src/server/core/account_transfer/identity.rs
+- desktop-tauri/src-tauri/server/src/server/core/api_keys.rs
+- desktop-tauri/src-tauri/server/src/server/core/auto_checkin.rs
+- desktop-tauri/src-tauri/server/src/server/core/proxies.rs
+- desktop-tauri/src-tauri/server/src/server/core/proxy_pool.rs
+- desktop-tauri/src-tauri/server/src/server/core/sub_kernel/runtime.rs
+- desktop-tauri/src-tauri/server/src/server/core/update/source.rs
+- desktop-tauri/src-tauri/server/src/server/core/upstream/rotate.rs
+- desktop-tauri/src-tauri/server/src/server/db/schema.rs
+- desktop-tauri/src-tauri/server/src/server/http.rs
+- desktop-tauri/ui/i18n/en/accounts.js
+- desktop-tauri/ui/i18n/en/agent.js
+- desktop-tauri/ui/i18n/en/checkin.js
+- desktop-tauri/ui/i18n/en/common.js
+- desktop-tauri/ui/i18n/en/keys.js
+- desktop-tauri/ui/i18n/en/routing.js
+- desktop-tauri/ui/i18n/en/settings.js
+- desktop-tauri/ui/i18n/en/update.js
+- desktop-tauri/ui/i18n/ja/accounts.js
+- desktop-tauri/ui/i18n/ja/agent.js
+- desktop-tauri/ui/i18n/ja/checkin.js
+- desktop-tauri/ui/i18n/ja/common.js
+- desktop-tauri/ui/i18n/ja/keys.js
+- desktop-tauri/ui/i18n/ja/settings.js
+- desktop-tauri/ui/i18n/ja/update.js
+- desktop-tauri/ui/i18n/ko/accounts.js
+- desktop-tauri/ui/i18n/ko/agent.js
+- desktop-tauri/ui/i18n/ko/checkin.js
+- desktop-tauri/ui/i18n/ko/common.js
+- desktop-tauri/ui/i18n/ko/keys.js
+- desktop-tauri/ui/i18n/ko/settings.js
+- desktop-tauri/ui/i18n/ko/update.js
+- desktop-tauri/ui/i18n/pt-BR/accounts.js
+- desktop-tauri/ui/i18n/pt-BR/agent.js
+- desktop-tauri/ui/i18n/pt-BR/checkin.js
+- desktop-tauri/ui/i18n/pt-BR/common.js
+- desktop-tauri/ui/i18n/pt-BR/keys.js
+- desktop-tauri/ui/i18n/pt-BR/settings.js
+- desktop-tauri/ui/i18n/pt-BR/update.js
+- desktop-tauri/ui/i18n/zh-Hant/accounts.js
+- desktop-tauri/ui/i18n/zh-Hant/add-account.js
+- desktop-tauri/ui/i18n/zh-Hant/checkin.js
+- desktop-tauri/ui/i18n/zh-Hant/common.js
+- desktop-tauri/ui/i18n/zh-Hant/keys.js
+- desktop-tauri/ui/i18n/zh-Hant/models.js
+- desktop-tauri/ui/i18n/zh-Hant/proxies.js
+- desktop-tauri/ui/i18n/zh-Hant/settings.js
+- desktop-tauri/ui/i18n/zh-Hant/update.js
+- desktop-tauri/ui-islands/src/islands/accounts-data.ts
+- desktop-tauri/ui-islands/src/islands/accounts-proxy-form.tsx
+- desktop-tauri/ui-islands/src/islands/accounts-shared.ts
+- desktop-tauri/ui-islands/src/islands/checkin-page.tsx
+- desktop-tauri/ui-islands/src/islands/checkin-schedule-tab.tsx
+- desktop-tauri/ui-islands/src/islands/proxies-dialogs.tsx
+- desktop-tauri/ui-islands/src/islands/proxies-state.ts
+- desktop-tauri/ui-islands/src/islands/routing-canvas.tsx
+- desktop-tauri/ui/islands/ui.css
+- desktop-tauri/ui/islands/ui.js
+- Dockerfile
+- scripts/release.sh
+
+## 分组
+- A: i18n JSON 22 + ui/i18n JS 37
+- B: ui-islands 8 + ui/islands bundle
+- C: server 15
+- D: Dockerfile / release.sh / release-flow skill

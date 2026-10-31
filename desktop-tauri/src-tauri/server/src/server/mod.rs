@@ -388,53 +388,13 @@ impl ServerState {
         // 与任务状态同为「kv 固定键 + 整份读写」的形态，把同一个 `Db` 传进去。
         // 它不参与启动预热，位置只要求早于任何一次 `/api/proxies/pool*` 请求。
         core::proxy_pool::install(db.clone());
-        // 代理设置（节点监听端口范围 + 出口测试网址，「网络代理」页的设置
-        // 弹窗）：与 proxyPool 同一形态的 kv 固定键。内核端口分配与出口
-        // 测试在运行期直接读它，位置只要求早于第一次内核启动 / 测试请求。
         core::proxy_settings::install(db.clone());
-        // 订阅存储（「订阅管理」维护的订阅链接）：同一个 `Db`（与 proxyPool
-        // 同一形态）。位置只要求早于任何一次 `/api/subscriptions*` 请求。
-        core::subscriptions::install(db.clone());
         // 云同步（设置页「数据 → 云同步」）：设置与状态落在 kv 的保留键
         // `cloudSync`，装库句柄即可。自动同步的工作线程在下面 spawn ——
         // 必须先装句柄再起线程，否则第一轮读设置会拿到默认值。
         core::cloud_sync::install(db.clone());
         if let Some(db) = db.clone() {
             core::cloud_sync::auto_sync::spawn_worker(db);
-        }
-        // 订阅内核（mihomo sidecar）的命令 worker：单条队列串行消费内核操作
-        // （下载 / 重建配置 / 重启 / 停止），见 `core::sub_kernel` 的模块头。
-        core::sub_kernel::spawn_worker();
-        // 启动时清一次孤儿订阅节点：正常路径下内核同步会摘掉它们，但内核未安装 /
-        // 手动关闭期间删掉的订阅没有人来收（旧版本还可能因为缺这一步留下历史
-        // 遗留）。清理放在内核启动之前 —— 它不依赖内核，读到什么就按什么清。
-        // 读订阅失败时 `live_ids` 返回 Err，这里整段跳过（宁可留着也不误删）。
-        match core::subscriptions::live_ids() {
-            Ok(live) => match core::proxy_pool::prune_orphan_subscription_items(&live) {
-                Ok(changes) if changes > 0 => logging::console_line(
-                    "[Subscription]",
-                    &format!("已清理 {changes} 个不属于任何订阅的节点"),
-                ),
-                Ok(_) => {}
-                Err(error) => logging::console_line(
-                    "[Subscription]",
-                    &format!("清理孤儿订阅节点失败: {error}"),
-                ),
-            },
-            Err(error) => logging::console_line(
-                "[Subscription]",
-                &format!("跳过孤儿节点清理（{error}）"),
-            ),
-        }
-        // 内核已安装且有启用的订阅 → 自动拉起（清理上次运行遗留的进程后
-        // 重建配置）。**未安装时不自动下载**：二进制 ~20-40MB，下载必须有
-        // 用户的手势（界面上的「下载内核」按钮），启动时静默拉网不合适。
-        if core::subscriptions::should_autostart() {
-            let providers = core::subscriptions::enabled_provider_inputs();
-            crate::spawn_task(async move {
-                core::sub_kernel::request_restart(providers);
-            });
-            logging::console_line("[Subscription]", "检测到已安装的代理内核与启用的订阅，后台自动拉起");
         }
         // 模型清单的持久化缓存：把**同一个 `Db`** 传进去（与配置 / 日志库 /
         // 账号库同一形态）。各家的远程清单在进程重启后由它读回，不再回落到
@@ -517,11 +477,6 @@ impl ServerState {
         // 的其余部分（日志、模型目录、健康检查、配置页）不依赖账号，让它们继续
         // 可用比整体拒绝启动更有用 —— 用户能在界面上看到那条 ❌ 日志并处理磁盘问题。
         let store = AccountStore::with_db(db.clone());
-        // 账号存储句柄给订阅内核（lazy listeners：内核 runtime 读「哪些订阅节点
-        // 需要监听器」决定给谁开 —— 账号引用 ∪ 被「测试」钉住的节点，见
-        // `sub_kernel::runtime::listener_node_keys`）。AccountStore 是轻量 Arc
-        // 句柄，clone 与 ServerState 里那份同实例。
-        core::sub_kernel::install_store(Some(store.clone()));
         // 插件家的登录回调要把账号落库，而那条链路拿不到 ServerState（它是
         // trait 方法，签名里只有一个插件不用的 &AccountStore）。装一个进程级
         // 句柄，见 `account_store::plugin_accounts::shared`。
@@ -575,6 +530,7 @@ impl ServerState {
         }));
         // 启动即收尾上次运行遗留的进行中行（详情见方法注释）：不等到第一条
         // 请求进来才清理，界面打开时看到的就已经是「已中断」的终态
+        core::billing::keepalive::install_stats(request_stats.clone());
         request_stats.sweep_stale_running();
         // ── 僵尸行的主动周期清扫（每 5 分钟一次）─────────────────────
         // 清扫的判定（1 小时阈值）此前只在「下一条请求进来」时顺带跑：
@@ -1026,20 +982,27 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
     // watch 置位，两个 serve 各拿一份 receiver；watch 发送端 drop 也会让
     // `wait_for` 返回，停机语义与单 oneshot 一致。
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut stop_requested = stop_rx.clone();
+    let stop_from_signal = stop_tx.clone();
     crate::spawn_task(async move {
-        let _ = shutdown_rx.await;
-        let _ = stop_tx.send(true);
+        tokio::select! {
+            _ = shutdown_rx => {}
+            _ = stop_requested.wait_for(|stop| *stop) => {}
+        }
+        stop_from_signal.send_replace(true);
     });
 
     // 停机收尾要用的统计句柄：先克隆出来再移进任务（`state` 是借用，不能
     // 随 async move 一起走）
     let request_stats = state.request_stats();
     let stop_main = stop_rx.clone();
+    let stop_from_main = stop_tx.clone();
     crate::spawn_task(async move {
         // 运行时上下文在这里必然成立，from_std 不会 panic
         let listener = match tokio::net::TcpListener::from_std(listener) {
             Ok(listener) => listener,
             Err(error) => {
+                stop_from_main.send_replace(true);
                 logging::log("[Server]", &format!("❌ 创建异步监听失败: {error}"));
                 return;
             }
@@ -1057,7 +1020,10 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
             // 已在处理中的请求会跑完再退出
             let _ = stop.wait_for(|stop| *stop).await;
         });
-        match server.await {
+        let result = server.await;
+        // 正常/异常退出均通知同一轮面板停止 accept。
+        stop_from_main.send_replace(true);
+        match result {
             Ok(()) => logging::log("[Server]", "服务已停止"),
             Err(error) => logging::log("[Server]", &format!("❌ 服务异常退出: {error}")),
         }
@@ -1074,10 +1040,12 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
     // 统计收尾只归主 serve（上面那个任务），这里只管转发请求。
     if let Some(listener) = panel_listener {
         let router = panel_router.expect("panel_port 与 panel_router 必须成对");
+        let stop_from_panel = stop_tx;
         crate::spawn_task(async move {
             let listener = match tokio::net::TcpListener::from_std(listener) {
                 Ok(listener) => listener,
                 Err(error) => {
+                    stop_from_panel.send_replace(true);
                     logging::log("[Server]", &format!("❌ 面板监听创建失败: {error}"));
                     return;
                 }
@@ -1090,7 +1058,9 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
                 let mut stop = stop_rx;
                 let _ = stop.wait_for(|stop| *stop).await;
             });
-            if let Err(error) = server.await {
+            let result = server.await;
+            stop_from_panel.send_replace(true);
+            if let Err(error) = result {
                 logging::log("[Server]", &format!("❌ 面板服务异常退出: {error}"));
             }
         });

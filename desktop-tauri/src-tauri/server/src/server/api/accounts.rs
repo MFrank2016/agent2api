@@ -83,32 +83,50 @@ pub(super) fn proxy_error(error: ProxyConfigError) -> Response {
     management_error(error.status_code, error.message)
 }
 
-/// 插件家的添加账号：把 payload 拆成 `NormalizeInput` 交给插件。
-///
-/// ── 为什么三种来源要在这里拆 ────────────────────────────────
-/// 插件只认 `NormalizeSource` 那四种形态，而面板传来的 payload 是一坨自由
-/// 字段（`token` / `accessToken` / `authFileContent` / `importDesktop` …）。
-/// 拆解是**网关的事**：它知道面板的历史契约；插件只知道「文本 / 文件 /
-/// 桌面端」这三类输入。
-///
-/// ── 落库为什么不用 `add_*_account` ──────────────────────────
-/// 那些是内置家的强类型入口。插件家的 `secret` 是不透明 JSON，落进
-/// `pluginSecret` 键（见 `account_store::plugin_accounts`）—— 于是它照样参与
-/// 选路、优先级、限额冷却，而网关不认识里面任何一个字段。
+/// 标准账号的添加入口：把面板 payload 拆成 `NormalizeInput` 交给真实 adapter。
+/// 插件与本体共用 secret/public 落库及公开白名单，不在 API 中读取令牌字段。
+/// `account_source` 是网关选择的来源，不从 payload 或 secret 中取。
 async fn add_plugin_account(
     state: &ServerState,
     adapter: &dyn crate::server::core::providers::adapter::ProviderAdapter,
     provider: &str,
     payload: &Value,
     import_name: Option<&str>,
+    account_source: &str,
 ) -> Response {
-    // 代理：插件的 normalize 可能要出网探活（取昵称 / 验令牌），用它
-    let proxy = crate::server::core::proxies::ResolvedProxy::from_json(
-        payload.get("proxy").unwrap_or(&Value::Null),
-    )
-    .ok()
-    .flatten()
-    .map(|proxy| agent2api_provider_protocol::WireProxy {
+    use crate::server::core::proxies::{normalize_account_proxy, resolve_account_proxy, ResolvedProxy};
+    // 缺省不覆盖存量出口；显式 null/direct 是需要落库的直连选择。
+    let proxy_config = match payload.get("proxy") {
+        Some(value) if !value.is_null() && !value.is_object() => {
+            return management_error(400, "账号代理配置必须是对象或 null，未回退直连");
+        }
+        Some(value) => match normalize_account_proxy(value) {
+            Ok(config) => Some(config.unwrap_or_else(|| json!({ "source": "direct" }))),
+            Err(error) => return proxy_error(error),
+        },
+        None => None,
+    };
+    // normalize 与落账号共用同一归一配置；pool/Clash 解析失败不能静默直连。
+    let selected_proxy = match proxy_config.as_ref() {
+        None => None,
+        Some(config) if config.get("source").and_then(Value::as_str) == Some("direct") => None,
+        Some(config) => {
+            if crate::server::core::proxies::is_rotate_config(config) {
+                return management_error(400, "添加标准账号不支持轮询代理，请选择直连或一条代理");
+            }
+            let Some(resolution) = resolve_account_proxy(Some(config)) else {
+                return management_error(400, "账号代理未能解析，未回退直连");
+            };
+            if resolution.error().is_some() {
+                return management_error(400, "账号代理无法解析，请检查所选代理是否存在且已启用；未回退直连");
+            }
+            match ResolvedProxy::from_json(&resolution.to_json()) {
+                Ok(Some(proxy)) => Some(proxy),
+                _ => return management_error(400, "账号代理出口无效，请检查主机与端口；未回退直连"),
+            }
+        }
+    };
+    let proxy = selected_proxy.map(|proxy| agent2api_provider_protocol::WireProxy {
         protocol: proxy.protocol,
         host: proxy.host,
         port: proxy.port,
@@ -143,7 +161,19 @@ async fn add_plugin_account(
                 .map(str::to_string),
         }
     } else {
-        agent2api_provider_protocol::NormalizeSource::Manual { payload: payload.clone() }
+        // 新 runtime 的手动归一器只吃自身凭证/方法参数，不把网关代理配置混入
+        // RAW 认证输入。旧插件仍收到原 payload，保留历史归一合同。
+        let mut manual_payload = payload.clone();
+        if crate::server::core::providers::is_scoped_runtime_provider(provider) {
+            if let Some(fields) = manual_payload.as_object_mut() {
+                if fields.get("methodIndex").is_some() {
+                    for key in ["provider", "name", "proxy"] { fields.remove(key); }
+                } else if account_source == "builtin" {
+                    for key in ["name", "proxy"] { fields.remove(key); }
+                }
+            }
+        }
+        agent2api_provider_protocol::NormalizeSource::Manual { payload: manual_payload }
     };
 
     let input = agent2api_provider_protocol::NormalizeInput {
@@ -160,12 +190,7 @@ async fn add_plugin_account(
         }
     };
 
-    // 账号 id：优先用插件给的稳定身份（同一账号登录两次会被识别成更新）
-    let id = if account.identity.trim().is_empty() {
-        format!("{provider}-{}", logging::now_ms())
-    } else {
-        account.identity.clone()
-    };
+    let id = account.identity.clone();
     let name = account
         .public
         .get("name")
@@ -173,16 +198,20 @@ async fn add_plugin_account(
         .filter(|value| !value.trim().is_empty())
         .or(import_name)
         .unwrap_or(adapter.label());
-    match state.store().plugin_upsert_account(
+    match state.store().plugin_upsert_account_with_source_and_proxy(
         &id,
         provider,
         name,
         &account.secret,
         &account.public,
+        account.desktop,
+        account_source,
+        proxy_config.as_ref(),
     ) {
-        Ok(record) => ok_json(json!({
+        Ok((record, proxy_saved)) => ok_json(json!({
             "account": record,
             "created": true,
+            "proxySaved": proxy_saved,
             "list": state.store().list_visible_accounts(),
         })),
         Err(message) => {
@@ -260,21 +289,6 @@ pub async fn accounts_entry(State(state): State<ServerState>, request: axum::ext
     dispatch(state, method, rest.as_deref(), &full_path, &query, &body).await
 }
 
-/// 账号写、批量改代理 / 删除账号后的**监听器对账**（lazy listeners 的触发点，
-/// 见 `api::proxies::reconcile_listeners`）。
-///
-/// 用「改动前后引用 id 集合」的差集来判：改个备注名 / 改密钥不该付一次内核
-/// 重启的等待（重启要重建全部监听器，几秒）。引用增加要补监听器、引用减少
-/// 要回收端口（删账号 / 改走别的代理 / 改直连）—— 两个方向都交给对账的缺口
-/// 检测收敛，这里不猜方向，只拦「没变化」这一种白重启。
-pub(super) fn reconcile_kernel_listeners(state: &ServerState, before: &std::collections::HashSet<String>) {
-    let after = state.store().referenced_pool_ids();
-    if &after == before {
-        return; // 引用集合没变（纯改配置），不重启
-    }
-    super::proxies::reconcile_listeners(state);
-}
-
 /// `/api/proxies*` 的入口（同样接受任意方法）。
 ///
 /// 已注册路径：`/api/proxies`、`/api/proxies/test`（Node 版原有的出口能力）与
@@ -305,7 +319,6 @@ pub async fn proxies_entry(State(state): State<ServerState>, request: axum::extr
         ("POST", "pool/enable") => super::proxies::pool_enable(&state, &body).await,
         ("POST", "pool/remove") => super::proxies::pool_remove(&state, &body).await,
         ("POST", "pool/test") => super::proxies::pool_test(&state, &body).await,
-        ("POST", "pool/provision") => super::proxies::pool_provision(&state, &body).await,
         ("POST", "pool/sync-clash") => super::proxies::pool_sync_clash(&state).await,
         ("GET", "settings") => super::proxies::settings_get().await,
         ("POST", "settings") => super::proxies::settings_save(&body).await,
@@ -359,6 +372,8 @@ pub async fn dispatch(
 
     // ② 固定子路径（Node 版把它们放在 `<id>` 通配之前的原因）
     match (method.as_str(), rest) {
+        ("GET", "sorting") => return super::accounts_sort::get_sorting(&state),
+        ("PUT", "sorting") => return super::accounts_sort::save_sorting(&state, body),
         ("GET", "export") => return export_accounts(&state),
         ("POST", "export-files") => return super::accounts_export::account_files(&state, body).await,
         ("POST", "import") => return import_accounts(&state, body).await,
@@ -570,9 +585,6 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
         Ok(value) => value,
         Err(response) => return response,
     };
-    // 引用集合快照（成功落账号后对账，见 `reconcile_kernel_listeners`）。
-    // 只有插件家的落库路径会走到收尾，所以快照在那里现取（见 `add_plugin_account`
-    // 的调用点）；内置分支全部直接返回 503，这里不再需要。
     let provider = payload
         .get("provider")
         .and_then(Value::as_str)
@@ -586,6 +598,9 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
     let import_name = name.as_deref();
     if let Some(response) = super::accounts_export::import_account_file(state, provider, &payload, import_name) {
         return response;
+    }
+    if crate::server::core::providers::availability::is_suspended(provider) {
+        return management_error(503, "该提供商已暂停接入，暂不支持添加账号；已有数据保留");
     }
     // ── 「文件导入」三字段（均为可选；文件导入契约）─────────────
     // 用户在界面上**手选**桌面客户端的凭证文件时，前端把文件内容放进这些字段：
@@ -620,23 +635,18 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
             Err(error) => store_error(error),
         };
     }
-    // ── 插件家优先（含「已被插件接管的内置家」）────────────────────
-    // 判据是「这个 id 此刻由插件服务」而不是「枚举里没有它」：内置家装上插件
-    // 之后**两边都有**，此时权威是插件（`adapter_by_id` 也是插件优先）。
-    // 这条必须排在下面的穷举 match **之前** ——
-    //   ① 第三方 provider 落进 `None` 分支会被当成 workbuddy 形态存进
-    //      workbuddy 组，凭证与分组双双错位；
-    //   ② 已被接管的内置家落进穷举分支会走**内置**的落库路径，写出没有
-    //      `pluginSecret` 的记录，插件那边读不到（症状是「刚加的账号不能用」）。
-    //
-    // 三种来源都交给插件的 `account.normalize`：
-    //   - `importDesktop` → `NormalizeSource::Desktop`（插件自己读本机客户端）
-    //   - `authFileContent` / `authFileB64` → 文件导入
-    //   - 其余 → 手动粘贴（payload 原样给插件，它知道自己的字段名）
-    if crate::server::core::plugin_host::serves_provider(provider) {
-        if let Some(adapter) = crate::server::core::providers::adapter::adapter_by_id(provider) {
-            return add_plugin_account(state, adapter.as_ref(), provider, &payload, import_name).await;
-        }
+    // 真实插件与本体 runtime ID 共用 normalize / 标准落库，必须先于旧枚举拒绝路径。
+    // 同一 ID 仍由插件优先执行；source 仅区分来源，不改变 provider 归属。
+    if crate::server::core::providers::is_executable_provider(provider) {
+        let Some(adapter) = crate::server::core::providers::adapter::adapter_by_id(provider) else {
+            return management_error(503, format!("提供商执行体尚未就绪：{provider}"));
+        };
+        let source = if crate::server::core::plugin_host::serves_provider(provider) {
+            "plugin"
+        } else {
+            "builtin"
+        };
+        return add_plugin_account(state, adapter.as_ref(), provider, &payload, import_name, source).await;
     }
     // ── 兜底分派：**每个分支都直接返回**（没有内置落库路径了）──────
     // 本版本不再内置任何一家的账号实现，所以这里的每个 arm 都是 503 指路。
@@ -995,8 +1005,9 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
         .filter(|value| !value.is_empty());
     let id = match id {
         Some(value) => value,
-        None => match state.store().get_active_entry() {
-            Some(entry) => entry.id,
+        // 默认刷新全局真实执行体队首，不借 WorkBuddy 专属会话入口选本体账号。
+        None => match state.store().current_account_id() {
+            Some(id) => id,
             None => return management_error(400, "当前没有可用账号"),
         },
     };
@@ -1011,13 +1022,9 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
             "自定义提供商账号的凭证由用户直接提供，无需刷新（更换凭证请重新添加或直接编辑）",
         );
     }
-    // ── 插件接管的家优先 ────────────────────────────────────────
-    // 下面整串都是内置家的判定（按各家 `*_account_record` 探记录），而插件
-    // 家的记录里凭证在 `pluginSecret` —— 那些探测函数对它一律返回 None，于是
-    // 插件家的账号会一路掉到最后的 workbuddy 兜底，用户得到一条与本家毫无关系
-    // 的错误。这里先按「账号归属的 provider 是否由插件服务」分流。
+    // 标准账号按顶层 provider 选择真实 adapter，不探测 secret 或占位 kind。
     if let Some(provider) = state.store().account_provider_of(&id) {
-        if crate::server::core::plugin_host::serves_provider(&provider) {
+        if crate::server::core::providers::is_executable_provider(&provider) {
             let Some(adapter) =
                 crate::server::core::providers::adapter::adapter_by_id(&provider)
             else {
@@ -1341,8 +1348,6 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
     if !patch.is_object() {
         return management_error(400, "请求内容必须是 JSON 对象");
     }
-    // 引用集合快照（改代理成功后对账，见 `reconcile_kernel_listeners`）
-    let refs_before = state.store().referenced_pool_ids();
     // CatPaw 的余额查询凭证（`balanceToken`）先落盘：它是**这一家独有**的字段，
     // 通用 `update_account` 不认识它（见 `update_catpaw_balance_token` 的说明：
     // 不把它塞进四家共用的 apply_patch）。放在通用 patch 之前做，于是同一次
@@ -1477,7 +1482,6 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
         Ok((account, mut changes)) => {
             changes.extend(balance_changes);
             // 改代理成功后对账：新引用的补监听器、旧引用失去的回收端口
-            reconcile_kernel_listeners(state, &refs_before);
             ok_json(json!({
                 "account": account,
                 "changes": changes,
@@ -1602,10 +1606,8 @@ pub fn delete_account(state: &ServerState, id: &str) -> Response {
     }
     // 引用快照要在删除**之前**取：被删账号撇下的引用要靠对账回收端口
     // （最后一个引用消失 → 这个节点的监听器该收了）
-    let refs_before = state.store().referenced_pool_ids();
     match state.store().remove_account(id) {
         Ok(()) => {
-            reconcile_kernel_listeners(state, &refs_before);
             ok_json(json!({ "list": state.store().list_visible_accounts() }))
         }
         Err(error) => store_error(error),

@@ -20,8 +20,11 @@
  */
 
 import { t } from '../i18n'
-import { imageAssets, type ImageAsset } from '../../../ui-shared/assistant-image-tools'
+import { readModelApiKeySelection, rememberModelApiKeySelection } from '../../../ui-shared/model-api-key-memory'
 import { readAssistantStream, type ChatEvent, type ToolCall } from '../../../ui-shared/assistant-stream'
+import { parseAssistantMessages, type ChatMessage } from '../../../ui-shared/assistant-history'
+export { DEFAULT_TITLE_PROMPT } from '../../../ui-shared/assistant-history'
+export type { ChatMessage } from '../../../ui-shared/assistant-history'
 export type { ChatEvent, ToolCall } from '../../../ui-shared/assistant-stream'
 
 export function newSessionId(): string {
@@ -39,7 +42,7 @@ type DesktopBridge = {
   platform?: string
   getBackendStatus?: () => Promise<BackendStatus | null | undefined>
   waitForBackend?: () => Promise<BackendStatus | null | undefined>
-  /** 直连网关要带的凭证头（桌面壳回第一把 Key、网页端 shim 回面板令牌/Key） */
+  /** 直连网关的管理凭证（桌面为本机会话；模型 Key 单独选择） */
   directCredentials?: () => Promise<unknown>
 }
 
@@ -83,27 +86,13 @@ function bridge(): DesktopBridge | undefined {
  *   · 桌面形态跨源 → 浏览器自动不带 cookie，于是能通过 `*` 的 CORS 检查
  *     —— 凭证改由请求头显式表达，见下。
  *
- * ── 凭证头从哪来（桌面端靠它才不是裸请求）────────────────────
- * 桌面形态跨源 = cookie 一个都带不上，而助手这三条接口挂在**受保护**的
- * `/api/*` 上，两种情形都要求凭证：
- *   · 配置了网关 Key 时（正常部署都有）：`require_api_key` 逐把比对 ——
- *     未配置 Key 才是「免鉴权放行」，一旦有 Key，裸请求拿到的是 401
- *     `invalid_api_key`；
- *   · 面板认证开启后（设置页开过局域网访问就会注册管理员，见
- *     `commands::panel_register`）：要「面板会话或一把启用的 Key」——
- *     两者都没有时是 401 `panel_login_required`，界面显示「请先登录管理
- *     面板」，而桌面上并没有登录页（登录页只服务浏览器面板）。
- * 所以这里的每条直连请求都先问桥要一份凭证头（`directCredentials`）：
- *   · 桌面壳回第一把启用的 Key（与壳自己发管理请求用的同一把）；
- *   · 网页端 shim 回面板令牌 / 用户输入的 Key（口径与它自己的 httpCall 一致）。
- * Key 那一栏为空时（还没建过 Key）多带一个头也不会被拒，所以两条形态、
- * 有没有 Key 都共用同一条码路。
+ * ── 管理凭证与模型 Key 分开 ───────────────────────────────────
+ * 管理接口使用 `directCredentials` 返回的会话头；模型调用另外携带用户选择的
+ * `x-api-key`，本机会话不能替代 Key，也不改变 Key 的模型或提供商限制。
  */
 const CREDENTIALS: RequestCredentials = 'same-origin'
 
-/** 直连网关的凭证头（桥给的，见上面一段）。取一次即缓存：
- *  网关换 Key 后旧值会一直 401，靠 [`requestDirect`] 的「401 清缓存重试一次」
- *  自愈，不必每次请求都问一遍桥。 */
+/** 桥返回的管理凭证缓存；明确的管理会话失效时重新获取一次。 */
 let cachedAuthHeaders: Record<string, string> | null = null
 
 /** 桥返回的凭证表 → 只保留值为非空字符串的项（形状校验，防老壳/异常值） */
@@ -164,8 +153,11 @@ export type PermissionMode = 'confirm' | 'full'
  *  完全一致，同名在多家时按账号优先级主备。 */
 export type AssistantConfig = {
   model: string | null
+  apiKeyId: string | null
   /** 思考等级（`reasoning_effort` 的取值）；null = 不指定（交给映射绑定） */
   reasoning: string | null
+  titleModel: string | null
+  titlePrompt: string
   /** 权限模式（改动类工具要不要先问） */
   mode: PermissionMode
   systemPromptEnabled: boolean
@@ -259,20 +251,21 @@ function wrapFetchError(error: unknown, base: string): Error {
  * 不带体 —— 与原先每个调用点自己拼 headers/body 相比，凭证合并、Content-Type
  * 与重试策略都只有这一处实现。
  *
- * 401 时清掉凭证缓存重试一次：面板认证开启后网关要的是「面板会话或一把启用
- * 的 Key」，而那把 Key 可能在两次请求之间被换掉（管理页里重新生成第一把），
- * 缓存住的旧值会一直 401 —— 重问一次桥就自愈。**401 表示服务端没有处理这次
- * 请求**，重发不会有副作用（对话也一样）。
+ * 桌面端只在明确的管理会话失效时清掉缓存重试一次，模型 Key 错误不重试。
  */
 export async function requestDirect(
   path: string,
-  options: { method: string; body?: unknown; signal?: AbortSignal },
+  options: { method: string; body?: unknown; signal?: AbortSignal; apiKey?: string },
   retried = false,
 ): Promise<Response> {
   const api = bridge()
   if (api?.platform !== 'web' && api?.waitForBackend) await api.waitForBackend()
   const base = await gatewayBase()
   const headers: Record<string, string> = { ...(await directAuthHeaders()) }
+  if (options.apiKey !== undefined) {
+    headers['x-api-key'] = options.apiKey
+    headers.Authorization = `Bearer ${options.apiKey}`
+  }
   const payload = options.body === undefined ? undefined : JSON.stringify(options.body)
   if (payload !== undefined) headers['Content-Type'] = 'application/json'
   let response: Response
@@ -289,18 +282,26 @@ export async function requestDirect(
     if (options.signal?.aborted) throw error
     throw wrapFetchError(error, base)
   }
-  if (response.status === 401 && !retried && (options.method === 'GET' || !path.startsWith('/api/assistant/images/'))) {
-    // 先把响应体读掉再重试：不消费会让这条连接一直吊着（同一把凭证再来一次
-    // 也还是同一个 401，内容没有价值）
-    await response.text().catch(() => '')
-    cachedAuthHeaders = null
-    return requestDirect(path, options, true)
+  if (response.status === 401 && !retried) {
+    type AuthFailure = { error?: { type?: string; code?: string } }
+    let rejected: AuthFailure | null = null
+    try { rejected = await response.clone().json() as AuthFailure } catch { /* 非 JSON 不触发会话恢复 */ }
+    const kind = rejected?.error?.type || rejected?.error?.code
+    const desktopRecovery = api?.platform !== 'web' && (kind === 'panel_login_required'
+      || kind === 'invalid_api_key' && options.apiKey === undefined)
+    const webRetry = api?.platform === 'web' && options.apiKey === undefined
+      && (options.method === 'GET' || !path.startsWith('/api/assistant/images/'))
+    if (desktopRecovery || webRetry) {
+      await response.text().catch(() => '')
+      cachedAuthHeaders = null
+      return requestDirect(path, options, true)
+    }
   }
   return response
 }
 
-export async function callJson<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
-  const response = await requestDirect(path, { method, body, signal })
+export async function callJson<T>(method: string, path: string, body?: unknown, signal?: AbortSignal, apiKey?: string): Promise<T> {
+  const response = await requestDirect(path, { method, body, signal, apiKey })
   const text = await response.text()
   let parsed: unknown = null
   try { parsed = text ? JSON.parse(text) : null } catch { parsed = null }
@@ -320,9 +321,16 @@ export async function loadAssistantConfig(): Promise<AssistantConfig> {
   const model = typeof config.model === 'string'
     ? config.model
     : (config.model as { id?: unknown } | null)?.id
+  const scope = await gatewayBase()
+  const apiKeyId = typeof config.apiKeyId === 'string' && config.apiKeyId.trim() ? config.apiKeyId.trim()
+    : readModelApiKeySelection(scope, 'assistant')
+  if (apiKeyId) rememberModelApiKeySelection(scope, 'assistant', apiKeyId)
   return {
     model: typeof model === 'string' && model.trim() ? model : null,
+    apiKeyId,
     reasoning: typeof config.reasoning === 'string' && config.reasoning.trim() ? config.reasoning : null,
+    titleModel: typeof config.titleModel === 'string' && config.titleModel.trim() ? config.titleModel : null,
+    titlePrompt: typeof config.titlePrompt === 'string' ? config.titlePrompt : '',
     mode: config.mode === 'full' ? 'full' : 'confirm',
     systemPromptEnabled: config.systemPromptEnabled !== false,
     systemPrompt: typeof config.systemPrompt === 'string' ? config.systemPrompt : '',
@@ -331,8 +339,12 @@ export async function loadAssistantConfig(): Promise<AssistantConfig> {
 }
 
 export async function saveAssistantConfig(config: AssistantConfig): Promise<AssistantConfig> {
+  const scope = await gatewayBase()
+  rememberModelApiKeySelection(scope, 'assistant', config.apiKeyId)
   const data = await callJson<{ config?: AssistantConfig }>('PUT', '/api/assistant/config', { config })
-  return data?.config && typeof data.config === 'object' ? data.config : config
+  const saved = data?.config && typeof data.config === 'object' ? data.config : config
+  rememberModelApiKeySelection(scope, 'assistant', saved.apiKeyId)
+  return saved
 }
 
 /* ─── 流式对话 ─────────────────────────────────────────────── */
@@ -345,11 +357,6 @@ export async function saveAssistantConfig(config: AssistantConfig): Promise<Assi
  * 真正发请求时由 [`toWireMessages`] 拼成 OpenAI 的
  * `[{type:"text"}, {type:"image_url"}]` 形态 —— 那才是上游认的形状。
  */
-export type ChatMessage =
-  | { role: 'user'; content: string; images?: string[] }
-  | { role: 'assistant'; content: string; toolCalls?: ToolCall[] }
-  | { role: 'tool'; toolCallId: string; content: string; images?: ImageAsset[] }
-
 /** 把页面层的消息数组转成上游认的形态（OpenAI 协议） */
 export function toWireMessages(messages: ChatMessage[]): Array<Record<string, unknown>> {
   return messages.map(message => {
@@ -387,6 +394,7 @@ export function toWireMessages(messages: ChatMessage[]): Array<Record<string, un
  */
 export async function streamChat(options: {
   model: string
+  apiKey: string
   messages: ChatMessage[]
   tools: Array<Record<string, unknown>>
   /** 本次请求的思考等级；缺省由后端的设置值兜底（见 api::assistant::chat） */
@@ -402,6 +410,7 @@ export async function streamChat(options: {
     method: 'POST',
     body,
     signal: options.signal,
+    apiKey: options.apiKey,
   })
   if (!response.ok || !response.body) {
     const text = await response.text().catch(() => '')
@@ -443,6 +452,7 @@ export type SessionSummary = {
   reasoning: string | null
   createdAt: number
   updatedAt: number
+  titleGenerated: boolean
 }
 
 /** 打开某一条时的完整形态 */
@@ -458,63 +468,7 @@ export type SessionDetail = SessionSummary & {
  * 等于「这段对话全丢了」。
  */
 function parseMessages(raw: unknown): ChatMessage[] {
-  if (!Array.isArray(raw)) return []
-  const messages: ChatMessage[] = []
-  for (const item of raw) {
-    if (!item || typeof item !== 'object') continue
-    const row = item as Record<string, unknown>
-    const role = String(row.role ?? '')
-    if (role === 'user') {
-      // content 两种形态：字符串（纯文本）或多模态块数组（带图）。块数组要
-      // 拆回「文本 + 图片 data URL」，页面层才不用到处判类型。
-      const rawContent = row.content
-      if (Array.isArray(rawContent)) {
-        const texts: string[] = []
-        const images: string[] = []
-        for (const part of rawContent) {
-          if (!part || typeof part !== 'object') continue
-          const block = part as Record<string, unknown>
-          if (block.type === 'text' && typeof block.text === 'string') texts.push(block.text)
-          if (block.type === 'image_url') {
-            const holder = block.image_url
-            const url = typeof holder === 'string'
-              ? holder
-              : (holder as { url?: unknown } | null | undefined)?.url
-            if (typeof url === 'string' && url) images.push(url)
-          }
-        }
-        messages.push({ role: 'user', content: texts.join('\n'), ...(images.length ? { images } : {}) })
-      } else {
-        const content = typeof rawContent === 'string' ? rawContent : ''
-        // 本版前端另存的一份 images 字段（历史里可能有过）也兼容读回来
-        const images = Array.isArray(row.images)
-          ? row.images.filter((url): url is string => typeof url === 'string' && Boolean(url))
-          : []
-        messages.push({ role: 'user', content, ...(images.length ? { images } : {}) })
-      }
-    } else if (role === 'assistant') {
-      const content = typeof row.content === 'string' ? row.content : ''
-      const rawCalls = Array.isArray(row.toolCalls) ? row.toolCalls : []
-      const toolCalls: ToolCall[] = rawCalls
-        .filter((call): call is Record<string, unknown> => Boolean(call) && typeof call === 'object')
-        .map(call => ({
-          id: String(call.id ?? ''),
-          name: String(call.name ?? ''),
-          arguments: typeof call.arguments === 'string' ? call.arguments : JSON.stringify(call.arguments ?? {}),
-        }))
-        .filter(call => call.name)
-      messages.push({
-        role: 'assistant',
-        content,
-        ...(toolCalls.length ? { toolCalls } : {}),
-      })
-    } else if (role === 'tool') {
-      const content = typeof row.content === 'string' ? row.content : ''
-      const images = imageAssets(row.images)
-      messages.push({ role: 'tool', toolCallId: String(row.toolCallId ?? ''), content, ...(images.length ? { images } : {}) })
-    }
-  }
-  return messages
+  return parseAssistantMessages(raw)
 }
 
 function toSummary(raw: unknown): SessionSummary | null {
@@ -529,6 +483,7 @@ function toSummary(raw: unknown): SessionSummary | null {
     reasoning: typeof row.reasoning === 'string' && row.reasoning ? row.reasoning : null,
     createdAt: Number(row.createdAt) || 0,
     updatedAt: Number(row.updatedAt) || 0,
+    titleGenerated: row.titleGenerated === true,
   }
 }
 
@@ -572,6 +527,20 @@ export async function saveSession(input: {
   const summary = toSummary(data?.session)
   if (!summary) throw new Error(t('会话响应不完整'))
   return summary
+}
+
+export async function summarizeSession(id: string, apiKey: string): Promise<SessionSummary> {
+  const data = await callJson<{ session?: unknown }>('POST', `/api/assistant/sessions/${encodeURIComponent(id)}/title`, undefined, undefined, apiKey)
+  const summary = toSummary(data.session)
+  if (!summary) throw new Error(t('会话响应不完整'))
+  return summary
+}
+
+export async function forkSession(id: string, messageId: string): Promise<SessionDetail> {
+  const data = await callJson<{ session?: unknown }>('POST', `/api/assistant/sessions/${encodeURIComponent(id)}/fork`, { id: newSessionId(), messageId })
+  const summary = toSummary(data.session)
+  if (!summary) throw new Error(t('会话响应不完整'))
+  return { ...summary, messages: parseMessages((data.session as Record<string, unknown>).messages) }
 }
 
 /** 删除一条会话 */

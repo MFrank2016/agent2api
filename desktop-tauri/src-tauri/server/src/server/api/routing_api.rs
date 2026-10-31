@@ -144,9 +144,12 @@ pub async fn get_routing_queue(
 
 /// 候选队列的 JSON（`/api/routing/queue` 与工作台共用同一份实现）。
 pub(crate) fn queue_json(state: &ServerState, model: Option<String>) -> Value {
+    let accounts = routing::accounts_of(&state.store().list_visible_accounts());
+    queue_for_accounts(state, model, &accounts)
+}
+
+pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, accounts: &[Value]) -> Value {
     let snapshot = config::current();
-    let accounts_value = state.store().list_visible_accounts();
-    let accounts = routing::accounts_of(&accounts_value);
     // 候选收窄：点名了模型 → 只留「清单里有它的家」（与转发同一张家清单，
     // `route_for_forward`）；没点名 → 全部账号。与 session.rs 的 ★ 推算同一取材。
     let providers: Vec<String> = match &model {
@@ -157,9 +160,8 @@ pub(crate) fn queue_json(state: &ServerState, model: Option<String>) -> Value {
         Some(_) => accounts
             .iter()
             .filter(|account| providers.contains(&routing::provider_of(account).to_string()))
-            .cloned()
-            .collect(),
-        None => accounts.clone(),
+            .cloned().collect(),
+        None => accounts.to_vec(),
     };
     let scoped = crate::server::core::routing_scope::apply_accounts(
         &scoped,

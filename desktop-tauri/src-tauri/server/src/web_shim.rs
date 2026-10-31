@@ -292,11 +292,12 @@ pub fn shim_js() -> &'static str {
   }
 
   function showLinkFallback(url) {
+    // url 已过登录导航校验；仍逐项转义，查询串只能当文本/属性，不能插入 HTML。
     ensureOverlay(
       '浏览器拦截了弹出窗口',
       '<div>请点击下面的链接打开授权页：</div>'
-      + '<a href="' + url.replace(/"/g, '&quot;') + '" target="_blank" rel="noopener" '
-      + 'style="color:#7fa7ff;word-break:break-all;">' + url + '</a>',
+      + '<a href="' + escapeHtml(url) + '" target="_blank" rel="noopener noreferrer" '
+      + 'style="color:#7fa7ff;word-break:break-all;">' + escapeHtml(url) + '</a>',
       '已完成，关闭'
     );
   }
@@ -322,7 +323,8 @@ pub fn shim_js() -> &'static str {
   // 把粘贴框推给用户。见 runLoginFlow 里那段说明。
   var MANUAL_CALLBACK_GRACE_MS = 10000;
 
-  function needsManualCallback(provider) {
+  // 只供没有 options 的旧调用使用；动态流程完全取所选 method 的 metadata。
+  function legacyNeedsManualCallback(provider) {
     return provider === 'trae'
       || provider === 'accio' || provider === 'accio-cn'
       || provider === 'codearts' || provider === 'autoclaw-intl'
@@ -345,6 +347,75 @@ pub fn shim_js() -> &'static str {
     return String(value == null ? '' : value)
       .replace(/&/g, '&amp;').replace(/</g, '&lt;')
       .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  function hasMethodIndex(options) {
+    return !!(options && Object.prototype.hasOwnProperty.call(options, 'methodIndex'));
+  }
+
+  // GET 动态元数据同时完成运行时 provider/索引校验，不复制 BUILTIN 或放行任意 id。
+  async function selectedLoginMethod(provider, options) {
+    if (!Number.isSafeInteger(options.methodIndex) || options.methodIndex < 0) {
+      throw new Error('登录方式索引必须是非负整数');
+    }
+    var metadata = await call('GET', '/api/session/login/methods?provider=' + encodeURIComponent(provider));
+    var method = metadata && Array.isArray(metadata.methods)
+      && metadata.methods.find(function (item) { return item && item.methodIndex === options.methodIndex; });
+    if (!method) throw new Error('该登录方式已不在提供商的运行时清单中，请重新选择');
+    return {
+      manualCallback: method.manualCallback === true,
+      callbackInput: method.callbackInput === 'code' ? 'code' : 'url',
+      localOnly: method.localOnly === true,
+      instructions: typeof metadata.instructions === 'string' ? metadata.instructions : '',
+    };
+  }
+
+  function loginCallbackTargets(authUrl) {
+    if (!authUrl) return [];
+    var auth;
+    try { auth = new URL(authUrl); } catch (e) { return []; }
+    var targets = [];
+    var collect = function (value, key) {
+      if (['redirect_uri', 'redirect', 'redirect_url', 'callback_url', 'auth_callback_url',
+        'navigate_uri', 'return_url'].indexOf(key) < 0) return;
+      try {
+        var target = new URL(value);
+        if (target.hostname && !target.username && !target.password) targets.push(target);
+      } catch (e) { /* 非 URL 的参数不构成合法 callback */ }
+    };
+    auth.searchParams.forEach(collect);
+    var question = auth.hash.indexOf('?');
+    if (question >= 0) new URLSearchParams(auth.hash.slice(question + 1)).forEach(collect);
+    return targets;
+  }
+
+  function checkedLoginUrl(value, started, targets) {
+    if (typeof value !== 'string' || /[\u0000-\u0020\u007f]/.test(value)) {
+      throw new Error('登录链接包含无效字符');
+    }
+    var parsed;
+    try { parsed = new URL(value); } catch (e) { throw new Error('登录链接无效'); }
+    if (!parsed.hostname || parsed.username || parsed.password) throw new Error('登录链接无效');
+    var hosts = started && started.allowedHosts;
+    if (hosts != null && (!Array.isArray(hosts) || hosts.some(function (host) {
+      return typeof host !== 'string' || !host.trim().replace(/^\*\./, '').replace(/\.$/, '');
+    }))) throw new Error('登录域名白名单格式无效');
+    var permittedHost = !Array.isArray(hosts) || hosts.length === 0 || hosts.some(function (host) {
+      if (typeof host !== 'string') return false;
+      var allowed = host.trim().toLowerCase().replace(/^\*\./, '').replace(/\.$/, '');
+      return allowed && (parsed.hostname.toLowerCase() === allowed
+        || parsed.hostname.toLowerCase().endsWith('.' + allowed));
+    });
+    var callbackHttp = parsed.protocol === 'http:'
+      && ['localhost', '127.0.0.1', '[::1]'].indexOf(parsed.hostname) >= 0
+      && (targets || []).some(function (target) {
+        return target.protocol === parsed.protocol && target.hostname === parsed.hostname
+          && target.port === parsed.port && target.pathname === parsed.pathname;
+      });
+    if (!permittedHost || (parsed.protocol !== 'https:' && !callbackHttp)) {
+      throw new Error('登录链接不是允许的 HTTPS 站点或合法本机回调地址');
+    }
+    return value; // 校验不重写原文，保留授权地址中的编码、顺序与签名。
   }
 
   // 官方小浣熊授权页在 login_source=desktop 时固定跳 office-raccoon://，
@@ -415,119 +486,117 @@ pub fn shim_js() -> &'static str {
     return authorizeUrl.toString();
   }
 
-  async function waitForManualCallback(provider, state, authUrl) {
-    // 称号链必须与上面 `needsManualCallback` 的白名单**一一对应**：少一支，
-    // 那一家就会顶着别家的名字弹框（`lobsterai` 曾经落到 `'AutoClaw'`，用户看到
-    // 的是「AutoClaw 需要粘贴回调地址」而手里登的却是有道龙虾）。
-    // 末尾兜底用 provider id 本身，不用任何一家的名字 —— 名字错的代价是误导，
-    // 显示 id 最坏也只是不好看。
-    var label = provider === 'raccoon' ? '小浣熊'
-      : provider === 'trae' ? 'Trae'
-      : provider.indexOf('accio') === 0 ? 'Accio'
-      : provider === 'codearts' ? 'CodeArts'
-      : provider === 'autoclaw-intl' ? 'AutoClaw 国际版'
-      : provider === 'lobsterai' ? 'LobsterAI（有道龙虾）'
-      : provider === 'antigravity' ? 'Antigravity'
-      : provider;
-    var callbackInstruction = '<strong>如果授权完成后账号没有自动出现</strong>，'
-        + '再复制授权页浏览器地址栏中的<strong>完整地址</strong>粘到下面提交；'
-        + '不要复制授权页原始地址，也不要改动参数。';
+  async function waitForManualCallback(provider, flow, authUrl, waitPromise) {
+    var label = window.wbProviders && window.wbProviders.labelOf
+      ? window.wbProviders.labelOf(provider) : provider;
+    var codeInput = flow.callbackInput === 'code';
+    var callbackInstruction = codeInput
+      ? '仅粘贴此登录方式要求的<strong>本人已授权令牌或一次性 code</strong>；不是设备码或完整回调地址。'
+        + '正文将原样通过受保护的 POST 提交；接受后仍须等待网关确认并保存账号。'
+      : '<strong>如果授权完成后账号没有自动出现</strong>，'
+        + '复制浏览器地址栏中的<strong>完整回调地址</strong>粘贴提交；'
+        + '不要改动参数。回调被接受后仍须等待网关确认并保存账号。';
     var linkStyle = 'flex:1;padding:7px 0;border:1px solid #3a3b3f;border-radius:6px;'
-        + 'background:transparent;color:#c9c9c9;font-size:13px;cursor:pointer;';
-    while (true) {
-      // 链接正文每轮重建：CodeArts 第一跳会把 authUrl 换成 portal 的下一跳，
-      // 复用上一轮的 HTML 会让用户看到一个已经作废的地址
-      var authLinkHtml = '<div style="margin-bottom:6px;color:#9a9a9a;">授权页地址</div>'
-          + '<code style="display:block;margin-bottom:8px;padding:8px 10px;border-radius:6px;'
-          + 'background:#26272b;color:#b8c7e6;font-size:12px;line-height:1.5;'
-          + 'word-break:break-all;max-height:96px;overflow:auto;">' + escapeHtml(authUrl) + '</code>'
-          + '<div style="display:flex;gap:8px;margin-bottom:14px;">'
-          + '<button type="button" data-a2a-act="open" style="' + linkStyle + '">打开授权页</button>'
-          + '<button type="button" data-a2a-act="copy" style="' + linkStyle + '">复制链接</button>'
-          + '</div>';
+      + 'background:transparent;color:#c9c9c9;font-size:13px;cursor:pointer;';
+    while (currentFlow === flow && !flow.canceled) {
+      // 空 URL 流程也能手工交回 code；不渲染空链接，更不能拿它当完成信号。
+      var authLinkHtml = authUrl ? '<div style="margin-bottom:6px;color:#9a9a9a;">授权页地址</div>'
+        + '<code style="display:block;margin-bottom:8px;padding:8px 10px;border-radius:6px;'
+        + 'background:#26272b;color:#b8c7e6;font-size:12px;line-height:1.5;'
+        + 'word-break:break-all;max-height:96px;overflow:auto;">' + escapeHtml(authUrl) + '</code>'
+        + '<div style="display:flex;gap:8px;margin-bottom:14px;">'
+        + '<button type="button" data-a2a-act="open" style="' + linkStyle + '">打开授权页</button>'
+        + '<button type="button" data-a2a-act="copy" style="' + linkStyle + '">复制链接</button>'
+        + '</div>' : '';
       var callbackUrl = await ensureOverlay(
-        label + '需要粘贴回调地址',
+        label + (codeInput ? '需要粘贴授权令牌或 code' : '需要粘贴回调地址'),
         '<div style="margin-bottom:10px;">' + callbackInstruction + '</div>'
+        + '<div data-a2a-login-progress style="white-space:pre-wrap;margin-bottom:10px;">'
+        + escapeHtml(loginProgressText(flow)) + '</div>'
         + authLinkHtml
-        + '<input type="text" spellcheck="false" autocomplete="off" placeholder="http://127.0.0.1:…/callback?..." '
+        + '<input type="password" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" '
+        + 'placeholder="' + (codeInput ? '此方式要求的授权令牌或一次性 code' : '本次登录的完整回调地址') + '" '
         + 'style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #3a3b3f;'
         + 'border-radius:6px;background:#26272b;color:#e8e8e8;">',
-        '提交回调地址',
+        codeInput ? '提交授权令牌或 code' : '提交回调地址',
         {
           cancelText: '取消登录',
           onMount: function (body) {
             var openBtn = body.querySelector('[data-a2a-act="open"]');
             var copyBtn = body.querySelector('[data-a2a-act="copy"]');
-            if (openBtn) {
-              openBtn.addEventListener('click', function () {
-                // noopener：授权页不该拿到面板的 window 引用
-                window.open(authUrl, '_blank', 'noopener');
-              });
-            }
-            if (copyBtn) {
-              copyBtn.addEventListener('click', function () {
-                copyText(authUrl).then(function () {
-                  copyBtn.textContent = '已复制';
-                  setTimeout(function () {
-                    if (copyBtn.isConnected) copyBtn.textContent = '复制链接';
-                  }, 1500);
-                }, function () {
-                  // 非安全上下文且 execCommand 也被禁：退回选中文本让用户手动复制
-                  copyBtn.textContent = '请手动复制上方链接';
-                });
-              });
-            }
+            if (openBtn) openBtn.addEventListener('click', function () {
+              if (currentFlow !== flow || flow.canceled) return;
+              try {
+                var checked = checkedLoginUrl(authUrl, flow.dynamic ? flow.started : null, flow.callbackTargets);
+                window.open(checked, '_blank', 'noopener,noreferrer');
+              } catch (e) {
+                flow.hint = '浏览器无法打开授权页，请复制上方链接手动打开。';
+                emitLogin();
+              }
+            });
+            if (copyBtn) copyBtn.addEventListener('click', function () {
+              copyText(authUrl).then(function () {
+                copyBtn.textContent = '已复制';
+                setTimeout(function () {
+                  if (copyBtn.isConnected) copyBtn.textContent = '复制链接';
+                }, 1500);
+              }, function () { copyBtn.textContent = '请手动复制上方链接'; });
+            });
           },
         }
       );
-      // DISPOSED = 覆盖层被别处接管（例如 401 弹了 API Key 框）：这一轮
-      // 粘贴已经不可能继续，按取消收尾。界面不需要再提示一次 —— 接管屏幕的
-      // 那个弹层（要 Key）本身就是对用户唯一的、更准确的说明。
-      if (callbackUrl === DISPOSED) {
+      if (callbackUrl === DISPOSED || currentFlow !== flow) {
         var takenOver = canceledError();
         takenOver.silent = true;
         throw takenOver;
       }
-      // null = 用户点了「取消登录」或按了 Esc
-      if (callbackUrl == null) return cancelWebLogin(state);
-      callbackUrl = String(callbackUrl || '').trim();
-      if (!callbackUrl) continue;
+      if (callbackUrl == null) return cancelWebLogin(flow.state);
+      // 完整 URL 和裸 code 保真传递，只用 trim 判空，不裁剪/解码/重组正文。
+      callbackUrl = String(callbackUrl);
+      if (!callbackUrl.trim()) continue;
+      var submitted;
       try {
-        var submitted = await call('POST', '/api/session/login/callback', {
-          state: state,
-          callbackUrl: callbackUrl,
+        if (currentFlow !== flow || flow.canceled) throw canceledError();
+        submitted = await call('POST', '/api/session/login/callback', {
+          state: flow.state, callbackUrl: callbackUrl,
         });
-        if (submitted && submitted.nextUrl) {
-          // CodeArts 第一跳只有 secret，需要先打开 portal 的下一跳；下一轮
-          // 再粘贴浏览器最终回调地址即可完成换码。
-          authUrl = String(submitted.nextUrl);
+        callbackUrl = '';
+        if (currentFlow !== flow || flow.canceled) throw canceledError();
+        if (submitted && typeof submitted.nextUrl === 'string' && submitted.nextUrl) {
+          authUrl = checkedLoginUrl(submitted.nextUrl, flow.dynamic ? flow.started : null, flow.callbackTargets);
           continue;
         }
-        // Trae 是把 query 注入现有 listener 后异步换证；其它几家也统一
-        // 以 /wait 的最终状态为准，避免把“已收到回调”误报成“已登录”。
-        return await pollWait(state, provider);
       } catch (error) {
-        // 取消不是失败：提交后的 pollWait 也会因「取消等待」抛 canceled，
-        // 若不先分流就会弹出一个莫名其妙的「回调提交失败」让用户重填。
+        callbackUrl = '';
         if (error && error.canceled) throw error;
-        // 提交失败也留着「取消登录」：否则用户只剩「重新填写」一条路，
-        // 想放弃时又得靠刷新页面
+        var failureMessage = codeInput ? '授权令牌或 code 未被接受；请检查此方式的要求。'
+          : error && error.message ? error.message : error;
         var retry = await ensureOverlay(
           '回调提交失败',
-          '<div style="margin-bottom:4px;">' + escapeHtml(error && error.message ? error.message : error)
-          + '</div><div>请确认复制的是授权完成后的完整地址，再重新提交。</div>',
-          '重新填写',
-          { cancelText: '取消登录' }
+          '<div style="margin-bottom:4px;">' + escapeHtml(failureMessage)
+          + '</div><div>' + (codeInput
+            ? '请确认粘贴的是此方式要求的本人授权令牌或一次性 code，不是设备码或回调地址，再重新提交。'
+            : '请确认复制的是本次授权完成后的完整回调地址，再重新提交。') + '</div>',
+          '重新填写', { cancelText: '取消登录' }
         );
-        // 覆盖层被别处接管：别再重开粘贴框（否则会在流程结束后留下一层幽灵遮罩）
-        if (retry === DISPOSED) {
+        if (retry === DISPOSED || currentFlow !== flow) {
           var retryTakenOver = canceledError();
           retryTakenOver.silent = true;
           throw retryTakenOver;
         }
-        if (retry == null) return cancelWebLogin(state);
+        if (retry == null) return cancelWebLogin(flow.state);
+        continue;
       }
+      var pendingHint = submitted && (typeof submitted.hint === 'string' ? submitted.hint
+        : submitted.pending && submitted.pending.hint);
+      if (typeof pendingHint === 'string') flow.hint = pendingHint;
+      else flow.hint = '回调已提交，正在等待网关确认登录并保存账号…';
+      emitLogin();
+      // accepted/Pending/甚至 callback 的 Done 都不是这里的成功出口：只复用
+      // 同一个 /wait Promise，避免双轮询消费流程或虚报「已添加」。
+      return await waitPromise;
     }
+    throw canceledError();
   }
 
   /** 用户主动取消粘贴回调：通知服务端撤掉这一轮登录任务，并向上抛一个
@@ -537,6 +606,7 @@ pub fn shim_js() -> &'static str {
    *  5 分钟超时才释放，用户随即重新发起会抢不到端口（与 `LoginService::cancel`
    *  注释里 AutoClaw / CodeArts 同一个坑）。 */
   async function cancelWebLogin(state) {
+    if (currentFlow && currentFlow.state === state) currentFlow.canceled = true;
     var canceled = true;
     try {
       var result = await call('POST', '/api/session/login/cancel', { state: state });
@@ -583,7 +653,7 @@ pub fn shim_js() -> &'static str {
   }
 
   // ── HTTP 调用：信封解包与桌面 gateway::unwrap_envelope 对齐 ──
-  async function httpCall(method, path, body, retried) {
+  async function httpCall(method, path, body, retried, selectedKey) {
     // 到期前先把令牌换掉：这一步让「access 过期 → 401 → 续期」不再发生，
     // 也就没有那条每 2 小时一次的 401（见 `ensureFreshSession`）。
     // 只在首轮做：重试那一趟（retried=true）刚刚续过期，再判一次纯属多余。
@@ -603,6 +673,7 @@ pub fn shim_js() -> &'static str {
       var panelRefresh = storedPanelToken('refresh');
       if (panelRefresh) headers['x-panel-refresh'] = panelRefresh;
     }
+    if (selectedKey !== undefined) headers['x-api-key'] = selectedKey;
     var init = { method: method, headers: headers };
     var wantsBody = method === 'POST' || method === 'PUT' || method === 'PATCH'
       || !(body === null || body === undefined);
@@ -626,7 +697,7 @@ pub fn shim_js() -> &'static str {
       var errorType = probe && probe.error && probe.error.type;
       if (errorType === 'panel_login_required') {
         var refreshed = await tryRefresh();
-        if (refreshed) return httpCall(method, path, body, true);
+        if (refreshed) return httpCall(method, path, body, true, selectedKey);
         // 续期失败 = 会话链真的没了：清掉本地令牌再跳登录页，
         // 否则下次进来还带着死 token，永远是同一轮失败。
         clearPanelAuth();
@@ -634,10 +705,10 @@ pub fn shim_js() -> &'static str {
         // 页面即将整页跳转，返回一个挂起的承诺占位
         return new Promise(function () {});
       }
-      var key = await askForKey();
+      var key = selectedKey === undefined ? await askForKey() : null;
       if (key) {
         storeKey(key);
-        return httpCall(method, path, body, true);
+        return httpCall(method, path, body, true, selectedKey);
       }
     }
     var payload;
@@ -773,9 +844,34 @@ pub fn shim_js() -> &'static str {
   var loginActive = false;
   var loginProvider = '';
   var loginListeners = new Set();
+  var loginProgressListeners = new Set();
+  function loginProgressText(flow) {
+    return flow ? [flow.instructions].concat(flow.notices || [], [flow.hint]).filter(function (value) {
+      return typeof value === 'string' && value;
+    }).join('\n') : '';
+  }
+  function loginSnapshot() {
+    var flow = loginActive && currentFlow;
+    return {
+      active: loginActive, provider: loginProvider,
+      mode: flow ? flow.mode : null, edition: flow ? flow.edition : null,
+      instructions: flow ? [flow.instructions].concat(flow.notices || []).filter(Boolean).join('\n') : '',
+      hint: flow ? flow.hint || '' : '',
+      state: flow && flow.dynamic && flow.state ? flow.state : null,
+      manualCallback: !!(flow && flow.dynamic && flow.manualCallback),
+      callbackInput: flow && flow.dynamic ? flow.callbackInput : 'url',
+    };
+  }
   function emitLogin() {
-    var payload = { active: loginActive, provider: loginProvider };
-    loginListeners.forEach(function (cb) { try { cb(payload); } catch (e) { console.warn(e); } });
+    var payload = loginSnapshot();
+    var notify = function (cb) { try { cb(payload); } catch (e) { /* 不记录可能含登录 URL 的异常 */ } };
+    loginListeners.forEach(notify);
+    loginProgressListeners.forEach(notify);
+    // 复用安全粘贴 dialog 的纯文本节点，轮询进度不能作为 HTML 解释。
+    if (activeOverlay) {
+      var text = activeOverlay.overlay.querySelector('[data-a2a-login-progress]');
+      if (text) text.textContent = loginProgressText(loginActive && currentFlow);
+    }
   }
 
   var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
@@ -788,20 +884,37 @@ pub fn shim_js() -> &'static str {
     + '授权完成后的回调会落到你本机而不是网关 —— 请复制浏览器地址栏里的'
     + '完整回调地址，粘回面板重试。';
 
-  async function pollWait(state, provider) {
-    var deadline = Date.now() + 5 * 60 * 1000;
-    while (Date.now() < deadline) {
-      if (isFlowCanceled(state)) throw canceledError();
-      await sleep(3000);
-      if (isFlowCanceled(state)) throw canceledError();
-      var wait = await call('GET', '/api/session/login/wait?state=' + encodeURIComponent(state));
-      if (wait && wait.done) {
-        if (wait.error) throw new Error(wait.error);
+  async function pollWait(flow) {
+    while (Date.now() < flow.deadline) {
+      if (currentFlow !== flow || flow.canceled) throw canceledError();
+      var wait;
+      try {
+        wait = await call('GET', '/api/session/login/wait?state=' + encodeURIComponent(flow.state));
+      } catch (error) {
+        if (currentFlow !== flow || flow.canceled) throw canceledError();
+        throw error;
+      }
+      if (currentFlow !== flow || flow.canceled) throw canceledError();
+      if (wait && wait.done === true && !wait.pending) {
+        if (wait.error) throw asError(wait.error);
         return wait.session == null ? {} : wait.session;
       }
+      if (wait) {
+        var hint = typeof wait.hint === 'string' ? wait.hint : wait.pending && wait.pending.hint;
+        var instructions = typeof wait.instructions === 'string' ? wait.instructions : flow.instructions;
+        var nextHint = typeof hint === 'string' ? hint : flow.hint;
+        if (instructions !== flow.instructions || nextHint !== flow.hint) {
+          flow.instructions = instructions;
+          flow.hint = nextHint;
+          emitLogin();
+        }
+      }
+      await sleep(flow.pollIntervalMs);
     }
-    var hint = provider && needsManualCallback(provider) ? MANUAL_CALLBACK_TIMEOUT_HINT : '';
-    throw new Error('登录等待超时（5 分钟）' + hint);
+    var timeoutHint = flow.callbackInput === 'code'
+      ? '：请重新发起，并按此方式要求粘贴本人已授权的令牌或一次性 code。'
+      : MANUAL_CALLBACK_TIMEOUT_HINT;
+    throw new Error('登录等待超时（5 分钟）' + (flow.manualCallback ? timeoutHint : ''));
   }
 
   /** 取消信号：用 `canceled` 标记与普通失败区分（界面据此提示「已取消」而非报错） */
@@ -814,101 +927,117 @@ pub fn shim_js() -> &'static str {
   /** 当前这一轮登录的 state 与取消标记。只记一轮（壳/桥本身也只允许一轮），
    *  换了新流程就整体替换 —— 上一轮的迟到轮询凭 state 比对自然失效。 */
   var currentFlow = null;
-  function isFlowCanceled(state) {
-    return !!(currentFlow && currentFlow.state === state && currentFlow.canceled);
-  }
 
-  /** 发起一次登录流程：先开窗口（用户手势还在时占位成功率高），再拿地址导航。 */
-  async function runLoginFlow(provider, startRequest) {
+  /** 旧流程保留用户手势占位；动态流程要先确认 URL 非空，绝不空开 browser。 */
+  async function runLoginFlow(provider, startRequest, config) {
+    if (loginActive || currentFlow) throw new Error('已有登录流程在进行，请先完成或取消当前登录');
+    config = config || {};
+    var dynamic = config.dynamic === true;
+    var popup = null;
+    var flow = {
+      state: '', canceled: false, dynamic: dynamic, mode: config.mode || 'embedded', edition: config.edition || 'cn',
+      instructions: '', hint: '', notices: [], manualCallback: false, callbackInput: 'url', started: null, callbackTargets: [],
+      pollIntervalMs: 3000, deadline: 0,
+    };
+    currentFlow = flow;
     loginActive = true;
     loginProvider = provider;
     emitLogin();
-    var popup = null;
-    // state 要等 /start 回来才知道，先把对象挂上 —— 取消可能发生在等待
-    // /start 的那几秒里（此时 currentFlow 已存在，标记能打上）
-    var flow = { state: '', canceled: false };
-    currentFlow = flow;
-    try { popup = window.open('about:blank', 'a2a-login'); } catch (e) { /* 拦截时走兜底 */ }
+    if (!dynamic) {
+      try {
+        popup = window.open('about:blank', 'a2a-login');
+        if (popup) popup.opener = null;
+      } catch (e) { /* 拦截时走兜底 */ }
+    }
     try {
-      var started = await startRequest;
-      var authUrl = started && started.authUrl;
-      if (!authUrl) throw new Error('网关未返回授权地址');
-      flow.state = String(started.state || '');
-      // 等 /start 的那段时间里用户已经点了取消：state 现在才拿到，补发一次
-      // 撤销请求，别让服务端那轮任务空转到 5 分钟超时（Trae 会占着回调端口）
-      if (flow.canceled) {
-        await cancelWebLogin(flow.state);
+      // 工厂延后到全局锁生效后执行，避免第二次调用先 POST 再被锁拒绝。
+      var started = await (typeof startRequest === 'function' ? startRequest(flow) : startRequest);
+      flow.started = started || {};
+      flow.state = String(started && (started.state || started.flow) || '');
+      if (!flow.state.trim()) throw new Error('网关未返回登录流程状态');
+      if (flow.canceled || currentFlow !== flow) await cancelWebLogin(flow.state);
+      var authUrl = started && Object.prototype.hasOwnProperty.call(started, 'url')
+        ? started.url : started && started.authUrl;
+      if (authUrl == null) authUrl = '';
+      if (typeof authUrl !== 'string') throw new Error('网关返回的登录链接格式无效');
+      var hasUrl = !!authUrl.trim();
+      flow.manualCallback = dynamic && typeof started.manualCallback === 'boolean' ? started.manualCallback
+        : dynamic ? !!(flow.method && flow.method.manualCallback) : legacyNeedsManualCallback(provider);
+      flow.callbackInput = dynamic && flow.manualCallback
+        && (started.callbackInput || flow.method && flow.method.callbackInput) === 'code' ? 'code' : 'url';
+      flow.instructions = typeof started.instructions === 'string' && started.instructions
+        ? started.instructions : flow.method && flow.method.instructions || '';
+      if (flow.method && flow.method.localOnly) {
+        flow.notices.push('此方式读取的是网关所在机器的本机客户端账号，不是当前浏览器所在电脑的账号；网页仍可发起。');
       }
-      authUrl = buildRaccoonWebAuthUrl(provider, started.state, authUrl);
-      if (popup && !popup.closed) {
-        popup.location.href = authUrl;
-      } else {
-        var second = null;
-        try { second = window.open(authUrl, '_blank'); } catch (e) { /* 落到链接兜底 */ }
-        if (!second) showLinkFallback(authUrl);
+      var onlyExternal = started.externalBrowser === true;
+      flow.mode = !hasUrl ? 'auto' : 'external';
+      if (dynamic && onlyExternal && config.mode === 'embedded' && hasUrl) {
+        flow.notices.push('该供应商只支持外部浏览器，授权页将在浏览器标签页中打开，不会伪装成内嵌窗口。');
       }
-      if (needsManualCallback(provider)) {
-        // 先给自动路径一段窗口期，再上兜底 —— 不是一上来就把粘贴框推到用户脸上。
-        //
-        // 这条链在「面板经回环地址访问」（桌面端、或远程机器上做了端口映射）时
-        // 是**自己走得完**的：网关给的 `redirect_uri` 就是
-        // `http://127.0.0.1:<网关端口>/…`，浏览器一跳就回来了。原来的写法把
-        // `waitForManualCallback` 直接放进 `Promise.race`，弹框几乎与授权页
-        // 同时出现，用户自然会去粘贴 —— 明明不需要（自动那条往往几秒就完成）。
-        //
-        // 真回不来的远端场景（浏览器与网关不同机且没有端口映射）照样会弹，
-        // 只是晚 10 秒 —— 那时的代价只是多等一会儿，比「让人以为必须手工粘」轻。
-        // 两边都保留：先完成的一方结束流程，finally 会关掉残留覆盖层。
-        //
-        // 两个分支各自把结果包成 {session} / {error} 再进竞速：落败的那一支
-        // 随后才会被 finally 唤醒（dispose）或被下一拍轮询判成取消，如果让它
-        // 直接 reject，Promise.race 已经 settle，那个 rejection 没人接 ——
-        // 控制台会冒出「Uncaught (in promise)」，用户则以为页面出了错。
-        var outcome = await Promise.race([
-          pollWait(started.state, provider).then(
-            function (session) { return { session: session }; },
-            function (error) { return { error: error }; }
-          ),
-          (async function () {
-            await sleep(MANUAL_CALLBACK_GRACE_MS);
-            // 窗口期里这一轮已经落定（自动路径成功 / 用户取消 / 用户关了
-            // 添加账号弹窗）：不能再弹粘贴框，否则流程结束后会留下一层
-            // 摘不掉的遮罩（currentFlow 已被 finally 清空）。
-            if (currentFlow !== flow || flow.canceled) throw canceledError();
-            return waitForManualCallback(provider, started.state, authUrl);
-          })().then(
-            function (session) { return { session: session }; },
-            function (error) { return { error: error }; }
-          ),
-        ]);
-        if (outcome.error) {
-          if (outcome.error.canceled) {
-            // 两种静默来源：外部发起的取消（那边已 toast）、或被其它弹层接管
-            var silent = flow.externalCancel || outcome.error.silent;
-            return silent ? { canceled: true, silent: true } : { canceled: true };
-          }
-          throw outcome.error;
+      var interval = Number(started.pollIntervalMs);
+      // 插件 pollIntervalMs=0 是回调型，不代表关闭网关 /wait；不用于猜 manualCallback。
+      flow.pollIntervalMs = Number.isFinite(interval) && interval > 0
+        ? Math.max(1000, Math.min(30000, interval)) : 3000;
+      flow.deadline = Date.now() + 5 * 60 * 1000;
+      if (hasUrl) {
+        if (!dynamic) authUrl = buildRaccoonWebAuthUrl(provider, flow.state, authUrl);
+        flow.callbackTargets = loginCallbackTargets(authUrl);
+        // 旧版没有白名单契约，保留原 SSO 行为；动态版严格采用真实 allowedHosts。
+        authUrl = checkedLoginUrl(authUrl, dynamic ? started : null, flow.callbackTargets);
+        if (popup && !popup.closed) popup.location.href = authUrl;
+        else {
+          var opened = false;
+          try {
+            // 先拿同源空页句柄再断开 opener；直接 noopener 会在成功时也返回 null，
+            // 不能据此误报「被拦截」。这一步只在已确认 URL 非空且合法后执行。
+            var second = window.open('about:blank', '_blank');
+            if (second) {
+              second.opener = null;
+              second.location.replace(authUrl);
+              opened = true;
+            }
+          } catch (e) { /* 显示安全链接兜底 */ }
+          if (!opened) showLinkFallback(authUrl);
         }
-        return outcome.session;
+      } else if (popup && !popup.closed) {
+        popup.close();
+        popup = null;
       }
-      return await pollWait(started.state, provider);
+      emitLogin();
+      var waiting = pollWait(flow);
+      if (!flow.manualCallback) return await waiting;
+      // 一个 /wait Promise 与安全粘贴 dialog 竞速，accepted 后仍等待同一个终态。
+      var outcome = await Promise.race([
+        waiting.then(function (session) { return { session: session }; },
+          function (error) { return { error: error }; }),
+        (async function () {
+          await sleep(MANUAL_CALLBACK_GRACE_MS);
+          if (currentFlow !== flow || flow.canceled) throw canceledError();
+          return waitForManualCallback(provider, flow, authUrl, waiting);
+        })().then(function (session) { return { session: session }; },
+          function (error) { return { error: error }; }),
+      ]);
+      if (outcome.error) throw outcome.error;
+      return outcome.session;
     } catch (error) {
-      // 用户主动取消 → 返回 {canceled:true}，界面按「已取消」提示而不是报错。
-      // externalCancel：取消由外部（「取消等待」按钮 / 关掉添加账号弹窗）发起，
-      // 那边已经 toast 过一次；error.silent：被别的弹层接管，由那个弹层说明。
-      // 两种情况都带上 silent，让引擎别再重复提示。
-      if (error && error.canceled) {
-        var quiet = flow.externalCancel || error.silent;
+      if (flow.canceled || (error && error.canceled)) {
+        var quiet = flow.externalCancel || (error && error.silent);
         return quiet ? { canceled: true, silent: true } : { canceled: true };
+      }
+      if (flow.state) {
+        call('POST', '/api/session/login/cancel', { state: flow.state }).catch(function () {});
       }
       throw error;
     } finally {
       if (popup && !popup.closed) { try { popup.close(); } catch (e) { /* 无害 */ } }
-      closeWebOverlay(true);
-      if (currentFlow === flow) currentFlow = null;
-      loginActive = false;
-      loginProvider = '';
-      emitLogin();
+      if (currentFlow === flow) {
+        closeWebOverlay(true);
+        currentFlow = null;
+        loginActive = false;
+        loginProvider = '';
+        emitLogin();
+      }
     }
   }
 
@@ -916,15 +1045,23 @@ pub fn shim_js() -> &'static str {
   var SHELL_UNAVAILABLE = '该操作在网页端不可用（仅桌面端支持）';
 
   var shellCommands = {
+    // 与老 edition/mode/provider 顺序的方法并存，直接 invoke 也收第五 options。
+    start_login: function (args) {
+      args = args || {};
+      return window.workbuddyDesktop.startLogin(args.edition, args.mode, args.provider,
+        args.socialRestore, args.options);
+    },
+    login_state: function () { return window.workbuddyDesktop.getLoginState(); },
+    cancel_login: function () { return window.workbuddyDesktop.cancelLogin(); },
     api_request: function (args) {
       var request = (args && args.request) || {};
-      return httpCall(request.method || 'GET', request.path || '/', request.body);
+      return httpCall(request.method || 'GET', request.path || '/', request.body, false,
+        request.apiKey === undefined ? undefined : String(request.apiKey));
     },
     check_update: function () {
       // 网页端没有「壳打包的版本号」这个概念：不带 current，服务端按自己的
       // 编译期版本比较（见 api/update 的 check 分支）。返回里带 selfUpdate /
-      // serverAsset / backupAvailable —— 面板据此决定显示「一键更新」、
-      // 「回滚」还是退回手动升级命令，不再由这里硬编码。
+      // serverAsset —— 面板据此决定显示「一键更新」还是手动升级命令。
       return call('GET', '/api/update/check');
     },
     get_update_status: function () { return call('GET', '/api/update/status'); },
@@ -1063,17 +1200,20 @@ pub fn shim_js() -> &'static str {
   }
 
   /**
-   * 整库备份（网页端）：`GET /api/backup/download` → 浏览器下载 .sql。
+   * 整库备份（网页端）：POST 密码参数，下载 .a2ab 加密包。
    *
    * 返回形状与桌面壳 `commands.rs::export_database` 对齐
    * （`{ bytes, tables, file }`），设置页的成功提示两端共用一套渲染。
-   * 表计数在后端放进 `X-Backup-Tables` 响应头 —— 响应体是几百 MB 的 SQL，
-   * 不能为了带元数据把它包成 JSON。
+   * 表计数在后端放进 `X-Backup-Tables` 响应头，响应体只承载加密包。
    */
-  async function exportDatabase(includeLogs) {
-    var path = '/api/backup/download?includeLogs=' + (includeLogs === false ? '0' : '1');
-    var response = await fetchAuthed(path, function () {
-      return { method: 'GET', headers: authHeaders({ 'Accept': '*/*' }) };
+  async function exportDatabase(includeLogs, password) {
+    var response = await fetchAuthed('/api/backup/download', function () {
+      return {
+        method: 'POST',
+        cache: 'no-store',
+        headers: authHeaders({ 'Accept': '*/*', 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ includeLogs: includeLogs !== false, password: password || '' }),
+      };
     });
     if (!response.ok) {
       // 失败时响应体是管理信封（错误文案在里面），交给统一的错误归一
@@ -1084,30 +1224,34 @@ pub fn shim_js() -> &'static str {
     }
     var tables = [];
     try { tables = JSON.parse(response.headers.get('x-backup-tables') || '[]'); } catch (e) { tables = []; }
+    var includedKeys = [];
+    try { includedKeys = JSON.parse(response.headers.get('x-backup-keys') || '[]'); } catch (e) { includedKeys = []; }
     var filename = fileNameFromDisposition(response.headers.get('content-disposition'))
-      || ('agent2api-backup-' + downloadStamp() + '.sql');
+      || ('agent2api-backup-' + downloadStamp() + '.a2ab');
     var blob = await response.blob();
     saveBlob(blob, filename);
-    return { bytes: blob.size, tables: tables, file: filename, saved: true };
+    return { bytes: blob.size, tables: tables, file: filename, saved: true, encrypted: true, includedKeys: includedKeys };
   }
 
   /**
-   * 整库恢复（网页端）：选一个 .sql 文件 → `POST /api/backup/upload`。
-   *
-   * 请求体直接放 File 对象，浏览器按文件流式发送 —— 不能 `file.text()`：
-   * 几百 MB 的备份在手机上会先把整份内容读成字符串，内存翻倍且容易 OOM。
+   * 整库恢复：选择 .a2ab 或旧 .sql，密码和 File 通过 multipart 流式上传。
+   * 不能 file.text()，否则大备份会在界面额外生成全量字符串。
    * 返回形状与桌面壳 `commands.rs::import_database` 一致
    * （`{ tables, safetyBackup, warning? }`）。
    */
-  async function importDatabase() {
-    var picked = await pickFile('.sql');
+  async function importDatabase(password) {
+    var picked = await pickFile('.a2ab,.sql');
     if (picked.canceled) return { canceled: true };
     var file = picked.file;
+    var form = new FormData();
+    form.append('password', password || '');
+    form.append('backup', file);
     var response = await fetchAuthed('/api/backup/upload', function () {
       return {
         method: 'POST',
-        headers: authHeaders({ 'Content-Type': 'application/sql', 'Accept': 'application/json' }),
-        body: file,
+        cache: 'no-store',
+        headers: authHeaders({ 'Accept': 'application/json' }),
+        body: form,
       };
     });
     var text = await response.text();
@@ -1292,29 +1436,44 @@ pub fn shim_js() -> &'static str {
 
     // ── 会话 ──
     getState: function () { return call('GET', '/api/session'); },
-    startLogin: function (edition, mode, provider) {
-      var target = provider || 'workbuddy';
-      // 小浣熊的 redirect 分支只有在浏览器以回环地址访问面板时才成立
-      // （前提见 raccoonCallbackOriginProblem 的注释）。预检不过就不发
-      // /start（省一个注定失败的登录任务），弹指引并 reject，由引擎 toast
-      // 收尾 —— 用户看到的不再是授权页那句「授权链接无效」。
-      if (target === 'raccoon') {
+    startLogin: function (edition, mode, provider, socialRestore, options) {
+      var target = String(provider || 'workbuddy').trim();
+      var dynamic = hasMethodIndex(options);
+      // 只有旧小浣熊入口才改 redirect/预检；动态方法不能被 provider 特判覆盖。
+      if (!dynamic && target === 'raccoon') {
         var problem = raccoonCallbackOriginProblem();
         if (problem) return reportRaccoonCallbackProblem(problem);
       }
-      return runLoginFlow(target, call('POST', '/api/session/login/start', {
-        edition: edition || 'cn',
-        provider: target,
-      }));
+      return runLoginFlow(target, async function (flow) {
+        if (dynamic) flow.method = await selectedLoginMethod(target, options);
+        if (flow.canceled) throw canceledError();
+        var body = { edition: edition || 'cn', provider: target };
+        // 不压缩第四参 socialRestore；第五参对象保持原字段/原值（含 proxy:null）。
+        if (options !== undefined) body.options = options;
+        if (dynamic) {
+          body.mode = mode || 'embedded';
+          body.socialRestore = socialRestore === true;
+          // 兼容当前 API 的平铺读取；options 字段也完整保留给新端点。
+          body.methodIndex = options.methodIndex;
+          if (Object.prototype.hasOwnProperty.call(options, 'inputs')) body.inputs = options.inputs;
+          if (Object.prototype.hasOwnProperty.call(options, 'proxy')) body.proxy = options.proxy;
+        } else if (options && Object.prototype.hasOwnProperty.call(options, 'proxy')) {
+          // 旧入口（内置表单的网页登录）也能带登录代理：网关的非动态分支读的
+          // 就是顶层 `proxy`（见 api::session 的 legacy_proxy）。少了这一句，
+          // 无头服务器上选了代理也仍然直连。
+          body.proxy = options.proxy;
+        }
+        return call('POST', '/api/session/login/start', body);
+      }, { dynamic: dynamic, mode: mode || 'embedded', edition: edition || 'cn' });
     },
     submitLoginCallback: function (state, callbackUrl) {
       return call('POST', '/api/session/login/callback', {
-        state: String(state || ''),
-        callbackUrl: String(callbackUrl || ''),
+        state: String(state == null ? '' : state),
+        callbackUrl: String(callbackUrl == null ? '' : callbackUrl),
       });
     },
     getLoginState: function () {
-      return Promise.resolve({ active: loginActive, provider: loginProvider });
+      return Promise.resolve(loginSnapshot());
     },
     cancelLogin: async function () {
       // 桌面壳只记一个活动登录；网页端由本状态机驱动。
@@ -1352,7 +1511,8 @@ pub fn shim_js() -> &'static str {
       // 网页端轮询拿到的是原始 session，直接返回会被前端误判为取消。
       // 用户取消时 runLoginFlow 给的是 `{canceled:true}`：必须映射成
       // `ok:false`，否则会被当成「拿到了一份叫 canceled 的 session」。
-      return runLoginFlow('autoclaw-intl', Promise.resolve({ state: state, authUrl: authUrl }))
+      return runLoginFlow('autoclaw-intl', function () { return Promise.resolve({ state: state, authUrl: authUrl }); },
+        { mode: mode || 'embedded', edition: 'intl' })
         .then(function (session) {
           if (session && session.canceled) return { ok: false, canceled: true };
           return { ok: true, session: session };
@@ -1421,6 +1581,10 @@ pub fn shim_js() -> &'static str {
       loginListeners.add(callback);
       return function () { loginListeners.delete(callback); };
     },
+    onLoginProgress: function (callback) {
+      loginProgressListeners.add(callback);
+      return function () { loginProgressListeners.delete(callback); };
+    },
     refreshSession: async function () {
       await call('POST', '/api/session/refresh', {});
       return call('GET', '/api/session');
@@ -1464,7 +1628,8 @@ pub fn shim_js() -> &'static str {
     // 模型测试：真打上游、会消耗额度；payload 原样透传（与桌面 bridge 对齐），
     // 各键都可选（account_id / prompt / system_prompt / reasoning / stream / test_id）。
     // 结论失败也返回 2xx —— 上游的错误在返回值的 status / error 里
-    testModel: function (payload) { return call('POST', '/api/models/test', payload || {}); },
+    testModel: function (payload, selectedKey) { return httpCall('POST', '/api/models/test', payload || {}, false, String(selectedKey || '')); },
+    getModelApiKeys: function () { return call('GET', '/api/model-access/keys'); },
 
     // ── 网关 API Key（多把）──
     getKeys: function () { return call('GET', '/api/keys'); },
@@ -1474,6 +1639,8 @@ pub fn shim_js() -> &'static str {
 
     // ── 多账号 ──
     getAccounts: function () { return call('GET', '/api/accounts'); },
+    getAccountSorting: function () { return call('GET', '/api/accounts/sorting'); },
+    saveAccountSorting: function (payload) { return call('PUT', '/api/accounts/sorting', payload || {}); },
     switchAccount: function (id) { return call('POST', '/api/accounts/current', { id: id }); },
     refreshAccountToken: function (id) { return call('POST', '/api/accounts/refresh', id ? { id: id } : {}); },
     removeAccount: function (id) { return call('DELETE', '/api/accounts/' + encodeURIComponent(id)); },
@@ -1555,8 +1722,6 @@ pub fn shim_js() -> &'static str {
     getProxyPool: function () { return call('GET', '/api/proxies/pool'); },
     createProxyPoolItem: function (payload) { return call('POST', '/api/proxies/pool', payload || {}); },
     updateProxyPoolItem: function (payload) { return call('POST', '/api/proxies/pool/update', payload || {}); },
-    // 启用 / 禁用（三种来源都放行；订阅节点禁用时后端会走关闭监听端口流程，
-    // 响应带 `listener`：none / closing / opening —— 前端据此轮询列表看端口落地）
     setProxyPoolItemEnabled: function (payload) { return call('POST', '/api/proxies/pool/enable', payload || {}); },
     removeProxyPoolItem: function (id) { return call('POST', '/api/proxies/pool/remove', { id: String(id || '') }); },
     testProxyPoolItem: function (id) { return call('POST', '/api/proxies/pool/test', { id: String(id || '') }); },
@@ -1565,22 +1730,6 @@ pub fn shim_js() -> &'static str {
     // 成对存在，契约见 api::proxies 的模块头 settings 两条）
     getProxySettings: function () { return call('GET', '/api/proxies/settings'); },
     saveProxySettings: function (payload) { return call('POST', '/api/proxies/settings', payload || {}); },
-    // 订阅（「网络代理」页的订阅区块；与桌面壳 bridge.rs 的同名方法成对存在，
-    // 契约见 api::subscriptions 的模块头 —— 写操作后端投一条内核命令（异步），
-    // 节点数与运行状态由轮询 kernel 看结果）
-    getSubscriptions: function () { return call('GET', '/api/subscriptions'); },
-    addSubscription: function (payload) { return call('POST', '/api/subscriptions/add', payload || {}); },
-    saveSubscription: function (payload) { return call('POST', '/api/subscriptions/save', payload || {}); },
-    refreshSubscription: function (id) { return call('POST', '/api/subscriptions/refresh', { id: String(id || '') }); },
-    removeSubscription: function (id) { return call('POST', '/api/subscriptions/remove', { id: String(id || '') }); },
-    decodeQrImage: function (payload) { return call('POST', '/api/subscriptions/decode-qr', payload || {}); },
-    getKernelStatus: function () { return call('GET', '/api/subscriptions/kernel'); },
-    downloadKernel: function (payload) { return call('POST', '/api/subscriptions/kernel/download', payload || {}); },
-    cancelKernelDownload: function () { return call('POST', '/api/subscriptions/kernel/download/cancel', {}); },
-    restartKernel: function () { return call('POST', '/api/subscriptions/kernel/restart', {}); },
-    // 手动关闭内核（与桌面壳 bridge.rs 的同名方法成对存在；只停进程，订阅与端口注册表保留）
-    stopKernel: function () { return call('POST', '/api/subscriptions/kernel/stop', {}); },
-    removeKernel: function () { return call('POST', '/api/subscriptions/kernel/remove', {}); },
     // 文件夹选择框是**壳的能力**（web 版没有壳）：回 `unsupported`，界面据此提示
     // 手输路径 —— 只回 `canceled` 的话，点一下按钮什么都不会发生，用户会以为卡了
     pickFolder: function () { return Promise.resolve({ canceled: true, unsupported: true }); },
@@ -1683,7 +1832,7 @@ pub fn shim_js() -> &'static str {
     },
     // WorkBuddy 国际版日活保活的模型链（与 bridge.rs 的同名方法成对维护）
     getCheckinKeepalive: function () { return call('GET', '/api/checkin-keepalive'); },
-    saveCheckinKeepalive: function (models) { return call('POST', '/api/checkin-keepalive', { models: models }); },
+    saveCheckinKeepalive: function (models, apiKeyId) { return call('POST', '/api/checkin-keepalive', { models: models, apiKeyId: apiKeyId }); },
     // 猫猫旅行定时排程（国内版；与 bridge.rs 的同名方法成对维护）
     getTravelSchedule: function () { return call('GET', '/api/travel-schedule'); },
     saveTravelSchedule: function (patch) { return call('POST', '/api/travel-schedule', patch); },
@@ -1771,9 +1920,7 @@ pub fn shim_js() -> &'static str {
     // 二进制与 ui 目录）→ restartService（进程优雅退出，容器由 restart 策略
     // 拉起，同一个容器、可写层保留）。未开 AGENT2API_SELF_UPDATE 的部署由
     // 后端 400 拒绝；面板按 check 返回的 selfUpdate 字段决定是否显示这些入口。
-    // 回滚用的是 install 留下的 .backup 备份（同一套替换逻辑的反向操作）。
     installUpdate: function () { return call('POST', '/api/update/install', {}); },
-    rollbackUpdate: function () { return call('POST', '/api/update/rollback', {}); },
     restartService: function () { return call('POST', '/api/update/restart', {}); },
 
     // ── 出站指纹脱敏 ──
@@ -2108,8 +2255,8 @@ pub fn shim_js() -> &'static str {
     // 网页端只能「下载附件」与「上传文件」，对应后端新加的一对 HTTP 端点
     // （见 api::backup_api 的模块头）。返回形状与桌面壳逐字段一致，设置页
     // 的提示文案与结果区两端共用。
-    exportDatabase: function (includeLogs) { return exportDatabase(includeLogs); },
-    importDatabase: function () { return importDatabase(); },
+    exportDatabase: function (includeLogs, password) { return exportDatabase(includeLogs, password); },
+    importDatabase: function (password) { return importDatabase(password); },
     // 恢复进度：网页端与桌面端同一条后端端点（见 api::backup_api）
     getBackupProgress: function () { return call('GET', '/api/backup/progress'); },
   };

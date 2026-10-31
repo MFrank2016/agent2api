@@ -28,7 +28,7 @@ use crate::server::{config, logging};
 
 pub use version::{
     api_base, assert_downloadable, compare_versions, custom_api_base, desktop_shell,
-    installer_kind, is_prerelease_version, pick_android_apk, pick_asset_by_name, pick_installer, safe_file_name,
+    installer_kind, is_prerelease_version, parse_version, pick_android_apk, pick_asset_by_name, pick_installer, safe_file_name,
     server_bundle_name, set_desktop_shell, UpdateError, DEFAULT_REPO, GITHUB_API,
     MAX_INSTALLER_BYTES, SOURCE_REPO,
 };
@@ -40,14 +40,8 @@ pub use token::{set_token, status_json};
 /// 请求 GitHub 的 UA（Node 版字面量，随项目改名同步）
 const USER_AGENT: &str = "agent2api-local-proxy";
 
-/// 两次「读更新源索引」之间的最小间隔：30 分钟。
-///
-/// 索引只是一行「构建产物在哪个仓库」，几乎不变；而更新检查可能几分钟一轮。
-/// 每轮都读一次 raw.githubusercontent.com 纯属白打（顺带消耗限额）。30 分钟
-/// 意味着「换了构建仓库」最迟半小时内被所有在线用户拿到，代价可接受。
-///
-/// 读失败也等这么久再试：失败多半是网络不通，立刻重试只会连着失败。
-const INDEX_RETRY_MS: i64 = 30 * 60 * 1000;
+/// 强制更新策略独立于用户的普通版本检查开关，每五分钟刷新一次。
+const INDEX_RETRY_MS: i64 = 5 * 60 * 1000;
 
 /// 本应用的当前版本号（编译期取自 Cargo.toml，发布流程与 tauri.conf.json
 /// 同步更新）。壳的 `checkUpdate` 命令用的是运行时 package_info —— 两者常态
@@ -118,11 +112,11 @@ struct Inner {
     /// 上次尝试解析索引的时刻（毫秒，0 = 还没试过）。与 [`INDEX_RETRY_MS`]
     /// 一起做节流。
     index_checked_at: i64,
+    app_index: index::AppIndex,
     download_dir: PathBuf,
     /// 容器内更新已应用、但进程还没重启（只活在内存里，重启即自然清零）。
     ///
-    /// 挡「同一版重复安装」：第二次替换会把上一版的 `.backup` 覆盖掉，
-    /// 回滚这条路就断了 —— 而界面在新版本已就位、只差重启时最容易连点。
+    /// 挡「同一版重复安装」：新版本已就位、只差重启时不再重复替换文件。
     pending_restart: bool,
 }
 
@@ -142,7 +136,8 @@ impl UpdateManager {
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        let repository = explicit.clone().unwrap_or_else(|| DEFAULT_REPO.to_string());
+        let app_index = if explicit.is_some() { index::AppIndex::default() } else { index::cached() };
+        let repository = explicit.clone().unwrap_or_else(|| app_index.repo.clone());
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 task: None,
@@ -152,6 +147,7 @@ impl UpdateManager {
                 repository_explicit: explicit.is_some(),
                 repository_from_index: false,
                 index_checked_at: 0,
+                app_index,
                 download_dir: directory.join("updates"),
                 pending_restart: false,
             })),
@@ -192,43 +188,37 @@ impl UpdateManager {
     /// 注意节流只影响「多久读一次」，不影响「解析后的值」：一旦读到过，就用它
     /// 覆盖 `repository` 并一直用下去（进程重启后重新读）。
     async fn resolve_repository(&self) -> String {
-        let (current, explicit, last_checked) = {
-            let guard = self.lock();
-            (
-                guard.repository.clone(),
-                guard.repository_explicit,
-                guard.index_checked_at,
-            )
-        };
-        // 环境变量显式指定：不读索引，用户说了算
-        if explicit {
-            return current;
-        }
-        // 节流：读成功后这个间隔内不再读；读失败同样等这么久 —— 失败多半是
-        // 网络不通，立刻重试只会连着失败
+        let (current, explicit) = { let guard = self.lock(); (guard.repository.clone(), guard.repository_explicit) };
+        if explicit { return current; }
         let now = logging::now_ms();
-        if last_checked != 0 && now.saturating_sub(last_checked) < INDEX_RETRY_MS {
-            return current;
-        }
-        // 到点：读一次索引（读不到会静默回落内置默认值，见 index 模块头）
-        let resolved = index::resolve_app_repo().await;
-        let from_index = resolved != DEFAULT_REPO;
-        if let Ok(mut guard) = self.inner.lock() {
-            // 「换过地址」说一次就够，不必每轮都记（这是 verbose 档）
-            if guard.repository != resolved {
-                logging::verbose(
-                    "[Update]",
-                    &format!(
-                        "更新源仓库改为 {resolved}（{}）",
-                        if from_index { "来自索引" } else { "内置默认值" }
-                    ),
-                );
-            }
-            guard.repository = resolved.clone();
-            guard.repository_from_index = from_index;
+        {
+            let mut guard = self.lock();
+            if guard.index_checked_at != 0 && now.saturating_sub(guard.index_checked_at) < INDEX_RETRY_MS { return current; }
             guard.index_checked_at = now;
         }
-        resolved
+        let resolved = index::resolve().await;
+        let repository = resolved.repo.clone();
+        let changed = {
+            let mut guard = self.lock();
+            let changed = guard.repository != repository;
+            guard.repository = repository.clone();
+            guard.repository_from_index = true;
+            guard.app_index = resolved;
+            changed
+        };
+        if changed { logging::verbose("[Update]", &format!("更新源仓库改为 {repository}（来自索引）")); }
+        repository
+    }
+
+    pub fn force_update(&self, current: &str) -> Option<Value> {
+        let guard = self.lock();
+        if guard.repository_explicit { return None; }
+        guard.app_index.required(current)
+    }
+
+    pub async fn refresh_policy(&self, current: &str) -> Value {
+        self.resolve_repository().await;
+        json!({ "currentVersion": current, "forceUpdate": self.force_update(current), "repository": self.repository() })
     }
 
     /// 下载目录（`{config_dir}/updates`）—— 与壳侧 `update::download_dir()` 同源
@@ -250,10 +240,11 @@ impl UpdateManager {
             )
         };
         let channels = config::update_channels();
+        let force_update = self.force_update(current_version);
         let latest = latest.filter(|release| {
             let prerelease = release["prerelease"] == true
                 || version::is_prerelease_version(release["tag"].as_str().unwrap_or(""));
-            channels.accepts(prerelease)
+            force_update.is_some() || channels.accepts(prerelease)
         });
         let latest_tag = latest
             .as_ref()
@@ -293,6 +284,7 @@ impl UpdateManager {
             }
         };
         json!({
+            "forceUpdate": force_update,
             "currentVersion": if version.is_empty() { Value::Null } else { Value::String(version) },
             "latestVersion": if latest_tag.is_empty() { Value::Null } else { Value::String(latest_tag.to_string()) },
             // 无法解析版本号时不谎报「有更新」，界面按 null 显示为「无法比较」
@@ -329,7 +321,6 @@ impl UpdateManager {
             "selfUpdate": selfupdate::supported(),
             "serverAsset": server_asset.unwrap_or(Value::Null),
             "serverChecksumUrl": server_checksum.unwrap_or(Value::Null),
-            "backupAvailable": selfupdate::backup_available(),
             // 已应用、只差重启：界面据此把按钮换成「立即重启」，
             // 而不是再给一次注定 400 的「下载并更新」
             "pendingRestart": pending_restart,
@@ -352,7 +343,7 @@ impl UpdateManager {
     //
     // 与上面的「下载安装包」是两条路：那条给桌面端下安装器（下完由壳启动
     // 安装程序），这条给容器里的自己换文件（下完由本进程原地替换 + 重启）。
-    // 三条入口都是 POST /api/update/{install,rollback,restart} 的唯一实现，
+    // 两条入口都是 POST /api/update/{install,restart} 的唯一实现，
     // 细节与安全边界见 selfupdate 模块头。
 
     /// 应用已下载的更新包：校验 → 解包 → 原子替换二进制与 ui 目录。
@@ -370,7 +361,7 @@ impl UpdateManager {
         if self.lock().task.as_ref().map(|task| task.active).unwrap_or(false) {
             return Err(UpdateError::with_status(400, "更新包还在下载中，请等下载完成后再安装"));
         }
-        // 已经应用过一次、还没重启：再替换一次会把上一版的备份顶掉（见 Inner 的说明）
+        // 已经应用过一次、还没重启：只允许重启，不再重复替换文件。
         if self.lock().pending_restart {
             return Err(UpdateError::with_status(
                 400,
@@ -408,6 +399,15 @@ impl UpdateManager {
                 400,
                 "本次发布没有提供容器内更新包，请在宿主机执行 docker compose pull && docker compose up -d 升级",
             ));
+        }
+        match compare_versions(&version, CURRENT_VERSION) {
+            Some(order) if order < 0 => {
+                return Err(UpdateError::with_status(400, "容器内更新不支持降级到较旧版本"));
+            }
+            None => {
+                return Err(UpdateError::with_status(400, "更新包版本号无法比较，已放弃安装"));
+            }
+            _ => {}
         }
         if checksum_url.is_empty() && !source::is_resource(&bundle_url) {
             return Err(UpdateError::with_status(
@@ -453,32 +453,6 @@ impl UpdateManager {
         }))
     }
 
-    /// 回滚到上一版本（上一版备份由 install 时留下）。
-    pub fn rollback(&self, ui_dir: Option<&Path>) -> Result<Value, UpdateError> {
-        if !selfupdate::supported() {
-            return Err(UpdateError::with_status(
-                400,
-                "当前部署不支持容器内更新：需要在容器中运行并设置 AGENT2API_SELF_UPDATE=1",
-            ));
-        }
-        let exe = selfupdate::current_exe_path()?;
-        let outcome = selfupdate::rollback(&exe, ui_dir)?;
-        // 回滚同样是「已应用待重启」：重启之前不许再来一次（同上）
-        self.lock().pending_restart = true;
-        logging::log(
-            "[Update]",
-            &format!(
-                "⚠️ 已回滚到上一版本{}，重启后生效",
-                if outcome.ui_updated { "（含界面文件）" } else { "" }
-            ),
-        );
-        Ok(json!({
-            "restored": true,
-            "needRestart": true,
-            "uiRestored": outcome.ui_updated,
-        }))
-    }
-
     /// 请求重启进程（容器由 restart 策略拉起；见 selfupdate 的重启钩子）。
     pub fn request_restart(&self) -> Result<Value, UpdateError> {
         if !selfupdate::supported() {
@@ -509,8 +483,30 @@ pub fn global_check_key() -> String {
         .unwrap_or_else(|| format!("updateCheck:{DEFAULT_REPO}"))
 }
 
+pub fn required_update() -> Option<Value> {
+    GLOBAL.get().and_then(|manager| manager.force_update(CURRENT_VERSION))
+}
+
 /// 初始化进程级管理器（幂等）
 pub fn init_global(manager: UpdateManager) -> UpdateManager {
-    let _ = GLOBAL.set(manager.clone());
+    let plugins_before = crate::server::core::plugin_host::settings::current();
+    if config::sync_installed_update_channel(CURRENT_VERSION) {
+        manager.invalidate_channel();
+        crate::server::core::plugin_host::settings::notify_changed(plugins_before);
+    }
+    if GLOBAL.set(manager.clone()).is_ok() {
+        let updater = manager.clone();
+        // 必须走 `crate::spawn_task`：本函数由 `ServerState::bootstrap` 调用，
+        // 而 headless（容器 / 命令行）的 bootstrap 跑在**建 Tokio 运行时之前**
+        // 的主线程上 —— 裸 `tokio::spawn` 在那里直接 panic，release 是
+        // panic=abort，进程当场退出，restart 策略把它拉起来又是同一次崩溃
+        // （v3.3.0-beta.5 容器内更新后无限重启的根因）。
+        crate::spawn_task(async move {
+            loop {
+                let _ = updater.refresh_policy(CURRENT_VERSION).await;
+                tokio::time::sleep(std::time::Duration::from_millis(INDEX_RETRY_MS as u64)).await;
+            }
+        });
+    }
     manager
 }

@@ -1,6 +1,9 @@
 import { t } from '../i18n'
 import { inactiveProvider } from './routing-display'
-import { bridge, errorMessage, notify, type RouteProfile, type RoutingWorkspace } from './routing-types'
+import { bridge, errorMessage, host, notify, type RouteOrderChange, type RouteProfile, type RoutingWorkspace } from './routing-types'
+import { adoptAccountSorting, syncAccountSorting } from './accounts-sort'
+import { activeGroupSortRules, manualOrderBlockedMessage } from './accounts-group-settings'
+import type { GroupSortRule } from './accounts-shared'
 
 export type RoutingState = {
   model: string
@@ -56,6 +59,8 @@ export async function loadWorkspace(silent = false): Promise<void> {
     for (const provider of workspace.profile.providers) {
       if (inactiveProvider(workspace, provider) && (!current.workspace || !inactiveProvider(current.workspace, provider))) expandedProviders.delete(provider)
     }
+    adoptAccountSorting(workspace.sorting)
+    syncAccountSorting()
     patch({ workspace, expandedProviders, error: '', loading: false })
   } catch (error) {
     if (sequence !== loadSequence) return
@@ -71,12 +76,14 @@ export function cloneProfile(): RouteProfile {
   if (!current.workspace) throw new Error(t('路由配置尚未读取'))
   return structuredClone(current.workspace.profile)
 }
-export async function saveProfile(profile: RouteProfile | null, model = current.model): Promise<boolean> {
+export async function saveProfile(profile: RouteProfile | null, model = current.model, orderChange?: RouteOrderChange): Promise<boolean> {
   if (current.busy) return false
   loadSequence += 1
   patch({ busy: true, loading: false, error: '' })
   try {
-    const workspace = await bridge().saveRoutingProfile({ model: model || null, profile })
+    const workspace = await bridge().saveRoutingProfile({ model: model || null, profile, orderChange })
+    adoptAccountSorting(workspace.sorting)
+    if (!model) void host().wbApp?.refresh?.()
     if (current.model === model) {
       const expandedProviders = new Set(current.expandedProviders)
       for (const provider of workspace.profile.providers) {
@@ -91,6 +98,7 @@ export async function saveProfile(profile: RouteProfile | null, model = current.
     notify(errorMessage(error), 'err')
     try {
       const workspace = await bridge().getRoutingWorkspace(current.model || undefined)
+      adoptAccountSorting(workspace.sorting)
       patch({ workspace })
     } catch { /* 保留错误与最近一次成功快照 */ }
     return false
@@ -104,7 +112,19 @@ export function accountOrder(provider: string, profile = current.workspace?.prof
   return (profile.accountOrder[provider] || []).filter(id => !profile.excludedAccounts.includes(id)
     && current.workspace?.accounts.some(account => account.id === id))
 }
+export function accountOrderRules(provider: string): GroupSortRule[] {
+  if (current.model && current.workspace?.customized) return []
+  return activeGroupSortRules(provider, current.workspace?.sorting?.rules[provider] || [])
+}
+export function accountOrderLocked(provider: string): boolean {
+  return accountOrderRules(provider).length > 0
+}
 export async function reorderAccount(provider: string, id: string, before: string): Promise<void> {
+  const orderRules = accountOrderRules(provider)
+  if (orderRules.length > 0) {
+    notify(manualOrderBlockedMessage(orderRules), 'err')
+    return
+  }
   if (id === before || !current.workspace || current.busy) return
   const profile = cloneProfile()
   const ids = profile.accountOrder[provider] || []
@@ -113,7 +133,7 @@ export async function reorderAccount(provider: string, id: string, before: strin
   if (from < 0 || to < 0) return
   ids.splice(from, 1)
   ids.splice(to, 0, id)
-  await saveProfile(profile)
+  await saveProfile(profile, current.model, { kind: 'account', provider })
 }
 export async function moveAccount(provider: string, id: string, direction: -1 | 1): Promise<void> {
   const all = accountOrder(provider)
@@ -136,7 +156,7 @@ export async function moveProvider(id: string, direction: -1 | 1): Promise<void>
   if (index < 0 || to < 0) return
   const [provider] = profile.providers.splice(index, 1)
   profile.providers.splice(to, 0, provider)
-  await saveProfile(profile)
+  await saveProfile(profile, current.model, { kind: 'provider' })
 }
 export async function addModel(model: string): Promise<boolean> {
   if (!model.trim()) return false

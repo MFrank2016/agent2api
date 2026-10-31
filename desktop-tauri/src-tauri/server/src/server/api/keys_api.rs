@@ -45,7 +45,6 @@ use axum::extract::{Path, State};
 use axum::response::Response;
 use serde_json::{json, Value};
 
-use crate::server::config;
 use crate::server::core::api_keys;
 use crate::server::errors;
 use crate::server::http::{ok_json, parse_body};
@@ -58,7 +57,11 @@ fn list_json(state: &ServerState) -> Value {
     // 与配额判定**分开**：那边看当前窗口，这边看 7 天滚动 —— 两个区间不同，
     // 合并成一次查询会让任一侧的口径被另一侧牵着走。
     let usage = crate::server::core::key_quota::usage_summary(now);
-    let keys: Vec<Value> = api_keys::list()
+    let entries = api_keys::list();
+    // beta.6：模型调用必须命中一把启用、可解密且非空的 Key（含环境变量 Key）。
+    let usable_key_count = entries.iter().filter(|entry| entry.is_usable()).count()
+        + usize::from(crate::server::config::parse::env_api_key_value().is_some());
+    let keys: Vec<Value> = entries
         .iter()
         .map(|entry| {
             let mut value = entry.public_json();
@@ -117,7 +120,8 @@ fn list_json(state: &ServerState) -> Value {
     providers.extend(crate::server::core::custom_providers::summary_json(&count_accounts));
     json!({
         "keys": keys,
-        "authRequired": config::current().api_key_set(),
+        "authRequired": true,
+        "usableKeyCount": usable_key_count,
         "providers": providers,
         // 「可用模型」多选的候选：**每家 → 对外名清单**，界面按当前勾了哪几家
         // 取并集（见模块头那一节与 catalog::models_by_provider 的说明）。
@@ -499,11 +503,7 @@ pub async fn delete_key(State(state): State<ServerState>, Path(id): Path<String>
         Ok(()) => {
             // 配置变了：清掉配额缓存（该 Key 的窗口种类可能不再被任何 Key 使用）
             crate::server::core::key_quota::invalidate();
-            let remaining = config::current().api_key_set();
-            logging::log(
-                "[Config]",
-                if remaining { "API Key 已删除" } else { "API Key 已删除，接口恢复免鉴权（仅监听 127.0.0.1）" },
-            );
+            logging::log("[Config]", "API Key 已删除；模型调用仍需携带启用的 Key");
             ok_json(list_json(&state))
         }
         Err(message) => errors::management_error(404, message),

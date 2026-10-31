@@ -1,36 +1,12 @@
-/**
- * 账号页的**状态 store**（非岛：`.ts` 不被 import.meta.glob 当岛加载）：快照、筛选、
- * 勾选、行内面板展开态、账号名隐藏、以及从快照派生的各种读法。
- *
- * ── 从 accounts-data.ts 拆出来的理由 ──────────────────────────
- * 「状态怎么存」与「动作怎么发」是两件事，混在一个文件里已经九百多行（约定单文件 ≤800）。
- * 拆开之后：本文件只回答「现在是什么状态、怎么改」，actions（余额 / 连接数 /
- * Clash 缓存 / 行内动作 / 弹窗 / 对外契约）在 accounts-data.ts —— 那个文件再
- * `export * from './accounts-store'`，于是视图侧的 import 路径一行不用改。
- *
- * ── 为什么是模块级 store + useSyncExternalStore ────────────────
- * 对外契约（`wbAccountsView.render()` / `refreshCaches()` / `syncConnections()` /
- * `syncBalancesSnapshot()`）从 React 之外调用，且必须与界面共用同一份状态 ——
- * 组件内部的 useState 做不到这一点。所以状态是一份模块级快照，改动一律走 patch()
- * （换新对象再通知订阅者）。
- *
- * ── 两种持有方式（刻意不同）──────────────────────────────
- *   · 高频小改动（连接数每 2 秒一轮）走 `patch({...})` 换新 Map / Set；
- *   · 少量原地可变的结构由各自的动作层维护（见 accounts-data.ts 的说明）。
- * 两条路都经过同一个订阅者集合，React 侧看不出差别。
- *
- * （签到相关状态曾在这里：`checkinBusy` 与新手任务弹窗 `onboarding`。签到动作
- * 迁到「签到中心」后两样都随之离开 —— 新手任务的查询 / 领取缓存现在在
- * checkin-state.ts，签到完成后自动处理的那条链也在那边。）
- */
+
 
 import {
-  shared, type AccountRecord, type AccountsSnapshot, type ClashSnapshot,
+  shared, type AccountRecord, type AccountsSnapshot, type AccountSorting,
   type HiddenAccountProvider, type HiddenAccountsSummary,
 } from './accounts-shared'
 import {
-  accountGroups, byPriorityOrder, filterCounts, matchesFilter, positionMap, providerSummaries,
-  visibleAccounts, DEFAULT_GROUP_SORT,
+  accountGroups, filterCounts, matchesFilter, positionMap, providerSummaries,
+  defaultGroupSortRules,
   type AccountFilter, type AccountGroup, type GroupSortRule, type TokenUsageLookup, type UsageLookup,
 } from './accounts-domain'
 
@@ -51,9 +27,6 @@ export type AccountsStore = {
   collapsed: ReadonlySet<string>
   selected: ReadonlySet<string>
   connections: ReadonlyMap<string, number>
-  /** Clash 出口列表缓存（`null` = 还没读到）；**只有代理表单的 Clash 直引档用**
-   *  （存量配置专用）—— 账号页的代理下拉列的是「网络代理」页的池条目 */
-  clash: ClashSnapshot | null
   dialog: AccountsDialog
   namesHidden: boolean
   /** 批量查询余额在途（工具条按钮的文案与禁用态） */
@@ -66,12 +39,10 @@ export type AccountsStore = {
    * 设置 → 显示 → 账号列表里。与 namesHidden 同属「怎么看这张表」的偏好。
    */
   groupTotalFiltered: boolean
-  /**
-   * 每家自己的**组内排序规则**（provider → 规则数组，按数组顺序比较）。
-   * 没有键 = 用 `DEFAULT_GROUP_SORT`（积分到期 → 添加时间），规则可被关掉；
-   * 见 accounts-domain 的 sortGroupMembers。与 collapsed 同一档展示偏好，落盘保存。
-   */
+  /** 全局消耗规则由网关保存；本地值仅用于旧设置迁移。 */
   groupSort: Readonly<Record<string, GroupSortRule[]>>
+  sorting: AccountSorting | null
+  sortBusy: boolean
 }
 
 /* ─── 跨次启动的记忆键 ───────────────────────── */
@@ -91,13 +62,7 @@ const NAMES_HIDDEN_KEY = 'workbuddy-desktop-accounts-names-hidden'
  */
 export const GROUP_TOTAL_FILTERED_KEY = 'workbuddy-desktop-accounts-group-total-filtered'
 
-/**
- * 组内排序规则的记忆键：`{ [provider]: GroupSortRule[] }`。
- *
- * 只存**显式改过**的那些家（没改的留给 `DEFAULT_GROUP_SORT`）——
- * 存全量的话，默认值以后要调整（比如把「添加时间」提到前面）时，
- * 所有老用户都会被自己那份旧快照钉死在新默认之外。
- */
+/** 旧版浏览器排序设置的迁移来源，不再写入新规则。 */
 export const GROUP_SORT_KEY = 'workbuddy-desktop-accounts-group-sort'
 
 /** 读回组内排序规则（坏数据整段丢弃，不让一个手改坏的键把整页排序拖垮） */
@@ -195,13 +160,14 @@ let store: AccountsStore = {
   collapsed: loadCollapsed(),
   selected: new Set<string>(),
   connections: new Map<string, number>(),
-  clash: null,
   dialog: null,
   namesHidden: loadNamesHidden(),
   usageBusy: false,
   usageInflight: new Set<string>(),
   groupTotalFiltered: loadGroupTotalFiltered(),
   groupSort: loadGroupSort(),
+  sorting: null,
+  sortBusy: false,
 }
 
 const listeners = new Set<() => void>()
@@ -215,7 +181,6 @@ export function getStore(): AccountsStore {
   return store
 }
 
-/** 换一份快照并通知订阅者（React 侧 getSnapshot 的引用比较靠它） */
 export function patch(partial: Partial<AccountsStore>): void {
   store = { ...store, ...partial, version: store.version + 1 }
   listeners.forEach(listener => listener())
@@ -282,7 +247,7 @@ export function findAccount(id: string): AccountRecord | null {
  *  注入：限流维度把「余额不足已跳过 / Token 限额已跳过」都算进已限流，而两份缓存
  *  都在 accounts-data（本文件不反向依赖它，避免 store⇄data 成环） */
 export function visibleList(usageOf?: UsageLookup, tokenUsageOf?: TokenUsageLookup): AccountRecord[] {
-  return visibleAccounts(allAccounts(), store.filter, usageOf, tokenUsageOf).slice().sort(byPriorityOrder)
+  return groupView(usageOf, tokenUsageOf).groups.flatMap(group => group.accounts)
 }
 
 export type GroupView = {
@@ -318,48 +283,26 @@ export function groupView(
     usageOf,
     tokenUsageOf,
     groupSortRules,
+    store.sorting || snapshot()?.sorting,
   )
   const groups = allGroups.filter(group => group.accounts.length > 0)
   return { groups, allGroups }
 }
 
-/**
- * 某一家当前的排序规则（没配过 = 默认规则的一份副本）。
- *
- * 返回副本而不是 `DEFAULT_GROUP_SORT` 本身：设置弹窗会就地改数组（上移 / 下移），
- * 直接把默认值递出去等于让一次取消不掉的操作写进模块常量。
- */
+/** 已保存的选择优先；未配置的家按当前申报能力生成默认规则。 */
 export function groupSortRules(provider: string): GroupSortRule[] {
-  const saved = store.groupSort[provider]
-  if (saved) return saved.map(rule => ({ ...rule }))
-  return DEFAULT_GROUP_SORT.map(rule => ({ ...rule }))
+  const effective = store.sorting?.rules[provider] || snapshot()?.sorting?.rules[provider]
+  const saved = effective || store.groupSort[provider]
+  if (saved) {
+    const rules = saved.map(rule => ({ ...rule }))
+    return [...rules, ...defaultGroupSortRules(provider).filter(rule => !rules.some(current => current.key === rule.key)).map(rule => ({ ...rule, on: false }))]
+  }
+  return defaultGroupSortRules(provider)
 }
 
 /** 这一家有没有**显式改过**规则（设置弹窗据此决定「恢复默认」是否可点） */
 export function hasCustomGroupSort(provider: string): boolean {
-  return Boolean(store.groupSort[provider])
-}
-
-/**
- * 写入某一家的排序规则。
- *
- * `null` = 删掉这条记录（回到默认）。空数组**不当作删除**：那是用户把两条规则
- * 都关掉了（想纯手动排序），与「恢复默认」是两件事 —— 混成一个会让「关掉所有
- * 规则」在下次启动时悄悄变回默认排序。
- */
-export function setGroupSortRules(provider: string, rules: GroupSortRule[] | null): void {
-  if (!provider) return
-  const next: Record<string, GroupSortRule[]> = { ...store.groupSort }
-  if (rules === null) delete next[provider]
-  else next[provider] = rules.map(rule => ({ ...rule }))
-  persistGroupSort(next)
-  patch({ groupSort: next })
-}
-
-function persistGroupSort(groupSort: Readonly<Record<string, GroupSortRule[]>>): void {
-  try {
-    localStorage.setItem(GROUP_SORT_KEY, JSON.stringify(groupSort))
-  } catch { /* 隐私模式等存不了就算了：本次会话内仍然生效 */ }
+  return Object.prototype.hasOwnProperty.call(store.sorting?.configured || store.groupSort, provider)
 }
 
 export function providerSummaryList(): Array<{ id: string; label: string; count: number }> {
@@ -370,9 +313,9 @@ export function segmentCounts(usageOf?: UsageLookup, tokenUsageOf?: TokenUsageLo
   return filterCounts(allAccounts(), store.filter, usageOf, tokenUsageOf)
 }
 
-/** 该账号在**全局队列**里的位置（序号与 ↑/↓ 的边界同源） */
+/** 全局有效消耗队列的位置，不受筛选影响。 */
 export function seats(): Map<string, { position: number; total: number }> {
-  return positionMap(allAccounts())
+  return positionMap(allAccounts(), store.sorting || snapshot()?.sorting)
 }
 
 /* ─── 筛选 ─────────────────────────────────── */
@@ -541,12 +484,6 @@ export function syncGroupTotalPreference(): void {
   patch({ groupTotalFiltered: next })
 }
 
-/**
- * 写入合计口径（设置页的开关调它；账号页订阅同一份 store，因此立即重画）。
- *
- * 落盘与内存两件事一起做：只落盘的话，同文档里已经挂载的账号页收不到
- * `storage` 事件（那个事件只在**别的**文档 / 窗口里触发），切回去还是旧口径。
- */
 export function setGroupTotalFiltered(next: boolean): void {
   try { localStorage.setItem(GROUP_TOTAL_FILTERED_KEY, next ? '1' : '0') } catch { /* 存不了只影响下次启动 */ }
   patch({ groupTotalFiltered: next })

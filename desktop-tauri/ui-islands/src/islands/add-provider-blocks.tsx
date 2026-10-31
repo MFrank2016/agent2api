@@ -23,6 +23,8 @@
 
 import * as React from 'react'
 import {
+  Alert,
+  AlertDescription,
   Button,
   DialogSection,
   Input,
@@ -72,10 +74,9 @@ import {
   type WebLoginController,
   type WebLoginView,
 } from './add-account-bridge'
-// 二进制文件 → base64 的读取工具（订阅导入在用，同一份足够：FileReader +
-// readAsDataURL）；`add-provider-blocks` 只借这一个函数，不引订阅那边的状态
-import { readFileAsBase64 } from './proxies-sub-state'
+import { readFileAsDataUrl } from '../../../ui-shared/file-read'
 import { accountFilePayload, accountExportEdition, isAccountExport } from './add-account-file'
+import { draftOfProxy, ProxyForm, readProxyDraft } from './accounts-proxy-form'
 import { t } from '../i18n'
 
 /**
@@ -152,6 +153,7 @@ function ManualSection({
   const prefix = config.provider
   const [busy, setBusy] = React.useState(false)
   const [hint, setHint] = React.useState('')
+  const [proxyDraft, setProxyDraft] = React.useState(() => draftOfProxy(undefined))
   const note = manualNoteOf(config)
   const fieldIds = config.fields.map(field => fieldIdOf(config, field))
 
@@ -171,6 +173,16 @@ function ManualSection({
         continue
       }
       payload[field.key] = value
+    }
+    // 登录代理随添加一起落库：插件在 `account.normalize` 里用它做真实校验
+    // （antigravity 的粘贴式要打一次 Google token 端点）。
+    if (config.loginProxy) {
+      try {
+        payload.proxy = readProxyDraft(proxyDraft)
+      } catch (error) {
+        toast(t('添加失败：{reason}', { reason: describeError(error) }), 'err')
+        return
+      }
     }
     await runAdd(setBusy, async () => {
       try {
@@ -221,6 +233,15 @@ function ManualSection({
           </div>
         )
       })}
+      {config.loginProxy ? (
+        <div className='flex min-w-0 flex-col gap-2'>
+          <Label>{t('登录出网代理')}</Label>
+          <ProxyForm draft={proxyDraft} onChange={setProxyDraft} idPrefix={`${prefix}-manual-proxy`} />
+          <p className='detail'>
+            {t('添加时要用它出网校验凭证（例如 Antigravity 要打一次 Google 的 token 端点）。无头服务器上没有系统代理，这里不选就走直连。')}
+          </p>
+        </div>
+      ) : null}
       <FieldGroup orientation='horizontal' className='field-row'>
         <Button id={`${prefix}-add-button`} onClick={() => { void submit() }} disabled={busy}>
           {busy ? t('添加中…') : addButtonTextOf(config)}
@@ -343,13 +364,7 @@ function GuestSection({
 
 /* ─── 导入凭证文件（通用版；WorkBuddy 那段是另一套 payload，不要合并）─── */
 
-/**
- * `readFileAsBase64` 返回的是**完整 data URL**（`data:…;base64,<正文>`）——
- * 订阅那条链的服务端会自己 `split_once("base64,")`，而 `POST /api/accounts`
- * 的 `authFileB64` 走的是裸 `BASE64.decode(encoded)`，**不认 data URL 前缀**。
- * 因此这里剥掉逗号前的头部再交出去，否则 KukuAI 的文件导入会得到
- * 「authFileB64 不是合法的 base64」。
- */
+
 function base64BodyOf(dataUrl: string): string {
   const comma = dataUrl.indexOf(',')
   return comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl
@@ -400,7 +415,7 @@ function FileImportSection({
             }
             Object.assign(payload, accountFilePayload(parsed, config.provider, remark))
           } else {
-            payload.authFileB64 = base64BodyOf(await readFileAsBase64(file))
+            payload.authFileB64 = base64BodyOf(await readFileAsDataUrl(file, t('文件读取失败')))
           }
         } else {
           const text = await file.text()
@@ -497,6 +512,13 @@ function WebLoginSection({
   const modeRef = React.useRef(mode)
   const regionRef = React.useRef(region)
   const controllerRef = React.useRef<WebLoginController | null>(null)
+  // 登录出网代理：只有 `config.loginProxy` 的家渲染这一块（上游必须经代理才
+  // 可达的那几家）。草稿放 ref 里是因为 `start` 闭包在挂载时就固定了，读
+  // state 会读到首次渲染的空值。
+  const [proxyDraft, setProxyDraft] = React.useState(() => draftOfProxy(undefined))
+  const proxyRef = React.useRef(proxyDraft)
+  proxyRef.current = proxyDraft
+  const [proxyError, setProxyError] = React.useState('')
   modeRef.current = mode
   regionRef.current = region
   // 网页端没有「内嵌窗口 / 系统浏览器」之分：桥接层收下 mode 后不使用它，
@@ -532,11 +554,28 @@ function WebLoginSection({
       },
       // 传哪个 edition 给壳侧：写死的 edition → 地区分段当前值（Qoder 两站都要登录）
       // → 'cn'（其余家既没有地区级，后端那条链也不读这个字段）
-      start: () => shared().workbuddyDesktop?.startLogin(
-        web.edition || regionRef.current || 'cn',
-        modeRef.current || 'embedded',
-        prefix,
-      ),
+      start: () => {
+        // 代理只在声明了 `loginProxy` 的家上采集；其余家不传这个键，
+        // 请求体与改造前逐字一致。采集失败（例如选了轮询档）当场拦下 ——
+        // 让它带着空代理去登录，用户只会看到「连不上上游」。
+        let options: { proxy?: unknown } | undefined
+        if (config.loginProxy) {
+          try {
+            options = { proxy: readProxyDraft(proxyRef.current) }
+          } catch (error) {
+            setProxyError(describeError(error))
+            throw error
+          }
+          setProxyError('')
+        }
+        return shared().workbuddyDesktop?.startLogin(
+          web.edition || regionRef.current || 'cn',
+          modeRef.current || 'embedded',
+          prefix,
+          undefined,
+          options,
+        )
+      },
       onSuccess: async result => {
         closeAddModals()
         await shared().wbApp?.refresh?.()
@@ -571,8 +610,23 @@ function WebLoginSection({
           />
         </div>
       ) : null}
+      {config.loginProxy ? (
+        <div className='flex min-w-0 flex-col gap-2'>
+          <Label>{t('登录出网代理')}</Label>
+          <ProxyForm
+            draft={proxyDraft}
+            onChange={value => { setProxyDraft(value); setProxyError('') }}
+            idPrefix={`${prefix}-login-proxy`}
+            allowRotate={false}
+          />
+          <p className='detail'>
+            {t('授权页、换证与取账号信息都走这条线路。无头服务器上没有系统代理，这里不选就走直连（多数网络里到不了 Google）。')}
+          </p>
+          {proxyError ? <Alert variant='destructive'><AlertDescription>{proxyError}</AlertDescription></Alert> : null}
+        </div>
+      ) : null}
       <FieldGroup orientation='horizontal' className='field-row'>
-        <Button id={`${prefix}-web-button`} disabled={loginView.disabled} onClick={() => controllerRef.current?.start()}>
+        <Button id={`${prefix}-web-button`} disabled={loginView.disabled || (isWeb && config.provider === 'doubaowork')} onClick={() => controllerRef.current?.start()}>
           {loginView.waiting && <Spinner />}{loginView.label}
         </Button>
         <Button
