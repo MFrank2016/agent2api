@@ -100,3 +100,14 @@
 - B: ui-islands 8 + ui/islands bundle
 - C: server 15
 - D: Dockerfile / release.sh / release-flow skill
+
+
+## 最终验证（2026-10-31）
+
+- 网关 `cargo test -p agent2api-server`：398 passed / 0 failed / 1 ignored。
+- 插件仓库 rebase：`52/52` tests、`28/28` verify、pack 33 家，commit `f1200295`。
+- 网关 `verify-plugin-host.mjs`：`28/28`。
+- `parity-check.mjs`：`122` 项检查，`0` 失败（修复 `data_dir` 后，commit `a488f24d`）。
+- 网关 release 构建：`31m00s`，二进制 20M。
+- 端到端：安装 beta.6 pack 后 33 家 provider 可用；demo 非流式与流式均 HTTP 200，返回「你好」。
+- 未推送、未打 tag；`beta` / `main` 未动。
