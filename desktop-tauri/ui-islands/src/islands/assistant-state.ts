@@ -117,7 +117,14 @@ async function directAuthHeaders(force = false): Promise<Record<string, string>>
 export async function gatewayBase(force = false): Promise<string> {
   if (cachedBase && !force) return cachedBase
   const api = bridge()
-  if (api?.platform === 'web') {
+  const isWebPage = typeof window !== 'undefined'
+    && /^https?:$/.test(window.location.protocol)
+    && window.location.hostname !== 'tauri.localhost'
+    && !(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__
+  // 登录页会在 web bridge 初始化前就调用 gatewayBase（更新检查）。
+  // 这时 api 还是 undefined，不能只认 api.platform === 'web'，否则会错误地
+  // 回退到 127.0.0.1，浏览器按 PNA/CORS 拦截公网页面到 loopback 的请求。
+  if (api?.platform === 'web' || (isWebPage && api?.platform !== 'desktop')) {
     const origin = typeof window === 'undefined' ? '' : window.location?.origin
     if (origin && origin !== 'null') {
       cachedBase = origin
