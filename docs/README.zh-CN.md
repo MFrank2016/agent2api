@@ -54,8 +54,9 @@ Agent2API 是一个 **AI 路由网关 + Agent 客户端接管**项目。它将�
 
 ## 🤝 支持的提供商
 
-提供商实现由独立插件提供。官方插件包共 30 个提供商 id —— 29 家真实提供商，另含 1 个仅用于协议验证的 `demo` 示例；安装对应插件后即可在「账号」页添加。
+提供商实现由独立插件提供。官方插件包共 31 个提供商 id —— 30 家真实提供商，另含 1 个仅用于协议验证的 `demo` 示例；安装对应插件后即可在「账号」页添加。
 
+- **Kiro**：支持 LLM 请求、Token 自动续期、模型列表与余额查询；无签到与领取类能力。
 - **Nous**：支持 LLM 请求、Token 自动续期与模型列表；无余额查询、签到与领取类能力。
 - **Tabbit（国内版 / 国际版）**：仅文本对话，不支持工具调用；Cookie/JWT 约 7 天过期且无续期接口；premium 模型需账号已设为默认浏览器并在粘贴 JSON 里加 `defaultBrowser: true`；国际版国内直连需代理。
 
@@ -65,11 +66,11 @@ Agent2API 是一个 **AI 路由网关 + Agent 客户端接管**项目。它将�
 
 三种形态，按你的环境选一个；**完整的安装、升级、卸载与排错见 [安装与部署](./install.md)**。
 
-| 形态 | 产物 | 界面 |
-| --- | --- | --- |
-| **桌面端**（Windows / macOS / Linux） | `Agent2API_<版本>_x64-setup.exe`、`_universal.dmg`、`_amd64.deb`、`_amd64.AppImage` | 应用窗口 |
-| **服务端**（Windows Server / Linux，无 GUI） | `agent2api-server-windows-amd64.zip`、`agent2api-server-linux-<arch>.tar.gz` | 浏览器面板 |
-| **Docker** | `aimodcc/agent2api:latest`（amd64 / arm64） | 浏览器面板 |
+| 形态                                         | 产物                                                                                | 界面       |
+| -------------------------------------------- | ----------------------------------------------------------------------------------- | ---------- |
+| **桌面端**（Windows / macOS / Linux）        | `Agent2API_<版本>_x64-setup.exe`、`_universal.dmg`、`_amd64.deb`、`_amd64.AppImage` | 应用窗口   |
+| **服务端**（Windows Server / Linux，无 GUI） | `agent2api-server-windows-amd64.zip`、`agent2api-server-linux-<arch>.tar.gz`        | 浏览器面板 |
+| **Docker**                                   | `aimodcc/agent2api:latest`（amd64 / arm64）                                         | 浏览器面板 |
 
 **桌面端**：启动后添加自定义提供商与账号，创建网关 Key，再在「Agent」页应用连接配置，或在客户端填入 `http://127.0.0.1:3065/v1` 和该 Key。额外提供商能力需先安装对应插件。
 

@@ -54,8 +54,9 @@ Agent2API is an **AI routing gateway with Agent client takeover**. It exposes a 
 
 ## 🤝 Supported Providers
 
-Provider implementations ship as separate plugins. The official plugin pack contains 30 provider ids — 29 real providers plus one `demo` entry used only for protocol verification; install the matching plugin to add an account on the Accounts page.
+Provider implementations ship as separate plugins. The official plugin pack contains 31 provider ids — 30 real providers plus one `demo` entry used only for protocol verification; install the matching plugin to add an account on the Accounts page.
 
+- **Kiro**: supports LLM requests, token auto-refresh, the model list and balance queries; no check-in or claim capabilities.
 - **Nous**: supports LLM requests, token auto-refresh and the model list; no balance query, check-in or claim capabilities.
 - **Tabbit (China / global)**: text chat only, no tool calling; Cookie/JWT expires in about 7 days with no refresh endpoint; premium models require the account to be set as the default browser and `defaultBrowser: true` added to the pasted JSON; the global edition needs a proxy when accessed from mainland China.
 
@@ -65,11 +66,11 @@ Provider implementations ship as separate plugins. The official plugin pack cont
 
 Three forms — pick the one that matches your setup; **the complete install, upgrade, uninstall and troubleshooting guide is in [Installation & deployment](./docs/install.en.md)**.
 
-| Form | Artifact | Interface |
-| --- | --- | --- |
-| **Desktop** (Windows / macOS / Linux) | `Agent2API_<version>_x64-setup.exe`, `_universal.dmg`, `_amd64.deb`, `_amd64.AppImage` | App window |
-| **Server** (Windows Server / Linux, headless) | `agent2api-server-windows-amd64.zip`, `agent2api-server-linux-<arch>.tar.gz` | Browser panel |
-| **Docker** | `aimodcc/agent2api:latest` (amd64 / arm64) | Browser panel |
+| Form                                          | Artifact                                                                               | Interface     |
+| --------------------------------------------- | -------------------------------------------------------------------------------------- | ------------- |
+| **Desktop** (Windows / macOS / Linux)         | `Agent2API_<version>_x64-setup.exe`, `_universal.dmg`, `_amd64.deb`, `_amd64.AppImage` | App window    |
+| **Server** (Windows Server / Linux, headless) | `agent2api-server-windows-amd64.zip`, `agent2api-server-linux-<arch>.tar.gz`           | Browser panel |
+| **Docker**                                    | `aimodcc/agent2api:latest` (amd64 / arm64)                                             | Browser panel |
 
 **Desktop**: add a custom provider and account, create a gateway key, then apply a connection profile on the Agent page or configure your client with `http://127.0.0.1:3065/v1` and that key. Additional provider capabilities require the corresponding plugin.
 

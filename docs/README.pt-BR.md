@@ -54,8 +54,9 @@ O Agent2API é um **gateway de roteamento de IA com gerenciamento de clientes Ag
 
 ## 🤝 Provedores compatíveis
 
-As implementações de provedores são fornecidas como plugins independentes. O pacote oficial de plugins contém 30 ids de provedores — 29 provedores reais e um `demo` usado apenas para verificação de protocolo; instale o plugin correspondente para adicionar uma conta na página "Contas".
+As implementações de provedores são fornecidas como plugins independentes. O pacote oficial de plugins contém 31 ids de provedores — 30 provedores reais e um `demo` usado apenas para verificação de protocolo; instale o plugin correspondente para adicionar uma conta na página "Contas".
 
+- **Kiro**: suporta requisições LLM, renovação automática do token, lista de modelos e consulta de saldo; não tem check-in nem resgates.
 - **Nous**: suporta requisições LLM, renovação automática do token e lista de modelos; não tem consulta de saldo, check-in nem resgates.
 - **Tabbit (China / global)**: apenas conversa de texto, sem chamada de ferramentas; Cookie/JWT expira em cerca de 7 dias sem endpoint de renovação; modelos premium exigem que a conta esteja definida como navegador padrão e `defaultBrowser: true` no JSON colado; a edição global precisa de proxy quando acessada da China continental.
 
@@ -65,11 +66,11 @@ As implementações de provedores são fornecidas como plugins independentes. O 
 
 Três formas — escolha a que combina com o seu ambiente; **o guia completo de instalação, atualização, desinstalação e solução de problemas está em [Instalação e implantação](./install.pt-BR.md)**.
 
-| Forma | Artefato | Interface |
-| --- | --- | --- |
-| **Desktop** (Windows / macOS / Linux) | `Agent2API_<versão>_x64-setup.exe`, `_universal.dmg`, `_amd64.deb`, `_amd64.AppImage` | Janela do app |
-| **Servidor** (Windows Server / Linux, sem GUI) | `agent2api-server-windows-amd64.zip`, `agent2api-server-linux-<arch>.tar.gz` | Painel no navegador |
-| **Docker** | `aimodcc/agent2api:latest` (amd64 / arm64) | Painel no navegador |
+| Forma                                          | Artefato                                                                              | Interface           |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------- | ------------------- |
+| **Desktop** (Windows / macOS / Linux)          | `Agent2API_<versão>_x64-setup.exe`, `_universal.dmg`, `_amd64.deb`, `_amd64.AppImage` | Janela do app       |
+| **Servidor** (Windows Server / Linux, sem GUI) | `agent2api-server-windows-amd64.zip`, `agent2api-server-linux-<arch>.tar.gz`          | Painel no navegador |
+| **Docker**                                     | `aimodcc/agent2api:latest` (amd64 / arm64)                                            | Painel no navegador |
 
 **Desktop**: adicione um provedor e uma conta, crie uma chave do gateway e aplique o perfil na página "Agent", ou configure o cliente com `http://127.0.0.1:3065/v1` e essa chave. Recursos adicionais exigem o plugin correspondente.
 
