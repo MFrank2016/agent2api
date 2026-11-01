@@ -57,7 +57,7 @@ RUN apt-get update \
 RUN if [ "$TARGETARCH" = "arm64" ]; then \
         rustup target add aarch64-unknown-linux-gnu \
         && apt-get update \
-        && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+        && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 # cc / cargo 按这两个变量找交叉工具（只在 arm64 构建时生效；amd64 原生用默认值）
