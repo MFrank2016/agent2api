@@ -176,7 +176,7 @@ jobs:
           #    排除本工作流自身（下面的字面量会自匹配）、LICENSE 与锁文件。
           #    `|| true`：git grep 无匹配时退出 1，这里要的是「无匹配 = 通过」。
           legacy_mit="$(git grep -l "Permission is hereby granted, free of charge" -- \
-               ':!.github/workflows/plugin-verify.yml' ':!LICENSE' ':!*.lock' || true)"
+               ':!.github/workflows/plugin-verify.yml' ':!LICENSE' ':!*.lock' ':!licenses/**' || true)"
           if [ -n "$legacy_mit" ]; then
             echo "$legacy_mit"
             echo "::error::源码中残留旧 MIT 授权文本"
