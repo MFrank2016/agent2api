@@ -2143,18 +2143,17 @@ pub async fn fetch_all(
             url.push_str("&nextToken=");
             url.push_str(&urlencode(token));
         }
-        let response = crate::http::get_json(client, &url, &headers).await?;
-        if !(200..300).contains(&response.status) {
+        // `http::get_json` 返回 `(status, Value)`，不是带字段的结构体。
+        let (status, payload) = crate::http::get_json(client, &url, &headers).await?;
+        if !(200..300).contains(&status) {
             if models.is_empty() {
                 return Err(format!(
-                    "Kiro 模型目录拉取失败：HTTP {} {}",
-                    response.status,
-                    response.error_head()
+                    "Kiro 模型目录拉取失败：HTTP {status} {}",
+                    head_of(&payload)
                 ));
             }
             break;
         }
-        let payload = response.body.unwrap_or(Value::Null);
         let added = parse_models(&payload);
         let mut new_count = 0;
         for model in added {
@@ -2171,6 +2170,11 @@ pub async fn fetch_all(
         }
     }
     Ok(models)
+}
+
+/// 错误体前 240 字符（`get_json` 已把空体 / 非 JSON 归成 `Null`）。
+fn head_of(payload: &Value) -> String {
+    payload.to_string().chars().take(240).collect()
 }
 
 /// 最小 query 编码（token 里可能带 `+` `/` `=`）。
@@ -2342,15 +2346,20 @@ pub async fn fetch(
         cred.region
     );
     let headers = super::auth::auth_headers(cred);
-    let response = crate::http::get_json(client, &url, &headers).await?;
-    if !(200..300).contains(&response.status) {
+    // `http::get_json` 返回 `(status, Value)`。
+    let (status, payload) = crate::http::get_json(client, &url, &headers).await?;
+    if !(200..300).contains(&status) {
         return Err(format!(
-            "Kiro 余额查询失败：HTTP {} {}",
-            response.status,
-            response.error_head()
+            "Kiro 余额查询失败：HTTP {status} {}",
+            head_of(&payload)
         ));
     }
-    normalize(&response.body.unwrap_or(Value::Null))
+    normalize(&payload)
+}
+
+/// 错误体前 240 字符（`get_json` 已把空体 / 非 JSON 归成 `Null`）。
+fn head_of(payload: &Value) -> String {
+    payload.to_string().chars().take(240).collect()
 }
 
 /// 把 `getUsageLimits` 的响应归一成网关认的形状。
@@ -2470,6 +2479,7 @@ git commit -m "feat(kiro): 余额查询（getUsageLimits）"
 
 - Modify: `crates/providers/src/providers/kiro/auth.rs`（`register_client` / `start_device` / `poll_token` / `refresh`）
 - Modify: `crates/providers/src/providers/kiro/mod.rs`（`login_start` / `login_poll` / `refresh_token`）
+- Modify: `crates/providers/src/http.rs`（新增 `post_form`，见 Step 3 第 0 段）
 - Test: `auth.rs` 的纯函数部分
 
 **Interfaces:**
@@ -2508,6 +2518,36 @@ Expected: FAIL（`chat_url` 未实现或行为不符）。
 
 - [ ] **Step 3: 实现 OAuth**
 
+**第 0 段：给 `crates/providers/src/http.rs` 新增表单 POST 辅助。**
+现有的 `post_json` 只把 body 序列化成 JSON，OAuth 的 `/token` 只认
+`application/x-www-form-urlencoded`；`send_raw` 也只收 `Option<&Value>`。
+在 `post_json` 之后追加：
+
+```rust
+/// 发一次 `application/x-www-form-urlencoded` POST 并解析 JSON 响应。
+///
+/// ── 为什么单独一个函数 ──────────────────────────────────────
+/// [`post_json`] 把 body 序列化成 JSON，而 OAuth 的 `/token` 这类端点
+/// 只认表单编码；[`send_raw`] 的 body 参数是 `Option<&Value>`，同样发不了
+/// 表单。返回口径与另两个一致：**非 2xx 也给 `Ok`**，判定权在调用方。
+pub async fn post_form(
+    client: &reqwest::Client,
+    url: &str,
+    form: &[(&str, &str)],
+) -> Result<(u16, Value), String> {
+    let response = client
+        .post(url)
+        .header("Accept", "application/json")
+        .form(form)
+        .send()
+        .await
+        .map_err(|error| describe(&error))?;
+    let status = response.status().as_u16();
+    let text = response.text().await.map_err(|error| describe(&error))?;
+    Ok((status, parse_json(&text)))
+}
+```
+
 `auth.rs` 追加：
 
 ```rust
@@ -2529,11 +2569,10 @@ pub async fn register_client(
         "grantTypes": ["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"],
         "issuerUrl": "https://view.awsapps.com/start"
     });
-    let response = crate::http::post_json(client, &url, &[], &body).await?;
-    if !(200..300).contains(&response.status) {
-        return Err(format!("Kiro 客户端注册失败：HTTP {} {}", response.status, response.error_head()));
+    let (status, payload) = crate::http::post_json(client, &url, &[], &body).await?;
+    if !(200..300).contains(&status) {
+        return Err(format!("Kiro 客户端注册失败：HTTP {status} {}", head_of(&payload)));
     }
-    let payload = response.body.unwrap_or_default();
     let client_id = payload.get("clientId").and_then(|v| v.as_str()).unwrap_or("");
     let client_secret = payload.get("clientSecret").and_then(|v| v.as_str()).unwrap_or("");
     if client_id.is_empty() || client_secret.is_empty() {
@@ -2555,11 +2594,10 @@ pub async fn start_device(
         "clientSecret": client_secret,
         "startUrl": "https://view.awsapps.com/start"
     });
-    let response = crate::http::post_json(client, &url, &[], &body).await?;
-    if !(200..300).contains(&response.status) {
-        return Err(format!("Kiro 设备授权失败：HTTP {} {}", response.status, response.error_head()));
+    let (status, payload) = crate::http::post_json(client, &url, &[], &body).await?;
+    if !(200..300).contains(&status) {
+        return Err(format!("Kiro 设备授权失败：HTTP {status} {}", head_of(&payload)));
     }
-    let payload = response.body.unwrap_or_default();
     let device_code = payload.get("deviceCode").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let verification_uri = payload
         .get("verificationUriComplete")
@@ -2589,21 +2627,8 @@ pub async fn poll_device(
         ("deviceCode", device_code),
         ("grantType", "urn:ietf:params:oauth:grant-type:device_code"),
     ];
-    let body: String = form
-        .iter()
-        .map(|(key, value)| format!("{key}={}", urlencode(value)))
-        .collect::<Vec<_>>()
-        .join("&");
-    let response = crate::http::send_raw(
-        client,
-        "POST",
-        &url,
-        &[("content-type".to_string(), "application/x-www-form-urlencoded".to_string())],
-        Some(body.as_bytes()),
-    )
-    .await?;
-    let payload = response.body.unwrap_or_default();
-    if (200..300).contains(&response.status) {
+    let (status, payload) = post_form(client, &url, &form).await?;
+    if (200..300).contains(&status) {
         let access = payload.get("accessToken").and_then(|v| v.as_str()).unwrap_or("");
         let refresh = payload.get("refreshToken").and_then(|v| v.as_str()).unwrap_or("");
         if access.is_empty() {
