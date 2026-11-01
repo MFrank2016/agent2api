@@ -771,7 +771,7 @@ impl ProviderAdapter for RpcAdapter {
                 .network(proto::methods::gateway::MODELS_REFRESH, Value::Object(params))
                 .await
             {
-                Ok(value) => match serde_json::from_value::<proto::RefreshOutcome>(value.clone()) {
+                Ok(value) => match serde_json::from_value::<proto::RefreshOutcome>(value) {
                     Ok(outcome) => {
                         if !outcome.refreshed {
                             return ModelRefreshOutcome {
@@ -782,25 +782,34 @@ impl ProviderAdapter for RpcAdapter {
                                 } else { outcome.message },
                             };
                         }
-                        let list = if crate::server::core::providers::is_scoped_runtime_provider(self.id) {
-                            match serde_json::from_value::<proto::ModelList>(value) {
-                                Ok(list) if list.meta.remote && outcome.count == list.models.len() => list,
-                                _ => return ModelRefreshOutcome::failed("插件刷新缺少同次真实远程模型快照，已保留旧清单"),
-                            }
-                        } else { match self.control(
+                        // ── 为什么两条路都要再要一次 MODELS_LIST ──────────────
+                        // `MODELS_REFRESH` 的返回形状恒是 `RefreshOutcome`
+                        // （`{refreshed, count, message}`），**不是** `ModelList`。
+                        // 以前 scoped 分支直接把它当 `ModelList` 反序列化，于是
+                        // 每一次「刷新模型清单」都必然失败（字段全缺 → Err）。
+                        // 正确口径：先用 `RefreshOutcome` 判成功，再补一次
+                        // `MODELS_LIST` 拿**同一次**的真实远程快照；scoped 家额外
+                        // 要求 `meta.remote`（否则拿回来的是兜底清单，等于没刷新）。
+                        let scoped = crate::server::core::providers::is_scoped_runtime_provider(self.id);
+                        let list = match self.control(
                             proto::methods::gateway::MODELS_LIST,
                             self.with_account(account_id),
                         ).await {
                             Ok(value) => match serde_json::from_value::<proto::ModelList>(value) {
+                                Ok(list) if scoped && !list.meta.remote => {
+                                    return ModelRefreshOutcome::failed(
+                                        "插件刷新缺少同次真实远程模型快照，已保留旧清单",
+                                    )
+                                }
                                 Ok(list) => list,
                                 Err(error) => return ModelRefreshOutcome::failed(
                                     format!("插件刷新后返回的模型清单无法解析: {error}"),
                                 ),
                             },
                             Err(error) => return ModelRefreshOutcome::failed(error.message),
-                        } };
+                        };
                         let count = super::rpc_cache::set_remote(self.id, list);
-                        if count == 0 && !crate::server::core::providers::is_scoped_runtime_provider(self.id) {
+                        if count == 0 && !scoped {
                             return ModelRefreshOutcome::failed("插件刷新后没有可用模型，已保留旧清单");
                         }
                         crate::server::core::providers::adapter::seed_hidden_visibility_defaults();

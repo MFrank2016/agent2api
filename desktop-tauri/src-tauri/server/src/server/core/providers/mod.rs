@@ -414,12 +414,22 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
     }
 }
 
-/// 这个 id 是否已知（旧身份、停用身份与真实插件的并集）。
+/// 这个 id 是否已知（旧身份、停用身份、稳定运行身份与真实插件的并集）。
 ///
 /// 缺执行体的 ID 仍可识别，便于导入存量数据；管理动作是否可用
 /// 必须另问 `is_executable_provider`。
+///
+/// ── 为什么要并上 `is_runtime_identity` ──────────────────────
+/// 纯插件家（如 `kiro`）既不在 `ProviderKind` 里、也不在停用表里，只靠
+/// `is_executable_provider`（= 插件此刻在跑）判定。插件没装 / 没起来时它
+/// 就「不认识自己」—— 存量账号列表、导入、模型管理全部 404，而错误文案
+/// 说的是「未知提供商」，与真实原因（插件没运行）完全无关。
+/// 稳定运行身份是**静态事实**，不依赖插件进程，所以并进来。
 pub fn is_known_provider_id(id: &str) -> bool {
-    kind_from_id(id).is_some() || availability::is_suspended(id) || is_executable_provider(id)
+    kind_from_id(id).is_some()
+        || availability::is_suspended(id)
+        || availability::is_runtime_identity(id)
+        || is_executable_provider(id)
 }
 
 /// 使用独立 FULL-auth 边界的稳定身份；停用不改变存量账号与错误分类语义。
