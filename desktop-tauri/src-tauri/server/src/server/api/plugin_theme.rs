@@ -86,6 +86,7 @@ const PROVIDER_ICONS: &[(&str, &[u8])] = &[
     ("modelscope", include_bytes!("../../../../../ui/assets/providers/modelscope.png")),
     ("atomcode", include_bytes!("../../../../../ui/assets/providers/atomcode.png")),
     ("lobsterai", include_bytes!("../../../../../ui/assets/providers/lobsterai.png")),
+    ("meoo", include_bytes!("../../../../../ui/assets/providers/meoo.png")),
 ];
 
 const MINIMAX_CODE_SVG: &[u8] = include_bytes!("../../../../../ui/assets/providers/minimax-code.svg");

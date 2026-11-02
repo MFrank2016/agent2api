@@ -49,6 +49,7 @@ const ICONS: Record<string, string> = {
   'modelscope-intl': 'assets/providers/modelscope.png',
   atomcode: 'assets/providers/atomcode.png',
   lobsterai: 'assets/providers/lobsterai.png',
+  meoo: 'assets/providers/meoo.png',
   doubaowork: 'assets/providers/doubaowork.png',
   cursor: 'assets/providers/cursor.svg',
   kiro: 'assets/providers/kiro.svg',
