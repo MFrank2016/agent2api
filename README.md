@@ -54,10 +54,11 @@ Agent2API is an **AI routing gateway with Agent client takeover**. It exposes a 
 
 ## 🤝 Supported Providers
 
-Provider implementations ship as separate plugins. The official plugin pack contains 31 provider ids — 30 real providers plus one `demo` entry used only for protocol verification; install the matching plugin to add an account on the Accounts page.
+Provider implementations ship as separate plugins. The official plugin pack contains 32 provider ids — 31 real providers plus one `demo` entry used only for protocol verification; install the matching plugin to add an account on the Accounts page.
 
 - **Kiro**: supports LLM requests, token auto-refresh, the model list and balance queries; no check-in or claim capabilities.
 - **Nous**: supports LLM requests, token auto-refresh and the model list; no balance query, check-in or claim capabilities.
+- **Meoo (秒悟)**: supports LLM requests, OAuth token refresh, the model list and points balance; no check-in or claim capabilities. Requires a Meoo project with AI service enabled; inference uses the project service AK.
 - **Tabbit (China / global)**: text chat only, no tool calling; Cookie/JWT expires in about 7 days with no refresh endpoint; premium models require the account to be set as the default browser and `defaultBrowser: true` added to the pasted JSON; the global edition needs a proxy when accessed from mainland China.
 
 `/v1/chat/completions`, `/v1/responses`, `/v1/messages` (incl. `count_tokens`) and `/v1/models` behave identically for every provider; model mapping, the global priority queue, 429 fallback, egress proxying, outbound fingerprint redaction and request reporting apply to all providers alike.

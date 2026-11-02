@@ -143,6 +143,8 @@ export const PROVIDER_ICONS: Record<string, string> = {
   'kimi-work': 'assets/providers/kimi-work.svg',
   opendesign: 'assets/providers/opendesign.svg',
   'nous-portal': 'assets/providers/nous-portal.svg',
+  // Meoo（秒悟）：官方站点 favicon 归一成 256×256
+  meoo: 'assets/providers/meoo.png',
   'claude-subscription': 'assets/providers/anthropic.png',
   'codex-subscription': 'assets/providers/openai.png',
   'chatgpt-subscription': 'assets/providers/openai.png',

@@ -54,10 +54,11 @@ O Agent2API é um **gateway de roteamento de IA com gerenciamento de clientes Ag
 
 ## 🤝 Provedores compatíveis
 
-As implementações de provedores são fornecidas como plugins independentes. O pacote oficial de plugins contém 31 ids de provedores — 30 provedores reais e um `demo` usado apenas para verificação de protocolo; instale o plugin correspondente para adicionar uma conta na página "Contas".
+As implementações de provedores são fornecidas como plugins independentes. O pacote oficial de plugins contém 32 ids de provedores — 31 provedores reais e um `demo` usado apenas para verificação de protocolo; instale o plugin correspondente para adicionar uma conta na página "Contas".
 
 - **Kiro**: suporta requisições LLM, renovação automática do token, lista de modelos e consulta de saldo; não tem check-in nem resgates.
 - **Nous**: suporta requisições LLM, renovação automática do token e lista de modelos; não tem consulta de saldo, check-in nem resgates.
+- **Meoo (秒悟)**: suporta requisições LLM, renovação automática de token OAuth, lista de modelos e saldo de pontos; sem check-in ou resgates. Requer um projeto Meoo com o serviço de IA ativado; a inferência usa a AK de serviço do projeto.
 - **Tabbit (China / global)**: apenas conversa de texto, sem chamada de ferramentas; Cookie/JWT expira em cerca de 7 dias sem endpoint de renovação; modelos premium exigem que a conta esteja definida como navegador padrão e `defaultBrowser: true` no JSON colado; a edição global precisa de proxy quando acessada da China continental.
 
 `/v1/chat/completions`, `/v1/responses`, `/v1/messages` (incl. `count_tokens`) e `/v1/models` funcionam igual para todos os provedores; mapeamento de modelos, fila global de prioridade, fallback em 429, proxy de saída, mascaramento de impressão digital de saída e relatórios de requisições valem para todos os provedores.
