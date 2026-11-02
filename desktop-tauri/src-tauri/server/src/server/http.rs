@@ -172,6 +172,15 @@ pub fn panel_router(state: ServerState) -> Router {
             "/auth/callback",
             get(api::session::login_lobsterai_callback),
         )
+        // Meoo 网页登录的 loopback 回调：官方 CLI 的 redirect_uri 是
+        // `http://127.0.0.1:<port>/oauth/callback`（斜杠路径），必须逐字匹配。
+        // 免鉴权的理由与上面几条同一句：调用方是用户的浏览器，它没有我们的
+        // API Key；安全性由本次登录任务的一次性 state 承担（插件侧再核对一次
+        // 回调里的 state，见 `providers/meoo/login.rs` 的 `exchange_callback`）。
+        .route(
+            "/oauth/callback",
+            get(api::session::login_meoo_callback),
+        )
         // ── 插件 UI 资源（`/plugins/{pack}/ui/*`）──
         // 插件包可以带页面（签到中心这类「只有装了插件才有意义」的功能），
         // 由网关出静态资源、客户端 iframe 嵌入。**不挂 protected**：iframe

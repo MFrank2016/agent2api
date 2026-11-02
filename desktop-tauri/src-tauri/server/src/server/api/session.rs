@@ -1542,6 +1542,56 @@ pub async fn login_lobsterai_callback(
     }
 }
 
+// ─── GET /oauth/callback（Meoo 的 loopback 回调）──────────────
+
+/// Meoo 网页登录的 loopback 回调（**浏览器 302 到这里**）。
+///
+/// ── 路径为什么是 `/oauth/callback`（斜杠）──────────────────
+/// 它是官方 Meoo CLI 的 `redirect_uri` 路径，授权页会逐字回落这个地址；
+/// 换一个形状（连字符 / 家名后缀）等于赌上游是否对回调路径做白名单，而
+/// 这条路没有实测支撑。`endpoints::CALLBACK_PATH` 是插件侧的唯一出处，
+/// 两边必须逐字相同。
+///
+/// ── 为什么免鉴权（挂 public 组）──────────────────────────────
+/// 调用方是**用户的浏览器**（授权页完成后顶层导航回来），它当然没有我们的
+/// API Key；安全性由本次登录任务生成的不可预测 state 承担。插件侧还会再
+/// 核对一次回调串里的 state（`providers/meoo/login.rs`），两道都要过。
+///
+/// ── 只有 provider == "meoo" 的任务才接收 ────────────────────
+/// 别家的 state 落到这条路径上说明回调被拼错了，直接拒绝比「试着换一次码」
+/// 安全：换码用的是任务绑定那一家的协议。
+pub async fn login_meoo_callback(
+    State(state): State<ServerState>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let task_state = params.get("state").cloned().unwrap_or_default();
+    let Some(task) = state.login().tasks().get(&task_state) else {
+        return oauth_callback_page(400, "登录任务不存在或已过期");
+    };
+    if task.snapshot().provider != "meoo" {
+        return oauth_callback_page(400, "这次登录不属于 Meoo");
+    }
+    if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
+        let error = state.login().reject_login_callback(&task_state, error).await;
+        return oauth_callback_page(error.status_code, &error.message);
+    }
+    if task.adapter().is_none() {
+        return oauth_callback_page(503, "Meoo 登录需要安装提供商插件");
+    }
+    let callback_url = match original_callback_url(&uri, &headers) {
+        Ok(url) => url,
+        Err(error) => return oauth_callback_page(error.status_code, &error.message),
+    };
+    login_callback_page(
+        state
+            .login()
+            .submit_login_callback(&task_state, &callback_url)
+            .await,
+    )
+}
+
 // ─── GET /oauth-callback（Antigravity 的 Google OAuth 登录回调）────
 
 /// Antigravity 网页登录的回调（**浏览器 302 到这里**，查询串带 `code` / `state`）。
