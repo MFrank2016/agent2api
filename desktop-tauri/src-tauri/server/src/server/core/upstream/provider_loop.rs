@@ -729,6 +729,8 @@ async fn attempt_queue(
                                     error.upstream_code,
                                     None,
                                     &error.message,
+                                    &custom_provider_id,
+                                    None,
                                 );
                                 // 与内置家的动作 1 同款：还有额度时被 429 的
                                 // 垫底（见那边的说明）
@@ -862,7 +864,14 @@ async fn attempt_queue(
                     {
                         let wire = cooldown_keys.for_provider(provider_id);
                         let group = adapter.quota_cooldown_models(account_id, &wire);
-                        mark_conversation_limited(service, account_id, &group, &class, &error.message);
+                        mark_conversation_limited(
+                            service,
+                            account_id,
+                            &group,
+                            &class,
+                            &error.message,
+                            provider_id,
+                        );
                         let label = if group.len() > 1 {
                             format!("{} 等 {} 个模型（福利池按账号记账）",
                                     group.first().cloned().unwrap_or_else(|| wire.clone()),
@@ -1490,6 +1499,11 @@ async fn attempt_queue(
                                 *upstream_code,
                                 *reset_at,
                                 &failure.error.message,
+                                provider_id,
+                                // 适配器还没把 Retry-After 串进分类结果
+                                // （`QuotaLimited` 只有 reset_at），分钟级限流
+                                // 先落 `apply_quota_rest` 的 60 秒默认值。
+                                None,
                             );
                             let limit_at =
                                 rotate::account_limit_reset_at(service, &account_id, &wire_model);
@@ -1802,6 +1816,10 @@ async fn attempt_queue(
                                 None,
                                 if refusal_reset_at > 0 { Some(refusal_reset_at) } else { None },
                                 &message,
+                                provider_id,
+                                // 正文拒绝这条路上没有响应头（200 + 正文），
+                                // 恢复时刻只可能来自正文解析。
+                                None,
                             );
                             logging::console_line(
                                 "[Upstream]",
@@ -2118,12 +2136,17 @@ fn log_aggregated(aggregated: &super::aggregate::AggregatedCompletion) {
 ///
 /// 非 `QuotaLimited` 直接返回 —— 记账闸门由调用方的 `if let` 判定，这里是
 /// 二次防御：别的路径误用本函数时不该落冷却。
+///
+/// `vendor` 是厂商身份，只影响归类里的厂商特例（见 `classify_quota_kind`）；
+/// 与 `reset_at` 同款「漏带没人报错」，所以它也在签名上、不在调用方算好再传
+/// 一个 `QuotaKind` 进来。
 fn mark_conversation_limited(
     service: &UpstreamService,
     account_id: &str,
     group: &[String],
     class: &UpstreamErrorClass,
     message: &str,
+    vendor: &str,
 ) {
     let UpstreamErrorClass::QuotaLimited { status, upstream_code, reset_at, .. } = class else {
         return;
@@ -2137,6 +2160,10 @@ fn mark_conversation_limited(
             *upstream_code,
             *reset_at,
             message,
+            vendor,
+            // 会话式路径的错误体里没有响应头可取（分类结果只有 reset_at），
+            // 分钟级限流落 `apply_quota_rest` 的 60 秒默认值。
+            None,
         );
     }
 }

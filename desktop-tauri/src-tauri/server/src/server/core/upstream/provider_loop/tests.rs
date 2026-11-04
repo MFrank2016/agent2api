@@ -130,7 +130,14 @@ fn stateful_quota_bookkeeping_keeps_the_adapter_reset_at() {
     };
     // 整组（福利池按账号记账）与单键走的是同一个循环，这里给两个名字覆盖循环体
     let group = vec!["m-benefit-a".to_string(), "m-benefit-b".to_string()];
-    mark_conversation_limited(&service, &id, &group, &class, "上游返回 403: insufficient quota");
+    mark_conversation_limited(
+        &service,
+        &id,
+        &group,
+        &class,
+        "上游返回 403: insufficient quota",
+        "custom-test",
+    );
     for name in &group {
         let stored = rotate::account_limit_reset_at(&service, &id, name);
         assert_eq!(stored, reset_at, "{name} 的 resetAt 应当是适配器给的恢复时刻");
@@ -164,7 +171,14 @@ fn stateful_quota_bookkeeping_falls_back_when_adapter_gives_no_reset_at() {
         upstream_code: None,
         status: 429,
     };
-    mark_conversation_limited(&service, &id, &single("m-429"), &class, message);
+    mark_conversation_limited(
+        &service,
+        &id,
+        &single("m-429"),
+        &class,
+        message,
+        "custom-test",
+    );
     let stored = rotate::account_limit_reset_at(&service, &id, "m-429");
     let seconds = (stored - now) / 1000;
     assert!(
@@ -184,7 +198,14 @@ fn stateful_quota_bookkeeping_ignores_non_quota_classes() {
         message: message.to_string(),
         upstream_code: None,
     };
-    mark_conversation_limited(&service, &id, &single("m-fatal"), &class, message);
+    mark_conversation_limited(
+        &service,
+        &id,
+        &single("m-fatal"),
+        &class,
+        message,
+        "custom-test",
+    );
     assert_eq!(rotate::account_limit_reset_at(&service, &id, "m-fatal"), 0, "非限额分类不该落冷却");
 }
 
@@ -200,7 +221,14 @@ fn codearts_daily_pool_envelope_cools_to_the_boundary_instead_of_ten_minutes() {
     let UpstreamErrorClass::QuotaLimited { reset_at: Some(reset_at), .. } = &class else {
         panic!("福利池耗尽的文案应分类为带恢复时刻的 QuotaLimited，实际 {class:?}");
     };
-    mark_conversation_limited(&service, &id, &single("glm-5.3-flash"), &class, &error.message);
+    mark_conversation_limited(
+        &service,
+        &id,
+        &single("glm-5.3-flash"),
+        &class,
+        &error.message,
+        "codearts",
+    );
 
     let stored = rotate::account_limit_reset_at(&service, &id, "glm-5.3-flash");
     assert_eq!(stored, *reset_at, "落库的恢复时刻必须是适配器算出的日池重置点");
@@ -255,9 +283,26 @@ fn that_one_argument_is_the_divider_between_a_day_and_ten_minutes() {
         upstream_code: Some(4291200),
         status: 403,
     };
-    mark_conversation_limited(&service, &id, &single("m-after"), &class, message);
+    mark_conversation_limited(
+        &service,
+        &id,
+        &single("m-after"),
+        &class,
+        message,
+        "custom-test",
+    );
     // 改前的那一发：另三个字段照旧，恢复时刻写成 None
-    rotate::mark_account_limited(&service, &pre_fix_id, "m-before", 403, Some(4291200), None, message);
+    rotate::mark_account_limited(
+        &service,
+        &pre_fix_id,
+        "m-before",
+        403,
+        Some(4291200),
+        None,
+        message,
+        "custom-test",
+        None,
+    );
 
     let after = rotate::account_limit_reset_at(&service, &id, "m-after");
     let before = rotate::account_limit_reset_at(&service, &pre_fix_id, "m-before");
@@ -272,6 +317,133 @@ fn that_one_argument_is_the_divider_between_a_day_and_ten_minutes() {
         after - before > 2 * 60 * 60 * 1000,
         "透传与写死 None 的差距应当是「一整天 vs 10 分钟」量级，实际差 {} 分钟",
         (after - before) / 60_000
+    );
+}
+
+// ── 分类结果 → rest 作用域（Task 1.3）───────────────────────────────────────
+//
+// 归类（`classify_quota_kind`）只回答「这是哪一类 429」；「停谁、停多久」是
+// 编排层的事：余额 / 验证类停**整个账号**，额度 / 套餐 / 分钟限流只停**这个
+// 模型**。两类写进 `RouteState` 的两张不同表（账号级 `backoff` / 模型级
+// `model_rest`），选路侧据此分别垫底与跳过 —— 写错表的症状是「一个模型的
+// 分钟限流把整账号其他模型也关了」，或者反过来「余额耗尽只停一个模型」。
+
+/// 账号级退避的截止时刻（没有记录时为 0）。
+fn account_backoff_until(service: &UpstreamService, account_id: &str) -> i64 {
+    service
+        .route
+        .snapshot("", logging::now_ms(), 0)
+        .resting
+        .get(account_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// 模型级 rest 的截止时刻（没有记录时为 0）。
+fn model_rest_until(service: &UpstreamService, account_id: &str, model: &str) -> i64 {
+    service
+        .route
+        .snapshot_for_model("", model, logging::now_ms(), 0)
+        .model_resting
+        .get(&(account_id.to_string(), model.to_string()))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// 余额不足 ⇒ **账号级**长休息（默认 24 小时），且**不**写模型级 rest。
+///
+/// 反了会怎样：只停一个模型时，同一账号换一个模型继续打，仍然每次都被
+/// 「余额不足」拒 —— 一轮对话里白撞 N 次；反过来若这里写了模型 rest，选路
+/// 那边两张表都命中，效果虽然更狠，但语义混乱（账号页会显示一个假的模型冷却）。
+#[test]
+fn quota_rest_credit_stops_the_account_not_the_model() {
+    let (_dir, service, id) = temp_service();
+    let now = logging::now_ms();
+    rotate::mark_account_limited(
+        &service,
+        &id,
+        "m-credit",
+        429,
+        None,
+        None,
+        "上游返回 429: 余额不足或无可用资源包",
+        "custom-credit",
+        None,
+    );
+    let until = account_backoff_until(&service, &id);
+    let hours = (until - now) / 3_600_000;
+    assert!(
+        (23..=25).contains(&hours),
+        "余额类应当停整个账号约 24 小时，实际 {hours} 小时"
+    );
+    assert_eq!(
+        model_rest_until(&service, &id, "m-credit"),
+        0,
+        "余额类不该再写一条模型级 rest"
+    );
+}
+
+/// 分钟级限流 ⇒ **模型级**短 rest（`retryAfterMs` 或默认 60 秒），账号不休息。
+///
+/// 反了会怎样：一次「20 requests per minute」把整个账号停 24 小时，同一账号
+/// 其他模型全部不可用 —— 这是最贵的一种误判。
+#[test]
+fn quota_rest_rate_stops_only_the_model_for_a_minute() {
+    let (_dir, service, id) = temp_service();
+    let now = logging::now_ms();
+    rotate::mark_account_limited(
+        &service,
+        &id,
+        "m-rate",
+        429,
+        None,
+        None,
+        "上游返回 429: Rate limit exceeded: 20 requests per minute",
+        "openrouter",
+        Some(60_000),
+    );
+    let until = model_rest_until(&service, &id, "m-rate");
+    let ms = until - now;
+    assert!(
+        (59_000..=61_000).contains(&ms),
+        "分钟级限流应当只停这个模型约 60 秒，实际 {ms} 毫秒"
+    );
+    assert_eq!(
+        account_backoff_until(&service, &id),
+        0,
+        "分钟级限流不该让整个账号休息"
+    );
+}
+
+/// 额度类 + 上游给了重置时刻 ⇒ 模型级 rest **停到那一刻**（不是 10 分钟兜底）。
+///
+/// 反了会怎样：日池 / 套餐额度的恢复时刻被兜底常量覆盖，账号按 10 分钟的节拍
+/// 反复去撞一个当天不会再恢复的模型（生产实测两小时白撞 8 次）。
+#[test]
+fn quota_rest_quota_with_reset_stops_the_model_until_then() {
+    let (_dir, service, id) = temp_service();
+    let now = logging::now_ms();
+    let reset_at = now + 3 * 60 * 60 * 1000;
+    rotate::mark_account_limited(
+        &service,
+        &id,
+        "m-quota",
+        429,
+        None,
+        Some(reset_at),
+        "上游返回 429: too many requests",
+        "custom-quota",
+        None,
+    );
+    assert_eq!(
+        model_rest_until(&service, &id, "m-quota"),
+        reset_at,
+        "额度类的模型 rest 应当停到上游给的重置时刻"
+    );
+    assert_eq!(
+        account_backoff_until(&service, &id),
+        0,
+        "额度类只停模型，不停整个账号"
     );
 }
 

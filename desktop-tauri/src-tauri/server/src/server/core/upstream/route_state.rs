@@ -450,14 +450,33 @@ impl RouteState {
         entry.until
     }
 
+    /// 把账号级退避的截止时刻**直接**定到 `until`（不累加失败笔数）。
+    ///
+    /// ── 与 [`Self::backoff_mark`] 的分工 ────────────────────────
+    /// 两张表是同一张（选路对「这个账号整体在休息」只认一条口径），区别只在
+    /// **时长从哪来**：`backoff_mark` 是网络失败的指数退避（15 分钟起、连续
+    /// 失败翻倍），这里是上游明确告知的恢复时刻 —— 余额耗尽 / 需要人机验证
+    /// 这类「等多久都没用，得有人去处理」的失败。
+    ///
+    /// 所以这里**不动 `strikes`**：一条业务拒绝不是一次「连续失败」，把它记成
+    /// 一笔会让后续真正的网络失败平白多翻一倍。已有笔数原样保留（不重置），
+    /// 因为那是这个账号此前确实失败过的历史，不该被一次业务拒绝抹掉。
+    pub(super) fn backoff_mark_until(&self, account_id: &str, until: i64) {
+        let Ok(mut table) = self.backoff.lock() else {
+            return;
+        };
+        let strikes = table
+            .get(account_id)
+            .map(|entry| entry.strikes)
+            .unwrap_or(0);
+        table.insert(account_id.to_string(), BackoffEntry { until, strikes });
+    }
+
     /// 记一笔模型级 rest（只盖住 `(account_id, model)` 这一格）。
     ///
     /// 与 [`Self::backoff_mark`] 分开存：账号级退避由连续失败笔数决定时长，
     /// 模型级 rest 的截止时刻由**调用方**（上游给的 `resetAt` / `retryAfter`）
     /// 直接给出，本函数不做翻倍。
-    ///
-    /// Task 1.3 把它接到错误分类的收尾路径上；在那之前没有生产调用点。
-    #[allow(dead_code)]
     pub(super) fn rest_mark(&self, account_id: &str, model: &str, until: i64) {
         if let Ok(mut table) = self.model_rest.lock() {
             table.insert((account_id.to_string(), model.to_string()), until);

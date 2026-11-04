@@ -44,7 +44,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use crate::server::config;
-use crate::server::core::providers::error_kind::classify_quota_kind;
+use crate::server::core::providers::error_kind::{classify_quota_kind, QuotaKind};
 use crate::server::core::providers::readiness;
 use crate::server::core::routing;
 use crate::server::errors::{self, GatewayError};
@@ -439,6 +439,20 @@ pub(super) fn with_proxy_notice(
 /// `model` 必须是**上游实际收到的真名**（不是客户端请求名）—— 调用方从
 /// `SendBody::wire_model` 取（见 `upstream::payload`）。传请求名会把冷却写在
 /// 上游永远不会记额度的键上，判定侧也就查不到它（见 `routing::CooldownKeys`）。
+///
+/// `vendor` 是**厂商身份**（内置 provider id，或自定义提供商的 id），只用于
+/// [`classify_quota_kind`] 的厂商特例（如智谱 1113 不带词表关键词）；
+/// `retry_after_ms` 是上游 `Retry-After` 换算出的毫秒数，只有分钟级限流会用它
+/// 决定模型 rest 的长度。
+///
+/// ── 落库 + 落内存，两件事一起做 ────────────────────────────
+/// 落库的 `rateLimits`（`mark_rate_limited`）是**跨重启**的事实，账号页的
+/// 「限流」列与选路判定都读它；落内存的 rest（[`apply_quota_rest`]）是**本进程**
+/// 的选路状态，按分类决定「停账号还是停模型」。两者必须同源同一次调用，
+/// 分开写就会漂移成「记录说停了、选路照打」。
+// 参数就是落库条目 + 归类输入（status/code/resetAt/message/vendor/retryAfter）：
+// 拆成结构体要在三个调用点各造一次，与 `mark_rate_limited` 同一取舍。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn mark_account_limited(
     service: &UpstreamService,
     account_id: &str,
@@ -447,6 +461,8 @@ pub(super) fn mark_account_limited(
     upstream_code: Option<i64>,
     reset_at: Option<i64>,
     message: &str,
+    vendor: &str,
+    retry_after_ms: Option<i64>,
 ) -> String {
     // Node 从 `error.body` 里再解析一次 msg 取恢复时间；Rust 侧的错误文案
     // 已经带上上游原文，`reset_at` 由适配器的 classify_error 解析后传进来，
@@ -457,11 +473,17 @@ pub(super) fn mark_account_limited(
         errors::parse_quota_reset_at(message)
     };
     // 归类交给 `classify_quota_kind`（词表 + 厂商特例），落进条目的 reason/scope。
-    // 这里暂时给空 vendor：本函数拿不到账号所属家的身份，Task 1.3 再把真实
-    // 厂商身份传进来；空 vendor 只会少命中「智谱 1113」这类厂商特例。
-    // `retry_after_ms` 暂传 None：响应头在 `mark_account_limited` 这一层不可见
-    // （由适配器 classify_error 消费），Task 1.3/1.4 再把 Retry-After 串下来。
-    let kind = classify_quota_kind(status as u16, upstream_code, message, "");
+    let kind = classify_quota_kind(status as u16, upstream_code, message, vendor);
+    // rest 的**作用域**由分类决定（见 `apply_quota_rest`）：余额 / 验证类停
+    // 整个账号，额度 / 套餐 / 分钟限流只停这个模型。
+    apply_quota_rest(
+        service,
+        account_id,
+        model,
+        kind,
+        if parsed > 0 { Some(parsed) } else { None },
+        retry_after_ms,
+    );
     let entry = service.store.mark_rate_limited(
         account_id,
         model,
@@ -474,7 +496,7 @@ pub(super) fn mark_account_limited(
         },
         message,
         kind,
-        None,
+        retry_after_ms,
     );
     match entry {
         Some(entry) => {
@@ -482,6 +504,43 @@ pub(super) fn mark_account_limited(
             format_reset_text(reset)
         }
         None => String::new(),
+    }
+}
+
+/// 把一次配额类失败落到正确的 **rest 作用域**。
+///
+/// ── 三条映射（口径见 `error_kind` 的模块头）─────────────────
+///   · `Credit` / `Verification`：账号级 —— 充值或人工处理之前，这个账号的
+///     **任何**模型都救不回来，只停一个模型等于让同一轮请求换个模型再撞一次。
+///     上游没给恢复时刻时按 24 小时（一天后再试，比 10 分钟更贴近「等人处理」）；
+///   · `Quota` / `Plan`：模型级 —— 额度按模型计，停到上游给的重置时刻，
+///     给不出时 10 分钟（与存储层兜底同一常量）；
+///   · `Rate`：模型级短休息 —— `Retry-After` 换算值，没有就 60 秒。
+///
+/// 两种作用域写进 `RouteState` 的两张表（账号级 `backoff` / 模型级
+/// `model_rest`），选路侧分别垫底与跳过。
+fn apply_quota_rest(
+    service: &UpstreamService,
+    account_id: &str,
+    model: &str,
+    kind: QuotaKind,
+    reset_at: Option<i64>,
+    retry_after_ms: Option<i64>,
+) {
+    let now = logging::now_ms();
+    match kind {
+        QuotaKind::Credit | QuotaKind::Verification => {
+            let until = reset_at.unwrap_or(now + 24 * 3600 * 1000);
+            service.route.backoff_mark_until(account_id, until);
+        }
+        QuotaKind::Rate => {
+            let until = now + retry_after_ms.unwrap_or(60_000);
+            service.route.rest_mark(account_id, model, until);
+        }
+        QuotaKind::Quota | QuotaKind::Plan => {
+            let until = reset_at.unwrap_or(now + 10 * 60 * 1000);
+            service.route.rest_mark(account_id, model, until);
+        }
     }
 }
 
