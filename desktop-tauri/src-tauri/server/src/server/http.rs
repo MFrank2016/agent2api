@@ -15,6 +15,7 @@
 //!               （Node 版这三条确实都没调 checkApiKey）
 //!   `protected` 需鉴权：/api/config、/api/logs*、/api/stats*、/api/retention、
 //!               /api/accounts*、/api/proxies*、/api/custom-providers*、
+//!               /api/presets、
 //!               /api/usage、/api/checkin*、/api/activity/*、/api/sanitize、
 //!               /api/auto-checkin*、/api/update/*、
 //!               /api/session/login/*、/api/session/refresh|logout、/auth/*
@@ -612,6 +613,10 @@ pub fn panel_router(state: ServerState) -> Router {
             get(api::custom_providers::get_custom_providers)
                 .post(api::custom_providers::create_custom_provider),
         )
+        // 预置提供商目录（新建表单的预填模板）：纯编译期常量、不写配置，
+        // 但它是「新建自定义提供商」这一步的输入，与上面几条同一屏，
+        // 一起挂 protected（面板/API Key 保护，不对公网开放）。
+        .route("/api/presets", get(api::custom_providers::get_presets))
         .route(
             "/api/custom-providers/update",
             post(api::custom_providers::update_custom_provider),

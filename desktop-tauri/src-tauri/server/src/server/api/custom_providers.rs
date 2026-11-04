@@ -1,6 +1,9 @@
 //! 自定义提供商管理 API（设置页「自定义提供商」区域）：
 //!
 //! - `GET  /api/custom-providers`          → `{providers: [...]}`（按 createdAt 升序）
+//! - `GET  /api/presets`                   → `{presets: [...]}`（编译期预置目录，
+//!                                            新建表单的预填模板，见
+//!                                            `core::custom_providers::preset_catalog`）
 //! - `POST /api/custom-providers`          → 新建提供商，**同时**创建该家第一个账号
 //! - `POST /api/custom-providers/update`   → `{id, name?, protocol?, baseUrl?, enabled?}`
 //! - `POST /api/custom-providers/remove`   → `{id}`，级联删除名下全部账号，
@@ -32,6 +35,7 @@ use serde_json::{json, Value};
 
 use crate::server::core::api_keys;
 use crate::server::core::custom_providers;
+use crate::server::core::custom_providers::preset_catalog;
 use crate::server::errors;
 use crate::server::http::{ok_json, parse_body};
 use crate::server::logging;
@@ -54,6 +58,16 @@ fn body_object(body: &Bytes) -> Result<serde_json::Map<String, Value>, Response>
 /// 列出全部自定义提供商（按 createdAt 升序，排序在存储层保证）。
 pub async fn get_custom_providers(State(_state): State<ServerState>) -> Response {
     ok_json(json!({ "providers": custom_providers::list() }))
+}
+
+// ─── GET /api/presets ───────────────────────────────────────
+
+/// 列出预置提供商目录（新建自定义提供商表单的预填模板）。
+///
+/// 目录是编译期常量（`preset_catalog::all()`），**不读配置、不落库**；响应
+/// 顺序即前端卡片网格顺序，不要重排。`GET` 不读 state，也不写任何东西。
+pub async fn get_presets() -> Response {
+    ok_json(json!({ "presets": preset_catalog::all() }))
 }
 
 // ─── POST /api/custom-providers ─────────────────────────────
@@ -418,5 +432,65 @@ pub async fn fetch_custom_models(State(state): State<ServerState>, body: Bytes) 
             ok_json(json!({ "models": models }))
         }
         Err(message) => errors::management_error(502, message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! `GET /api/presets` 的契约：目录原样出口（条目数 + 两张关键卡片的字段）。
+    //!
+    //! ── 为什么直接调 handler ──────────────────────────────────
+    //! 本仓没有「带鉴权层的整表 Router」测试夹具（`http.rs` 里那套 `oneshot`
+    //! 只服务 CORS 探针），而这条 handler 不读 state —— 直接调用既覆盖了路由
+    //! 指向的函数，也不用为一个纯读接口起 DB 造 `ServerState`。鉴权由
+    //! `panel_router` 的 protected 层统一保证，不在本用例的射程内。
+
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+
+    /// 读回 JSON 响应体（测试里允许 expect）。
+    async fn json_of(response: Response) -> Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("响应体读取不应失败");
+        serde_json::from_slice(&bytes).expect("响应体必须是 JSON")
+    }
+
+    #[tokio::test]
+    async fn presets_endpoint_lists_catalog() {
+        let response = get_presets().await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = json_of(response).await;
+        let presets = body["data"]["presets"]
+            .as_array()
+            .expect("data.presets 必须是数组");
+        assert_eq!(presets.len(), 24, "目录条目数必须与前端 24 张卡片一致");
+
+        let openai = presets
+            .iter()
+            .find(|preset| preset["id"] == "openai")
+            .expect("openai 卡片必须存在");
+        assert_eq!(openai["name"], "OpenAI");
+        assert_eq!(openai["kind"], "vendor");
+        assert_eq!(openai["protocols"][0]["protocol"], "chat_completions");
+        assert_eq!(
+            openai["protocols"][0]["baseUrl"],
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(openai["noKey"], false);
+        assert_eq!(openai["icon"], "openai.png");
+
+        let zen = presets
+            .iter()
+            .find(|preset| preset["id"] == "opencode-zen")
+            .expect("opencode-zen 卡片必须存在");
+        assert_eq!(zen["noKey"], true, "Zen 免费档无需 API Key");
+        assert_eq!(zen["clientEmulation"], "opencode");
+        assert!(
+            zen.get("quirks").is_none(),
+            "Zen 的伪装是顶层 clientEmulation，不应出现在 quirks 里"
+        );
     }
 }
