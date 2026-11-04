@@ -58,6 +58,7 @@ mod provider_loop;
 mod rotate;
 mod route_state;
 mod route_sticky;
+pub mod rpm;
 pub mod sse;
 pub mod stall;
 pub mod translate;
