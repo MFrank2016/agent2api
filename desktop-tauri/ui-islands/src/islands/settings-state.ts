@@ -1905,7 +1905,15 @@ export async function saveMasking(patch: MaskingPatch): Promise<void> {
     const saved = await bridge.saveMasking(patch)
     if (saved === undefined) await loadMasking()
     else renderMasking(saved)
-    toast(t('✅ 出站脱敏设置已保存'))
+    // 与 saveSanitizeConfig 同一口径：写库失败（saved=false）时不能说「已保存」，
+    // 否则会和面板里的常驻红色告警自相矛盾。
+    const persisted = snapshot.masking.saved
+    toast(
+      persisted
+        ? t('✅ 出站脱敏设置已保存')
+        : t('出站脱敏设置仅本次运行生效，写入数据库失败，请检查配置目录'),
+      persisted ? 'ok' : 'err',
+    )
   } catch (error) {
     toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
     await loadMasking()
