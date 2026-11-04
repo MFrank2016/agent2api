@@ -99,6 +99,9 @@ pub mod key_quota;
 pub mod legacy_api_key;
 pub mod limiter;
 pub mod login;
+/// 出站可逆脱敏（请求换占位符、回复还原）：规则 + 按请求隔离的映射会话。
+/// 与 `sanitize` 的区别见模块头。
+pub mod masking;
 /// 下发内容的通用后处理（与具体上游无关的内容改写，见模块头）。
 pub mod middleware;
 pub mod model_meta;
