@@ -66,12 +66,44 @@ pub struct TransportRequest {
     /// 请求头（由适配器给出；不含出网代理相关）
     pub headers: Vec<(String, String)>,
     /// 已序列化的请求体（由编排层从适配器的 `plan.body` 序列化而来）
+    ///
+    /// 开启出站脱敏时，这里是**脱敏后**的字节（构造阶段已换好，见
+    /// [`crate::server::core::masking::mask_outbound`]）。
     pub payload: String,
     /// 出网代理（账号级；与 provider 无关，由编排层解析后带上）
     pub egress: crate::server::core::proxies::AccountEgress,
     /// 账号未配代理时本家是否**跟随系统代理**出网（编排层按适配器的能力位填，
     /// 默认 false = 直连）。为 true 的家见 `ProviderAdapter::system_proxy_when_unset`。
     pub system_proxy_when_unset: bool,
+    /// 本次请求的脱敏会话（`None` = 未脱敏）。
+    ///
+    /// 映射（占位符 → 原文）必须与 `payload` 同源：构造阶段调用
+    /// [`crate::server::core::masking::mask_outbound`]，`Some((masked, session))`
+    /// 时把 `masked` 放进 `payload`、会话放进这里，回复侧再取出来还原
+    /// （Task 5.3）。**不要在这里放与 `payload` 不匹配的会话** —— 那会让
+    /// 回复还原出错误的原文。
+    pub mask_session: Option<crate::server::core::masking::MaskSession>,
+}
+
+impl TransportRequest {
+    /// 构造辅助：对序列化后的请求体跑一次出站脱敏门禁。
+    ///
+    /// 返回 `(payload, mask_session)`：关闭脱敏时原样返回（会话为 `None`，
+    /// 字节不变）；开启时返回脱敏后的字节与会话，二者必须一起放进
+    /// [`TransportRequest`]（见 `mask_session` 的说明）。
+    ///
+    /// 开启却脱敏失败 → `Err(原因)`：调用方映射成 503，并**不发送任何请求**
+    /// （fail-closed）。错误类型用 `String` 而不是 `GatewayError`，避免在
+    /// `Result` 里搬一个体积很大的错误结构（调用点各自映射状态码）。
+    pub fn mask_payload(
+        payload: String,
+    ) -> Result<(String, Option<crate::server::core::masking::MaskSession>), String> {
+        match crate::server::core::masking::mask_outbound(&payload) {
+            Ok(None) => Ok((payload, None)),
+            Ok(Some((masked, session))) => Ok((masked, Some(session))),
+            Err(message) => Err(message),
+        }
+    }
 }
 
 /// 归一化后的上游错误：`{code, message}`
@@ -164,8 +196,20 @@ fn rotation_attempts(plan: &RotationPlan) -> usize {
 pub async fn send_chat_request(
     plan: &TransportRequest,
 ) -> Result<wreq::Response, UpstreamRequestError> {
+    // ── 出站脱敏门禁（fail-closed）────────────────────────────────
+    // 正常情况下构造阶段已经脱敏并把会话挂在 plan 上（`payload` 已是脱敏后
+    // 的字节，回复侧用 `plan.mask_session` 还原）—— 这里不再二次脱敏。
+    // 只有「未挂会话」的请求才在发送前补一次门禁：关闭时原样放行（字节不变），
+    // 开启却脱敏失败时**一个字节都不发**（503，且不重试）。
+    let payload = match &plan.mask_session {
+        Some(_) => plan.payload.clone(),
+        None => match crate::server::core::masking::mask_outbound(&plan.payload) {
+            Ok(None) => plan.payload.clone(),
+            Ok(Some((masked, _session))) => masked,
+            Err(message) => return Err(UpstreamRequestError::masking_failed(message)),
+        },
+    };
     let url = plan.url.clone();
-    let payload = plan.payload.clone();
     let headers = plan.headers.clone();
     let response = crate::server::core::egress::dispatch(
         &plan.egress,
@@ -225,7 +269,13 @@ pub async fn send_chat_request(
                 }
             };
             let safe_to_retry = error.is_connect() || error.is_builder();
-            Err(UpstreamRequestError { message, reason, safe_to_retry })
+            Err(UpstreamRequestError {
+                message,
+                reason,
+                safe_to_retry,
+                status_code: 502,
+                retryable: true,
+            })
         }
         Err(_elapsed) => {
             let seconds = headers_budget.as_secs();
@@ -233,12 +283,14 @@ pub async fn send_chat_request(
                 reason: format!("等待响应超时({seconds}秒)"),
                 message: format!("等待响应超时({seconds}秒，出口 {via})"),
                 safe_to_retry: false,
+                status_code: 502,
+                retryable: true,
             })
         }
     }
 }
 
-/// 传输层失败（统一收敛成 502，与 Node 的 fetchViaProxy 一致）
+/// 传输层失败（默认收敛成 502，与 Node 的 fetchViaProxy 一致）
 #[derive(Clone, Debug)]
 pub struct UpstreamRequestError {
     pub message: String,
@@ -248,11 +300,30 @@ pub struct UpstreamRequestError {
     pub reason: String,
     /// 只有请求尚未写出（建连或构造失败）才允许非幂等的生图自动重试。
     pub safe_to_retry: bool,
+    /// 下发给客户端的状态码（传输层失败默认 502；出站脱敏失败是 503）。
+    pub status_code: i32,
+    /// 是否允许按设置退避重发。脱敏门禁失败**不可重试**：重发只会得到同
+    /// 一份错误，且没有任何字节到过上游。
+    pub retryable: bool,
 }
 
 impl UpstreamRequestError {
+    /// 出站脱敏 fail-closed：请求体没有发出去，按 503 收敛。
+    ///
+    /// `message` 由 [`crate::server::core::masking::mask_outbound`] 给出，
+    /// 只描述「为什么没发」，**不含请求体内容**（不记录、不回显明文）。
+    pub fn masking_failed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            reason: "出站脱敏失败".to_string(),
+            safe_to_retry: false,
+            status_code: 503,
+            retryable: false,
+        }
+    }
+
     pub fn to_gateway_error(&self) -> GatewayError {
-        GatewayError::with_status(502, self.message.clone())
+        GatewayError::with_status(self.status_code, self.message.clone())
     }
 }
 
@@ -368,4 +439,64 @@ pub fn new_span_id() -> String {
         id.push_str(&format!("{byte:02x}"));
     }
     id
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use super::*;
+
+    /// 开启脱敏但脱敏器不可用：门禁必须 fail-closed —— 返回 503，且
+    /// **一个请求都不能发到上游**（用本地计数服务验证）。
+    #[tokio::test]
+    async fn masking_enabled_without_masker_sends_nothing() {
+        let _guard = crate::server::core::masking::config::testing::enabled_without_masker();
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let app = axum::Router::new().route(
+            "/chat",
+            axum::routing::post(move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/chat", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let plan = TransportRequest {
+            url,
+            headers: Vec::new(),
+            payload: r#"{"messages":[]}"#.to_string(),
+            egress: crate::server::core::proxies::AccountEgress::Direct,
+            system_proxy_when_unset: false,
+            // 构造阶段没走门禁（模拟旧调用点 / 未挂会话的请求）
+            mask_session: None,
+        };
+        let result = send_chat_request(&plan).await;
+        match result {
+            Err(error) => {
+                assert_eq!(error.status_code, 503);
+                assert!(!error.retryable);
+                assert_eq!(error.to_gateway_error().status_code, 503);
+                assert!(
+                    error.message.contains("未发送任何请求"),
+                    "{}",
+                    error.message
+                );
+            }
+            Ok(_) => panic!("脱敏器不可用时不应发出请求"),
+        }
+        // 门禁在 egress::dispatch 之前返回：上游一次都没被打到。
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
 }

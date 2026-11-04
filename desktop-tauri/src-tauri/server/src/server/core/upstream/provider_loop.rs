@@ -1245,6 +1245,20 @@ async fn attempt_queue(
                     return Err(gateway);
                 }
             };
+            // 出站脱敏门禁（关闭时原样返回；开启却失败 → 503，不发送）。
+            // 与序列化失败同属「本机就发不出去」：先给明细定稿，再直接返回
+            // —— 换账号重来也改变不了配置问题（fail-closed）。
+            let (payload, mask_session) = match TransportRequest::mask_payload(payload) {
+                Ok(prepared) => prepared,
+                Err(message) => {
+                    let error = GatewayError::with_status(503, message);
+                    ctx.telemetry.finish_last_attempt(
+                        Some(i64::from(error.status_code)),
+                        Some(&error.message),
+                    );
+                    return Err(error);
+                }
+            };
             logging::verbose(
                 "[Upstream]",
                 &format!(
@@ -1277,6 +1291,7 @@ async fn attempt_queue(
                 // 能力位由适配器给；账号已配代理或本次显式指定了直连/节点时它不参与
                 system_proxy_when_unset: ctx.proxy_override.is_none()
                     && adapter.system_proxy_when_unset(),
+                mask_session,
             };
             // ── 调试模式：抓一份即将发出去的原始报文 ──────────────────
             // 位置在 `build_chat_request` 之后（URL / 头 / body 都已定稿）。
@@ -2876,6 +2891,8 @@ async fn send_or_cancel(
             message: cancellation::MANUAL_TERMINATED.to_string(),
             reason: cancellation::MANUAL_TERMINATED.to_string(),
             safe_to_retry: false,
+            status_code: 502,
+            retryable: false,
         }),
     }
 }
@@ -2971,27 +2988,33 @@ async fn send_with_retry(
                     });
                 }
                 // 传输层失败（DNS/代理/连接）：按设置退避重发，吸收链路抖动；
-                // 次数用完才收敛成 502，与改造前的兜底一致
-                if let Some(advice) = transport_retry_advice(&error, budget.remaining) {
-                    budget.remaining -= 1;
-                    let used = budget.used();
-                    telemetry.note_attempt_retry(&advice.reason, None, advice.delay_ms);
-                    logging::console_line(
-                        "[Upstream]",
-                        &retry_log_line(&advice.reason, advice.delay_ms, used, budget.total),
-                    );
-                    sleep_or_cancel(telemetry, advice.delay_ms).await;
-                    continue;
+                // 次数用完才收敛成 502，与改造前的兜底一致。
+                // 例外：不可重试的错误（出站脱敏 fail-closed）直接收尾 ——
+                // 重发只会得到同一份错误，且本来就没有字节到过上游。
+                if error.retryable {
+                    if let Some(advice) = transport_retry_advice(&error, budget.remaining) {
+                        budget.remaining -= 1;
+                        let used = budget.used();
+                        telemetry.note_attempt_retry(&advice.reason, None, advice.delay_ms);
+                        logging::console_line(
+                            "[Upstream]",
+                            &retry_log_line(&advice.reason, advice.delay_ms, used, budget.total),
+                        );
+                        sleep_or_cancel(telemetry, advice.delay_ms).await;
+                        continue;
+                    }
                 }
                 let gateway = error.to_gateway_error();
                 return Err(OutboundFailure {
                     class: UpstreamErrorClass::Fatal {
-                        status: 502,
+                        status: u16::try_from(gateway.status_code).unwrap_or(502),
                         message: gateway.message.clone(),
                         upstream_code: None,
                     },
                     error: gateway,
-                    stop: false,
+                    // 不可重试的门禁失败：不要换账号重来（换谁都不会变），
+                    // 直接把 503 交给客户端。
+                    stop: !error.retryable,
                 });
             }
         };

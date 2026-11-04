@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use regex::Regex;
 use serde_json::Value;
@@ -257,15 +257,19 @@ fn lock_state(state: &Mutex<State>) -> MutexGuard<'_, State> {
 /// 它自身实现 [`Masker`] 只是为了单测 / 单次调用；内部映射表有上限
 /// （超限按插入顺序淘汰），**请求路径必须用 [`RulesMasker::session`]**，
 /// 否则映射会跨请求共享（见父模块模块头）。
+///
+/// 规则用 `Arc<[CompiledRule]>` 持有：会话只克隆这个 Arc（引用计数 +1），
+/// 于是 [`MaskSession`] 是 `'static` 的 —— 它能随请求一起跨 `await` 存活，
+/// 不必挂在借用上（请求结构体无法携带生命周期参数）。
 pub struct RulesMasker {
-    rules: Vec<CompiledRule>,
+    rules: Arc<[CompiledRule]>,
     state: Mutex<State>,
 }
 
 impl Default for RulesMasker {
     fn default() -> Self {
         Self {
-            rules: default_rules().to_vec(),
+            rules: default_rules().to_vec().into(),
             state: Mutex::new(State::bounded(MAX_SHARED_ENTRIES)),
         }
     }
@@ -277,23 +281,29 @@ impl RulesMasker {
         let mut rules = default_rules().to_vec();
         rules.extend(word_rules(words));
         Self {
-            rules,
+            rules: rules.into(),
             state: Mutex::new(State::bounded(MAX_SHARED_ENTRIES)),
         }
     }
 
     /// 每次请求拿一个：映射只属于这次请求，请求结束随 session 释放。
-    pub fn session(&self) -> MaskSession<'_> {
+    ///
+    /// 返回的会话拥有规则（`Arc` 克隆），不带生命周期参数 —— 见
+    /// [`RulesMasker`] 的说明。
+    pub fn session(&self) -> MaskSession {
         MaskSession {
-            rules: &self.rules,
+            rules: Arc::clone(&self.rules),
             state: Mutex::new(State::default()),
         }
     }
 }
 
 /// 一次请求的脱敏会话：mask 与 restore 共用同一份映射。
-pub struct MaskSession<'a> {
-    rules: &'a [CompiledRule],
+///
+/// 拥有规则（`Arc` 克隆），因此可以独立于 [`RulesMasker`] 存活 —— 出站
+/// 请求把会话放进传输层、回复侧再取出来还原（见父模块模块头）。
+pub struct MaskSession {
+    rules: Arc<[CompiledRule]>,
     state: Mutex<State>,
 }
 
@@ -314,15 +324,15 @@ impl Masker for RulesMasker {
     }
 }
 
-impl Masker for MaskSession<'_> {
+impl Masker for MaskSession {
     fn mask_json(&self, value: &mut Value) -> MaskReport {
         let mut state = lock_state(&self.state);
-        mask_value(value, self.rules, &mut state)
+        mask_value(value, &self.rules, &mut state)
     }
 
     fn mask_text(&self, text: &str) -> (String, MaskReport) {
         let mut state = lock_state(&self.state);
-        mask_text_with(self.rules, text, &mut state)
+        mask_text_with(&self.rules, text, &mut state)
     }
 
     fn restore(&self, text: &str) -> String {

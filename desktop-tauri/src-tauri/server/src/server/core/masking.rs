@@ -14,14 +14,27 @@
 //! [`RulesMasker`] 自身也实现了 [`Masker`]（便于单测 / 单次调用），但它内部的
 //! 映射表是**有上限**的（超限按插入顺序淘汰），且不应在请求路径上共享使用。
 //!
+//! [`MaskSession`] **拥有**规则（`Arc<[CompiledRule]>` 克隆），不带生命周期
+//! 参数 —— 于是它能跟着请求跨 `await` 存活（请求结构体无法携带借用）。出站
+//! 路径的入口是 [`mask_outbound`]：构造请求时调用一次，把「脱敏后的字节 +
+//! 会话」一起放进传输层（`TransportRequest`），回复侧再用同一份会话还原。
+//!
+//! ## 出站门禁（fail-closed）
+//!
+//! 开关由 [`config::active`] 决定：关闭时 [`mask_outbound`] 原样放行（连 JSON
+//! 都不解析，字节与改造前一致）；开启却做不到（脱敏器不可用、请求体不是
+//! JSON）时返回错误，调用方必须**一个字节都不发**。宁可让这条请求 503，
+//! 也不能把明文漏给上游。
+//!
 //! ## 占位符
 //!
 //! 形如 `[[A2A_MASK_<kind>_<n>]]`，`n` 进程内全局递增（跨会话也不重复），
 //! 因此占位符不会与普通文本或其他会话的占位符混淆；还原时按前缀精确匹配，
 //! 不认识的占位符原样保留。
 
+pub(crate) mod config;
 mod rules;
-
+pub use config::MaskConfig;
 pub use rules::{MaskSession, RulesMasker};
 
 use serde_json::Value;
@@ -77,6 +90,33 @@ pub trait Masker {
     fn mask_text(&self, text: &str) -> (String, MaskReport);
     /// 按本脱敏器的映射还原占位符；不认识的占位符原样保留。
     fn restore(&self, text: &str) -> String;
+}
+
+/// 出站门禁：按配置决定要不要脱敏，并给出**本次请求的会话**。
+///
+/// 返回 `Ok(None)` 表示「未开启脱敏」—— 调用方原样发送，字节与改造前完全
+/// 一致（连 JSON 都不解析，避免无谓的序列化漂移）。
+///
+/// 返回 `Ok(Some((masked, session)))` 表示已脱敏：`masked` 是新的请求体，
+/// `session` 持有本次映射，回复侧用它还原（Task 5.3）。
+///
+/// 错误一律 **fail-closed**：配置要求脱敏却做不到（没有脱敏器、请求体不是
+/// JSON、序列化失败）时返回错误文案，调用方必须**一个字节都不发**。宁可让
+/// 这一条请求 503，也不能把明文漏给上游。
+pub fn mask_outbound(payload: &str) -> Result<Option<(String, MaskSession)>, String> {
+    if !config::active().enabled {
+        return Ok(None);
+    }
+    let Some(masker) = config::masker() else {
+        return Err("脱敏已开启但脱敏器不可用，未发送任何请求".to_string());
+    };
+    let mut value: Value = serde_json::from_str(payload)
+        .map_err(|_| "脱敏已开启但请求体不是合法 JSON，未发送任何请求".to_string())?;
+    let session = masker.session();
+    session.mask_json(&mut value);
+    let serialized = serde_json::to_string(&value)
+        .map_err(|_| "脱敏后请求体序列化失败，未发送任何请求".to_string())?;
+    Ok(Some((serialized, session)))
 }
 
 #[cfg(test)]
@@ -252,5 +292,60 @@ mod tests {
         let report = masker.mask_json(&mut body);
         assert_eq!(body["a@b.com"], "plain");
         assert!(report.hits.is_empty(), "{report:?}");
+    }
+
+    // ── 出站门禁（mask_outbound）────────────────────────────────────
+
+    /// 关闭脱敏：原样放行，调用方拿不到会话（= 回复侧不做还原）。
+    #[test]
+    fn masking_disabled_is_byte_identical() {
+        let _guard = config::testing::disabled();
+        let payload = r#"{"model":"m","messages":[{"role":"user","content":"a@b.com"}]}"#;
+        let result = mask_outbound(payload);
+        assert!(matches!(result, Ok(None)), "{:?}", result.err());
+        // 关闭时连解析都不做：字节不变。
+        assert_eq!(
+            payload,
+            r#"{"model":"m","messages":[{"role":"user","content":"a@b.com"}]}"#
+        );
+    }
+
+    /// 开启但没有可用脱敏器：fail-closed，绝不把明文发出去。
+    #[test]
+    fn masking_enabled_without_masker_sends_nothing() {
+        let _guard = config::testing::enabled_without_masker();
+        match mask_outbound(r#"{"messages":[]}"#) {
+            Err(error) => assert!(error.contains("未发送任何请求"), "{error}"),
+            Ok(_) => panic!("没有脱敏器时必须报错而不是放行"),
+        }
+    }
+
+    /// 开启：对象键不变、字符串值脱敏，且返回的会话能还原原文。
+    #[test]
+    fn masking_enabled_masks_json_values() {
+        let masker = std::sync::Arc::new(RulesMasker::default());
+        let _guard = config::testing::enabled_with(masker);
+        let payload =
+            r#"{"model":"example-model","messages":[{"role":"user","content":"mail a@b.com"}]}"#;
+        let (masked, session) = mask_outbound(payload)
+            .expect("脱敏器可用时不应失败")
+            .expect("开启脱敏时应返回掩码后的请求体");
+        assert!(!masked.contains("a@b.com"), "{masked}");
+        assert!(masked.contains(PLACEHOLDER_PREFIX), "{masked}");
+        // 键与普通值不变。
+        let value: Value = serde_json::from_str(&masked).expect("掩码后仍是合法 JSON");
+        assert_eq!(value["model"], "example-model");
+        assert!(value["messages"][0].get("content").is_some());
+        // 会话可还原（Task 5.3 的回复还原依赖这一份映射）。
+        let restored = session.restore(&masked);
+        assert!(restored.contains("a@b.com"), "{restored}");
+    }
+
+    /// 开启但请求体不是 JSON：fail-closed，返回错误而不是原样发送。
+    #[test]
+    fn masking_enabled_rejects_non_json_payload() {
+        let masker = std::sync::Arc::new(RulesMasker::default());
+        let _guard = config::testing::enabled_with(masker);
+        assert!(mask_outbound("not json").is_err());
     }
 }

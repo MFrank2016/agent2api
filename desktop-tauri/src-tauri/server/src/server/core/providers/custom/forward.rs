@@ -273,6 +273,9 @@ pub(crate) async fn forward(
     quirks.apply_emulation_to_body(&mut outbound, &base_url);
     let payload = serde_json::to_string(&outbound)
         .map_err(|error| GatewayError::with_status(500, format!("请求体序列化失败: {error}")))?;
+    // 出站脱敏门禁（关闭时原样返回；开启却失败 → 503，不发送）
+    let (payload, mask_session) = TransportRequest::mask_payload(payload)
+        .map_err(|message| GatewayError::with_status(503, message))?;
     // ── 出站头（三段拼装，顺序不可换）────────────────────────────
     //   ① 默认头：**只有 apiKey 非空才带凭证头** —— 无需鉴权的上游
     //      （`noAuth` 账号）拿到一个空 `Bearer ` 会当成凭证错误，
@@ -307,6 +310,7 @@ pub(crate) async fn forward(
         egress,
         // 自定义家没有能力位（用户自己配的出口就是唯一口径：配了就代理，没配就直连）
         system_proxy_when_unset: false,
+        mask_session,
     };
     let response = send_chat_request(&transport)
         .await
@@ -620,6 +624,9 @@ async fn forward_translated(
     };
     let payload = serde_json::to_string(&payload)
         .map_err(|error| GatewayError::with_status(500, format!("请求体序列化失败: {error}")))?;
+    // 出站脱敏门禁（关闭时原样返回；开启却失败 → 503，不发送）
+    let (payload, mask_session) = TransportRequest::mask_payload(payload)
+        .map_err(|message| GatewayError::with_status(503, message))?;
 
     logging::verbose(
         "[CustomProvider]",
@@ -637,6 +644,7 @@ async fn forward_translated(
         egress,
         // 自定义家没有能力位（用户自己配的出口就是唯一口径：配了就代理，没配就直连）
         system_proxy_when_unset: false,
+        mask_session,
     };
     let response = send_chat_request(&transport)
         .await

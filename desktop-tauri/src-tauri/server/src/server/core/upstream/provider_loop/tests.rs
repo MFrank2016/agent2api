@@ -38,6 +38,8 @@ async fn mock_upstream(
             egress: crate::server::core::proxies::AccountEgress::Direct,
             // 测试替身按默认能力位（false = 直连），与生产里不带这一步的家同款
             system_proxy_when_unset: false,
+            // 测试请求体没有走脱敏门禁（未开启脱敏），因此不带会话
+            mask_session: None,
         },
         hits,
         task,
