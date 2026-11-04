@@ -44,6 +44,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use crate::server::config;
+use crate::server::core::providers::error_kind::classify_quota_kind;
 use crate::server::core::providers::readiness;
 use crate::server::core::routing;
 use crate::server::errors::{self, GatewayError};
@@ -454,13 +455,25 @@ pub(super) fn mark_account_limited(
     } else {
         errors::parse_quota_reset_at(message)
     };
+    // 归类交给 `classify_quota_kind`（词表 + 厂商特例），落进条目的 reason/scope。
+    // 这里暂时给空 vendor：本函数拿不到账号所属家的身份，Task 1.3 再把真实
+    // 厂商身份传进来；空 vendor 只会少命中「智谱 1113」这类厂商特例。
+    // `retry_after_ms` 暂传 None：响应头在 `mark_account_limited` 这一层不可见
+    // （由适配器 classify_error 消费），Task 1.3/1.4 再把 Retry-After 串下来。
+    let kind = classify_quota_kind(status as u16, upstream_code, message, "");
     let entry = service.store.mark_rate_limited(
         account_id,
         model,
         status as i64,
         upstream_code,
-        if parsed > 0 { Some(parsed as f64) } else { None },
+        if parsed > 0 {
+            Some(parsed as f64)
+        } else {
+            None
+        },
         message,
+        kind,
+        None,
     );
     match entry {
         Some(entry) => {

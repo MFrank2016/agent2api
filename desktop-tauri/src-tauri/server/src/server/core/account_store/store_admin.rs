@@ -48,8 +48,49 @@ use crate::server::core::account_store::state::{
 };
 use crate::server::core::account_store::store::AccountStore;
 use crate::server::core::account_store::store_util::{token_tail_of, truncate_chars};
+use crate::server::core::providers::error_kind::QuotaKind;
 use crate::server::core::providers::{provider_index, DEFAULT_PROVIDER_ID};
 use crate::server::logging;
+
+/// 构造一条 `rateLimits[model]` 条目（纯函数，不碰库，便于单测 JSON 形状）。
+///
+/// `kind` 决定两个**给人看也给人用**的字段：
+///   - `reason`：归类名（`credit` / `quota` / `rate` / `plan` / `verification`），
+///     前端据此显示「余额不足 / 额度用尽 / 分钟级限流」，而不是笼统一句「限流」；
+///   - `scope`：冷却作用域 —— 余额与验证类停整个账号（`account`），其余停到
+///     该模型（`model`）。上层按它决定是整号摘除还是只跳过这一个模型。
+///
+/// `retryAfterMs` 是上游 `Retry-After` 换算出的毫秒（没给就是 `null`）：它只对
+/// `Rate` 有意义，但原样记录不丢信息，上层可据此缩短默认 rest。
+///
+/// 旧条目（改造前落盘的）没有这三个字段，读取侧一律按「缺失 = 未知」处理，
+/// 所以这是**纯增量**，不需要迁移数据。
+fn rate_limit_entry(
+    status: i64,
+    code: Option<i64>,
+    reset_at: Option<f64>,
+    message: &str,
+    kind: QuotaKind,
+    retry_after_ms: Option<i64>,
+) -> Value {
+    let (reason, scope) = match kind {
+        QuotaKind::Credit => ("credit", "account"),
+        QuotaKind::Verification => ("verification", "account"),
+        QuotaKind::Quota => ("quota", "model"),
+        QuotaKind::Rate => ("rate", "model"),
+        QuotaKind::Plan => ("plan", "model"),
+    };
+    json!({
+        "status": if status == 0 { 429 } else { status },
+        "code": code.map(Value::from).unwrap_or(Value::Null),
+        "resetAt": reset_at.map(json_number).unwrap_or(Value::Null),
+        "message": truncate_chars(message, 300),
+        "at": logging::now_ms(),
+        "reason": reason,
+        "scope": scope,
+        "retryAfterMs": retry_after_ms.map(Value::from).unwrap_or(Value::Null),
+    })
+}
 
 impl AccountStore {
     // ─── 凭证回写与限额标记 ──────────────────────────────────
@@ -173,9 +214,12 @@ impl AccountStore {
     /// 记录账号对某模型的限额状态（上游 429 / code 6004）。
     ///
     /// resetAt 为恢复时间戳；缺失时给 10 分钟兜底冷却，避免短时间内反复撞限额。
+    /// `kind` 是这次限额的归类（见 [`QuotaKind`]），落进条目的 `reason` / `scope`；
+    /// `retry_after_ms` 是上游 `Retry-After`（没有就 `None`）。
     ///
     /// ── 冷却键的最终形态：provider × 账号 × 模型（Agent2API W2b-T3 确认）──
-    /// 落盘位置是 `accounts[i].rateLimits[model] = {status, code, resetAt, message, at}`，
+    /// 落盘位置是 `accounts[i].rateLimits[model] = {status, code, resetAt, message, at,
+    /// reason, scope, retryAfterMs}`，
     /// 即**冷却键挂在账号记录内部**，而每条账号记录只属于一个 provider
     /// （`record.provider()` 是单值）。所以「provider 维度」已经天然成立，
     /// **不需要改数据结构**：`accounts[i]` 这一个下标就同时确定了 provider 与账号，
@@ -183,6 +227,9 @@ impl AccountStore {
     ///
     /// 选路时候选集合跨提供商（全局队列），但限额判定仍是「这条账号记录对这个
     /// 模型」—— 记录内的键天然不会串到别的账号上。
+    // 参数就是落盘条目的字段（status/code/resetAt/message/at + 三个归类字段），
+    // 拆成结构体反而要在两个调用点各造一次；与仓库里其它长签名函数同一取舍。
+    #[allow(clippy::too_many_arguments)]
     pub fn mark_rate_limited(
         &self,
         id: &str,
@@ -191,6 +238,8 @@ impl AccountStore {
         code: Option<i64>,
         reset_at: Option<f64>,
         message: &str,
+        kind: QuotaKind,
+        retry_after_ms: Option<i64>,
     ) -> Option<Value> {
         let _guard = self.guard();
         // 只读目标那一行。这一条在改造前是全量写盘里**最亏**的一个：一次 429
@@ -201,13 +250,7 @@ impl AccountStore {
             Some(value) if value.is_finite() && value > now as f64 => value,
             _ => now as f64 + 10.0 * 60.0 * 1000.0,
         };
-        let entry = json!({
-            "status": if status == 0 { 429 } else { status },
-            "code": code.map(Value::from).unwrap_or(Value::Null),
-            "resetAt": json_number(reset),
-            "message": truncate_chars(message, 300),
-            "at": now,
-        });
+        let entry = rate_limit_entry(status, code, Some(reset), message, kind, retry_after_ms);
         let mut limits = match record.get("rateLimits") {
             Some(Value::Object(map)) => map.clone(),
             _ => Map::new(),
@@ -1035,5 +1078,68 @@ impl AccountStore {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::core::providers::error_kind::QuotaKind;
+
+    #[test]
+    fn rate_limit_entry_carries_reason_and_scope() {
+        let entry = rate_limit_entry(
+            429,
+            Some(1113),
+            Some(1_800_000_000_000.0),
+            "余额不足",
+            QuotaKind::Credit,
+            None,
+        );
+        assert_eq!(entry["reason"], "credit");
+        assert_eq!(entry["scope"], "account");
+        assert_eq!(entry["retryAfterMs"], Value::Null);
+    }
+
+    #[test]
+    fn rate_limit_entry_maps_every_kind_to_reason_and_scope() {
+        // 作用域只有两种：余额 / 人机验证停整个账号，其余停到模型。
+        let cases = [
+            (QuotaKind::Credit, "credit", "account"),
+            (QuotaKind::Verification, "verification", "account"),
+            (QuotaKind::Quota, "quota", "model"),
+            (QuotaKind::Rate, "rate", "model"),
+            (QuotaKind::Plan, "plan", "model"),
+        ];
+        for (kind, reason, scope) in cases {
+            let entry = rate_limit_entry(429, None, Some(1_800_000_000_000.0), "", kind, None);
+            assert_eq!(entry["reason"], reason, "{kind:?}");
+            assert_eq!(entry["scope"], scope, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn rate_limit_entry_keeps_retry_after_and_defaults_zero_status() {
+        // status 0 = 调用方没拿到状态码（插件上报），落盘按 429 记。
+        let entry = rate_limit_entry(
+            0,
+            None,
+            Some(1_800_000_000_000.0),
+            "rate limit: 20 requests per minute",
+            QuotaKind::Rate,
+            Some(30_000),
+        );
+        assert_eq!(entry["status"], 429);
+        assert_eq!(entry["retryAfterMs"], 30_000);
+        assert_eq!(entry["reason"], "rate");
+        assert_eq!(entry["scope"], "model");
+    }
+
+    #[test]
+    fn rate_limit_entry_without_reset_at_leaves_it_null() {
+        // 兜底冷却由 `mark_rate_limited` 补（10 分钟），纯函数本身不编时间。
+        let entry = rate_limit_entry(429, None, None, "", QuotaKind::Quota, None);
+        assert_eq!(entry["resetAt"], Value::Null);
+        assert_eq!(entry["code"], Value::Null);
     }
 }

@@ -22,6 +22,7 @@ use std::time::Duration;
 use agent2api_provider_protocol as proto;
 
 use crate::server::core::account_store::AccountStore;
+use crate::server::core::providers::error_kind::QuotaKind;
 use crate::server::core::providers::ProviderKind;
 use crate::server::logging;
 
@@ -215,6 +216,9 @@ impl GatewayCallbacks for StoreCallbacks {
     {
         Box::pin(async move {
             self.check_account(&account, None)?;
+            // 插件只上报「这个模型限额了」，不带归类：按最保守的 Quota 记
+            // （模型级、停到 resetAt），既不误判成分钟级限流而反复重试，也不会
+            // 因为缺 kind 就把整个账号摘掉。Retry-After 协议里也没有。
             self.store.mark_rate_limited(
                 &account,
                 &model,
@@ -222,6 +226,8 @@ impl GatewayCallbacks for StoreCallbacks {
                 None,
                 reset_at.map(|value| value as f64),
                 "插件上报限额",
+                QuotaKind::Quota,
+                None,
             );
             Ok(())
         })
