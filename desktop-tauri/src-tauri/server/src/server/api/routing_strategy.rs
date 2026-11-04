@@ -207,6 +207,7 @@ fn parse_routing_patch(object: &Map<String, Value>) -> Result<RoutingPatch, Stri
         config::ROUTING_BREAKER_MIN_SUCCESS,
         config::ROUTING_BREAKER_MAX_SUCCESS,
     )?;
+    patch.shadow_quota_kind = parse_bool(object, config::KEY_ROUTING_SHADOW_QUOTA_KIND)?;
 
     Ok(patch)
 }
@@ -245,6 +246,7 @@ fn routing_patch_is_empty(patch: &RoutingPatch) -> bool {
         && patch.breaker_threshold.is_none()
         && patch.breaker_timeout_seconds.is_none()
         && patch.breaker_success_threshold.is_none()
+        && patch.shadow_quota_kind.is_none()
 }
 
 /// 统一的路由设置响应体（GET 与 POST 共用；`/api/routing` 别名也复用它）。
@@ -267,6 +269,7 @@ pub(super) fn routing_json() -> Value {
         config::KEY_ROUTING_BREAKER_THRESHOLD: settings.breaker_threshold,
         config::KEY_ROUTING_BREAKER_TIMEOUT: settings.breaker_timeout_seconds,
         config::KEY_ROUTING_BREAKER_SUCCESS: settings.breaker_success_threshold,
+        config::KEY_ROUTING_SHADOW_QUOTA_KIND: settings.shadow_quota_kind,
     })
 }
 
@@ -357,6 +360,7 @@ mod tests {
             "routingSticky": null,
             "routingFailoverBackoff": null,
             "routingBreakerThreshold": null,
+            "routingShadowQuotaKind": null,
         })))
         .unwrap_or_default();
         assert!(routing_patch_is_empty(&extra));
@@ -390,6 +394,7 @@ mod tests {
             "routingBreakerThreshold": 7,
             "routingBreakerTimeoutSeconds": 120,
             "routingBreakerSuccessThreshold": 3,
+            "routingShadowQuotaKind": false,
         })))
         .unwrap_or_default();
         assert_eq!(patch.sticky, Some(StickyMode::Session));
@@ -399,6 +404,7 @@ mod tests {
         assert_eq!(patch.breaker_threshold, Some(7));
         assert_eq!(patch.breaker_timeout_seconds, Some(120));
         assert_eq!(patch.breaker_success_threshold, Some(3));
+        assert_eq!(patch.shadow_quota_kind, Some(false));
     }
 
     #[test]

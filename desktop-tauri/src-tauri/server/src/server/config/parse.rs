@@ -678,6 +678,51 @@ pub(super) fn routing_from(map: &Map<String, Value>) -> RoutingSettings {
             ROUTING_BREAKER_MIN_SUCCESS,
             ROUTING_BREAKER_MAX_SUCCESS,
         ),
+        shadow_quota_kind: bool_field(KEY_ROUTING_SHADOW_QUOTA_KIND, defaults.shadow_quota_kind),
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    //! 路由设置的默认值与解析口径。
+    //!
+    //! `shadow_quota_kind` 的默认值必须是 **true**：它是「新 rest 行为先只观察、
+    //! 不改变选路」的影子开关，默认 false 等于一升级就把 Task 1.3 的新作用域
+    //! 直接推到所有存量安装上 —— 那不是影子模式，而是全量切换。
+
+    use super::*;
+    use serde_json::json;
+
+    fn object(value: Value) -> Map<String, Value> {
+        match value {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        }
+    }
+
+    #[test]
+    fn shadow_quota_kind_defaults_true() {
+        assert!(RoutingSettings::default().shadow_quota_kind);
+    }
+
+    #[test]
+    fn shadow_quota_kind_missing_keeps_the_default() {
+        assert!(routing_from(&Map::new()).shadow_quota_kind);
+    }
+
+    #[test]
+    fn shadow_quota_kind_parses_an_explicit_false() {
+        let settings = routing_from(&object(json!({ "routingShadowQuotaKind": false })));
+        assert!(!settings.shadow_quota_kind, "显式关掉影子模式必须读得出来");
+    }
+
+    #[test]
+    fn shadow_quota_kind_wrong_type_falls_back_to_true() {
+        let settings = routing_from(&object(json!({ "routingShadowQuotaKind": "false" })));
+        assert!(
+            settings.shadow_quota_kind,
+            "类型写坏 = 没配，必须回落默认（true），而不是按字符串内容猜"
+        );
     }
 }
 

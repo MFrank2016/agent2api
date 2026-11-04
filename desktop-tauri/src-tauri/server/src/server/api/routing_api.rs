@@ -126,6 +126,7 @@ pub(crate) fn routing_json(settings: config::RoutingSettings) -> Value {
         config::KEY_ROUTING_BREAKER_THRESHOLD: settings.breaker_threshold,
         config::KEY_ROUTING_BREAKER_TIMEOUT: settings.breaker_timeout_seconds,
         config::KEY_ROUTING_BREAKER_SUCCESS: settings.breaker_success_threshold,
+        config::KEY_ROUTING_SHADOW_QUOTA_KIND: settings.shadow_quota_kind,
     })
 }
 

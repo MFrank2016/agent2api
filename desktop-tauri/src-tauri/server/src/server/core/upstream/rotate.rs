@@ -545,6 +545,12 @@ pub(super) fn vendor_identity(provider_id: &str) -> String {
 /// 返回值就是**落库用的 `resetAt`**：内存 rest 与 `rateLimits` 必须同一个
 /// 截止时刻（理由见 [`mark_account_limited`]）。
 ///
+/// ── 影子模式（`routingShadowQuotaKind`，默认开）──────────────
+/// 开着时**只算截止时刻、不写 rest 表**：调用方照旧把它落进 `rateLimits`
+/// （reason / scope 一起记），选路仍只按落库条目 + 限流垫底判定 —— 分类判据
+/// 在真流量上还没验够，升级不能新增一层会改变选路的 rest。关掉后三条映射才
+/// 真正生效。
+///
 /// [`RouteState::account_rest_mark`]: super::route_state::RouteState::account_rest_mark
 fn apply_quota_rest(
     service: &UpstreamService,
@@ -555,20 +561,27 @@ fn apply_quota_rest(
     retry_after_ms: Option<i64>,
 ) -> i64 {
     let now = logging::now_ms();
+    let shadow = config::routing_settings().shadow_quota_kind;
     match kind {
         QuotaKind::Credit | QuotaKind::Verification => {
             let until = reset_at.unwrap_or_else(|| now.saturating_add(ACCOUNT_REST_MS));
-            service.route.account_rest_mark(account_id, until);
+            if !shadow {
+                service.route.account_rest_mark(account_id, until);
+            }
             until
         }
         QuotaKind::Rate => {
             let until = now.saturating_add(retry_after_ms.unwrap_or(RATE_REST_MS));
-            service.route.rest_mark(account_id, model, until);
+            if !shadow {
+                service.route.rest_mark(account_id, model, until);
+            }
             until
         }
         QuotaKind::Quota | QuotaKind::Plan => {
             let until = reset_at.unwrap_or_else(|| now.saturating_add(QUOTA_REST_MS));
-            service.route.rest_mark(account_id, model, until);
+            if !shadow {
+                service.route.rest_mark(account_id, model, until);
+            }
             until
         }
     }

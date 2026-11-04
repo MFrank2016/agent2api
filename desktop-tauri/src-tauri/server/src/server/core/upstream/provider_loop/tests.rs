@@ -355,6 +355,54 @@ fn model_rest_until(service: &UpstreamService, account_id: &str, model: &str) ->
         .unwrap_or(0)
 }
 
+/// 落库条目本身（`rateLimits[model]`；没有记录时为 `Null`）。
+fn persisted_limit(service: &UpstreamService, account_id: &str, model: &str) -> Value {
+    let snapshot = service.store.list_accounts();
+    crate::server::core::routing::accounts_of(&snapshot)
+        .iter()
+        .find(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
+        .and_then(|account| account.get("rateLimits"))
+        .and_then(|limits| limits.get(model))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// 用例串行跑：本模块改的是进程级路由设置快照（`config::update` 是非原子
+/// 读改写），与 config / think_strip / provider_options 的用例共用同一把锁。
+fn hold_config() -> std::sync::MutexGuard<'static, ()> {
+    crate::server::core::provider_options::CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 用例期间把 `routingShadowQuotaKind` 设成指定值，`Drop` 时恢复原值。
+///
+/// 影子模式是**进程级**配置：不恢复的话，任何后跑的用例都会读到本用例写下的
+/// 值（本仓已经吃过一次全局状态污染的苦，见 `api::think_strip` 的 `RestoreThink`）。
+struct ShadowQuotaKind {
+    previous: bool,
+}
+
+impl ShadowQuotaKind {
+    fn set(enabled: bool) -> Self {
+        let previous = config::routing_settings().shadow_quota_kind;
+        config::set_routing(config::RoutingPatch {
+            shadow_quota_kind: Some(enabled),
+            ..Default::default()
+        });
+        Self { previous }
+    }
+}
+
+impl Drop for ShadowQuotaKind {
+    fn drop(&mut self) {
+        let _ = config::set_routing(config::RoutingPatch {
+            shadow_quota_kind: Some(self.previous),
+            ..Default::default()
+        });
+    }
+}
+
 /// 余额不足 ⇒ **账号级硬休息**（默认 24 小时）、不写模型 rest，且落库的
 /// `resetAt` 与内存是同一个时刻。
 ///
@@ -363,6 +411,9 @@ fn model_rest_until(service: &UpstreamService, account_id: &str, model: &str) ->
 /// 落库那条放行，内存的 24 小时只是软垫底（照样会被选中）。
 #[test]
 fn quota_rest_credit_stops_the_account_not_the_model() {
+    // Task 1.4：这些用例钉的是「关掉影子模式」后的完整 rest 行为。
+    let _guard = hold_config();
+    let _shadow = ShadowQuotaKind::set(false);
     let (_dir, service, id) = temp_service();
     let now = logging::now_ms();
     rotate::mark_account_limited(
@@ -397,6 +448,9 @@ fn quota_rest_credit_stops_the_account_not_the_model() {
 /// 需要人机验证 ⇒ 与余额类同档：**账号级硬休息**（不是模型级）。
 #[test]
 fn quota_rest_verification_also_stops_the_whole_account() {
+    // Task 1.4：这些用例钉的是「关掉影子模式」后的完整 rest 行为。
+    let _guard = hold_config();
+    let _shadow = ShadowQuotaKind::set(false);
     let (_dir, service, id) = temp_service();
     rotate::mark_account_limited(
         &service,
@@ -427,6 +481,9 @@ fn quota_rest_verification_also_stops_the_whole_account() {
 /// 账号仍被硬停到截止时刻 —— 期间所有模型都被 `plan_route` 跳过，只能重启进程。
 #[test]
 fn a_successful_forward_lifts_the_account_rest() {
+    // Task 1.4：这些用例钉的是「关掉影子模式」后的完整 rest 行为。
+    let _guard = hold_config();
+    let _shadow = ShadowQuotaKind::set(false);
     let (_dir, service, id) = temp_service();
     rotate::mark_account_limited(
         &service,
@@ -457,6 +514,9 @@ fn a_successful_forward_lifts_the_account_rest() {
 /// 「点了没反应」（转发仍被硬跳过）。
 #[test]
 fn the_manual_clear_lifts_the_account_rest() {
+    // Task 1.4：这些用例钉的是「关掉影子模式」后的完整 rest 行为。
+    let _guard = hold_config();
+    let _shadow = ShadowQuotaKind::set(false);
     let (_dir, service, id) = temp_service();
     rotate::mark_account_limited(
         &service,
@@ -489,6 +549,9 @@ fn the_manual_clear_lifts_the_account_rest() {
 /// 或者内存说 60 秒、落库说 10 分钟 —— 选路按落库那条走，实际就是 10 分钟。
 #[test]
 fn quota_rest_rate_stops_only_the_model_for_a_minute() {
+    // Task 1.4：这些用例钉的是「关掉影子模式」后的完整 rest 行为。
+    let _guard = hold_config();
+    let _shadow = ShadowQuotaKind::set(false);
     let (_dir, service, id) = temp_service();
     let now = logging::now_ms();
     rotate::mark_account_limited(
@@ -532,6 +595,9 @@ fn quota_rest_rate_stops_only_the_model_for_a_minute() {
 /// 反复去撞一个当天不会再恢复的模型（生产实测两小时白撞 8 次）。
 #[test]
 fn quota_rest_quota_with_reset_stops_the_model_until_then() {
+    // Task 1.4：这些用例钉的是「关掉影子模式」后的完整 rest 行为。
+    let _guard = hold_config();
+    let _shadow = ShadowQuotaKind::set(false);
     let (_dir, service, id) = temp_service();
     let now = logging::now_ms();
     let reset_at = now + 3 * 60 * 60 * 1000;
@@ -563,6 +629,115 @@ fn quota_rest_quota_with_reset_stops_the_model_until_then() {
     );
 }
 
+// ── 影子模式开关（Task 1.4）───────────────────────────────────────────────
+//
+// Task 1.3 的新作用域在真流量上的判据还没攒够：分类错一次的代价是「整个账号
+// 被停一天」或「只停一个模型、换个模型继续白撞」。`routingShadowQuotaKind`
+// 默认开，让 `rateLimits` 先把分类结果（reason / scope）记下来供观察，而选路
+// 状态保持升级前的行为；关掉后才按分类真正写 rest。
+
+/// 默认（影子开）：**只落 `rateLimits`**，不写账号级 / 模型级 rest。
+///
+/// 反了会怎样：升级即全量切换 —— 一个尚未验证的分类判据直接改变所有账号的
+/// 选路，且用户没有任何开关可以退回去。
+#[test]
+fn shadow_mode_records_the_limit_without_touching_route_state() {
+    let _guard = hold_config();
+    let _shadow = ShadowQuotaKind::set(true);
+    let (_dir, service, id) = temp_service();
+    let now = logging::now_ms();
+    rotate::mark_account_limited(
+        &service,
+        &id,
+        "m-shadow-credit",
+        429,
+        None,
+        None,
+        "上游返回 429: 余额不足或无可用资源包",
+        "custom-credit",
+        None,
+    );
+    // 落库条目仍要带分类字段：影子模式观察的正是这些值
+    let entry = persisted_limit(&service, &id, "m-shadow-credit");
+    assert!(!entry.is_null(), "影子模式下 rateLimits 仍必须落库");
+    assert_eq!(
+        entry.get("reason").and_then(Value::as_str),
+        Some("credit"),
+        "reason 必须记下来（影子模式的观察对象）"
+    );
+    assert_eq!(
+        entry.get("scope").and_then(Value::as_str),
+        Some("account"),
+        "scope 必须记下来（影子模式的观察对象）"
+    );
+    let persisted = rotate::account_limit_reset_at(&service, &id, "m-shadow-credit");
+    assert!(persisted > now, "落库的 resetAt 必须是未来时刻");
+    assert_eq!(
+        account_rest_until(&service, &id),
+        0,
+        "影子模式下不许写账号级 rest（选路保持旧行为）"
+    );
+    assert_eq!(
+        model_rest_until(&service, &id, "m-shadow-credit"),
+        0,
+        "影子模式下不许写模型级 rest（选路保持旧行为）"
+    );
+}
+
+/// 关掉影子模式：分类重新决定作用域 —— 余额类写账号级 rest，分钟限流写模型级。
+#[test]
+fn turning_shadow_off_restores_the_classified_rest_scopes() {
+    let _guard = hold_config();
+    let _shadow = ShadowQuotaKind::set(false);
+
+    let (_credit_dir, credit_service, credit_id) = temp_service();
+    rotate::mark_account_limited(
+        &credit_service,
+        &credit_id,
+        "m-shadow-credit",
+        429,
+        None,
+        None,
+        "上游返回 429: 余额不足或无可用资源包",
+        "custom-credit",
+        None,
+    );
+    assert!(
+        account_rest_until(&credit_service, &credit_id) > 0,
+        "关掉影子模式后，余额类必须硬停整个账号"
+    );
+    assert_eq!(
+        model_rest_until(&credit_service, &credit_id, "m-shadow-credit"),
+        0,
+        "余额类仍不该写模型级 rest"
+    );
+
+    let (_rate_dir, rate_service, rate_id) = temp_service();
+    let now = logging::now_ms();
+    rotate::mark_account_limited(
+        &rate_service,
+        &rate_id,
+        "m-shadow-rate",
+        429,
+        None,
+        None,
+        "上游返回 429: Rate limit exceeded: 20 requests per minute",
+        "openrouter",
+        Some(30_000),
+    );
+    let until = model_rest_until(&rate_service, &rate_id, "m-shadow-rate");
+    let ms = until - now;
+    assert!(
+        (29_000..=31_000).contains(&ms),
+        "关掉影子模式后，分钟限流应当只停这个模型约 30 秒，实际 {ms} 毫秒"
+    );
+    assert_eq!(
+        account_rest_until(&rate_service, &rate_id),
+        0,
+        "分钟限流不该让整个账号休息"
+    );
+}
+
 /// 200 + 正文配额拒绝的记账必须落在**上游真名**上（不是客户端请求名）。
 ///
 /// 反了会怎样：`rateLimits` 写在一个没人读的键上 —— 判定侧
@@ -571,6 +746,9 @@ fn quota_rest_quota_with_reset_stops_the_model_until_then() {
 /// 只能人工去账号页清。改前正是这样（传的是 `&model`）。
 #[test]
 fn body_refusal_bookkeeping_is_keyed_by_the_wire_model() {
+    // Task 1.4：这些用例钉的是「关掉影子模式」后的完整 rest 行为。
+    let _guard = hold_config();
+    let _shadow = ShadowQuotaKind::set(false);
     let (_dir, service, id) = temp_service();
     let reset_at = logging::now_ms() + 30 * 60 * 1000;
     // 请求名 `alias` 在这一家实际发出 `wire-model`（映射生效时两者不同）

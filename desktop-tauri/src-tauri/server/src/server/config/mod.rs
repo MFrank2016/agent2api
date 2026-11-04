@@ -1813,6 +1813,13 @@ pub fn set_routing(patch: RoutingPatch) -> bool {
                 .insert(KEY_ROUTING_BREAKER_SUCCESS.to_string(), Value::from(count));
             next.breaker_success_threshold = count;
         }
+        if let Some(enabled) = patch.shadow_quota_kind {
+            config.raw.insert(
+                KEY_ROUTING_SHADOW_QUOTA_KIND.to_string(),
+                Value::Bool(enabled),
+            );
+            next.shadow_quota_kind = enabled;
+        }
         config.routing = next;
     })
 }

@@ -1111,6 +1111,23 @@ pub const KEY_ROUTING_BREAKER_TIMEOUT: &str = "routingBreakerTimeoutSeconds";
 /// 恢复阈值：熔断放行后要连续成功几次才算恢复（`routingBreakerSuccessThreshold`）
 pub const KEY_ROUTING_BREAKER_SUCCESS: &str = "routingBreakerSuccessThreshold";
 
+/// **配额分类的 rest 影子模式**（`routingShadowQuotaKind`，**默认开**）。
+///
+/// 开启时，配额类失败只落**跨重启的事实**（账号记录的 `rateLimits`，含
+/// `reason` / `scope` / `retryAfterMs`），**不写**新的内存 rest 表
+/// （`RouteState::account_rest` / `model_rest`）—— 选路仍按旧行为走落库条目 +
+/// 限流垫底。关闭后，[`crate::server::core::upstream::rotate`] 的
+/// `apply_quota_rest` 才按分类把账号级 / 模型级 rest 真正落到选路状态上。
+///
+/// ── 为什么默认开 ────────────────────────────────────────────
+/// 新作用域（余额停账号 24 小时、分钟限流只停模型）在真流量上的判据还没攒够：
+/// 分类错一次的代价是「整个账号被停一天」或「只停一个模型、换个模型继续白撞」。
+/// 影子模式让 `rateLimits` 先记录分类结果供观察，选路仍只按落库条目 +
+/// 限流垫底判定（不新增内存 rest）；确认无副作用后再由用户 / 后续版本关掉它切换。
+///
+/// 本任务不提供界面开关，只保证配置 / API 可读写（`/api/routing-strategy`）。
+pub const KEY_ROUTING_SHADOW_QUOTA_KIND: &str = "routingShadowQuotaKind";
+
 pub const STICKY_OFF: &str = "off";
 pub const STICKY_TURN: &str = "turn";
 pub const STICKY_SESSION: &str = "session";
@@ -1177,6 +1194,9 @@ pub struct RoutingSettings {
     pub breaker_threshold: i64,
     pub breaker_timeout_seconds: i64,
     pub breaker_success_threshold: i64,
+    /// 配额分类的 rest 影子模式（[`KEY_ROUTING_SHADOW_QUOTA_KIND`]）：开 = 只落
+    /// `rateLimits`、不写新的账号级 / 模型级 rest；关 = 按分类改变选路状态。
+    pub shadow_quota_kind: bool,
 }
 
 impl Default for RoutingSettings {
@@ -1189,6 +1209,8 @@ impl Default for RoutingSettings {
             breaker_threshold: 5,
             breaker_timeout_seconds: 60,
             breaker_success_threshold: 2,
+            // 影子模式默认开：升级不新增内存 rest（理由见键的说明）。
+            shadow_quota_kind: true,
         }
     }
 }
@@ -1203,6 +1225,8 @@ pub struct RoutingPatch {
     pub breaker_threshold: Option<i64>,
     pub breaker_timeout_seconds: Option<i64>,
     pub breaker_success_threshold: Option<i64>,
+    /// 影子模式开关（`None` = 该项不动）
+    pub shadow_quota_kind: Option<bool>,
 }
 
 // ─── 长度截断的自动续写（autoContinue / autoContinueMaxRounds）─────────
