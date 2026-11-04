@@ -135,6 +135,12 @@ pub fn mask_outbound(payload: &str) -> Result<Option<(String, MaskSession)>, Str
 ///   - 只有 [`PlaceholderBuffer::finish`] 才把压住的字节原样吐出 —— 它本来就
 ///     不是占位符（上游被切断 / 普通方括号文本），不能吞掉。
 ///
+/// ── fail-closed：不能安全放进原始 JSON 的原文保留占位符 ──────────
+/// 原始字节这条路径没有 JSON 转义能力：原文若含 `"` / `\` / 控制字符，直接替换
+/// 会破坏 `data: {…}` 外壳（下游解析器整帧丢弃，客户端拿到 200 却少内容）。
+/// 这类值在这里**保持占位符**（不发明文、也不破坏帧），非流式出口会在 JSON
+/// 解析之后由 [`Restorer::restore_json`] 正确还原。
+///
 /// ── 为什么按字节而不是 `String` ───────────────────────────────
 /// 分片边界不保证落在 UTF-8 字符边界（中文正文很常见）。按字节扫描占位符、
 /// 其余字节原样搬运，就不会把半截汉字解码成 U+FFFD，也不会因为一片非法
@@ -208,14 +214,14 @@ impl Restorer {
         buffer.finish(&|text| session.restore(text))
     }
 
-    /// 还原一份已经解析成 JSON 的响应体（非流式出口用）。
+    /// 还原一份已经解析成 JSON 的响应体（非流式出口**唯一**的还原点）。
     ///
-    /// ── 为什么非流式还要在 Value 上再来一遍 ──────────────────────
-    /// 流式还原作用在**原始字节**上，它能修好「一个占位符被 TCP 分片切开」，
-    /// 但修不好「占位符被上游拆进两个 `delta` 事件」—— 两个事件之间夹着
-    /// `"}]}\n\ndata: {…` 这样的 JSON 外壳，原始字节里已经不是连续的一段。
+    /// ── 为什么在 Value 上还原、而不是原始字节 ────────────────────
     /// 聚合器把 `content` / `tool_calls.function.arguments` 拼回一个字符串之后，
-    /// 占位符重新变完整，所以非流式出口在**聚合完成的 body 上**再还原一次。
+    /// 占位符重新变完整 —— 无论它原来是被 TCP 分片切开，还是被上游拆进两个
+    /// `delta` 事件（后者在原始字节里夹着 `"}]}\n\ndata: {…` 外壳，已经不连续）。
+    /// 更重要的是：这里由 serde 负责转义，原文含 `"` / `\` / 控制字符也不会
+    /// 破坏 JSON（原始字节路径对这些值是 fail-closed 保留占位符）。
     ///
     /// 只改字符串值（对象键与 `mask_json` 同口径不动）；未脱敏时什么都不做。
     pub fn restore_json(&self, value: &mut Value) {
@@ -273,7 +279,8 @@ fn split_point(bytes: &[u8]) -> usize {
 /// 还原一段字节里的全部完整占位符；其余字节**原样搬运**。
 ///
 /// 只对占位符本身做 UTF-8 解码（前缀 / 后缀都是 ASCII），因此非法 UTF-8 的
-/// 正文不会被改动，也不会 panic。
+/// 正文不会被改动，也不会 panic。原文不能安全放进原始 JSON 时保留占位符
+/// （见 [`plaintext_fits_raw_json`]）。
 fn restore_placeholders(bytes: &[u8], restore: &dyn Fn(&str) -> String) -> Vec<u8> {
     let prefix = PLACEHOLDER_PREFIX.as_bytes();
     let suffix = PLACEHOLDER_SUFFIX.as_bytes();
@@ -296,7 +303,16 @@ fn restore_placeholders(bytes: &[u8], restore: &dyn Fn(&str) -> String) -> Vec<u
         let token_end = prefix.len() + end + suffix.len();
         let token = &after[..token_end];
         match std::str::from_utf8(token) {
-            Ok(text) => out.extend_from_slice(restore(text).as_bytes()),
+            // fail-closed：原文若含 `"` / `\` / 控制字符，塞进原始 `data: {…}`
+            // 字节会破坏 JSON 外壳（下游解析器整帧丢弃，客户端 200 少内容）。
+            // 这种值**不下发明文**，保留占位符 —— 非流式出口会在 JSON 解析
+            // 之后用 `Restorer::restore_json` 正确还原（那里由序列化器负责转义）。
+            Ok(text) => match restore(text) {
+                restored if plaintext_fits_raw_json(&restored) => {
+                    out.extend_from_slice(restored.as_bytes())
+                }
+                _ => out.extend_from_slice(token),
+            },
             // 占位符内部出现非法 UTF-8：原样保留，不做任何猜测
             Err(_) => out.extend_from_slice(token),
         }
@@ -304,6 +320,17 @@ fn restore_placeholders(bytes: &[u8], restore: &dyn Fn(&str) -> String) -> Vec<u
     }
     out.extend_from_slice(rest);
     out
+}
+
+/// 还原出来的原文能不能直接放进原始 SSE / JSON 字节里。
+///
+/// `"` 会提前闭合 JSON 字符串、`\` 会变成非法转义、控制字符（含换行）会截断
+/// 或拆坏 `data:` 行 —— 三者都会让下游解析器整帧失败。这类值在**原始字节**
+/// 这条路径上保持占位符（fail-closed），交给解析后的 `restore_json` 还原。
+fn plaintext_fits_raw_json(text: &str) -> bool {
+    !text
+        .bytes()
+        .any(|byte| byte == b'"' || byte == b'\\' || byte < 0x20)
 }
 
 /// 字节串里第一次出现 `needle` 的位置（`needle` 非空）。
@@ -649,5 +676,53 @@ mod tests {
         let mut restorer = Restorer::new(None);
         assert!(restorer.push(chunk).is_none());
         assert!(restorer.finish().is_empty());
+    }
+
+    /// 原文含 `"` / `\` / 控制字符时，**原始字节**路径必须保留占位符
+    /// （fail-closed）：直接替换会破坏 `data: {…}` 的 JSON 外壳。
+    /// 解析后的 JSON 路径（`restore_json`）由序列化器转义，能完整还原。
+    #[test]
+    fn unsafe_plaintext_keeps_the_placeholder_on_raw_bytes() {
+        let masker = RulesMasker::with_words(&["he said \"hi\"".to_string()]);
+        let session = masker.session();
+        let (masked, report) = session.mask_text("say he said \"hi\" now");
+        assert_eq!(report.hits.len(), 1, "{report:?}");
+
+        let restore = |text: &str| session.restore(text);
+        let mut buffer = PlaceholderBuffer::new();
+        let mut out = buffer.push(masked.as_bytes(), &restore);
+        out.extend(buffer.finish(&restore));
+        assert_eq!(
+            String::from_utf8(out).expect("样例都是 UTF-8"),
+            masked,
+            "原始字节路径不能把带引号的原文塞进 JSON"
+        );
+
+        // 解析后还原：由 serde 负责转义，原文完整回来
+        let mut value = serde_json::json!({ "content": masked });
+        Restorer::new(Some(session)).restore_json(&mut value);
+        assert_eq!(value["content"], "say he said \"hi\" now");
+    }
+
+    /// 占位符内部是非法 UTF-8：原样透传（不 panic、不改字节）。
+    #[test]
+    fn invalid_utf8_inside_placeholder_passes_through() {
+        let session = RulesMasker::default().session();
+        let restore = |text: &str| session.restore(text);
+        let chunk = b"[[A2A_MASK_\xff]]";
+        let mut buffer = PlaceholderBuffer::new();
+        let mut out = buffer.push(chunk, &restore);
+        out.extend(buffer.finish(&restore));
+        assert_eq!(out, chunk);
+    }
+
+    /// 流结束时压着的半截前缀要由 `finish` 吐出（经 `Restorer` 的接线路径）。
+    #[test]
+    fn restorer_finish_emits_held_prefix() {
+        let session = RulesMasker::default().session();
+        let mut restorer = Restorer::new(Some(session));
+        let emitted = restorer.push(b"data: tail [[A2A_M").unwrap_or_default();
+        assert_eq!(emitted, b"data: tail ");
+        assert_eq!(restorer.finish(), b"[[A2A_M");
     }
 }

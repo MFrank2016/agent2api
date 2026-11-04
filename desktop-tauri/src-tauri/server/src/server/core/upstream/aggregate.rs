@@ -145,10 +145,11 @@ async fn aggregate_frame_stream_inner(
     // 非流式总超时（默认 300 秒）才报 502（详见 `cancellable` 的说明）。
     let mut stream = cancellation::cancellable(stream, telemetry.cancel_token());
     let mut buffer = String::new();
-    // 回复还原器（Task 5.3）：按本次尝试的脱敏会话把占位符换回原文。
-    // 位置在采集之后、SSE 逐行解析之前 —— 占位符可能横跨分片，解析后再拼
-    // 就晚了。`None` 会话时逐片原样透传（字节与接入前一致）。
-    let mut restorer = crate::server::core::masking::Restorer::new(mask_session);
+    // 回复还原器（Task 5.3）：**只在聚合完成后**对 body 做还原（见文件末尾）。
+    // 不在原始字节上还原：`restore_json` 已经覆盖「占位符被分片切开 / 被拆进
+    // 两个 delta 事件」两种情形，而在解析前把明文塞回 `data: {…}` 会因为原文
+    // 含 `"` / `\` / 控制字符破坏 JSON 外壳（帧被静默丢弃 → 200 少内容）。
+    let restorer = crate::server::core::masking::Restorer::new(mask_session);
     let mut acc = CompletionAccumulator {
         rewrite: policy.rewrite,
         strip_newline_chunks: policy.strip_newline_chunks,
@@ -182,24 +183,20 @@ async fn aggregate_frame_stream_inner(
             telemetry.note_first_frame();
         }
         // 原始字节由输入侧（HTTP 字节流或协议翻译流）采集，聚合器只消费 chat 帧。
-        // 还原必须在逐行解析之前：占位符可能被分片切开（见 `masking::PlaceholderBuffer`）。
-        let restored = restorer.push(&chunk);
-        let payload: &[u8] = match restored.as_deref() {
-            Some(bytes) => bytes,
-            None => chunk.as_ref(),
-        };
-        buffer.push_str(&String::from_utf8_lossy(payload));
-        drain_lines(&mut buffer, &mut acc, &telemetry)?;
+        // 还原**不在这里做**（见 `restorer` 的说明与文件末尾的 `restore_json`）。
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        // 逐行消费（只处理到最后一个 '\n' 之前的内容）
+        while let Some(index) = buffer.find('\n') {
+            let line = buffer[..index].trim().to_string();
+            buffer.drain(..=index);
+            if line.is_empty() {
+                continue;
+            }
+            acc.consume_line(&line, &telemetry)?;
+        }
         if buffer.len() > MAX_LINE_BYTES {
             return Err(GatewayError::with_status(502, "上游返回的单行数据过大，已中断"));
         }
-    }
-    // 流结束：先把还原器压住的半截前缀原样吐出（它本来就不是占位符），
-    // 再按原有规则处理最后一段没有换行结尾的尾行
-    let rest = restorer.finish();
-    if !rest.is_empty() {
-        buffer.push_str(&String::from_utf8_lossy(&rest));
-        drain_lines(&mut buffer, &mut acc, &telemetry)?;
     }
     // 尾行（上游没以换行结尾）
     let tail = buffer.trim().to_string();
@@ -208,31 +205,11 @@ async fn aggregate_frame_stream_inner(
     }
 
     let mut completion = acc.into_completion();
-    // 非流式出口的第二次还原：占位符若被上游拆进两个 delta 事件，原始字节
-    // 里已经夹着 JSON 外壳（见 `Restorer::restore_json` 的说明），聚合把字符串
-    // 拼回来之后在这里统一还原（含 `tool_calls[].function.arguments`）。
+    // 非流式出口**唯一**的还原点：占位符无论被分片切开、还是被拆进两个 delta
+    // 事件，聚合后都已拼回完整字符串；在 Value 上还原由 serde 负责转义，
+    // 原文含 `"` / `\` / 控制字符也不会破坏 JSON（含 `tool_calls[].function.arguments`）。
     restorer.restore_json(&mut completion.body);
     Ok(completion)
-}
-
-/// 把 `buffer` 里已经完整的行逐条喂给聚合器（只消费到最后一个 `\n`）。
-///
-/// 抽成函数是为了让「每片」与「流尾冲刷」两条路径用同一份逐行逻辑 ——
-/// 两份实现一改一漏，就会出现「分片内能聚合、流尾那行被忽略」的静默差异。
-fn drain_lines(
-    buffer: &mut String,
-    acc: &mut CompletionAccumulator,
-    telemetry: &RequestTelemetry,
-) -> Result<(), GatewayError> {
-    while let Some(index) = buffer.find('\n') {
-        let line = buffer[..index].trim().to_string();
-        buffer.drain(..=index);
-        if line.is_empty() {
-            continue;
-        }
-        acc.consume_line(&line, telemetry)?;
-    }
-    Ok(())
 }
 
 /// 聚合状态（Node 的局部变量集中到这里，便于 `consume_line` 返回 Result）

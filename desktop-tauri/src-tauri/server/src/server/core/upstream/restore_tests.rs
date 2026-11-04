@@ -126,6 +126,16 @@ async fn disabled_masking_is_byte_identical() {
     assert_eq!(String::from_utf8_lossy(&out), body);
 }
 
+/// 一片流以半截前缀 `[[A2A_M` 结尾（带非空会话）：EOF 时 `finish` 必须把它
+/// 原样吐出，不能因为「可能是占位符」就吞掉正文。
+#[tokio::test]
+async fn trailing_partial_prefix_is_flushed_at_eof() {
+    let (session, _masked_text, _placeholder) = masked("key sk-abc123");
+    let body = frame(json!({"content": "tail [[A2A_M"}));
+    let out = drain(vec![body.as_bytes().to_vec()], Some(session)).await;
+    assert_eq!(String::from_utf8_lossy(&out), body, "流尾半截前缀被吞掉了");
+}
+
 /// 非流式出口：`tool_calls[].function.arguments` 里的占位符（以转义 JSON 字符串
 /// 的形态出现、且横跨两个 arguments 增量）同样要还原。
 #[tokio::test]
