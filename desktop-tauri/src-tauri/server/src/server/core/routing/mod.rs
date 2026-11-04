@@ -42,6 +42,7 @@ use crate::server::core::account_store::store_crud::{
 };
 use crate::server::core::account_store::store_util::js_truthy;
 
+pub mod seat;
 pub mod strategy;
 
 // 选路策略层的公开出口：枚举 / 运行时状态 / 带策略的挑选。
