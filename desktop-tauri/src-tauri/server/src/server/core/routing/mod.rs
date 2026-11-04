@@ -606,6 +606,12 @@ pub struct PlanMeta<'a> {
     pub sunk: &'a HashMap<String, i64>,
     /// 休息中的账号 → 休息截止时刻（失败退避）
     pub resting: &'a HashMap<String, i64>,
+    /// 账号级**硬**休息：账号 id → 恢复截止时刻。
+    ///
+    /// 与 `resting` 分工：`resting` 是网络失败的指数退避（软垫底，仍可能被
+    /// 选中试一次），本表是「余额耗尽 / 需要人机验证」这类**换模型也没用**
+    /// 的失败 —— 直接跳过，且不分模型（额度按账号算）。
+    pub account_resting: &'a HashMap<String, i64>,
     /// 模型级 rest：(账号 id, 模型) → 休息截止时刻。
     ///
     /// 与 `resting` 分工：`resting` 是**账号级**退避（对所有模型生效，只垫底），
@@ -712,6 +718,16 @@ pub fn plan_route(
                     "对该模型限流冷却中，{} 恢复（恢复后自动回来）",
                     clock_text(reset_at, now)
                 ),
+            ));
+            continue;
+        }
+        // 账号级**硬**休息（余额耗尽 / 需要人机验证）：换模型也没用，直接跳过。
+        // 与下面的 `model_resting` 分工：那边只停一格，这边停整个账号；
+        // 与函数末尾的 `resting`（软垫底）分工：那边只是排到队尾。
+        if meta.account_resting.contains_key(&id) {
+            blocked.push(entry(
+                "cooldown",
+                "额度耗尽/需要验证，恢复后自动回来".to_string(),
             ));
             continue;
         }
@@ -948,6 +964,9 @@ mod plan_tests {
         let counts = HashMap::new();
         let balances = HashMap::new();
         let limiter = HashSet::new();
+        // 账号级硬休息表在本 helper 里恒为空（要注入的用例自己建 `PlanMeta`，
+        // 见 `account_rest_hard_blocks_every_model`）
+        let account_resting = HashMap::new();
         let meta = PlanMeta {
             strategies: settings,
             state,
@@ -956,6 +975,7 @@ mod plan_tests {
             advance,
             sunk,
             resting,
+            account_resting: &account_resting,
             model_resting,
             open,
             limiter_blocked: &limiter,
@@ -1126,6 +1146,7 @@ mod plan_tests {
             advance: true,
             sunk: &empty_i,
             resting: &empty_i,
+            account_resting: &empty_i,
             model_resting: &model_resting,
             open: &empty_s,
             limiter_blocked: &limiter,
@@ -1164,6 +1185,60 @@ mod plan_tests {
                 ids(&result),
                 vec!["b", "a"],
                 "账号级 rest 应对 {model} 同样生效"
+            );
+        }
+    }
+
+    /// 账号级**硬**休息（余额耗尽 / 需要验证）对**每个**模型都直接跳过 ——
+    /// 不是「排到队尾」，而是根本不进可用清单。
+    ///
+    /// 与上面 `account_level_rest_still_applies_to_every_model`（软退避只垫底）
+    /// 是两张表、两种处置：余额耗尽时换个模型再打仍然被拒，硬跳过才不白撞。
+    #[test]
+    fn account_rest_hard_blocks_every_model() {
+        let accounts = vec![account("a", "p", 100), account("b", "p", 101)];
+        let settings = RoutingStrategySettings::default();
+        let state = RoutingState::new();
+        let empty_i = HashMap::new();
+        let empty_s = HashSet::new();
+        let empty_m: HashMap<(String, String), i64> = HashMap::new();
+        let mut account_resting = HashMap::new();
+        account_resting.insert("a".to_string(), 10_000_i64);
+        for model in ["model-1", "model-2"] {
+            let keys = CooldownKeys::new(model);
+            let counts = HashMap::new();
+            let balances = HashMap::new();
+            let limiter = HashSet::new();
+            let meta = PlanMeta {
+                strategies: &settings,
+                state: &state,
+                balances: &balances,
+                model,
+                advance: true,
+                sunk: &empty_i,
+                resting: &empty_i,
+                account_resting: &account_resting,
+                model_resting: &empty_m,
+                open: &empty_s,
+                limiter_blocked: &limiter,
+                sticky_account: None,
+            };
+            let result = plan_route(&accounts, &keys, &counts, &[], 1_000, &meta);
+            assert_eq!(
+                ids(&result),
+                vec!["b"],
+                "账号级硬休息应对 {model} 同样跳过 a"
+            );
+            let blocked = result
+                .blocked
+                .iter()
+                .find(|entry| entry.id == "a")
+                .expect("a 应被账号级硬休息跳过");
+            assert_eq!(blocked.state, "cooldown");
+            assert!(
+                blocked.reason.contains("额度耗尽/需要验证"),
+                "原因句应说明是额度/验证类硬休息：{}",
+                blocked.reason
             );
         }
     }

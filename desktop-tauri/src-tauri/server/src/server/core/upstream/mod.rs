@@ -292,13 +292,22 @@ pub(super) struct RouteTarget {
     pub decision: Option<Value>,
 }
 
-/// 队列端点要的只读事实：沉底 / 账号级休息 / 模型级休息 / 熔断。
-pub type RouteQueueFacts = (
-    HashMap<String, i64>,
-    HashMap<String, i64>,
-    HashMap<(String, String), i64>,
-    std::collections::HashSet<String>,
-);
+/// 队列端点要的只读事实：沉底 / 账号级软退避 / 账号级硬休息 / 模型级休息 / 熔断。
+///
+/// 用具名结构体而不是五元组：其中三张表的类型都是 `HashMap<String, i64>`，
+/// 元组里的位置一旦写错，编译期不会报错而语义会静默错位。
+pub struct RouteQueueFacts {
+    /// 沉底：账号 id → 沉底时刻（30 分钟内有效）
+    pub sunk: HashMap<String, i64>,
+    /// 账号级**软**退避（网络失败）：只垫底，不跳过
+    pub resting: HashMap<String, i64>,
+    /// 账号级**硬**休息（余额耗尽 / 需要验证）：对所有模型硬跳过
+    pub account_resting: HashMap<String, i64>,
+    /// 模型级 rest：(账号 id, 上游真名) → 恢复时刻，只跳过那一格
+    pub model_resting: HashMap<(String, String), i64>,
+    /// 熔断打开的账号
+    pub open: std::collections::HashSet<String>,
+}
 
 impl UpstreamService {
     pub fn new(store: AccountStore, auth: AuthService) -> Self {
@@ -314,17 +323,18 @@ impl UpstreamService {
 
     /// 路由运行期状态的**只读快照**（`api::routing` 的队列端点用）。
     ///
-    /// 返回纯 std 容器（沉底表 / 账号级休息表 / 模型级休息表 / 熔断集合），
-    /// 不把本模块的私有类型漏出去；面板只看不写，粘性查找不在此做（预演不该
-    /// 刷新会话计时）。
+    /// 返回纯 std 容器（沉底表 / 账号级软退避 / 账号级硬休息 / 模型级休息表 /
+    /// 熔断集合），不把本模块的私有类型漏出去；面板只看不写，粘性查找不在此做
+    /// （预演不该刷新会话计时）。
     pub fn route_queue_facts(&self, now: i64) -> RouteQueueFacts {
         let snapshot = self.route.snapshot("", now, 0);
-        (
-            snapshot.sunk,
-            snapshot.resting,
-            snapshot.model_resting,
-            snapshot.open,
-        )
+        RouteQueueFacts {
+            sunk: snapshot.sunk,
+            resting: snapshot.resting,
+            account_resting: snapshot.account_resting,
+            model_resting: snapshot.model_resting,
+            open: snapshot.open,
+        }
     }
 
     pub fn route_sticky_sessions(&self, model: Option<&str>, now: i64) -> Vec<Value> {

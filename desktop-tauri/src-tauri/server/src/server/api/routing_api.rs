@@ -210,17 +210,18 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
     // 面板只**看**当前状态，不做粘性查找、不推进有状态策略（游标 / LRU / 加权轮询）
     // —— 预演不该刷新任何会话的计时，也不该消耗下一次轮询
     let routing_state = state.upstream().routing();
-    let (sunk, resting, model_resting, open) = state.upstream().route_queue_facts(now);
+    let facts = state.upstream().route_queue_facts(now);
     let meta = routing::PlanMeta {
         strategies: &strategies,
         state: &routing_state,
         balances: &balances,
         model: model.as_deref().unwrap_or(""),
         advance: false,
-        sunk: &sunk,
-        resting: &resting,
-        model_resting: &model_resting,
-        open: &open,
+        sunk: &facts.sunk,
+        resting: &facts.resting,
+        account_resting: &facts.account_resting,
+        model_resting: &facts.model_resting,
+        open: &facts.open,
         limiter_blocked: &limiter_blocked,
         sticky_account: None,
     };

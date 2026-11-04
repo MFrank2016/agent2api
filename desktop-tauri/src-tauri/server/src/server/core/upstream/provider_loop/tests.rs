@@ -323,17 +323,22 @@ fn that_one_argument_is_the_divider_between_a_day_and_ten_minutes() {
 // ── 分类结果 → rest 作用域（Task 1.3）───────────────────────────────────────
 //
 // 归类（`classify_quota_kind`）只回答「这是哪一类 429」；「停谁、停多久」是
-// 编排层的事：余额 / 验证类停**整个账号**，额度 / 套餐 / 分钟限流只停**这个
-// 模型**。两类写进 `RouteState` 的两张不同表（账号级 `backoff` / 模型级
-// `model_rest`），选路侧据此分别垫底与跳过 —— 写错表的症状是「一个模型的
-// 分钟限流把整账号其他模型也关了」，或者反过来「余额耗尽只停一个模型」。
+// 编排层的事：余额 / 验证类**硬停整个账号**，额度 / 套餐 / 分钟限流只停**这个
+// 模型**。前者进 `RouteState::account_rest`（选路硬跳过，不分模型），后者进
+// `model_rest`（只跳过那一格）—— 写错表的症状是「一个模型的分钟限流把整账号
+// 其他模型也关了」，或者反过来「余额耗尽只停一个模型、换个模型继续白撞」。
+//
+// 另外钉住两条**跨层一致性**（改前它们各说各话）：
+//   · 内存 rest 与落库的 `rateLimits.resetAt` 必须是**同一个截止时刻**
+//     （选路先查落库条目，不一致时内存那份就是摆设）；
+//   · 落库/落内存的键必须是**上游真名**（请求名只在客户端那一侧成立）。
 
-/// 账号级退避的截止时刻（没有记录时为 0）。
-fn account_backoff_until(service: &UpstreamService, account_id: &str) -> i64 {
+/// 账号级**硬**休息的截止时刻（没有记录时为 0）。
+fn account_rest_until(service: &UpstreamService, account_id: &str) -> i64 {
     service
         .route
         .snapshot("", logging::now_ms(), 0)
-        .resting
+        .account_resting
         .get(account_id)
         .copied()
         .unwrap_or(0)
@@ -350,11 +355,12 @@ fn model_rest_until(service: &UpstreamService, account_id: &str, model: &str) ->
         .unwrap_or(0)
 }
 
-/// 余额不足 ⇒ **账号级**长休息（默认 24 小时），且**不**写模型级 rest。
+/// 余额不足 ⇒ **账号级硬休息**（默认 24 小时）、不写模型 rest，且落库的
+/// `resetAt` 与内存是同一个时刻。
 ///
 /// 反了会怎样：只停一个模型时，同一账号换一个模型继续打，仍然每次都被
-/// 「余额不足」拒 —— 一轮对话里白撞 N 次；反过来若这里写了模型 rest，选路
-/// 那边两张表都命中，效果虽然更狠，但语义混乱（账号页会显示一个假的模型冷却）。
+/// 「余额不足」拒 —— 一轮对话里白撞 N 次；而落库停在 10 分钟兜底时，选路按
+/// 落库那条放行，内存的 24 小时只是软垫底（照样会被选中）。
 #[test]
 fn quota_rest_credit_stops_the_account_not_the_model() {
     let (_dir, service, id) = temp_service();
@@ -370,23 +376,55 @@ fn quota_rest_credit_stops_the_account_not_the_model() {
         "custom-credit",
         None,
     );
-    let until = account_backoff_until(&service, &id);
+    let until = account_rest_until(&service, &id);
     let hours = (until - now) / 3_600_000;
     assert!(
         (23..=25).contains(&hours),
-        "余额类应当停整个账号约 24 小时，实际 {hours} 小时"
+        "余额类应当硬停整个账号约 24 小时，实际 {hours} 小时"
     );
     assert_eq!(
         model_rest_until(&service, &id, "m-credit"),
         0,
         "余额类不该再写一条模型级 rest"
     );
+    assert_eq!(
+        rotate::account_limit_reset_at(&service, &id, "m-credit"),
+        until,
+        "落库的 resetAt 必须与内存的账号级休息同一个截止时刻"
+    );
 }
 
-/// 分钟级限流 ⇒ **模型级**短 rest（`retryAfterMs` 或默认 60 秒），账号不休息。
+/// 需要人机验证 ⇒ 与余额类同档：**账号级硬休息**（不是模型级）。
+#[test]
+fn quota_rest_verification_also_stops_the_whole_account() {
+    let (_dir, service, id) = temp_service();
+    rotate::mark_account_limited(
+        &service,
+        &id,
+        "m-captcha",
+        429,
+        None,
+        None,
+        "上游返回 429: please complete the captcha to continue",
+        "custom-verify",
+        None,
+    );
+    assert!(
+        account_rest_until(&service, &id) > 0,
+        "验证类应当硬停整个账号"
+    );
+    assert_eq!(
+        model_rest_until(&service, &id, "m-captcha"),
+        0,
+        "验证类不该只停一个模型"
+    );
+}
+
+/// 分钟级限流 ⇒ **模型级**短 rest（`retryAfterMs` 或默认 60 秒），账号不休息；
+/// 落库的 `resetAt` 也必须是这 60 秒，而不是存储层的 10 分钟兜底。
 ///
-/// 反了会怎样：一次「20 requests per minute」把整个账号停 24 小时，同一账号
-/// 其他模型全部不可用 —— 这是最贵的一种误判。
+/// 反了会怎样：一次「20 requests per minute」把整个账号停 24 小时（最贵的误判），
+/// 或者内存说 60 秒、落库说 10 分钟 —— 选路按落库那条走，实际就是 10 分钟。
 #[test]
 fn quota_rest_rate_stops_only_the_model_for_a_minute() {
     let (_dir, service, id) = temp_service();
@@ -409,13 +447,24 @@ fn quota_rest_rate_stops_only_the_model_for_a_minute() {
         "分钟级限流应当只停这个模型约 60 秒，实际 {ms} 毫秒"
     );
     assert_eq!(
-        account_backoff_until(&service, &id),
+        account_rest_until(&service, &id),
         0,
         "分钟级限流不该让整个账号休息"
     );
+    let persisted = rotate::account_limit_reset_at(&service, &id, "m-rate");
+    assert_eq!(
+        persisted, until,
+        "落库的 resetAt 必须与内存的模型级 rest 同一个截止时刻"
+    );
+    assert!(
+        persisted < now + 5 * 60 * 1000,
+        "落库不该退回 10 分钟兜底（实际 {} 秒）",
+        (persisted - now) / 1000
+    );
 }
 
-/// 额度类 + 上游给了重置时刻 ⇒ 模型级 rest **停到那一刻**（不是 10 分钟兜底）。
+/// 额度类 + 上游给了重置时刻 ⇒ 模型级 rest **停到那一刻**（不是 10 分钟兜底），
+/// 落库同一个值。
 ///
 /// 反了会怎样：日池 / 套餐额度的恢复时刻被兜底常量覆盖，账号按 10 分钟的节拍
 /// 反复去撞一个当天不会再恢复的模型（生产实测两小时白撞 8 次）。
@@ -441,10 +490,150 @@ fn quota_rest_quota_with_reset_stops_the_model_until_then() {
         "额度类的模型 rest 应当停到上游给的重置时刻"
     );
     assert_eq!(
-        account_backoff_until(&service, &id),
+        account_rest_until(&service, &id),
         0,
         "额度类只停模型，不停整个账号"
     );
+    assert_eq!(
+        rotate::account_limit_reset_at(&service, &id, "m-quota"),
+        reset_at,
+        "落库的 resetAt 与内存的模型级 rest 必须一致"
+    );
+}
+
+/// 200 + 正文配额拒绝的记账必须落在**上游真名**上（不是客户端请求名）。
+///
+/// 反了会怎样：`rateLimits` 写在一个没人读的键上 —— 判定侧
+/// （`plan_route` → `rate_limit_reset_at`）与清除侧（成功转发后的
+/// `cap_cleared`）都按真名查，于是「标记了却永不生效、也永不清除」，
+/// 只能人工去账号页清。改前正是这样（传的是 `&model`）。
+#[test]
+fn body_refusal_bookkeeping_is_keyed_by_the_wire_model() {
+    let (_dir, service, id) = temp_service();
+    let reset_at = logging::now_ms() + 30 * 60 * 1000;
+    // 请求名 `alias` 在这一家实际发出 `wire-model`（映射生效时两者不同）
+    mark_body_refusal_limited(
+        &service,
+        &id,
+        "wire-model",
+        Some(reset_at),
+        "上游返回 200: 额度耗尽",
+        "custom-refusal",
+    );
+    assert_eq!(
+        model_rest_until(&service, &id, "wire-model"),
+        reset_at,
+        "模型级 rest 必须记在真名上"
+    );
+    assert_eq!(
+        model_rest_until(&service, &id, "alias"),
+        0,
+        "请求名上不该有任何 rest（没人按它查）"
+    );
+    assert_eq!(
+        rotate::account_limit_reset_at(&service, &id, "wire-model"),
+        reset_at,
+        "落库条目也必须记在真名上"
+    );
+    assert_eq!(
+        rotate::account_limit_reset_at(&service, &id, "alias"),
+        0,
+        "请求名上不该有落库条目"
+    );
+}
+
+/// 调用点本身也钉一次：`attempt_queue` 的正文拒绝分支必须把 `&wire_model`
+/// 交给记账函数。
+///
+/// ── 为什么这里读源码 ─────────────────────────────────────────
+/// 上一条件用覆盖的是「记账函数按真名落键」，覆盖不到「调用点传了谁」——
+/// 而 Finding 1 的全部内容就是调用点传了 `&model`。这条路径又没法端到端跑：
+/// 正文配额标记由插件适配器声明（`stream_refusal_markers`），网关内置适配器
+/// 一个都不声明，测试进程里没有能触发它的适配器。于是退一步钉住那一行实参：
+/// 它一旦改回请求名，这条用例立刻红，而不是等生产上「标了却永不生效」。
+#[test]
+fn the_refusal_call_site_passes_the_wire_model() {
+    let source = include_str!("../provider_loop.rs");
+    let call = source
+        .split("let reset_text = mark_body_refusal_limited(")
+        .nth(1)
+        .expect("正文拒绝分支应当调用 mark_body_refusal_limited");
+    let args = &call[..call.find(");").expect("调用应当以 ); 结束")];
+    assert!(
+        args.contains("&wire_model"),
+        "调用点必须传上游真名（判定侧按它查）：{args}"
+    );
+    assert!(
+        !args.contains("&model,"),
+        "调用点不能传客户端请求名（没人按它查）：{args}"
+    );
+}
+
+/// 调用点同样钉一次：自定义提供商分支必须传**解析后的厂商身份**，不是 id 本身。
+///
+/// 理由与上一条同款（读源码，因为这条分支要真实的自定义家配置与出网替身）：
+/// 解析本身由 `custom_zhipu_vendor_resolves_to_the_balance_scheme` 覆盖，这里
+/// 只钉「调用点有没有用它」。改回 `&custom_provider_id` 时智谱 1113 特例对
+/// 自定义家重新变成死代码，而任何单测都不会红 —— 所以在这里红。
+#[test]
+fn the_custom_call_site_resolves_the_vendor_identity() {
+    let source = include_str!("../provider_loop.rs");
+    // 文件里第一处 `rotate::mark_account_limited(` 就是自定义分支
+    let call_start = source
+        .find("rotate::mark_account_limited(")
+        .expect("自定义分支应当记账");
+    let call = &source[call_start..];
+    let args = &call[..call.find(");").expect("调用应当以 ); 结束")];
+    assert!(
+        args.contains("&vendor"),
+        "自定义分支应当传解析后的厂商身份：{args}"
+    );
+    let window = &source[call_start.saturating_sub(400)..call_start];
+    assert!(
+        window.contains("let vendor = rotate::vendor_identity(&custom_provider_id);"),
+        "厂商身份必须由余额方案解析（否则智谱 1113 特例对自定义家永远不命中）"
+    );
+}
+
+/// 自定义家的厂商身份先解析成**余额方案**（`zhipu`），智谱 1113 特例才活着。
+///
+/// 反了会怎样：自定义 provider id 是 `custom-0c8cd27f7e10` 这类用户自取的串，
+/// `ZHIPU_VENDORS` 永远不匹配 ⇒「业务码 1113 + 文案里没有关键词」的余额耗尽
+/// 会被判成 `Quota`（只停一个模型），账号换个模型继续被拒。
+#[test]
+fn custom_zhipu_vendor_resolves_to_the_balance_scheme() {
+    use crate::server::core::custom_providers;
+    use crate::server::core::providers::error_kind::{classify_quota_kind, QuotaKind};
+
+    let key = custom_providers::KEY_CUSTOM_PROVIDERS;
+    let previous = crate::server::config::with_raw(|raw| raw.get(key).cloned());
+    crate::server::config::update_raw_field(
+        key,
+        json!([{ "id": "custom-zhipu-test", "name": "智谱", "balanceScheme": "zhipu" }]),
+    );
+
+    // 内置家：身份就是 provider id 本身
+    assert_eq!(rotate::vendor_identity("workbuddy"), "workbuddy");
+    // 自定义家：先问余额方案
+    let vendor = rotate::vendor_identity("custom-zhipu-test");
+    assert_eq!(vendor, "zhipu", "自定义家的厂商身份应当是余额方案");
+    assert_eq!(
+        classify_quota_kind(429, Some(1113), "", &vendor),
+        QuotaKind::Credit,
+        "解析后的厂商身份必须让智谱 1113 判成 Credit（账号级）"
+    );
+    // 没接余额查询的自定义家：回落 provider id 本身
+    assert_eq!(rotate::vendor_identity("custom-plain"), "custom-plain");
+
+    // 还原全局配置（本用例只借这一次读；别的用例可能同时读同一个键）
+    match previous {
+        Some(Some(value)) => {
+            crate::server::config::update_raw_field(key, value);
+        }
+        _ => {
+            crate::server::config::update_raw_field(key, json!([]));
+        }
+    }
 }
 
 const APIG_TOO_LARGE_BODY: &str = r#"{"error_msg":"Request entity too large","error_code":"APIG.0201","request_id":"apig-test"}"#;

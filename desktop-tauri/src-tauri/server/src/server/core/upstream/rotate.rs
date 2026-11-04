@@ -193,6 +193,7 @@ pub(super) async fn select_target_account(
         advance,
         sunk: &snap.sunk,
         resting: &snap.resting,
+        account_resting: &snap.account_resting,
         model_resting: &snap.model_resting,
         open: &snap.open,
         limiter_blocked: &balance_blocked_ids,
@@ -440,10 +441,10 @@ pub(super) fn with_proxy_notice(
 /// `SendBody::wire_model` 取（见 `upstream::payload`）。传请求名会把冷却写在
 /// 上游永远不会记额度的键上，判定侧也就查不到它（见 `routing::CooldownKeys`）。
 ///
-/// `vendor` 是**厂商身份**（内置 provider id，或自定义提供商的 id），只用于
-/// [`classify_quota_kind`] 的厂商特例（如智谱 1113 不带词表关键词）；
-/// `retry_after_ms` 是上游 `Retry-After` 换算出的毫秒数，只有分钟级限流会用它
-/// 决定模型 rest 的长度。
+/// `vendor` 是**厂商身份**（内置 provider id，或自定义提供商的余额方案 /
+/// preset key —— 见 [`vendor_identity`]），只用于 [`classify_quota_kind`] 的
+/// 厂商特例（如智谱 1113 不带词表关键词）；`retry_after_ms` 是上游
+/// `Retry-After` 换算出的毫秒数，只有分钟级限流会用它决定模型 rest 的长度。
 ///
 /// ── 落库 + 落内存，两件事一起做 ────────────────────────────
 /// 落库的 `rateLimits`（`mark_rate_limited`）是**跨重启**的事实，账号页的
@@ -474,9 +475,9 @@ pub(super) fn mark_account_limited(
     };
     // 归类交给 `classify_quota_kind`（词表 + 厂商特例），落进条目的 reason/scope。
     let kind = classify_quota_kind(status as u16, upstream_code, message, vendor);
-    // rest 的**作用域**由分类决定（见 `apply_quota_rest`）：余额 / 验证类停
-    // 整个账号，额度 / 套餐 / 分钟限流只停这个模型。
-    apply_quota_rest(
+    // rest 的**作用域与截止时刻**由分类决定（见 `apply_quota_rest`）：余额 /
+    // 验证类停整个账号，额度 / 套餐 / 分钟限流只停这个模型。
+    let until = apply_quota_rest(
         service,
         account_id,
         model,
@@ -489,11 +490,10 @@ pub(super) fn mark_account_limited(
         model,
         status as i64,
         upstream_code,
-        if parsed > 0 {
-            Some(parsed as f64)
-        } else {
-            None
-        },
+        // 落库的恢复时刻与内存里的 rest **用同一个值**：选路先查落库条目
+        // （`plan_route` 的 `rate_limit_reset_at`），两边不一致时以它为准，
+        // 内存那份就成了摆设（改前 Rate 落 10 分钟兜底、Credit 只软垫底）。
+        Some(until as f64),
         message,
         kind,
         retry_after_ms,
@@ -507,18 +507,45 @@ pub(super) fn mark_account_limited(
     }
 }
 
-/// 把一次配额类失败落到正确的 **rest 作用域**。
+/// 额度耗尽 / 需要人机验证时，账号级硬休息的默认时长（24 小时）。
+///
+/// 比模型级兜底（10 分钟）长得多：这两类失败「等一会儿」不会好，得有人去
+/// 充值 / 过验证；短休息只会让同一个账号按分钟节拍被反复撞。
+const ACCOUNT_REST_MS: i64 = 24 * 3600 * 1000;
+/// 额度类（`Quota` / `Plan`）给不出恢复时刻时的模型级 rest（10 分钟）。
+///
+/// 与存储层兜底同一常量（`account_store::mark_rate_limited` 的 `10 * 60 * 1000`）：
+/// 落库与内存必须是同一个截止时刻，否则选路按落库那条走、内存这份白写。
+const QUOTA_REST_MS: i64 = 10 * 60 * 1000;
+/// 分钟级限流没给 `Retry-After` 时的模型级 rest（60 秒）。
+const RATE_REST_MS: i64 = 60_000;
+
+/// 一次失败所属的**厂商身份**：内置 provider id，或自定义提供商的余额方案 /
+/// preset key（`zhipu` / `zhipu_zai` / `glm` / `glm-cn` 这类）。
+///
+/// 自定义家的 provider id 是用户自取的（`custom-0c8cd27f7e10`），直接拿它当
+/// 厂商身份会让 [`classify_quota_kind`] 的厂商特例（智谱 1113 不带关键词）
+/// 永远不命中 —— 那条特例认的是**上游身份**，所以先问余额方案，问不到
+/// （这一家没接余额查询）才回落 id 本身。
+pub(super) fn vendor_identity(provider_id: &str) -> String {
+    crate::server::core::custom_providers::balance_scheme_of(provider_id)
+        .unwrap_or_else(|| provider_id.to_string())
+}
+
+/// 把一次配额类失败落到正确的 **rest 作用域**，返回统一的恢复时刻。
 ///
 /// ── 三条映射（口径见 `error_kind` 的模块头）─────────────────
-///   · `Credit` / `Verification`：账号级 —— 充值或人工处理之前，这个账号的
-///     **任何**模型都救不回来，只停一个模型等于让同一轮请求换个模型再撞一次。
-///     上游没给恢复时刻时按 24 小时（一天后再试，比 10 分钟更贴近「等人处理」）；
+///   · `Credit` / `Verification`：账号级**硬休息**（[`RouteState::account_rest_mark`]）
+///     —— 充值或人工处理之前，这个账号的**任何**模型都救不回来，只停一个模型
+///     等于让同一轮请求换个模型再撞一次。上游没给恢复时刻时按 24 小时；
 ///   · `Quota` / `Plan`：模型级 —— 额度按模型计，停到上游给的重置时刻，
 ///     给不出时 10 分钟（与存储层兜底同一常量）；
 ///   · `Rate`：模型级短休息 —— `Retry-After` 换算值，没有就 60 秒。
 ///
-/// 两种作用域写进 `RouteState` 的两张表（账号级 `backoff` / 模型级
-/// `model_rest`），选路侧分别垫底与跳过。
+/// 返回值就是**落库用的 `resetAt`**：内存 rest 与 `rateLimits` 必须同一个
+/// 截止时刻（理由见 [`mark_account_limited`]）。
+///
+/// [`RouteState::account_rest_mark`]: super::route_state::RouteState::account_rest_mark
 fn apply_quota_rest(
     service: &UpstreamService,
     account_id: &str,
@@ -526,20 +553,23 @@ fn apply_quota_rest(
     kind: QuotaKind,
     reset_at: Option<i64>,
     retry_after_ms: Option<i64>,
-) {
+) -> i64 {
     let now = logging::now_ms();
     match kind {
         QuotaKind::Credit | QuotaKind::Verification => {
-            let until = reset_at.unwrap_or(now + 24 * 3600 * 1000);
-            service.route.backoff_mark_until(account_id, until);
+            let until = reset_at.unwrap_or_else(|| now.saturating_add(ACCOUNT_REST_MS));
+            service.route.account_rest_mark(account_id, until);
+            until
         }
         QuotaKind::Rate => {
-            let until = now + retry_after_ms.unwrap_or(60_000);
+            let until = now.saturating_add(retry_after_ms.unwrap_or(RATE_REST_MS));
             service.route.rest_mark(account_id, model, until);
+            until
         }
         QuotaKind::Quota | QuotaKind::Plan => {
-            let until = reset_at.unwrap_or(now + 10 * 60 * 1000);
+            let until = reset_at.unwrap_or_else(|| now.saturating_add(QUOTA_REST_MS));
             service.route.rest_mark(account_id, model, until);
+            until
         }
     }
 }
@@ -745,6 +775,7 @@ pub(super) fn pick_next_account(
         advance: false,
         sunk: &snap.sunk,
         resting: &snap.resting,
+        account_resting: &snap.account_resting,
         model_resting: &snap.model_resting,
         open: &snap.open,
         limiter_blocked: &balance_blocked_ids,

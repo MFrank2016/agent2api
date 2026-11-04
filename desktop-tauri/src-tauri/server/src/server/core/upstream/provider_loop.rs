@@ -721,6 +721,10 @@ async fn attempt_queue(
                                     &custom_provider_id,
                                     &model,
                                 );
+                                // 厂商身份先解析成上游身份（自定义家的 id 是用户
+                                // 自取的，认不出「智谱 1113」这类厂商特例，见
+                                // `rotate::vendor_identity`）
+                                let vendor = rotate::vendor_identity(&custom_provider_id);
                                 rotate::mark_account_limited(
                                     service,
                                     &account_id,
@@ -729,7 +733,7 @@ async fn attempt_queue(
                                     error.upstream_code,
                                     None,
                                     &error.message,
-                                    &custom_provider_id,
+                                    &vendor,
                                     None,
                                 );
                                 // 与内置家的动作 1 同款：还有额度时被 429 的
@@ -1808,18 +1812,15 @@ async fn attempt_queue(
                     if is_quota {
                         if let Some(account_id) = &target.account_id {
                             refusal_reset_at = parse_quota_reset_at(&upstream_text);
-                            let reset_text = rotate::mark_account_limited(
+                            // 冷却键用**上游真名**（`wire_model`），不是请求名 ——
+                            // 理由见 `mark_body_refusal_limited` 的说明。
+                            let reset_text = mark_body_refusal_limited(
                                 service,
                                 account_id,
-                                &model,
-                                429,
-                                None,
+                                &wire_model,
                                 if refusal_reset_at > 0 { Some(refusal_reset_at) } else { None },
                                 &message,
                                 provider_id,
-                                // 正文拒绝这条路上没有响应头（200 + 正文），
-                                // 恢复时刻只可能来自正文解析。
-                                None,
                             );
                             logging::console_line(
                                 "[Upstream]",
@@ -2109,6 +2110,38 @@ fn log_aggregated(aggregated: &super::aggregate::AggregatedCompletion) {
             aggregated.chunk_count
         ),
     );
+}
+
+/// 200 + 正文配额拒绝的记账：冷却键必须是**上游真名**。
+///
+/// ── 为什么单独成函数 ──────────────────────────────────────────
+/// 这里传错模型名不会有任何报错：`rateLimits` 会落在客户端请求名上，而判定侧
+/// （`plan_route` 的 `rate_limit_reset_at`）与清除侧（`cap_cleared`）都按**真名**
+/// 查 —— 于是「标记了却永不生效、也永不清除」，只能靠人工去账号页清。单独成
+/// 函数后，「用哪个名字」这条口径有了一个可断言的落点（见 tests 的
+/// `body_refusal_bookkeeping_is_keyed_by_the_wire_model`）。
+///
+/// `vendor` 与 [`mark_conversation_limited`] 同口径：厂商身份，不是 provider id。
+fn mark_body_refusal_limited(
+    service: &UpstreamService,
+    account_id: &str,
+    wire_model: &str,
+    reset_at: Option<i64>,
+    message: &str,
+    vendor: &str,
+) -> String {
+    rotate::mark_account_limited(
+        service,
+        account_id,
+        wire_model,
+        429,
+        None,
+        reset_at,
+        message,
+        vendor,
+        // 正文拒绝这条路上没有响应头（200 + 正文），恢复时刻只可能来自正文解析。
+        None,
+    )
 }
 
 /// 会话式路径的限额记账：把适配器分类出的**恢复时刻原样**带到存储层。

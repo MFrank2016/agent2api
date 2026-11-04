@@ -92,6 +92,13 @@ pub(super) struct RouteState {
     sink: Mutex<HashMap<String, i64>>,
     /// 熔断：账号 id → 状态
     breaker: Mutex<HashMap<String, BreakerEntry>>,
+    /// 账号级硬休息：账号 id → 恢复时刻。
+    ///
+    /// 与 [`Self::backoff`] 的区别在**语义**而不是键：`backoff` 是「刚失败过，
+    /// 先让一让」（软垫底，仍可能被选中试一次），本表是「这个账号在恢复前
+    /// 根本答不了」（余额耗尽 / 需要人机验证）—— 选路对它是**硬跳过**，
+    /// 换哪个模型都一样（额度按账号算，换模型仍然被拒）。
+    account_rest: Mutex<HashMap<String, i64>>,
     /// 模型级 rest：键 = (account_id, model)，与账号级 backoff 分开。
     ///
     /// 上游的 429 常常只针对一个模型（额度 / 分钟限额按模型计），把整个账号
@@ -109,6 +116,8 @@ pub(super) struct RouteSnapshot {
     pub sunk: HashMap<String, i64>,
     /// 休息中的账号（值 = 休息截止时刻）
     pub resting: HashMap<String, i64>,
+    /// 账号级硬休息：账号 id → 恢复截止时刻（选路硬跳过，不分模型）。
+    pub account_resting: HashMap<String, i64>,
     /// 模型级 rest：(账号 id, 模型) → 休息截止时刻。
     ///
     /// `snapshot`（不点名模型）装整张表，由 `plan_route` 按自己的 `meta.model`
@@ -450,26 +459,20 @@ impl RouteState {
         entry.until
     }
 
-    /// 把账号级退避的截止时刻**直接**定到 `until`（不累加失败笔数）。
+    /// 记一笔账号级**硬休息**：恢复时刻之前，这个账号对所有模型都不可用。
     ///
     /// ── 与 [`Self::backoff_mark`] 的分工 ────────────────────────
-    /// 两张表是同一张（选路对「这个账号整体在休息」只认一条口径），区别只在
-    /// **时长从哪来**：`backoff_mark` 是网络失败的指数退避（15 分钟起、连续
-    /// 失败翻倍），这里是上游明确告知的恢复时刻 —— 余额耗尽 / 需要人机验证
-    /// 这类「等多久都没用，得有人去处理」的失败。
+    /// `backoff_mark` 是网络失败的指数退避（15 分钟起、连续失败翻倍），选路
+    /// 只把它当**软垫底**（排到队尾，仍可能被选中试一次）；本表是上游明确
+    /// 告知「这个账号现在答不了」—— 余额耗尽 / 需要人机验证 —— 选路对它
+    /// **硬跳过**，因为换模型也没用（额度按账号算）。
     ///
-    /// 所以这里**不动 `strikes`**：一条业务拒绝不是一次「连续失败」，把它记成
-    /// 一笔会让后续真正的网络失败平白多翻一倍。已有笔数原样保留（不重置），
-    /// 因为那是这个账号此前确实失败过的历史，不该被一次业务拒绝抹掉。
-    pub(super) fn backoff_mark_until(&self, account_id: &str, until: i64) {
-        let Ok(mut table) = self.backoff.lock() else {
-            return;
-        };
-        let strikes = table
-            .get(account_id)
-            .map(|entry| entry.strikes)
-            .unwrap_or(0);
-        table.insert(account_id.to_string(), BackoffEntry { until, strikes });
+    /// 所以这里**不动 `strikes`**：一条业务拒绝不是一次「连续失败」，记成
+    /// 一笔会让后续真正的网络失败平白多翻一倍。
+    pub(super) fn account_rest_mark(&self, account_id: &str, until: i64) {
+        if let Ok(mut table) = self.account_rest.lock() {
+            table.insert(account_id.to_string(), until);
+        }
     }
 
     /// 记一笔模型级 rest（只盖住 `(account_id, model)` 这一格）。
@@ -595,6 +598,17 @@ impl RouteState {
         // 装整张表，由 `plan_route` 按自己的 `meta.model` 查；点名时只装该模型
         // 的条目（队列端点按模型预演时省掉无关的键）。到点自动失效，与
         // resting / open 同款。
+        let account_resting = self
+            .account_rest
+            .lock()
+            .map(|table| {
+                table
+                    .iter()
+                    .filter(|(_, until)| **until > now)
+                    .map(|(id, until)| (id.clone(), *until))
+                    .collect()
+            })
+            .unwrap_or_default();
         let model_resting = self
             .model_rest
             .lock()
@@ -611,6 +625,7 @@ impl RouteState {
             sticky_hit,
             sunk,
             resting,
+            account_resting,
             model_resting,
             open,
         }
