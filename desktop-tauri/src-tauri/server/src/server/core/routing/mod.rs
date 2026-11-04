@@ -252,11 +252,35 @@ pub fn max_accounts_of(account: &Value) -> u64 {
         .min(MAX_ACCOUNTS_LIMIT)
 }
 
-/// 逐家的「储备位次」标记：前 `max_accounts` 个可用账号保持可用，其余为储备
-/// （前面的账号都不可用才轮到）。`max_accounts == 0` = **不限**，全 false。
+/// 把账号记录上的 `maxAccounts` 汇总成**逐家**上限：同一 provider 取该家所有
+/// 账号里**最小的非零值**（0 = 不限，不参与取最小）。全为 0 的家不出现在表里
+/// （= 不限）。
 ///
-/// 储备只影响**状态标注**，不改变排序 —— 转发仍按整条清单从头往后找，只是
-/// 界面把超出上限的位次标成「储备」。上限是逐家口径，见 [`PlanMeta::max_accounts`]。
+/// 为什么取最小非零：`maxAccounts` 存在每条账号记录上，同一家不同账号可能填了
+/// 不同的值（手改 / 旧数据 / 批量编辑）。选路只能执行一个数，取最小的那个是
+/// 唯一不会**超出**任何一条账号声明的口径；全 0 说明这家没设上限。
+pub fn max_accounts_by_provider(accounts: &[Value]) -> HashMap<String, u64> {
+    let mut caps: HashMap<String, u64> = HashMap::new();
+    for account in accounts {
+        let cap = max_accounts_of(account);
+        if cap == 0 {
+            continue;
+        }
+        caps.entry(provider_of(account).to_string())
+            .and_modify(|current| *current = (*current).min(cap))
+            .or_insert(cap);
+    }
+    caps
+}
+
+/// 逐家的「储备位次」标记：前 `max_accounts` 个可用账号保持可用，其余为储备。
+/// `max_accounts == 0` = **不限**，全 false。
+///
+/// 储备是**本次调用**的标记，不是账号的永久属性：应用后 [`plan_route`] 会把
+/// 所有 `reserve` 稳定后置到 `ordered` 末尾，因此线性转发一定先走完本家 / 跨家
+/// 的全部 `usable` 位次，才会轮到储备。重试时前面的 kept 已进 `tried` / `blocked`，
+/// 重新计算后原来的储备会被提升为 `usable` —— 这正是「前面的都不可用才使用」
+/// 的实现方式，不跨调用保存原始 kept 集合。
 fn reserve_flags(len: usize, max_accounts: u64) -> Vec<bool> {
     if max_accounts == 0 {
         return vec![false; len];
@@ -641,7 +665,11 @@ pub struct PlanMeta<'a> {
     /// provider id → 该家**同时使用**的账号数上限（`maxAccounts`；0 / 缺键 = 不限）。
     ///
     /// 用**逐家**表而非单个数字：跨家队列里一家的上限不能把另一家也算成储备。
-    /// 超出上限的位次只改状态（`reserve`），不改变排序。
+    /// 由 [`max_accounts_by_provider`] 从账号记录汇总：同家取**最小的非零**
+    /// `maxAccounts`，全 0 的家不进表。
+    ///
+    /// 超出上限的位次标成 `reserve`，并被稳定后置到整条 `ordered` 的末尾
+    /// （不是只在本家组内后置）—— 线性转发会先用完所有 `usable`，再回头试储备。
     pub max_accounts: &'a HashMap<String, u64>,
     /// 粘性命中的账号 id（`None` = 无命中）
     pub sticky_account: Option<&'a str>,
@@ -912,8 +940,11 @@ pub fn plan_route(
         .collect();
 
     // 储备账号（`maxAccounts`，**逐家**）：排序完成后按 provider 分组，每家的
-    // 前 N 个可用账号保持可用，其余只改状态、不挪位置 —— 「前面的账号都不可用
-    // 才轮到它」由转发按清单顺序自然实现，储备位次仍在队列里，只是界面标出来。
+    // 前 N 个可用账号保持可用，其余标成 `reserve`。标记完成后**稳定分区**：
+    // 所有 `usable` 在前、所有 `reserve` 在后，各自保持原有相对顺序 ——
+    // 储备只在本家组内后置是不够的（`[p1 usable, p2 reserve, q1 usable]` 会让
+    // 线性转发在 q1 之前用掉 p2），必须全局后置才能兑现「kept 全部失败后才用
+    // 储备」。分区不改变策略序，只把 `reserve` 这一类整体挪到队尾。
     // 已进 `blocked` 的候选不在这张表里，因此不会被误标。
     {
         let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
@@ -936,6 +967,9 @@ pub fn plan_route(
                 }
             }
         }
+        // 稳定分区（`sort_by_key` 是稳定排序）：`false`（usable）在前，
+        // `true`（reserve）在后，同类内部保持策略序。
+        ordered_entries.sort_by_key(|entry| entry.state == "reserve");
     }
 
     RoutePlan {
@@ -1430,8 +1464,13 @@ mod plan_tests {
         max_accounts.insert("p".to_string(), 1_u64);
         max_accounts.insert("q".to_string(), 2_u64);
         let result = plan_with_limits(&accounts, &settings, &state, &HashSet::new(), &max_accounts);
-        // 排序本身不变，只是把超出上限的位次标成储备
-        assert_eq!(ids(&result), vec!["p1", "p2", "p3", "q1", "q2"]);
+        // 储备全局后置：usable 保持策略序（p1、q1、q2），reserve 跟在末尾（p2、p3）
+        assert_eq!(ids(&result), vec!["p1", "q1", "q2", "p2", "p3"]);
+        assert_ne!(
+            result.ordered.first().map(|entry| entry.state),
+            Some("reserve"),
+            "只要还有 usable，队首就不能是储备"
+        );
         let state_of = |id: &str| {
             result
                 .ordered
@@ -1462,7 +1501,7 @@ mod plan_tests {
 mod limit_tests {
     use serde_json::json;
 
-    use super::{max_accounts_of, max_rpm_of, queue_limit_of};
+    use super::{max_accounts_by_provider, max_accounts_of, max_rpm_of, queue_limit_of};
 
     /// 新增的三个账号上限字段：缺键 = 0（不限 / 不排队），与 `maxConcurrent`
     /// 的向后兼容口径一致 —— 存量记录没有这些键，读侧不能报错也不能当成非零。
@@ -1488,5 +1527,24 @@ mod limit_tests {
         assert_eq!(max_rpm_of(&dirty), 0);
         assert_eq!(max_accounts_of(&dirty), 0);
         assert_eq!(queue_limit_of(&dirty), 0);
+    }
+
+    /// `maxAccounts` 是账号级字段，选路要的是逐家上限：同家取**最小非零**，
+    /// 全 0 的家不进表（不限）。
+    #[test]
+    fn max_accounts_aggregates_per_provider_by_min_non_zero() {
+        let accounts = vec![
+            json!({"id": "p1", "provider": "p", "maxAccounts": 1}),
+            json!({"id": "p2", "provider": "p", "maxAccounts": 3}),
+            json!({"id": "p3", "provider": "p", "maxAccounts": 0}),
+            json!({"id": "q1", "provider": "q"}),
+            json!({"id": "q2", "provider": "q", "maxAccounts": 0}),
+            json!({"id": "r1", "provider": "r", "maxAccounts": 0}),
+            json!({"id": "r2", "provider": "r", "maxAccounts": 2}),
+        ];
+        let caps = max_accounts_by_provider(&accounts);
+        assert_eq!(caps.get("p"), Some(&1), "p 家取最小非零 1");
+        assert_eq!(caps.get("q"), None, "q 家全 0 = 不限，不进表");
+        assert_eq!(caps.get("r"), Some(&2), "r 家忽略 0 后取 2");
     }
 }
