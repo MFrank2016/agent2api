@@ -9,7 +9,9 @@ import {
 } from '@ui'
 import { t } from '../i18n'
 import {
-  ACCOUNT_CONCURRENCY_MAX as CONC_MAX, errorMessage, shared, toast,
+  ACCOUNT_CONCURRENCY_MAX as CONC_MAX, ACCOUNT_MAX_ACCOUNTS as ACCOUNTS_MAX,
+  ACCOUNT_QUEUE_MAX as QUEUE_MAX, ACCOUNT_RPM_MAX as RPM_MAX,
+  errorMessage, shared, toast,
   type AccountRecord, type LimiterGroup,
 } from './accounts-shared'
 import {
@@ -43,6 +45,17 @@ function peersOf(account: AccountLike, all: AccountLike[]): AccountLike[] {
 
 function labelOf(account: AccountLike | null | undefined): string {
   return displayNameOf(account) || account?.id || ''
+}
+
+/**
+ * 读一个「数值上限」草稿（RPM / 同家账号数 / 排队上限）：本地先归一成
+ * **非负整数**并封顶 `cap`（number 输入挡不住手工脏值 / 粘贴），后端 400
+ * 只该是最后防线。0 的语义由各字段的文案说明（不限 / 不排队），这里不区分。
+ */
+function readLimitDraft(draft: string, cap: number, label: string): { value: number } | { error: string } {
+  const raw = Number(draft)
+  if (!Number.isFinite(raw) || raw < 0) return { error: t('{label}必须是 0~{cap} 的整数', { label, cap }) }
+  return { value: Math.min(cap, Math.round(raw)) }
 }
 
 /* ─── 账号设置弹窗 ───────────────────────────── */
@@ -247,6 +260,11 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
   const [pane, setPane] = React.useState<PaneId>(initialPane)
   // 并发上限草稿（原列表 ⋯ 菜单的 conc-dialog 迁入「基本」分组）：0~999，0 = 不限
   const [concDraft, setConcDraft] = React.useState(() => String(Number(account?.maxConcurrent) || 0))
+  // 选路上限草稿（同一分组，紧挨并发上限）：RPM / 同家账号数 / 排队上限。
+  // 三者都是「0 = 特殊语义」（不限 / 不限 / 不排队），所以初值取后端公开形态的 0
+  const [rpmDraft, setRpmDraft] = React.useState(() => String(Number(account?.maxRpm) || 0))
+  const [accountsCapDraft, setAccountsCapDraft] = React.useState(() => String(Number(account?.maxAccounts) || 0))
+  const [queueDraft, setQueueDraft] = React.useState(() => String(Number(account?.queueLimit) || 0))
 
   // 「提供商」那一段：目录里查得到才算自定义家（id 前缀只说明「长得像」，而记录本身
   // 才带着协议 / Base URL 的现值 —— 三个字段要拿它预填）。
@@ -458,6 +476,22 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
     const concNext = Math.min(CONC_MAX, Math.round(concRaw))
     const concCurrent = Number(target.maxConcurrent) || 0
     const concPatch: Record<string, unknown> = concNext !== concCurrent ? { maxConcurrent: concNext } : {}
+    // 选路上限（RPM / 同家账号数 / 排队）：与并发同一套本地归一（非负整数 + 封顶）。
+    // 三者的 0 语义不同（不限 / 不限 / 不排队），但校验与写入完全同构，故并成一张表；
+    // 只把**真改了**的键带上 —— 对着现状保存不该凭空多出一条变更日志。
+    const limitPatch: Record<string, unknown> = {}
+    for (const limit of [
+      { key: 'maxRpm', draft: rpmDraft, cap: RPM_MAX, label: t('RPM 上限') },
+      { key: 'maxAccounts', draft: accountsCapDraft, cap: ACCOUNTS_MAX, label: t('同家账号上限') },
+      { key: 'queueLimit', draft: queueDraft, cap: QUEUE_MAX, label: t('排队上限') },
+    ]) {
+      const read = readLimitDraft(limit.draft, limit.cap, limit.label)
+      if ('error' in read) {
+        toast(read.error, 'err')
+        return
+      }
+      if (read.value !== (Number(target[limit.key]) || 0)) limitPatch[limit.key] = read.value
+    }
 
     setBusy(true)
     try {
@@ -485,6 +519,7 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
         ...planPatch,
         ...credentialPatch,
         ...concPatch,
+        ...limitPatch,
         ...(balanceQueryPatch ? { balanceQuery: balanceQueryPatch } : {}),
         ...(usageChanges && 'patch' in usageChanges ? usageChanges.patch : {}),
         ...(limiterChanges && 'patch' in limiterChanges ? limiterChanges.patch : {}),
@@ -597,6 +632,30 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
                     {concDefault > 0
                       ? t('并发上限 填 0 即按本家默认 {default}；填 1 或 2 就按填的算，更大的数会被本家上限截断（原列表 ⋯ 菜单的「并发上限」入口已并入这里）', { default: concDefault })
                       : t('并发上限 0~{max}；达到上限的账号跳过、请求转给其他账号（原列表 ⋯ 菜单的「并发上限」入口已并入这里）', { max: CONC_MAX })}
+                  </p>
+                  <Field orientation='horizontal' className='field-row'>
+                    <FieldLabel htmlFor='account-rpm-input'>{t('RPM 上限')}</FieldLabel>
+                    <Input id='account-rpm-input' type='number' min={0} max={RPM_MAX} step={1}
+                      className='max-w-[110px]' value={rpmDraft}
+                      onChange={event => setRpmDraft(event.currentTarget.value)} />
+                    <span className='detail'>{t('0 = 不限')}</span>
+                  </Field>
+                  <Field orientation='horizontal' className='field-row'>
+                    <FieldLabel htmlFor='account-accounts-cap-input'>{t('同家账号上限')}</FieldLabel>
+                    <Input id='account-accounts-cap-input' type='number' min={0} max={ACCOUNTS_MAX} step={1}
+                      className='max-w-[110px]' value={accountsCapDraft}
+                      onChange={event => setAccountsCapDraft(event.currentTarget.value)} />
+                    <span className='detail'>{t('0 = 不限')}</span>
+                  </Field>
+                  <Field orientation='horizontal' className='field-row'>
+                    <FieldLabel htmlFor='account-queue-input'>{t('排队上限')}</FieldLabel>
+                    <Input id='account-queue-input' type='number' min={0} max={QUEUE_MAX} step={1}
+                      className='max-w-[110px]' value={queueDraft}
+                      onChange={event => setQueueDraft(event.currentTarget.value)} />
+                    <span className='detail'>{t('0 = 不排队')}</span>
+                  </Field>
+                  <p className='detail acct-dlg-hint'>
+                    {t('RPM 上限按滚动 60 秒计（0~{rpm}）；同家账号上限 = 该提供商同时使用的账号数（0~{accounts}）；排队上限 = 账号在途已满时最多排几个，0 = 不排队（0~{queue}）。', { rpm: RPM_MAX, accounts: ACCOUNTS_MAX, queue: QUEUE_MAX })}
                   </p>
                 </div>
               ) : null}
