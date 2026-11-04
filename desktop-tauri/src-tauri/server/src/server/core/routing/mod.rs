@@ -37,6 +37,9 @@ use std::sync::Mutex;
 use serde_json::{json, Value};
 
 use crate::server::core::account_store::priority::{by_priority_order, normalize_priority};
+use crate::server::core::account_store::store_crud::{
+    MAX_ACCOUNTS_LIMIT, MAX_QUEUE_LIMIT, MAX_RPM_LIMIT,
+};
 use crate::server::core::account_store::store_util::js_truthy;
 
 pub mod strategy;
@@ -221,6 +224,43 @@ pub fn max_concurrent_of(account: &Value) -> u64 {
         .get("maxConcurrent")
         .and_then(Value::as_u64)
         .unwrap_or(0)
+}
+
+/// 滚动 60 秒的请求上限（`maxRpm`）：0 = **不限**。
+///
+/// 与 [`max_concurrent_of`] 同一口径（缺键 / 非数字 = 0），另外在读侧再封顶
+/// 一次 [`MAX_RPM_LIMIT`] —— 写入侧已经挡过一遍（`store_crud` 的归一化），
+/// 但手改记录、旧数据、导入文件都能绕过写入侧；选路是最后一个能拦住
+/// 「一个账号一秒打一万次」的地方。
+pub fn max_rpm_of(account: &Value) -> u64 {
+    account
+        .get("maxRpm")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(MAX_RPM_LIMIT)
+}
+
+/// 同一 provider **同时使用**的账号数上限（`maxAccounts`）：0 = **不限**。
+///
+/// 「同时使用」按选路顺序的前 N 个账号计（其余是储备账号），见 Phase 2 的
+/// `reserve_flags`。读侧封顶 [`MAX_ACCOUNTS_LIMIT`]，理由同 [`max_rpm_of`]。
+pub fn max_accounts_of(account: &Value) -> u64 {
+    account
+        .get("maxAccounts")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(MAX_ACCOUNTS_LIMIT)
+}
+
+/// 账号在途已满时的排队上限（`queueLimit`）：0 = **不排队**（直接换号 / 429）。
+///
+/// 读侧封顶 [`MAX_QUEUE_LIMIT`]，理由同 [`max_rpm_of`]。
+pub fn queue_limit_of(account: &Value) -> u64 {
+    account
+        .get("queueLimit")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(MAX_QUEUE_LIMIT)
 }
 
 /// 按优先级挑选本次请求使用的账号。
@@ -989,4 +1029,35 @@ mod plan_tests {
     }
 }
 
+#[cfg(test)]
+mod limit_tests {
+    use serde_json::json;
 
+    use super::{max_accounts_of, max_rpm_of, queue_limit_of};
+
+    /// 新增的三个账号上限字段：缺键 = 0（不限 / 不排队），与 `maxConcurrent`
+    /// 的向后兼容口径一致 —— 存量记录没有这些键，读侧不能报错也不能当成非零。
+    #[test]
+    fn new_limits_default_to_zero_and_are_clamped() {
+        let account = json!({"id":"a","maxRpm": 20, "maxAccounts": 2});
+        assert_eq!(max_rpm_of(&account), 20);
+        assert_eq!(max_accounts_of(&account), 2);
+        assert_eq!(queue_limit_of(&json!({"id":"a"})), 0);
+        assert_eq!(queue_limit_of(&json!({"id":"a","queueLimit": 8})), 8);
+    }
+
+    /// 读侧也要封顶：手改记录 / 旧数据可以塞进任意数字，选路不能因此
+    /// 无限排队或把 RPM 窗口撑爆。
+    #[test]
+    fn new_limits_are_capped_and_ignore_non_numbers() {
+        let oversized = json!({"maxRpm": 99_999, "maxAccounts": 5_000, "queueLimit": 9_999});
+        assert_eq!(max_rpm_of(&oversized), 10_000);
+        assert_eq!(max_accounts_of(&oversized), 999);
+        assert_eq!(queue_limit_of(&oversized), 1_000);
+
+        let dirty = json!({"maxRpm": "20", "maxAccounts": -1, "queueLimit": 1.5});
+        assert_eq!(max_rpm_of(&dirty), 0);
+        assert_eq!(max_accounts_of(&dirty), 0);
+        assert_eq!(queue_limit_of(&dirty), 0);
+    }
+}
