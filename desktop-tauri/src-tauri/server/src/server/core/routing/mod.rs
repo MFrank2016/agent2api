@@ -261,9 +261,20 @@ pub fn max_accounts_of(account: &Value) -> u64 {
 /// 为什么取最小非零：`maxAccounts` 存在每条账号记录上，同一家不同账号可能填了
 /// 不同的值（手改 / 旧数据 / 批量编辑）。选路只能执行一个数，取最小的那个是
 /// 唯一不会**超出**任何一条账号声明的口径；全 0 说明这家没设上限。
+///
+/// ── 只统计「会参与转发」的账号 ──────────────────────────────
+/// 禁用 / 无凭证的账号永远进不了 `plan_route` 的可用位次，却带着一个
+/// `maxAccounts` 值 —— 把它们算进汇总会让一个从未上场的账号把整家上限压小
+/// （例如 3 个启用账号 + 1 个已禁用但填了 `maxAccounts=1` 的旧记录 ⇒ 只放行
+/// 1 个，另外两个被无端标成储备）。公开形态里这两个事实是显式布尔：
+/// `enabled === false` / `hasCredentials === false`；缺键按「是」处理（与
+/// `account_usability` 的「只有显式 false 才算禁用」同一口径）。
 pub fn max_accounts_by_provider(accounts: &[Value]) -> HashMap<String, u64> {
     let mut caps: HashMap<String, u64> = HashMap::new();
     for account in accounts {
+        if !counts_toward_max_accounts(account) {
+            continue;
+        }
         let cap = max_accounts_of(account);
         if cap == 0 {
             continue;
@@ -273,6 +284,12 @@ pub fn max_accounts_by_provider(accounts: &[Value]) -> HashMap<String, u64> {
             .or_insert(cap);
     }
     caps
+}
+
+/// 这条账号记录是否算进 `maxAccounts` 的汇总（启用且看起来有凭证）。
+fn counts_toward_max_accounts(account: &Value) -> bool {
+    !matches!(account.get("enabled"), Some(Value::Bool(false)))
+        && !matches!(account.get("hasCredentials"), Some(Value::Bool(false)))
 }
 
 /// 逐家的「储备位次」标记：前 `max_accounts` 个可用账号保持可用，其余为储备。
@@ -1548,5 +1565,28 @@ mod limit_tests {
         assert_eq!(caps.get("p"), Some(&1), "p 家取最小非零 1");
         assert_eq!(caps.get("q"), None, "q 家全 0 = 不限，不进表");
         assert_eq!(caps.get("r"), Some(&2), "r 家忽略 0 后取 2");
+    }
+
+    /// 禁用 / 无凭证的账号不参与 `maxAccounts` 汇总。
+    ///
+    /// 它们永远进不了可用位次，却带着一个上限值：算进去会让一条从未上场的
+    /// 旧记录把整家上限压小（3 个启用账号 + 1 条禁用记录填 1 ⇒ 只放行 1 个）。
+    #[test]
+    fn max_accounts_ignores_disabled_and_credential_less_accounts() {
+        let accounts = vec![
+            // 启用的三条：真正的上限来源
+            json!({"id": "a1", "provider": "p", "enabled": true, "hasCredentials": true, "maxAccounts": 3}),
+            json!({"id": "a2", "provider": "p", "enabled": true, "hasCredentials": true, "maxAccounts": 0}),
+            json!({"id": "a3", "provider": "p", "maxAccounts": 0}),
+            // 禁用：不该把上限压成 1
+            json!({"id": "off", "provider": "p", "enabled": false, "hasCredentials": true, "maxAccounts": 1}),
+            // 无凭证：同样不该参与
+            json!({"id": "empty", "provider": "p", "enabled": true, "hasCredentials": false, "maxAccounts": 1}),
+            // 另一家只剩禁用账号 ⇒ 不出现在表里（= 不限）
+            json!({"id": "q1", "provider": "q", "enabled": false, "maxAccounts": 1}),
+        ];
+        let caps = max_accounts_by_provider(&accounts);
+        assert_eq!(caps.get("p"), Some(&3), "禁用 / 无凭证记录不能压低上限");
+        assert_eq!(caps.get("q"), None, "只剩禁用账号的家不该有上限");
     }
 }

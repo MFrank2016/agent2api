@@ -69,7 +69,7 @@
       // 这些句子仍留在 i18n-src/*/add-account.json：事实来源搬到服务端后
       // `scan.mjs --check` 会把它们报成「孤儿键」，**别按孤儿删掉** —— 运行时
       // 还是要靠这份译文。
-      hint: item?.hint ? wbI18n.t(item.hint) : '',
+      hint: item?.hint ? (window.wbI18n?.t?.(item.hint) ?? item.hint) : '',
       placeholder: item?.placeholder || '',
       quirks: item?.quirks || {},
       account: { noAuth: item?.noKey === true },

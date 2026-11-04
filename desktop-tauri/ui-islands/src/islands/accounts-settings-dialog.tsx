@@ -648,14 +648,14 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
                     <span className='detail'>{t('0 = 不限')}</span>
                   </Field>
                   <Field orientation='horizontal' className='field-row'>
-                    <FieldLabel htmlFor='account-queue-input'>{t('排队上限')}</FieldLabel>
+                    <FieldLabel htmlFor='account-queue-input'>{t('排队上限（暂未启用，预留）')}</FieldLabel>
                     <Input id='account-queue-input' type='number' min={0} max={QUEUE_MAX} step={1}
                       className='max-w-[110px]' value={queueDraft}
                       onChange={event => setQueueDraft(event.currentTarget.value)} />
                     <span className='detail'>{t('0 = 不排队')}</span>
                   </Field>
                   <p className='detail acct-dlg-hint'>
-                    {t('RPM 上限按滚动 60 秒计（0~{rpm}）；同家账号上限 = 该提供商同时使用的账号数（0~{accounts}）；排队上限 = 账号在途已满时最多排几个，0 = 不排队（0~{queue}）。', { rpm: RPM_MAX, accounts: ACCOUNTS_MAX, queue: QUEUE_MAX })}
+                    {t('RPM 上限按滚动 60 秒计（0~{rpm}）；同家账号上限 = 该提供商同时使用的账号数（0~{accounts}）；排队上限暂未启用（预留，0~{queue}）。', { rpm: RPM_MAX, accounts: ACCOUNTS_MAX, queue: QUEUE_MAX })}
                   </p>
                 </div>
               ) : null}

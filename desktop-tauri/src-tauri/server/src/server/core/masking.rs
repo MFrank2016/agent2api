@@ -169,8 +169,9 @@ pub fn mask_outbound(payload: &str) -> Result<Option<(String, MaskSession, MaskR
 /// 其余字节原样搬运，就不会把半截汉字解码成 U+FFFD，也不会因为一片非法
 /// UTF-8 而 panic。
 ///
-/// 压住的字节最多是一个前缀的长度（约 11 字节）+ 一个未闭合的占位符，
-/// **不会**缓冲整段回复：客户端看到的只是这一小段延迟。
+/// 压住的字节最多是一个前缀的长度（约 11 字节）+ 一个未闭合的占位符；
+/// 后者另有 [`MAX_HELD_TAIL`] 上限（64 KiB），到顶即原样下发 —— 因此**不会**
+/// 缓冲整段回复：客户端看到的只是这一小段延迟。
 #[derive(Default)]
 pub struct PlaceholderBuffer {
     /// 上一片结尾处还没判定完的字节（可能是半截前缀 / 未闭合占位符）
@@ -278,16 +279,27 @@ fn restore_value(value: &mut Value, session: &MaskSession) {
     }
 }
 
+/// 一个未闭合占位符最多压住多少字节（见 [`split_point`]）。
+///
+/// 完整占位符只有几十字节；超过这个上限还没有 `]]`，说明它根本不是占位符
+/// （用户正文里恰好写了 `[[A2A_MASK_` 前缀），继续压住会把整段回复扣在网关
+/// 里。到上限即原样下发，后续分片重新开始判定。
+const MAX_HELD_TAIL: usize = 64 * 1024;
+
 /// 这一片里「要下发」与「先压住」的分界点（见 [`PlaceholderBuffer`]）。
 ///
-/// 返回 `bytes.len()` 表示全部可以下发。两条规则（先命中先用）：
-///   1. 最后一个完整前缀之后还没有 `]]` → 从前缀起整段压住；
+/// 返回 `bytes.len()` 表示全部可以下发。三条规则（先命中先用）：
+///   1. 最后一个完整前缀之后还没有 `]]` → 从前缀起整段压住；但压住的字节
+///      超过 [`MAX_HELD_TAIL`] 时不再压（原样下发，见该常量的说明）；
 ///   2. 结尾是前缀的一段**真前缀**（如 `[[A2A_M`）→ 压住这段。
 fn split_point(bytes: &[u8]) -> usize {
     let prefix = PLACEHOLDER_PREFIX.as_bytes();
     if let Some(start) = rfind_bytes(bytes, prefix) {
         let after = &bytes[start + prefix.len()..];
         if find_bytes(after, PLACEHOLDER_SUFFIX.as_bytes()).is_none() {
+            if bytes.len() - start > MAX_HELD_TAIL {
+                return bytes.len();
+            }
             return start;
         }
     }
@@ -871,5 +883,68 @@ mod tests {
         let emitted = restorer.push(b"data: tail [[A2A_M").unwrap_or_default();
         assert_eq!(emitted, b"data: tail ");
         assert_eq!(restorer.finish(), b"[[A2A_M");
+    }
+
+    /// 正文里恰好写了 `[[A2A_MASK_` 但永远不闭合：压住的尾巴有上限，
+    /// 到顶必须原样下发，不能把整段回复扣在网关里。
+    #[test]
+    fn an_unclosed_literal_prefix_does_not_hold_the_whole_stream() {
+        let session = RulesMasker::default().session();
+        let restore = |text: &str| session.restore(text);
+        let mut buffer = PlaceholderBuffer::new();
+
+        let mut chunk = b"before [[A2A_MASK_".to_vec();
+        chunk.extend(std::iter::repeat(b'x').take(MAX_HELD_TAIL + 16));
+        let mut out = buffer.push(&chunk, &restore);
+        assert_eq!(
+            out, chunk,
+            "超过压住上限后必须把已收字节原样下发（不能继续扣着）"
+        );
+        out.extend(buffer.finish(&restore));
+        assert_eq!(out, chunk, "finish 不应再吐出重复的尾巴");
+    }
+
+    /// 图片 / 多模态载荷（data URL、长 base64、`image_url` / `source` /
+    /// `inline_data` 外壳）不脱敏；普通正文照常脱敏。
+    ///
+    /// base64 字符集与 `sk-` 的字符重叠是**概率事件**，替换会把图片数据改坏；
+    /// 这些载荷也不是「用户写下的秘密文本」。
+    #[test]
+    fn binary_and_image_payloads_are_not_masked() {
+        let masker = RulesMasker::default();
+        let base64_with_key = format!("{}/sk-abc123{}", "A".repeat(140), "B".repeat(20));
+        let data_url = format!(
+            "data:image/png;base64,{}/sk-abc123{}",
+            "A".repeat(140),
+            "B".repeat(20)
+        );
+        let mut body = json!({
+            "messages": [
+                { "role": "user", "content": [
+                    { "type": "image_url", "image_url": { "url": data_url } },
+                    { "type": "text", "text": "mail me at a@b.com" }
+                ]},
+                // 裸 base64（不在 image_url 外壳里）：靠形状判定跳过
+                { "role": "user", "content": base64_with_key },
+            ],
+            "inline_data": { "mime_type": "image/png", "data": data_url },
+            "source": { "type": "base64", "media_type": "image/png", "data": data_url }
+        });
+
+        let report = masker.mask_json(&mut body);
+        let serialized = body.to_string();
+        assert!(
+            serialized.contains("sk-abc123"),
+            "图片 / base64 载荷里的 sk- 不能被替换: {serialized}"
+        );
+        assert!(
+            !serialized.contains("a@b.com"),
+            "普通文本仍必须脱敏（不能因为跳过二进制而整体失效）: {serialized}"
+        );
+        assert_eq!(
+            report.hits.len(),
+            1,
+            "只应命中普通文本里的邮箱: {report:?}"
+        );
     }
 }

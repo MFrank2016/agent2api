@@ -45,6 +45,19 @@
 //! 在正确时机调 [`send_body`]（选路与凭证就绪之后、构造请求之前），同一家
 //! 同池同降级状态的发送体在本次请求内只算一次（换到同一家的另一个账号时复用）。
 //!
+//! ── 出站脱敏与有状态 / 插件 provider（fail-closed）──────────────
+//! 无状态路径的脱敏挂在 `TransportRequest` 上：`mask_outbound` 给出「脱敏后的
+//! 字节 + 还原会话」，回复侧再用同一份会话还原。有状态 provider（以及把请求体
+//! 交给插件进程直发的插件 provider）**不经过** `TransportRequest`：适配器拿到的
+//! 是 [`send_body`] 的结果、由它自己发上游，编排层既没有地方挂会话，也没有机会
+//! 在回复侧还原。
+//!
+//! 因此这里选择**拒绝**而不是「发一份没脱敏的明文」：脱敏开启时
+//! [`attempt_stateful`] 在调用适配器之前直接返回 503（不可重试）。这条限制是
+//! 刻意的 —— 线程化一条会话穿过插件 RPC / 会话式回复流的改造面远大于收益，
+//! 而漏发明文是安全承诺（「明文不出网关」）的直接违背。关闭脱敏后这些家照常
+//! 工作；要同时使用脱敏与会话式 provider，需要等后续版本把会话接进该路径。
+//!
 //! ── 内容拦截的补救（动作 0）为什么也在本文件 ──────────────────
 //! 上游按**逐字**匹配审核，撞上就是 HTTP 400 —— 那多半是客户端 system 模板
 //! 的指纹误报（见 `core::sanitize`）。补救分两步：**换最小中性提示词立刻重发
@@ -771,7 +784,11 @@ async fn attempt_queue(
                             &conv_key, &model, account_id, sticky_source, logging::now_ms(),
                             config::routing_settings().sticky.ttl_ms().unwrap_or(0), sticky_generation,
                         );
-                        note_route_success(service, account_id);
+                        note_route_success(
+                            service,
+                            account_id,
+                            &custom_forward::cooldown_model(&custom_provider_id, &model),
+                        );
                     }
                     return Ok(outcome);
                 },
@@ -910,7 +927,10 @@ async fn attempt_queue(
                             &conv_key, &model, account_id, sticky_source, logging::now_ms(),
                             config::routing_settings().sticky.ttl_ms().unwrap_or(0), sticky_generation,
                         );
-                        note_route_success(service, account_id);
+                        // 会话式路径的发送体真名在 attempt_stateful 内部（已用它对
+                        // `cap_cleared`）；这里拿到的是请求名，仅作为成功清 rest 的
+                        // 兜底键 —— 别名场景由 `cap_cleared` 按真名清落库条目。
+                        note_route_success(service, account_id, &model);
                     }
                     return Ok(outcome);
                 },
@@ -1373,7 +1393,7 @@ async fn attempt_queue(
                                 .route
                                 .breaker_success(account_id, route_settings.breaker_success_threshold);
                         }
-                        note_route_success(service, account_id);
+                        note_route_success(service, account_id, &wire_model);
                         // 这次转发成功 = 账号的登录态**此刻确实可用**：清掉可能
                         // 存在的「需要重新登录」标记（用户可能已经在别处重新登录
                         // 过，或者之前那次 401 是上游抖动）。
@@ -2255,17 +2275,21 @@ fn log_aggregated(aggregated: &super::aggregate::AggregatedCompletion) {
     );
 }
 
-/// 一次成功转发后的路由状态收尾：把「这个账号刚才不行」的三张表一起清。
+/// 一次成功转发后的路由状态收尾：把「这个账号刚才不行」的几张表一起清。
 ///
 /// ── 为什么收口成一个函数 ──────────────────────────────────────
 /// 三条成功出口（自定义 / 会话式 / 无状态）原本各写两行 `backoff_clear` +
 /// `sink_clear`。加第三张表（账号级硬休息）时漏掉任何一处都不会报错，症状是
 /// 「充值到账、也真的转发成功了，账号却仍被硬停到 24 小时截止」—— 所以让
 /// 「成功要清什么」只有一个落点，以后再加表也只改这里。
-fn note_route_success(service: &UpstreamService, account_id: &str) {
+///
+/// `model` 是本次真正发送的**上游真名**（限额冷却键）：模型级 rest 也按它存，
+/// 传请求名会清不掉别名请求写下的那一格（见 `routing::CooldownKeys`）。
+fn note_route_success(service: &UpstreamService, account_id: &str, model: &str) {
     service.route.backoff_clear(account_id);
     service.route.sink_clear(account_id);
     service.route.account_rest_clear(account_id);
+    service.route.model_rest_clear(account_id, model);
 }
 
 /// 200 + 正文配额拒绝的记账：冷却键必须是**上游真名**。
@@ -2549,6 +2573,30 @@ async fn attempt_custom(
     }
 }
 
+/// 有状态 / 插件 provider 的出站脱敏门禁（fail-closed）。
+///
+/// 脱敏开启时这些家无法安全发送：请求体由适配器 / 插件进程直发，编排层既挂不上
+/// [`crate::server::core::masking::MaskSession`]，回复侧也没有还原点（见模块头）。
+/// 返回 503 且**不重试** —— 与无状态路径的 `masking_failed` 同一语义：没有任何
+/// 字节到过上游，重发只会得到同一份错误。
+///
+/// 判据用 `config::active().enabled`（而不是先跑一次 `mask_outbound`）：有状态
+/// 路径根本用不上那次脱敏的产物，而「开启却读不到配置」时 `active` 也按开启
+/// 处理，于是同样在这里拦住 —— 正是 fail-closed 想要的。
+fn stateful_masking_gate(provider_label: &str) -> Result<(), GatewayError> {
+    if crate::server::core::masking::config::active().enabled {
+        return Err(GatewayError::with_status(
+            503,
+            format!(
+                "出站脱敏已开启，但 {provider_label} 走会话式转发（请求体由适配器直接发送），\
+                 无法保证脱敏与回复还原，已拒绝发送：请关闭脱敏后重试，或改用无状态提供商"
+            ),
+        )
+        .with_code("masking_unsupported"));
+    }
+    Ok(())
+}
+
 /// **有状态 provider** 的一次转发（架构文档 §4.2.1；`is_stateful` 为 true 的家走这条）。
 ///
 /// ── 共用与不共用的部分（与无状态路径逐条对照）───────────────
@@ -2589,6 +2637,12 @@ async fn attempt_stateful(
     connections: &mut ConnectionGuard,
     degraded: bool,
 ) -> Result<ForwardOutcome, GatewayError> {
+    // ── 出站脱敏门禁（fail-closed，见模块头）────────────────────────
+    // 会话式 / 插件 provider 自己发上游，脱敏会话挂不到请求上，回复侧也无法
+    // 还原。开启脱敏时**一个字节都不发**：宁可 503，也不把明文漏给上游。
+    // 放在最前面（连账号校验之前）：这条拒绝与「哪个账号」无关，早退也避免
+    // 产生一次「已尝试」的记账。
+    stateful_masking_gate(adapter.label())?;
     let model = model_of(ctx.body);
     // 没有账号记录（走默认登录态）时，只有声明了环境变量旁路的 provider 能继续
     // —— 与无状态路径同一判据与文案（`allows_anonymous_default_session`）
@@ -2818,6 +2872,9 @@ fn cap_cleared(
     };
     let had_limit = rotate::account_had_limit(service, account_id, model);
     service.store.clear_rate_limit(account_id, model);
+    // 内存里的模型级 rest 与落库条目同一个键（上游真名）：成功一次就立刻解除，
+    // 否则上游提前恢复 / 误判之后账号仍会被钉到截止时刻（见 `model_rest_clear`）。
+    service.route.model_rest_clear(account_id, model);
     // 仅当之前确实处于限额状态才记一条，避免每次成功请求都刷日志
     if had_limit {
         let label = account_label(target.account.as_ref(), account_id, session);

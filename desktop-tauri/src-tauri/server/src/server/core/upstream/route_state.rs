@@ -500,6 +500,25 @@ impl RouteState {
         }
     }
 
+    /// 成功一次（或用户手动清除）→ 立即解除**这个模型**的 rest。
+    ///
+    /// 与 [`Self::account_rest_clear`] 同一条理由：模型级 rest 也只在写入路径
+    /// 存在时，充值 / 误判 / 上游提前恢复之后账号仍会被钉到截止时刻。成功转发
+    /// 是「这个账号对这个模型此刻确实能用」的最强反证，所以成功出口要清掉它。
+    /// 账号级硬休息拦的是**所有**模型，因此由调用方另外调 `account_rest_clear`。
+    pub(super) fn model_rest_clear(&self, account_id: &str, model: &str) {
+        if let Ok(mut table) = self.model_rest.lock() {
+            table.remove(&(account_id.to_string(), model.to_string()));
+        }
+    }
+
+    /// 手动清除某个账号的**全部**模型级 rest（账号页「清除限流」不点名模型时）。
+    pub(super) fn model_rest_clear_all(&self, account_id: &str) {
+        if let Ok(mut table) = self.model_rest.lock() {
+            table.retain(|(id, _), _| id != account_id);
+        }
+    }
+
     /// 成功一次 → 清退避记录（连续失败的链子断了）。
     pub(super) fn backoff_clear(&self, account_id: &str) {
         if let Ok(mut table) = self.backoff.lock() {
@@ -844,6 +863,37 @@ mod tests {
         assert!(!expired
             .model_resting
             .contains_key(&("a".into(), "model-1".into())));
+    }
+
+    /// 模型级 rest 可以立即解除（成功转发 / 手动清除）：单模型与整账号两条路径。
+    #[test]
+    fn a_model_rest_can_be_lifted_immediately() {
+        let state = RouteState::new();
+        state.rest_mark("a", "model-1", 1_000);
+        state.rest_mark("a", "model-2", 1_000);
+        state.rest_mark("b", "model-1", 1_000);
+
+        state.model_rest_clear("a", "model-1");
+        let snap = state.snapshot("", 500, 0);
+        assert!(
+            !snap.model_resting.contains_key(&("a".into(), "model-1".into())),
+            "点名清除后这一格必须消失"
+        );
+        assert!(
+            snap.model_resting.contains_key(&("a".into(), "model-2".into())),
+            "同账号的其他模型不受影响"
+        );
+
+        state.model_rest_clear_all("a");
+        let snap = state.snapshot("", 500, 0);
+        assert!(
+            !snap.model_resting.keys().any(|(id, _)| id == "a"),
+            "整账号清除后该账号的全部模型 rest 都必须消失"
+        );
+        assert!(
+            snap.model_resting.contains_key(&("b".into(), "model-1".into())),
+            "其他账号不受影响"
+        );
     }
 
     /// 账号级硬休息**可以立即解除**（成功转发 / 手动清除），不必等截止时刻。

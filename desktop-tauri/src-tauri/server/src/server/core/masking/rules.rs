@@ -189,9 +189,17 @@ fn mask_text_with(rules: &[CompiledRule], text: &str, state: &mut State) -> (Str
     (out, report)
 }
 
-fn mask_value(value: &mut Value, rules: &[CompiledRule], state: &mut State) -> MaskReport {
+fn mask_value(value: &mut Value, rules: &[CompiledRule], state: &mut State, in_media: bool) -> MaskReport {
     match value {
         Value::String(text) => {
+            // ── 图片 / 多模态载荷不脱敏（2026-11 修）─────────────────
+            // base64 里出现 `sk-` 这样的子串是**概率事件**（字符集重叠），
+            // 替换它会把图片数据改坏（上游解码失败 / 画面损坏），而且这类
+            // 载荷本来就不是「用户写下的秘密文本」。判据只收「明显是二进制」
+            // 的形状，普通正文（含空格、标点、较短）照常脱敏。
+            if in_media || looks_like_binary_payload(text) {
+                return MaskReport::default();
+            }
             let (next, report) = mask_text_with(rules, text, state);
             *text = next;
             report
@@ -199,20 +207,49 @@ fn mask_value(value: &mut Value, rules: &[CompiledRule], state: &mut State) -> M
         Value::Array(items) => {
             let mut report = MaskReport::default();
             for item in items {
-                report.absorb(mask_value(item, rules, state));
+                report.absorb(mask_value(item, rules, state, in_media));
             }
             report
         }
         Value::Object(map) => {
             // 只遍历值：对象键（字段名）不是用户内容，不能脱敏。
+            // 图片载荷的常见外壳（OpenAI / Anthropic / Gemini 三种形状）由键名
+            // 认出来，整棵子树跳过；其余对象照常递归。
             let mut report = MaskReport::default();
-            for item in map.values_mut() {
-                report.absorb(mask_value(item, rules, state));
+            for (key, item) in map.iter_mut() {
+                let media = in_media || is_media_payload_key(key);
+                report.absorb(mask_value(item, rules, state, media));
             }
             report
         }
         _ => MaskReport::default(),
     }
+}
+
+/// 图片 / 多模态载荷的外壳键：这些键下的字符串是二进制（base64）或媒体 URL，
+/// 不是用户正文。三种主流形状：
+///   - OpenAI：`image_url`（其下 `url`）
+///   - Anthropic：`source`（其下 `data` / `url`）
+///   - Gemini：`inline_data`（其下 `data`）
+fn is_media_payload_key(key: &str) -> bool {
+    matches!(key, "inline_data" | "image_url" | "source")
+}
+
+/// 字符串看起来像二进制载荷（base64 / data URL）。
+///
+/// 保守判定，只跳过「一眼不是自然语言」的值：
+///   - `data:` 开头（data URL，base64 里可能夹换行，前缀足以认定）；
+///   - 长度 > 128 且**全部**由 base64 字符集组成（没有空格 / 标点 / 换行）。
+///
+/// 普通正文（句子、代码、短标识符）不会同时满足这两条。
+fn looks_like_binary_payload(text: &str) -> bool {
+    if text.starts_with("data:") {
+        return true;
+    }
+    text.len() > 128
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_'))
 }
 
 /// 单遍还原：只替换本映射表认识的占位符，不认识的（含残缺前缀）原样保留。
@@ -327,7 +364,7 @@ pub struct MaskSession {
 impl Masker for RulesMasker {
     fn mask_json(&self, value: &mut Value) -> MaskReport {
         let mut state = lock_state(&self.state);
-        mask_value(value, &self.rules, &mut state)
+        mask_value(value, &self.rules, &mut state, false)
     }
 
     fn mask_text(&self, text: &str) -> (String, MaskReport) {
@@ -344,7 +381,7 @@ impl Masker for RulesMasker {
 impl Masker for MaskSession {
     fn mask_json(&self, value: &mut Value) -> MaskReport {
         let mut state = lock_state(&self.state);
-        mask_value(value, &self.rules, &mut state)
+        mask_value(value, &self.rules, &mut state, false)
     }
 
     fn mask_text(&self, text: &str) -> (String, MaskReport) {

@@ -258,6 +258,15 @@ pub(super) async fn select_target_account(
     //   ② 一个都没有（未尝试的账号**全部**达到并发上限）→ 挑**余量最大**
     //      的账号强塞。
     //
+    // ── 账号级硬休息不参与兜底（2026-11 修）────────────────────
+    // 余额耗尽 / 需要人机验证写进 `RouteState::account_rest` 的账号是**硬跳过**
+    // 的：换模型也救不回来。兜底的存在意义是「明知可能失败也再试一次」，但它
+    // 只能对「软」状态（限额冷却 / 并发满 / 垫底）这么做 —— 把硬休息账号重新
+    // 塞回发送队列等于让一次请求按兜底节拍反复撞一个已被上游明确拒绝的账号。
+    // 因此下面两个兜底选择器都先按 `snap.account_resting` 过滤；钉住的账号
+    // （模型测试）是唯一例外，与既有 pinned 语义一致。全部候选都在硬休息时
+    // 选择器返回 None，请求按既有「无可用账号 / 限额」路径收尾。
+    //
     // ── 为什么 ② 强塞而不是报 503（本级的取舍）──────────────────
     // 限流是「等得起」的：冷却有明确恢复时间，到点账号自然回来；并发挤占
     // 则是**即刻自愈**的 —— 在途请求一轮对话结束后计数立刻回落（见
@@ -268,13 +277,25 @@ pub(super) async fn select_target_account(
     // ── 兜底次序（Task 2.3）────────────────────────────────────
     // `plan.ordered` 只含**可用**账号（储备在末尾），被冷却 / 并发挡下的候选在
     // `plan.blocked` 里 —— 而本级的用途正是「明知可能失败也再试一次」，所以
-    // 候选仍取自 `enabled`，但用 plan 给它们定次序：
+    // 候选取自 `fallback_pool`（已剔除硬休息），但用 plan 给它们定次序：
     //   · plan 里的 usable 位次最先（它们的恢复时刻最值得赌一次）；
     //   · 其余非储备账号其次（冷却中 / 并发满的 kept 仍优先于储备）；
     //   · 储备最后 —— 储备可能更空闲、恢复更早，但绝不能抢在 kept 前面。
+    let fallback_pool: Vec<Value> = if pinned.is_some() {
+        enabled.clone()
+    } else {
+        enabled
+            .iter()
+            .filter(|account| {
+                routing::account_id(account)
+                    .is_none_or(|id| !snap.account_resting.contains_key(id))
+            })
+            .cloned()
+            .collect()
+    };
     let mut best_effort: Option<Value> = None;
     let mut best_key: Option<(u8, usize, i64)> = None;
-    for account in &enabled {
+    for account in &fallback_pool {
         let Some(id) = routing::account_id(account) else {
             continue;
         };
@@ -299,7 +320,7 @@ pub(super) async fn select_target_account(
     if best_effort.is_none() {
         // ① 无果：在「全部达到并发上限」（或没有未尝试账号）时按余量挤占。
         // 挑出的账号走与 ① 同一条收尾（取会话 → 组装选路结果）。
-        if let Some(account) = squeeze_by_headroom(&enabled, &counts, tried_ids, keys, now, &plan) {
+        if let Some(account) = squeeze_by_headroom(&fallback_pool, &counts, tried_ids, keys, now, &plan) {
             if let Some(id) = routing::account_id(&account).map(str::to_string) {
                 if let Some(entry) = service.store.get_session_by_id(&id) {
                     return Ok(with_proxy_notice(
@@ -511,7 +532,9 @@ pub(super) fn mark_account_limited(
         // 落库的恢复时刻与内存里的 rest **用同一个值**：选路先查落库条目
         // （`plan_route` 的 `rate_limit_reset_at`），两边不一致时以它为准，
         // 内存那份就成了摆设（改前 Rate 落 10 分钟兜底、Credit 只软垫底）。
-        Some(until as f64),
+        // 影子模式下 `apply_quota_rest` 返回 `None` ⇒ 存储层沿用旧的 10 分钟
+        // 兜底（见那里的说明）：影子模式不该改变选路行为。
+        until.map(|value| value as f64),
         message,
         kind,
         retry_after_ms,
@@ -560,14 +583,14 @@ pub(super) fn vendor_identity(provider_id: &str) -> String {
 ///     给不出时 10 分钟（与存储层兜底同一常量）；
 ///   · `Rate`：模型级短休息 —— `Retry-After` 换算值，没有就 60 秒。
 ///
-/// 返回值就是**落库用的 `resetAt`**：内存 rest 与 `rateLimits` 必须同一个
-/// 截止时刻（理由见 [`mark_account_limited`]）。
+/// 返回值是**落库用的 `resetAt`**（`None` = 交给存储层的 10 分钟兜底）：
+/// 内存 rest 与 `rateLimits` 必须同一个截止时刻（理由见 [`mark_account_limited`]）。
 ///
 /// ── 影子模式（`routingShadowQuotaKind`，默认开）──────────────
-/// 开着时**只算截止时刻、不写 rest 表**：调用方照旧把它落进 `rateLimits`
-/// （reason / scope 一起记），选路仍只按落库条目 + 限流垫底判定 —— 分类判据
-/// 在真流量上还没验够，升级不能新增一层会改变选路的 rest。关掉后三条映射才
-/// 真正生效。
+/// 开着时**只观察、不改变选路**：不写 rest 表，并且返回 `None` —— 落库的
+/// `resetAt` 沿用改造前的 10 分钟兜底，而不是分类算出的 60 秒 / 24 小时。
+/// 若把分类截止时刻落进 `rateLimits`，选路（读落库条目）就会按新时长冷却，
+/// 影子模式等于已经生效了。关掉后三条映射才真正落到内存 + 落库。
 ///
 /// [`RouteState::account_rest_mark`]: super::route_state::RouteState::account_rest_mark
 fn apply_quota_rest(
@@ -577,32 +600,30 @@ fn apply_quota_rest(
     kind: QuotaKind,
     reset_at: Option<i64>,
     retry_after_ms: Option<i64>,
-) -> i64 {
+) -> Option<i64> {
     let now = logging::now_ms();
     let shadow = config::routing_settings().shadow_quota_kind;
-    match kind {
+    if shadow {
+        return None;
+    }
+    let until = match kind {
         QuotaKind::Credit | QuotaKind::Verification => {
             let until = reset_at.unwrap_or_else(|| now.saturating_add(ACCOUNT_REST_MS));
-            if !shadow {
-                service.route.account_rest_mark(account_id, until);
-            }
+            service.route.account_rest_mark(account_id, until);
             until
         }
         QuotaKind::Rate => {
             let until = now.saturating_add(retry_after_ms.unwrap_or(RATE_REST_MS));
-            if !shadow {
-                service.route.rest_mark(account_id, model, until);
-            }
+            service.route.rest_mark(account_id, model, until);
             until
         }
         QuotaKind::Quota | QuotaKind::Plan => {
             let until = reset_at.unwrap_or_else(|| now.saturating_add(QUOTA_REST_MS));
-            if !shadow {
-                service.route.rest_mark(account_id, model, until);
-            }
+            service.route.rest_mark(account_id, model, until);
             until
         }
-    }
+    };
+    Some(until)
 }
 
 /// 该账号对某模型当前的限额恢复时间戳（未限额 0）——上报事件时用，
@@ -731,6 +752,9 @@ fn fallback_class(plan: &routing::RoutePlan, id: &str) -> (u8, usize) {
 
 /// 全部账号达到并发上限时的**挤占**挑选：余量（`limit - count`）最大者优先。
 ///
+/// `candidates` 是调用方已剔除「账号级硬休息」与已尝试账号后的兜底池
+/// （见 `select_target_account` 的说明）；本函数只按并发余量 / 兜底次序挑。
+///
 /// ── 排序口径（任务约定，改动前先读）──────────────────────────
 ///   · **兜底优先类**（[`fallback_class`]）先于余量：usable 优先、储备最后 ——
 ///     储备账号即便更空闲，也不能抢在 kept 前面被挤占（`maxAccounts` 的口径是
@@ -746,7 +770,7 @@ fn fallback_class(plan: &routing::RoutePlan, id: &str) -> (u8, usize) {
 /// 设了上限还打到这个账号」的答案）。没有可挤的账号（全部已尝试过）时
 /// 返回 None，由调用方落到尾部的「无账号」兜底。
 fn squeeze_by_headroom(
-    enabled: &[Value],
+    candidates: &[Value],
     counts: &HashMap<String, usize>,
     tried_ids: &[String],
     keys: &routing::CooldownKeys<'_>,
@@ -757,7 +781,7 @@ fn squeeze_by_headroom(
     let mut best_class = u8::MAX;
     let mut best_headroom = i64::MIN;
     let mut best_reset = f64::INFINITY;
-    for account in enabled {
+    for account in candidates {
         let Some(id) = routing::account_id(account) else {
             continue;
         };

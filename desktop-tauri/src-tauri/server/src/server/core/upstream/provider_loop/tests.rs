@@ -118,6 +118,8 @@ fn single(name: &str) -> Vec<String> {
 
 #[test]
 fn stateful_quota_bookkeeping_keeps_the_adapter_reset_at() {
+    let _guard = hold_config();
+    let _shadow = ShadowQuotaKind::set(false);
     let (_dir, service, id) = temp_service();
     let now = logging::now_ms();
     // 可辨恢复时刻：3 小时后。刻意与 10 分钟兜底不同量级 —— 改前这里落的是
@@ -161,6 +163,8 @@ fn stateful_quota_bookkeeping_keeps_the_adapter_reset_at() {
 
 #[test]
 fn stateful_quota_bookkeeping_falls_back_when_adapter_gives_no_reset_at() {
+    let _guard = hold_config();
+    let _shadow = ShadowQuotaKind::set(false);
     let (_dir, service, id) = temp_service();
     let now = logging::now_ms();
     // 429 是分钟级限流，CodeArts 的 classify 那边就给 None（给它零点会把一个只是
@@ -216,6 +220,8 @@ fn stateful_quota_bookkeeping_ignores_non_quota_classes() {
 fn codearts_daily_pool_envelope_cools_to_the_boundary_instead_of_ten_minutes() {
     use crate::server::errors::GatewayError;
 
+    let _guard = hold_config();
+    let _shadow = ShadowQuotaKind::set(false);
     let (_dir, service, id) = temp_service();
     // 生产库里那条真实文案（HTTP 200 的 SSE 里折出 403，首包门送进会话式分支）
     let error = GatewayError::with_status(403, "上游报告 InferHub.4291.200：insufficient quota");
@@ -262,6 +268,8 @@ fn codearts_daily_pool_envelope_cools_to_the_boundary_instead_of_ten_minutes() {
 
 #[test]
 fn that_one_argument_is_the_divider_between_a_day_and_ten_minutes() {
+    let _guard = hold_config();
+    let _shadow = ShadowQuotaKind::set(false);
     let (_dir, service, id) = temp_service();
     // 同一个账号库里放两条账号：一条按「改后的写法」记账，一条按「改前的写法」
     // （同一个 rotate::mark_account_limited，只是恢复时刻写死 None）。
@@ -502,7 +510,7 @@ fn a_successful_forward_lifts_the_account_rest() {
         account_rest_until(&service, &id) > 0,
         "前置：余额类应当硬停账号"
     );
-    note_route_success(&service, &id);
+    note_route_success(&service, &id, "m-credit");
     assert_eq!(
         account_rest_until(&service, &id),
         0,
@@ -674,6 +682,11 @@ fn shadow_mode_records_the_limit_without_touching_route_state() {
     );
     let persisted = rotate::account_limit_reset_at(&service, &id, "m-shadow-credit");
     assert!(persisted > now, "落库的 resetAt 必须是未来时刻");
+    let minutes = (persisted - now) / 60_000;
+    assert!(
+        (9..=11).contains(&minutes),
+        "影子模式落库必须沿用旧的 10 分钟兜底（而不是分类的 24 小时），实际 {minutes} 分钟"
+    );
     assert_eq!(
         account_rest_until(&service, &id),
         0,
@@ -1281,3 +1294,285 @@ fn reserve_is_only_reached_after_the_kept_account_is_tried() {
     );
 }
 
+
+
+// ── 模型级 rest 的解除路径（deferred minor）──────────────────────────────
+//
+// 模型级 rest 原先只有写入路径：上游提前恢复 / 分类误判之后，账号仍会被
+// `plan_route` 钉到截止时刻。成功一次必须能立即解除这一格。
+
+#[test]
+fn a_successful_forward_lifts_the_model_rest() {
+    let _guard = hold_config();
+    let _shadow = ShadowQuotaKind::set(false);
+    let (_dir, service, id) = temp_service();
+    rotate::mark_account_limited(
+        &service,
+        &id,
+        "m-rate",
+        429,
+        None,
+        None,
+        "上游返回 429: Rate limit exceeded: 20 requests per minute",
+        "openrouter",
+        Some(30_000),
+    );
+    assert!(
+        model_rest_until(&service, &id, "m-rate") > 0,
+        "前置：分钟限流应当写模型级 rest"
+    );
+    note_route_success(&service, &id, "m-rate");
+    assert_eq!(
+        model_rest_until(&service, &id, "m-rate"),
+        0,
+        "成功一次应当立即解除这个模型的 rest"
+    );
+}
+
+// ── 账号级硬休息不被兜底选择器绕过（I2）──────────────────────────────────
+//
+// 第一级选路本来就跳过硬休息账号；但「全部冷却 / 并发满」时的两级兜底曾直接从
+// `enabled` 里挑，于是余额耗尽 / 待验证的账号会被重新塞回发送队列。这里把两个
+// 候选都标成冷却（迫使进入兜底），再给其中一个加硬休息：兜底必须挑另一个。
+
+#[tokio::test]
+async fn the_last_resort_selector_skips_hard_resting_accounts() {
+    const PROVIDER: &str = "custom-loop-rest-test";
+    let _guard = hold_config();
+    let (_dir, service, _seed) = temp_service();
+    let add = |uid: &str, token: &str| {
+        service
+            .store
+            .add_account(
+                &json!({"auth": {"accessToken": token}, "account": {"uid": uid}}),
+                None,
+                Some(PROVIDER),
+            )
+            .expect("账号应当能建起来")["id"]
+            .as_str()
+            .expect("公开形态应带 id")
+            .to_string()
+    };
+    let rested = add("rested-1", "at-rested");
+    let healthy = add("healthy-2", "at-healthy");
+    // 两个都进入「限额冷却」：第一级选路会全部跳过，迫使走兜底选择器。
+    for id in [&rested, &healthy] {
+        rotate::mark_account_limited(
+            &service,
+            id,
+            "m-rest",
+            429,
+            None,
+            None,
+            "上游返回 429: Rate limit exceeded: 20 requests per minute",
+            "openrouter",
+            Some(30_000),
+        );
+    }
+    // 只给其中一个加账号级硬休息（余额耗尽类）。
+    service
+        .route
+        .account_rest_mark(&rested, logging::now_ms() + 24 * 3600 * 1000);
+
+    let keys = rotate::CooldownKeys::new("m-rest");
+    let providers = [PROVIDER];
+    let target = rotate::select_target_account(&service, &providers, &keys, &[], None, "")
+        .await
+        .expect("兜底应当能选出未被硬休息的账号");
+    assert_eq!(
+        target.account_id.as_deref(),
+        Some(healthy.as_str()),
+        "硬休息账号不能被兜底选择器重新选中"
+    );
+
+    // 钉住（模型测试）是既有例外：点名硬休息账号时仍要让它发一次。
+    let pinned = rotate::select_target_account(
+        &service,
+        &providers,
+        &keys,
+        &[],
+        Some(&rested),
+        "",
+    )
+    .await
+    .expect("钉住的账号应当照常被选中");
+    assert_eq!(
+        pinned.account_id.as_deref(),
+        Some(rested.as_str()),
+        "pinned 语义不受硬休息过滤影响"
+    );
+}
+
+// ── 有状态 / 插件 provider 的出站脱敏门禁（C1）────────────────────────────
+//
+// 会话式 provider 的请求体由适配器直接发上游，编排层挂不上 `MaskSession`，
+// 回复侧也没有还原点。脱敏开启时必须**拒绝发送**（503、不可重试），而不是把
+// 明文交给适配器。这条用例用有状态 mock 适配器钉住「503 + 一次都没发」。
+
+/// 有状态 mock：`forward_conversation` 只计数，被调到就说明门禁漏了。
+struct StatefulMaskProbe {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ProviderAdapter for StatefulMaskProbe {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::WorkBuddy
+    }
+
+    fn label(&self) -> &'static str {
+        "有状态测试家"
+    }
+
+    fn list_models(&self) -> Vec<Value> {
+        Vec::new()
+    }
+
+    fn build_chat_request(
+        &self,
+        _account: &Value,
+        _body: &Value,
+        _client_headers: &axum::http::HeaderMap,
+    ) -> Result<crate::server::core::providers::adapter::ChatRequestPlan, GatewayError> {
+        Err(GatewayError::new("有状态测试家不该走无状态构造"))
+    }
+
+    fn classify_error(&self, status: u16, _error_body: &Value) -> UpstreamErrorClass {
+        UpstreamErrorClass::Fatal {
+            status,
+            message: "测试分类".to_string(),
+            upstream_code: None,
+        }
+    }
+
+    fn ensure_access_token<'a>(
+        &'a self,
+        _store: &'a crate::server::core::account_store::AccountStore,
+        _account_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async move { Ok(String::new()) })
+    }
+
+    fn refresh_models<'a>(
+        &'a self,
+        _store: &'a crate::server::core::account_store::AccountStore,
+        _account_id: &'a str,
+        _force: bool,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = crate::server::core::providers::adapter::ModelRefreshOutcome,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { crate::server::core::providers::adapter::ModelRefreshOutcome::unchanged() })
+    }
+
+    fn is_stateful(&self) -> bool {
+        true
+    }
+
+    fn forward_conversation<'a>(
+        &'a self,
+        _store: &'a crate::server::core::account_store::AccountStore,
+        _account_id: &'a str,
+        _body: &'a Value,
+        _client_headers: &'a axum::http::HeaderMap,
+        _proxy: Option<crate::server::core::proxies::ResolvedProxy>,
+        _stream: bool,
+        _telemetry: &'a Arc<RequestTelemetry>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ForwardOutcome, GatewayError>> + Send + 'a>,
+    > {
+        let calls = Arc::clone(&self.calls);
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ForwardOutcome::Completion {
+                body: json!({ "ok": true }),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn stateful_provider_refuses_to_send_when_masking_is_enabled() {
+    let (_dir, service, id) = temp_service();
+    let masker = Arc::new(crate::server::core::masking::RulesMasker::default());
+    let _guard = crate::server::core::masking::config::testing::enabled_with(masker);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adapter = StatefulMaskProbe {
+        calls: Arc::clone(&calls),
+    };
+
+    let body = json!({"model": "m", "messages": [{"role": "user", "content": "key sk-abc123"}]});
+    let headers = axum::http::HeaderMap::new();
+    let telemetry = Arc::new(RequestTelemetry::new());
+    let sanitize = crate::server::config::SanitizeSettings::default();
+    let providers = std::collections::BTreeMap::new();
+    let prompt = crate::server::core::prompt::PromptPlan::new(
+        crate::server::core::prompt::PromptChoice {
+            mode: crate::server::core::prompt::PromptMode::Passthrough,
+            text: "",
+            source: crate::server::core::prompt::PromptSource::None,
+        },
+        &providers,
+    );
+    let ctx = ProviderContext {
+        body: &body,
+        stream: false,
+        images: None,
+        client_headers: &headers,
+        telemetry: &telemetry,
+        sanitize: &sanitize,
+        developer_role_compat: true,
+        prompt,
+        preserve_system_prompt: false,
+        key_scope: None,
+        pinned_account: None,
+        ignore_model_gate: false,
+        proxy_override: None,
+    };
+    let target = RouteTarget {
+        provider: "workbuddy".to_string(),
+        account_id: Some(id),
+        account: None,
+        egress: crate::server::core::proxies::AccountEgress::Direct,
+        priority: None,
+        proxy_notice: None,
+        decision: None,
+    };
+    let mut slot: Option<InFlightGuard> = None;
+    let mut connections = ConnectionGuard::new(service.connections());
+
+    let error = match attempt_stateful(
+        &service,
+        &ctx,
+        "workbuddy",
+        &adapter,
+        target,
+        &mut slot,
+        &mut connections,
+        false,
+    )
+    .await
+    {
+        Ok(_) => panic!("脱敏开启时有状态 provider 必须拒绝发送"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.status_code, 503);
+    assert_eq!(error.code.as_deref(), Some("masking_unsupported"));
+    assert!(
+        error.message.contains("出站脱敏已开启"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "门禁必须在调用适配器之前返回：上游一次都不该被打到"
+    );
+}

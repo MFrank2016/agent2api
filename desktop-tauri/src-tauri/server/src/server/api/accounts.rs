@@ -1594,6 +1594,10 @@ pub fn clear_rate_limits(state: &ServerState, id: &str, body: &Bytes) -> Respons
     // 逐模型清除时也清账号级：硬休息拦的是**所有**模型，只清一个模型而不解除它，
     // 用户看到的仍然是「清了也没用」。
     state.upstream().clear_account_rest(id);
+    // 模型级 rest 是**第三张**内存表（与落库的 `rateLimits`、账号级硬休息都分开）：
+    // 只清前两张时，`plan_route` 仍会按模型级 rest 跳过这个账号的这个模型。
+    // 点名模型就清这一格；「全部清除」清该账号的全部模型。
+    state.upstream().clear_model_rest(id, model);
     if cleared > 0 {
         logging::log(
             "[Accounts]",

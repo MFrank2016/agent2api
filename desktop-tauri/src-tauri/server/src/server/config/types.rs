@@ -1116,8 +1116,11 @@ pub const KEY_ROUTING_BREAKER_SUCCESS: &str = "routingBreakerSuccessThreshold";
 /// 开启时，配额类失败只落**跨重启的事实**（账号记录的 `rateLimits`，含
 /// `reason` / `scope` / `retryAfterMs`），**不写**新的内存 rest 表
 /// （`RouteState::account_rest` / `model_rest`）—— 选路仍按旧行为走落库条目 +
-/// 限流垫底。关闭后，[`crate::server::core::upstream::rotate`] 的
-/// `apply_quota_rest` 才按分类把账号级 / 模型级 rest 真正落到选路状态上。
+/// 限流垫底。落库条目的 `resetAt` 也保持**旧口径**（存储层的 10 分钟兜底），
+/// 不采用分类算出的 60 秒 / 24 小时：选路读的正是这个字段，写新值等于影子
+/// 模式已经改变选路。关闭后，[`crate::server::core::upstream::rotate`] 的
+/// `apply_quota_rest` 才按分类把账号级 / 模型级 rest 真正落到选路状态上，
+/// 并把同一个截止时刻写进 `rateLimits`。
 ///
 /// ── 为什么默认开 ────────────────────────────────────────────
 /// 新作用域（余额停账号 24 小时、分钟限流只停模型）在真流量上的判据还没攒够：

@@ -371,6 +371,18 @@ impl UpstreamService {
         self.route.account_rest_clear(account_id);
     }
 
+    /// 手动解除**模型级** rest（账号页「清除限流」按钮）。
+    ///
+    /// `model` 为 `None` = 清这个账号的全部模型（对应端点不点名模型的「全部
+    /// 清除」）。与 [`Self::clear_account_rest`] 一起调用：落库条目、账号级
+    /// 硬休息、模型级 rest 三张表都要清，否则「清除」只清掉界面看得到的那张。
+    pub fn clear_model_rest(&self, account_id: &str, model: Option<&str>) {
+        match model {
+            Some(model) => self.route.model_rest_clear(account_id, model),
+            None => self.route.model_rest_clear_all(account_id),
+        }
+    }
+
     pub fn route_sticky_sessions(&self, model: Option<&str>, now: i64) -> Vec<Value> {
         self.route.sticky_list(model, now, crate::server::core::routing::sticky_ttl_ms(
             crate::server::config::routing_settings().sticky,

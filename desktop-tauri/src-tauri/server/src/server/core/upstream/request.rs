@@ -213,11 +213,21 @@ pub async fn send_chat_request(
     // 的字节，回复侧用 `plan.mask_session` 还原）—— 这里不再二次脱敏。
     // 只有「未挂会话」的请求才在发送前补一次门禁：关闭时原样放行（字节不变），
     // 开启却脱敏失败时**一个字节都不发**（503，且不重试）。
+    //
+    // 脱敏成功却**没有把会话带回来**的构造方（未来新增、忘了挂会话）：同样
+    // fail-closed。发出去的是脱敏后的字节，回复侧却没有映射可还原 —— 客户端
+    // 会收到占位符而不是原文，而且这条请求的明文已经被替换掉、无法重放。宁可
+    // 503，也不发一条注定还原不了的请求。当前 4 个构造点都会挂会话，这条分支
+    // 只是防御未来的回归。
     let payload = match &plan.mask_session {
         Some(_) => plan.payload.clone(),
         None => match crate::server::core::masking::mask_outbound(&plan.payload) {
             Ok(None) => plan.payload.clone(),
-            Ok(Some((masked, _session, _report))) => masked,
+            Ok(Some(_)) => {
+                return Err(UpstreamRequestError::masking_failed(
+                    "请求体已脱敏但未挂会话，拒绝发送",
+                ))
+            }
             Err(message) => return Err(UpstreamRequestError::masking_failed(message)),
         },
     };
@@ -509,6 +519,56 @@ mod tests {
         }
         // 门禁在 egress::dispatch 之前返回：上游一次都没被打到。
         assert_eq!(hits.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    /// 脱敏成功但构造方忘了挂会话：必须 fail-closed（503、不发、不重试）。
+    ///
+    /// 发出去的是脱敏后的字节，而回复侧没有映射可还原 —— 客户端会看到占位符，
+    /// 且明文已被替换、无法重放。这条分支是防御未来构造点的回归。
+    #[tokio::test]
+    async fn masking_without_a_session_is_refused_instead_of_sent() {
+        let masker = std::sync::Arc::new(crate::server::core::masking::RulesMasker::default());
+        let _guard = crate::server::core::masking::config::testing::enabled_with(masker);
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let app = axum::Router::new().route(
+            "/chat",
+            axum::routing::post(move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/chat", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let plan = TransportRequest {
+            url,
+            headers: Vec::new(),
+            payload: r#"{"messages":[{"role":"user","content":"key sk-abc123"}]}"#.to_string(),
+            egress: crate::server::core::proxies::AccountEgress::Direct,
+            system_proxy_when_unset: false,
+            // 构造方忘了把 mask_outbound 的会话带回来
+            mask_session: None,
+        };
+        let error = send_chat_request(&plan)
+            .await
+            .expect_err("脱敏成功却未挂会话时必须拒绝发送");
+        assert_eq!(error.status_code, 503);
+        assert!(!error.retryable);
+        assert!(
+            error.message.contains("未挂会话"),
+            "{}",
+            error.message
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "上游一次都不该被打到");
         server.abort();
     }
 }
