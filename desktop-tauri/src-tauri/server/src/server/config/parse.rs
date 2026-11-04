@@ -726,6 +726,106 @@ mod routing_tests {
     }
 }
 
+// ─── 出站脱敏（maskSecrets / maskPii / maskWords）────────────────
+
+/// 由原始 JSON 解析出站脱敏设置（缺字段用默认值；类型不符回落默认）。
+///
+/// 与路由设置同一口径：读侧不报错、不夹紧 —— 手改库写坏的项只影响它自己，
+/// 不能让整个网关起不来。词表里非字符串项直接丢弃（它不可能是用户想要的词），
+/// 空白词丢掉，重复词按首次出现保留（顺序就是界面上的顺序）。
+pub(super) fn mask_from(map: &Map<String, Value>) -> MaskSettings {
+    let defaults = MaskSettings::default();
+    let bool_field = |key: &str, default: bool| -> bool {
+        map.get(key).and_then(Value::as_bool).unwrap_or(default)
+    };
+    let mut words: Vec<String> = Vec::new();
+    if let Some(items) = map.get(KEY_MASK_WORDS).and_then(Value::as_array) {
+        for item in items {
+            let Some(word) = item.as_str() else {
+                continue;
+            };
+            let word = word.trim();
+            if word.is_empty() || words.iter().any(|seen| seen == word) {
+                continue;
+            }
+            words.push(word.to_string());
+        }
+    }
+    MaskSettings {
+        secrets: bool_field(KEY_MASK_SECRETS, defaults.secrets),
+        pii: bool_field(KEY_MASK_PII, defaults.pii),
+        words,
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    //! 出站脱敏设置的默认值与解析口径。
+    //!
+    //! 默认必须是**全关**：脱敏会改写请求体字节（关闭时连 JSON 都不解析），
+    //! 没有配置就不该发生。词表非空本身也算开启 —— 用户填了词却发现没生效，
+    //! 是这里最容易写歪的一条。
+
+    use super::*;
+    use serde_json::json;
+
+    fn object(value: Value) -> Map<String, Value> {
+        match value {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        }
+    }
+
+    #[test]
+    fn mask_defaults_are_off_with_no_words() {
+        let settings = MaskSettings::default();
+        assert!(!settings.secrets);
+        assert!(!settings.pii);
+        assert!(settings.words.is_empty());
+        assert!(!settings.enabled(), "全关时不得视为开启");
+
+        let parsed = mask_from(&Map::new());
+        assert_eq!(parsed, settings, "缺失字段必须逐项等于默认值");
+    }
+
+    #[test]
+    fn mask_flags_and_words_parse_from_config() {
+        let settings = mask_from(&object(json!({
+            "maskSecrets": true,
+            "maskPii": true,
+            "maskWords": ["Project Falcon", "a@b.com"],
+        })));
+        assert!(settings.secrets);
+        assert!(settings.pii);
+        assert_eq!(settings.words, vec!["Project Falcon", "a@b.com"]);
+        assert!(settings.enabled());
+    }
+
+    #[test]
+    fn mask_words_alone_enable_masking() {
+        let settings = mask_from(&object(json!({ "maskWords": ["secret"] })));
+        assert!(!settings.secrets);
+        assert!(!settings.pii);
+        assert!(settings.enabled(), "词表非空就必须开启，否则用户填了词也不生效");
+    }
+
+    #[test]
+    fn mask_wrong_types_fall_back_and_junk_words_are_dropped() {
+        let settings = mask_from(&object(json!({
+            "maskSecrets": "true",
+            "maskPii": 1,
+            "maskWords": ["  Project Falcon  ", "", 42, "Project Falcon", "a@b.com"],
+        })));
+        assert!(!settings.secrets, "类型写坏 = 没配，回落默认（关）");
+        assert!(!settings.pii);
+        assert_eq!(
+            settings.words,
+            vec!["Project Falcon", "a@b.com"],
+            "空白词 / 非字符串项丢弃，重复词按首次出现保留"
+        );
+    }
+}
+
 // ─── 长度截断的自动续写（autoContinue / autoContinueMaxRounds）────────
 
 /// 由原始 JSON 解析「自动续写」开关：文件的字面布尔 > 环境变量 > 关。

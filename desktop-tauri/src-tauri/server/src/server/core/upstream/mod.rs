@@ -769,10 +769,10 @@ impl Stream for ForwardStream {
                     // 之前，因为用户要看的是上游原样吐出来的东西，而不是
                     // 我们改写 / 合并后的帧（那正是「上游到底发了什么」要回答的）。
                     //
-                    // TODO(5.4): 采集口径要跟着脱敏走 —— 开启脱敏时这里采到的
-                    // 是含占位符的上游原文（明文不会进采集器，这一点是对的），
-                    // 但请求侧采集（provider_loop 的 `reset_request`）目前仍用
-                    // 脱敏前的 `plan.body`，必须在 5.4 一并改成脱敏后的报文。
+                    // 采集口径跟着脱敏走：这里采的是上游**原样字节**，开启脱敏时
+                    // 其中是占位符（明文不会进采集器）。请求侧（provider_loop 的
+                    // `reset_request`）已改为采集脱敏后的 `transport.payload`，
+                    // 于是调试报文的两侧一致，磁盘上不会出现明文密钥。
                     if let Some(capture) = &self.capture {
                         capture.push(&bytes);
                     }

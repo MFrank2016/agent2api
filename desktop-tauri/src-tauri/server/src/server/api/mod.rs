@@ -21,6 +21,7 @@
 //!   models.rs     POST /api/models/refresh（手动刷新模型清单；管理 API，
 //!                 与上一条的对外只读探针是两个分组，见该文件模块头）
 //!   sanitize.rs   GET/PUT /api/sanitize（出站指纹脱敏开关）
+//!   masking.rs    GET/PUT /api/masking（可逆脱敏：密钥 / 个人信息 / 自定义词）
 //!   prompt.rs     GET/PUT /api/prompt（系统提示词模式 + 内容拦截降级状态）
 //!   auto_checkin.rs /api/auto-checkin*（定时签到设置 / 手动执行）
 //!   scheduled_tasks.rs /api/scheduled-tasks*（间隔型定时任务的开关 / 间隔 / 立即执行）
@@ -151,6 +152,9 @@ pub mod routing_strategy;
 pub mod routing_trace;
 pub mod routing_workspace;
 pub mod sanitize;
+// 可逆脱敏设置（密钥 / 个人信息 / 自定义词）：`GET/PUT /api/masking`。
+// 与 `/api/sanitize` 分开的理由见该模块头（指纹脱敏不可逆，这里可逆）。
+pub mod masking;
 pub mod scheduled_tasks;
 pub mod session;
 // 侧边栏布局（GET/PUT /api/sidebar-layout）：桌面壳与网页端两个 origin

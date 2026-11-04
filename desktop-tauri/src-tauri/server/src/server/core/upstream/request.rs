@@ -88,19 +88,31 @@ pub struct TransportRequest {
 impl TransportRequest {
     /// 构造辅助：对序列化后的请求体跑一次出站脱敏门禁。
     ///
-    /// 返回 `(payload, mask_session)`：关闭脱敏时原样返回（会话为 `None`，
-    /// 字节不变）；开启时返回脱敏后的字节与会话，二者必须一起放进
-    /// [`TransportRequest`]（见 `mask_session` 的说明）。
+    /// 返回 `(payload, mask_session, report)`：关闭脱敏时原样返回（会话为
+    /// `None`、报告为空，字节不变）；开启时返回脱敏后的字节、会话与命中
+    /// 元数据。前两者必须一起放进 [`TransportRequest`]（见 `mask_session`
+    /// 的说明），报告交给调用方记 `mask_hits`。
     ///
     /// 开启却脱敏失败 → `Err(原因)`：调用方映射成 503，并**不发送任何请求**
     /// （fail-closed）。错误类型用 `String` 而不是 `GatewayError`，避免在
     /// `Result` 里搬一个体积很大的错误结构（调用点各自映射状态码）。
     pub fn mask_payload(
         payload: String,
-    ) -> Result<(String, Option<crate::server::core::masking::MaskSession>), String> {
+    ) -> Result<
+        (
+            String,
+            Option<crate::server::core::masking::MaskSession>,
+            crate::server::core::masking::MaskReport,
+        ),
+        String,
+    > {
         match crate::server::core::masking::mask_outbound(&payload) {
-            Ok(None) => Ok((payload, None)),
-            Ok(Some((masked, session))) => Ok((masked, Some(session))),
+            Ok(None) => Ok((
+                payload,
+                None,
+                crate::server::core::masking::MaskReport::default(),
+            )),
+            Ok(Some((masked, session, report))) => Ok((masked, Some(session), report)),
             Err(message) => Err(message),
         }
     }
@@ -205,7 +217,7 @@ pub async fn send_chat_request(
         Some(_) => plan.payload.clone(),
         None => match crate::server::core::masking::mask_outbound(&plan.payload) {
             Ok(None) => plan.payload.clone(),
-            Ok(Some((masked, _session))) => masked,
+            Ok(Some((masked, _session, _report))) => masked,
             Err(message) => return Err(UpstreamRequestError::masking_failed(message)),
         },
     };

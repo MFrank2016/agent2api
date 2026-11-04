@@ -151,6 +151,12 @@ pub struct RuntimeConfig {
     /// 与 timeouts 同一理由：转发层**每次选路**都要取它（改完设置下一个
     /// 请求就生效，不重启进程），解析一次存下来最省事。
     routing: RoutingSettings,
+    /// 出站脱敏开关与词表（设置页「隐私」区域）。
+    ///
+    /// 与 `sanitize` 同一理由：转发层**每次构造请求体**都要判一次（改完设置
+    /// 下一个请求就生效），解析一次存下来最省事。关闭时出站路径连 JSON 都
+    /// 不解析，字节与改造前逐字节一致（见 `core::masking` 的模块头）。
+    mask: MaskSettings,
     routing_profiles: std::sync::Arc<RoutingProfiles>,
     account_sort: std::sync::Arc<AccountSortSettings>,
     /// 事件日志的保存目录（原始配置值；None = 未设置，用配置目录）。
@@ -302,6 +308,11 @@ impl RuntimeConfig {
     /// 出站指纹脱敏是否开启（转发层每次发送前判一次，见字段说明）
     pub fn sanitize_fingerprints(&self) -> bool {
         self.sanitize.enabled
+    }
+
+    /// 出站脱敏设置（密钥 / 个人信息 / 自定义词，转发层每次构造请求体时取一次）
+    pub fn mask_settings(&self) -> &MaskSettings {
+        &self.mask
     }
 
     /// 开发者角色兼容是否开启（转发层每次发送前判一次，见字段说明）
@@ -552,6 +563,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
     let captcha_pool = captcha_pool_from(&raw);
     let routing_strategy = routing_strategy_from(&raw);
     let routing = routing_from(&raw);
+    let mask = mask_from(&raw);
     RuntimeConfig {
         // 文件里有就用文件的，否则环境变量兜底（对应 `if (config.apiKey && !opts.apiKey)`）。
         // 这里存的是**磁盘原值**：`apiKey` 从本轮改造起可能是 `enc1:` 信封（顶层旧
@@ -571,6 +583,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         captcha_pool,
         routing_strategy,
         routing,
+        mask,
         routing_profiles: routing_profiles::from_raw(&raw),
         account_sort: account_sort::from_raw(&raw),
         log_dir: string_field(&raw, KEY_LOG_DIR),
@@ -1824,6 +1837,59 @@ pub fn set_routing(patch: RoutingPatch) -> bool {
     })
 }
 
+// ─── 出站脱敏（maskSecrets / maskPii / maskWords）──────────────
+
+/// 只取出站脱敏设置的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 `routing_settings()` 同一取舍：转发层每次构造请求体都要取一次，
+/// 读锁取一份快照即可。配置尚未初始化时给默认值（全关）—— 与
+/// [`mask_settings_checked`] 的区别只在「读不到时给不给 `None`」。
+pub fn mask_settings() -> MaskSettings {
+    mask_settings_checked().unwrap_or_default()
+}
+
+/// 读不到配置时返回 `None`（fail-closed 接缝，见 `core::masking::config`）。
+///
+/// 「读不到」只有两种情况：全局快照还没初始化（启动早期）、或读锁中毒。
+/// 生产路径上脱敏开关本身也是从同一份快照读的，所以这里返回 `None` 时
+/// 通常连 `active().enabled` 都不会成立；保留这个返回值是为了让
+/// `core::masking::config::masker()` 能在「配置要求脱敏却读不到规则」时
+/// 明确地 fail-closed，而不是拿一份空规则悄悄放行。
+pub fn mask_settings_checked() -> Option<MaskSettings> {
+    CONFIG
+        .read()
+        .ok()?
+        .as_ref()
+        .map(|config| config.mask.clone())
+}
+
+/// 更新出站脱敏设置（`None` = 该项不动），返回是否写盘成功。
+///
+/// 与 `set_routing` 同一模式：内存快照与 raw 底稿一起改 —— 前者让下一个请求
+/// 立刻用新值，后者保证写盘时不吃掉配置里的其它字段。
+pub fn set_mask_settings(patch: MaskPatch) -> bool {
+    update(|config| {
+        let mut next = config.mask.clone();
+        let mut write_bool = |key: &str, value: bool, slot: &mut bool| {
+            config.raw.insert(key.to_string(), Value::Bool(value));
+            *slot = value;
+        };
+        if let Some(enabled) = patch.secrets {
+            write_bool(KEY_MASK_SECRETS, enabled, &mut next.secrets);
+        }
+        if let Some(enabled) = patch.pii {
+            write_bool(KEY_MASK_PII, enabled, &mut next.pii);
+        }
+        if let Some(words) = patch.words {
+            config
+                .raw
+                .insert(KEY_MASK_WORDS.to_string(), Value::from(words.clone()));
+            next.words = words;
+        }
+        config.mask = next;
+    })
+}
+
 /// 把选路策略设置编成 raw 底稿里的形态：`{ "default": "...", "providers": {...} }`。
 /// 逐家表为空时不写 `providers` 键（配置里不留没意义的空对象，与
 /// `set_prompt_provider` 对空表的处理同一取向）。
@@ -2539,9 +2605,9 @@ mod auto_continue_tests {
     /// 全局快照是进程级状态，而 `update()` 是「读整份 → 改 → 写整份」的**非原子**
     /// 读改写：两条用例并行时，一条的写可能被另一条「读走的旧底稿」整体盖掉。
     /// 本模块动全局的用例因此串行跑（与 `api::panel` 那把探针槽位锁同一手法）。
-    static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn hold_config() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn hold_config() -> std::sync::MutexGuard<'static, ()> {
         CONFIG_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
@@ -2677,6 +2743,82 @@ mod auto_continue_tests {
         let _ = set_auto_continue_patch(AutoContinuePatch {
             enabled: Some(false),
             max_rounds: Some(DEFAULT_AUTO_CONTINUE_MAX_ROUNDS),
+        });
+    }
+}
+
+
+#[cfg(test)]
+mod mask_settings_tests {
+    //! 出站脱敏设置在**读写入口**这一层的形状：默认全关、setter 同时写底稿与
+    //! 解析字段、部分更新不牵连兄弟项。
+    //!
+    //! 全局快照的读改写与 `auto_continue_tests` 共用同一把测试锁：两个模块都会
+    //! 动进程级配置，各用一把锁等于没锁。
+
+    use super::auto_continue_tests::hold_config;
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn mask_settings_roundtrip_through_patch_and_snapshot() {
+        let _guard = hold_config();
+        // 起点固定：先回到出厂态，免得别的用例留下的状态改变判据
+        let _ = set_mask_settings(MaskPatch {
+            secrets: Some(false),
+            pii: Some(false),
+            words: Some(Vec::new()),
+        });
+        assert!(!mask_settings().enabled(), "复位后必须全关");
+        assert!(current().raw()[KEY_MASK_SECRETS] == json!(false));
+
+        let saved = set_mask_settings(MaskPatch {
+            secrets: Some(true),
+            pii: Some(true),
+            words: Some(vec!["Project Falcon".to_string()]),
+        });
+        assert_eq!(
+            saved,
+            db().is_some(),
+            "返回值只该由「落库成不成功」决定（测试进程里没有库）"
+        );
+        let settings = mask_settings();
+        assert!(settings.secrets);
+        assert!(settings.pii);
+        assert_eq!(settings.words, vec!["Project Falcon"]);
+        assert!(settings.enabled());
+        assert_eq!(current().raw()[KEY_MASK_SECRETS], json!(true));
+        assert_eq!(current().raw()[KEY_MASK_PII], json!(true));
+        assert_eq!(current().raw()[KEY_MASK_WORDS], json!(["Project Falcon"]));
+        assert_eq!(
+            current().mask_settings(),
+            &settings,
+            "轻量读取与快照 getter 必须是同一个值"
+        );
+
+        // 部分更新：只动 pii，另外两项原样保留
+        set_mask_settings(MaskPatch {
+            pii: Some(false),
+            ..Default::default()
+        });
+        let settings = mask_settings();
+        assert!(settings.secrets, "部分更新不许把兄弟项按默认值补齐");
+        assert!(!settings.pii);
+        assert_eq!(settings.words, vec!["Project Falcon"]);
+
+        // 清空词表：secrets 仍开着，整体仍是开启
+        set_mask_settings(MaskPatch {
+            words: Some(Vec::new()),
+            ..Default::default()
+        });
+        assert!(mask_settings().words.is_empty());
+        assert!(mask_settings().enabled());
+
+        // 复位出厂态
+        let _ = set_mask_settings(MaskPatch {
+            secrets: Some(false),
+            pii: Some(false),
+            words: Some(Vec::new()),
         });
     }
 }

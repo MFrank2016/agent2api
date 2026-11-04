@@ -274,8 +274,10 @@ pub(crate) async fn forward(
     let payload = serde_json::to_string(&outbound)
         .map_err(|error| GatewayError::with_status(500, format!("请求体序列化失败: {error}")))?;
     // 出站脱敏门禁（关闭时原样返回；开启却失败 → 503，不发送）
-    let (payload, mask_session) = TransportRequest::mask_payload(payload)
+    let (payload, mask_session, mask_report) = TransportRequest::mask_payload(payload)
         .map_err(|message| GatewayError::with_status(503, message))?;
+    // 命中元数据（只记类型 / 数量，不记原文）
+    telemetry.note_mask_hits(&mask_report.counts());
     // ── 出站头（三段拼装，顺序不可换）────────────────────────────
     //   ① 默认头：**只有 apiKey 非空才带凭证头** —— 无需鉴权的上游
     //      （`noAuth` 账号）拿到一个空 `Bearer ` 会当成凭证错误，
@@ -630,8 +632,10 @@ async fn forward_translated(
     let payload = serde_json::to_string(&payload)
         .map_err(|error| GatewayError::with_status(500, format!("请求体序列化失败: {error}")))?;
     // 出站脱敏门禁（关闭时原样返回；开启却失败 → 503，不发送）
-    let (payload, mask_session) = TransportRequest::mask_payload(payload)
+    let (payload, mask_session, mask_report) = TransportRequest::mask_payload(payload)
         .map_err(|message| GatewayError::with_status(503, message))?;
+    // 命中元数据（只记类型 / 数量，不记原文）
+    telemetry.note_mask_hits(&mask_report.counts());
 
     logging::verbose(
         "[CustomProvider]",

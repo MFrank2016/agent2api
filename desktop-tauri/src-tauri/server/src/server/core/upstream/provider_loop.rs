@@ -1249,7 +1249,8 @@ async fn attempt_queue(
             // 出站脱敏门禁（关闭时原样返回；开启却失败 → 503，不发送）。
             // 与序列化失败同属「本机就发不出去」：先给明细定稿，再直接返回
             // —— 换账号重来也改变不了配置问题（fail-closed）。
-            let (payload, mask_session) = match TransportRequest::mask_payload(payload) {
+            let (payload, mask_session, mask_report) = match TransportRequest::mask_payload(payload)
+            {
                 Ok(prepared) => prepared,
                 Err(message) => {
                     let error = GatewayError::with_status(503, message);
@@ -1260,6 +1261,9 @@ async fn attempt_queue(
                     return Err(error);
                 }
             };
+            // 命中元数据（只记类型 / 数量，不记原文）：跨家降级时每一家各脱敏
+            // 一次，`note_mask_hits` 负责并集累加。
+            ctx.telemetry.note_mask_hits(&mask_report.counts());
             logging::verbose(
                 "[Upstream]",
                 &format!(
@@ -1301,10 +1305,36 @@ async fn attempt_queue(
             // 为 None，这一段完全不执行（零开销）。
             let capture = ctx.telemetry.capture();
             if let Some(capture) = capture.as_deref() {
-                // TODO(5.4): 开启脱敏后这里采集的是 `plan.body`（**脱敏前**的明文）。
-                // 调试报文必须与实际上行的字节一致，5.4 要改成用 `transport.payload`
-                // （脱敏后的报文），否则调试页会把明文密钥留在磁盘上。
-                capture.reset_request(&transport.url, provider_id, &transport.headers, &plan.body);
+                // 调试报文必须与**实际上行的字节**一致：开启脱敏时 `plan.body`
+                // 仍是明文，直接采集会把密钥留在磁盘上。用 `transport.payload`
+                // （已脱敏的字节）解析回 Value；关闭脱敏时仍走 `plan.body`，
+                // 字节与改造前完全一致（也避免一次无谓的解析）。
+                //
+                // 解析失败只可能是内部数据坏了（payload 刚由 `to_string` 生成）：
+                // 此时退化成「把脱敏后的字节当字符串存」，宁可少一层结构，
+                // 也不能把明文 `plan.body` 写进调试报文。
+                match transport.mask_session {
+                    Some(_) => match serde_json::from_str::<Value>(&transport.payload) {
+                        Ok(body) => capture.reset_request(
+                            &transport.url,
+                            provider_id,
+                            &transport.headers,
+                            &body,
+                        ),
+                        Err(_) => capture.reset_request(
+                            &transport.url,
+                            provider_id,
+                            &transport.headers,
+                            &Value::String(transport.payload.clone()),
+                        ),
+                    },
+                    None => capture.reset_request(
+                        &transport.url,
+                        provider_id,
+                        &transport.headers,
+                        &plan.body,
+                    ),
+                }
             }
             match send_with_retry(
                 adapter,

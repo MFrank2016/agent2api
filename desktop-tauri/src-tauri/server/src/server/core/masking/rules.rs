@@ -274,14 +274,33 @@ impl Default for RulesMasker {
 }
 
 impl RulesMasker {
-    /// 默认规则 + 自定义词表（字面匹配；优先级最低，同起点同长度时让位内置规则）。
-    pub fn with_words(words: &[String]) -> Self {
-        let mut rules = default_rules().to_vec();
+    /// 按设置选择规则族：`tokens` 控制密钥 / 令牌，`emails` 控制邮箱，
+    /// `words` 是自定义词（字面匹配；优先级最低，同起点同长度时让位内置规则）。
+    ///
+    /// 三档互相独立是**用户可见的语义**：只开密钥脱敏时，邮箱必须原样上行
+    /// （企业场景常见「留邮箱、遮 Key」）。两个开关都关且词表为空时得到一份
+    /// 空规则集 —— 不脱敏任何东西，但调用方仍能拿到一个可用的脱敏器
+    /// （开关本身由 `core::masking::config::active` 把关）。
+    pub fn with_rules(tokens: bool, emails: bool, words: &[String]) -> Self {
+        let mut rules: Vec<CompiledRule> = default_rules()
+            .iter()
+            .filter(|rule| match rule.kind {
+                "api_key" => tokens,
+                "email" => emails,
+                _ => true,
+            })
+            .cloned()
+            .collect();
         rules.extend(word_rules(words));
         Self {
             rules: rules.into(),
             state: Mutex::new(State::bounded(MAX_SHARED_ENTRIES)),
         }
+    }
+
+    /// 默认规则 + 自定义词表（两族内置规则都开）。
+    pub fn with_words(words: &[String]) -> Self {
+        Self::with_rules(true, true, words)
     }
 
     /// 每次请求拿一个：映射只属于这次请求，请求结束随 session 释放。

@@ -72,6 +72,23 @@ impl MaskReport {
         }
     }
 
+    /// 按**类型**汇总成 `(kind, 次数)`（供请求日志的 hit 元数据用）。
+    ///
+    /// 计数单位是**占位符**而不是出现次数：同一个值复用同一个占位符（`note`
+    /// 已按占位符去重），所以「3 处相同的邮箱」只算 1 次 —— 与
+    /// `TelemetrySnapshot::mask_hits` 的「命中了几类、各几个值」口径一致。
+    /// 顺序按类型首次出现的顺序，读侧不需要再排。
+    pub fn counts(&self) -> Vec<(String, usize)> {
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for hit in &self.hits {
+            match counts.iter_mut().find(|(kind, _)| kind == hit.kind) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((hit.kind.to_string(), 1)),
+            }
+        }
+        counts
+    }
+
     /// 记录一次命中（同一占位符只记一次）。
     fn note(&mut self, kind: &'static str, placeholder: &str) {
         if self.hits.iter().any(|seen| seen.placeholder == placeholder) {
@@ -100,13 +117,15 @@ pub trait Masker {
 /// 返回 `Ok(None)` 表示「未开启脱敏」—— 调用方原样发送，字节与改造前完全
 /// 一致（连 JSON 都不解析，避免无谓的序列化漂移）。
 ///
-/// 返回 `Ok(Some((masked, session)))` 表示已脱敏：`masked` 是新的请求体，
-/// `session` 持有本次映射，回复侧用它还原（Task 5.3）。
+/// 返回 `Ok(Some((masked, session, report)))` 表示已脱敏：`masked` 是新的
+/// 请求体，`session` 持有本次映射（回复侧用它还原，Task 5.3），`report` 是
+/// 本次命中元数据（**只有类型与占位符，没有原文**；调用方据此记
+/// `mask_hits`）。
 ///
 /// 错误一律 **fail-closed**：配置要求脱敏却做不到（没有脱敏器、请求体不是
 /// JSON、序列化失败）时返回错误文案，调用方必须**一个字节都不发**。宁可让
 /// 这一条请求 503，也不能把明文漏给上游。
-pub fn mask_outbound(payload: &str) -> Result<Option<(String, MaskSession)>, String> {
+pub fn mask_outbound(payload: &str) -> Result<Option<(String, MaskSession, MaskReport)>, String> {
     if !config::active().enabled {
         return Ok(None);
     }
@@ -116,10 +135,10 @@ pub fn mask_outbound(payload: &str) -> Result<Option<(String, MaskSession)>, Str
     let mut value: Value = serde_json::from_str(payload)
         .map_err(|_| "脱敏已开启但请求体不是合法 JSON，未发送任何请求".to_string())?;
     let session = masker.session();
-    session.mask_json(&mut value);
+    let report = session.mask_json(&mut value);
     let serialized = serde_json::to_string(&value)
         .map_err(|_| "脱敏后请求体序列化失败，未发送任何请求".to_string())?;
-    Ok(Some((serialized, session)))
+    Ok(Some((serialized, session, report)))
 }
 
 /// 跨分片还原的字节缓冲（流式回复用）。
@@ -505,6 +524,63 @@ mod tests {
         assert_eq!(masker.restore(&text), "a@b.sk-abcdefgh");
     }
 
+    /// 只开密钥脱敏：邮箱原样上行（三档互相独立）。
+    #[test]
+    fn secrets_only_does_not_mask_emails() {
+        let masker = RulesMasker::with_rules(true, false, &[]);
+        let (text, report) = masker.mask_text("key sk-abc123 mail a@b.com");
+        assert!(!text.contains("sk-abc123"), "{text}");
+        assert!(text.contains("a@b.com"), "只开密钥时邮箱必须原样: {text}");
+        assert_eq!(report.hits.len(), 1);
+        assert_eq!(report.hits[0].kind, "api_key");
+    }
+
+    /// 只开个人信息脱敏：密钥原样上行。
+    #[test]
+    fn pii_only_does_not_mask_tokens() {
+        let masker = RulesMasker::with_rules(false, true, &[]);
+        let (text, report) = masker.mask_text("key sk-abc123 mail a@b.com");
+        assert!(
+            text.contains("sk-abc123"),
+            "只开 PII 时密钥必须原样: {text}"
+        );
+        assert!(!text.contains("a@b.com"), "{text}");
+        assert_eq!(report.hits.len(), 1);
+        assert_eq!(report.hits[0].kind, "email");
+    }
+
+    /// 只给自定义词：内置规则一条都不跑，词按字面盖掉。
+    #[test]
+    fn words_only_masks_custom_words() {
+        let masker = RulesMasker::with_rules(false, false, &["Project Falcon".to_string()]);
+        let (text, report) = masker.mask_text("Project Falcon sk-abc123 a@b.com");
+        assert!(!text.contains("Project Falcon"), "{text}");
+        assert!(
+            text.contains("sk-abc123"),
+            "没开密钥时 token 必须原样: {text}"
+        );
+        assert!(text.contains("a@b.com"), "没开 PII 时邮箱必须原样: {text}");
+        assert_eq!(report.hits.len(), 1);
+        assert_eq!(report.hits[0].kind, "word");
+        assert_eq!(masker.restore(&text), "Project Falcon sk-abc123 a@b.com");
+    }
+
+    /// 报告按 kind 汇总成（类型, 次数），不出现原文。
+    #[test]
+    fn report_counts_kinds_without_originals() {
+        let masker = RulesMasker::default();
+        let (_text, report) = masker.mask_text("sk-abc123 a@b.com sk-abc123");
+        let counts = report.counts();
+        assert_eq!(
+            counts,
+            vec![("api_key".to_string(), 1), ("email".to_string(), 1)],
+            "同一个值复用同一个占位符，只算一次"
+        );
+        let debug = format!("{counts:?}");
+        assert!(!debug.contains("sk-abc123"), "{debug}");
+        assert!(!debug.contains("a@b.com"), "{debug}");
+    }
+
     /// 超长自定义词跳过而不是 panic（配置来源不可信）。
     #[test]
     fn oversized_custom_words_are_skipped_not_fatal() {
@@ -561,7 +637,7 @@ mod tests {
         let _guard = config::testing::enabled_with(masker);
         let payload =
             r#"{"model":"example-model","messages":[{"role":"user","content":"mail a@b.com"}]}"#;
-        let (masked, session) = mask_outbound(payload)
+        let (masked, session, _report) = mask_outbound(payload)
             .expect("脱敏器可用时不应失败")
             .expect("开启脱敏时应返回掩码后的请求体");
         assert!(!masked.contains("a@b.com"), "{masked}");
@@ -573,6 +649,58 @@ mod tests {
         // 会话可还原（Task 5.3 的回复还原依赖这一份映射）。
         let restored = session.restore(&masked);
         assert!(restored.contains("a@b.com"), "{restored}");
+    }
+
+    /// 出站门禁把命中元数据一并交回（调用方据此记 `mask_hits`，不记原文）。
+    #[test]
+    fn mask_outbound_returns_hit_metadata() {
+        let masker = std::sync::Arc::new(RulesMasker::with_rules(true, false, &[]));
+        let _guard = config::testing::enabled_with(masker);
+        let payload = r#"{"messages":[{"role":"user","content":"sk-abc123 a@b.com"}]}"#;
+        let (masked, _session, report) = mask_outbound(payload)
+            .expect("脱敏器可用时不应失败")
+            .expect("开启脱敏时应返回掩码后的请求体");
+        assert!(!masked.contains("sk-abc123"), "{masked}");
+        assert!(masked.contains("a@b.com"), "只开密钥时邮箱原样: {masked}");
+        assert_eq!(report.counts(), vec![("api_key".to_string(), 1)]);
+    }
+
+    /// 只开 PII：出站门禁只盖邮箱，密钥原样上行。
+    #[test]
+    fn mask_outbound_pii_only_leaves_tokens_alone() {
+        let masker = std::sync::Arc::new(RulesMasker::with_rules(false, true, &[]));
+        let _guard = config::testing::enabled_with(masker);
+        let payload = r#"{"messages":[{"role":"user","content":"sk-abc123 a@b.com"}]}"#;
+        let (masked, _session, report) = mask_outbound(payload)
+            .expect("脱敏器可用时不应失败")
+            .expect("开启脱敏时应返回掩码后的请求体");
+        assert!(
+            masked.contains("sk-abc123"),
+            "只开 PII 时密钥原样: {masked}"
+        );
+        assert!(!masked.contains("a@b.com"), "{masked}");
+        assert_eq!(report.counts(), vec![("email".to_string(), 1)]);
+    }
+
+    /// 只给自定义词：出站门禁按字面盖词，内置规则不跑。
+    #[test]
+    fn mask_outbound_words_only_masks_custom_words() {
+        let masker = std::sync::Arc::new(RulesMasker::with_rules(
+            false,
+            false,
+            &["Project Falcon".to_string()],
+        ));
+        let _guard = config::testing::enabled_with(masker);
+        let payload = r#"{"messages":[{"role":"user","content":"Project Falcon sk-abc123"}]}"#;
+        let (masked, _session, report) = mask_outbound(payload)
+            .expect("脱敏器可用时不应失败")
+            .expect("开启脱敏时应返回掩码后的请求体");
+        assert!(!masked.contains("Project Falcon"), "{masked}");
+        assert!(
+            masked.contains("sk-abc123"),
+            "没开密钥时 token 原样: {masked}"
+        );
+        assert_eq!(report.counts(), vec![("word".to_string(), 1)]);
     }
 
     /// 开启但请求体不是 JSON：fail-closed，返回错误而不是原样发送。

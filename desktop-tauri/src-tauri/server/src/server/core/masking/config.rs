@@ -3,31 +3,37 @@
 //! 出站脱敏要不要做、用哪份规则，由这里回答；调用方（[`super::mask_outbound`]）
 //! 只认 [`MaskConfig`] 与 [`masker`] 两个入口。
 //!
-//! ## 现在与将来
+//! ## 开关从哪来
 //!
-//! 本次（Task 5.2）只落**出站门禁**：`enabled` 恒为 `false`，[`masker`] 恒给
-//! 一份默认规则的 [`RulesMasker`] —— 于是生产行为与改造前逐字节一致（关闭时
-//! 连 JSON 都不解析）。
+//! 三项设置（`maskSecrets` / `maskPii` / `maskWords`）由 `server::config` 解析
+//! 进运行期快照；[`active`] 把三档合并成一个 `enabled`（任一打开或词表非空），
+//! [`masker`] 按同一份设置选择规则族。改完设置下一个请求就生效，不必重启。
 //!
-//! Task 5.4 会把这两个函数换成读真实设置（`maskSecrets` / `maskPii` /
-//! `maskWords`）：把开关与词表接进来即可，**调用方不需要改**。
-//! 因此这里刻意保持「无参数、进程级」的形态：设置是全局的，调用点不该各自
-//! 决定读哪一份。
+//! 关闭是**安全默认**：没有配置就没有理由改写用户请求体（改写会改变字节，
+//! 进而影响上游缓存与排障对照）。关闭时 [`super::mask_outbound`] 连 JSON 都
+//! 不解析，出站字节与改造前逐字节一致。
+//!
+//! ## fail-closed
+//!
+//! [`masker`] 返回 `None` 只表示「配置要求脱敏，却读不到配置」—— 调用方据此
+//! 返回 503、**一个字节都不发**。当前配置读侧在未初始化 / 读锁中毒时会明确
+//! 返回 `None`（见 `config::mask_settings_checked`），而不是拿一份空规则悄悄
+//! 放行；两者都关且词表为空时它仍返回 `Some`（空规则集），因为「要不要脱敏」
+//! 由 [`active`] 的 `enabled` 决定，不由 `None` 决定。
 //!
 //! ## 测试接缝
 //!
-//! 配置是进程级的，但测试需要「开启 + 无脱敏器」这种组合。`#[cfg(test)]`
+//! 配置是进程级的，但测试需要「开启 + 指定规则」这种组合。`#[cfg(test)]`
 //! 下用线程局部覆盖（[`testing`]）：每个测试线程有自己的覆盖值，互不串味；
 //! 覆盖只在测试构建里存在，生产代码看不到这条路径。
 
 use std::sync::Arc;
 
+use crate::server::config::MaskSettings;
+
 use super::RulesMasker;
 
 /// 脱敏开关的快照。
-///
-/// 目前只有「开 / 关」一位；Task 5.4 会按设置拆成密钥 / 个人信息 / 自定义词
-/// 三档（届时新增字段，[`active`] 负责合并成最终值）。
 #[derive(Clone, Debug, Default)]
 pub struct MaskConfig {
     pub enabled: bool,
@@ -35,8 +41,8 @@ pub struct MaskConfig {
 
 /// 当前的脱敏开关。
 ///
-/// Task 5.4 之前恒为关闭 —— 关闭是**安全默认**：没有配置就没有理由改写用户
-/// 请求体（改写会改变字节，进而影响上游缓存与排障对照）。
+/// `enabled = maskSecrets || maskPii || !maskWords.is_empty()`：词表非空本身
+/// 也算开启，否则用户填了词却发现没生效。
 pub fn active() -> MaskConfig {
     #[cfg(test)]
     {
@@ -44,13 +50,17 @@ pub fn active() -> MaskConfig {
             return config;
         }
     }
-    MaskConfig { enabled: false }
+    MaskConfig {
+        enabled: crate::server::config::mask_settings().enabled(),
+    }
 }
 
-/// 当前的脱敏器（`None` = 配置要求脱敏但拿不到规则）。
+/// 当前的脱敏器（`None` = 配置要求脱敏但读不到配置）。
 ///
-/// 现在恒给默认规则；Task 5.4 会按设置构造（自定义词表、是否含 PII 等），
-/// 并在规则编译失败等异常情况下返回 `None` —— 调用方据此 fail-closed。
+/// 按设置选择规则族（密钥 / 邮箱 / 自定义词，见
+/// [`RulesMasker::with_rules`]）。同一份设置的脱敏器会被缓存：规则编译
+/// （尤其自定义词的正则）不该落在每个请求的热路径上；设置一改，指纹不匹配
+/// 就重建。
 pub fn masker() -> Option<Arc<RulesMasker>> {
     #[cfg(test)]
     {
@@ -58,12 +68,24 @@ pub fn masker() -> Option<Arc<RulesMasker>> {
             return masker;
         }
     }
-    static MASKER: std::sync::OnceLock<Arc<RulesMasker>> = std::sync::OnceLock::new();
-    Some(
-        MASKER
-            .get_or_init(|| Arc::new(RulesMasker::default()))
-            .clone(),
-    )
+    let settings = crate::server::config::mask_settings_checked()?;
+    static CACHE: std::sync::Mutex<Option<(MaskSettings, Arc<RulesMasker>)>> =
+        std::sync::Mutex::new(None);
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((cached, masker)) = cache.as_ref() {
+        if *cached == settings {
+            return Some(masker.clone());
+        }
+    }
+    let masker = Arc::new(RulesMasker::with_rules(
+        settings.secrets,
+        settings.pii,
+        &settings.words,
+    ));
+    *cache = Some((settings, masker.clone()));
+    Some(masker)
 }
 
 /// 测试专用覆盖（仅 `#[cfg(test)]` 构建可见）。

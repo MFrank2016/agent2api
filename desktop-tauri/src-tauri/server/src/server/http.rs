@@ -675,6 +675,14 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/sanitize",
             get(api::sanitize::get_sanitize).put(api::sanitize::put_sanitize),
         )
+        // ── 可逆脱敏（密钥 / 个人信息 / 自定义词）──
+        // 与 /api/sanitize 同形（GET 读 / PUT 写），同样挂 protected：它决定
+        // 出站请求体要不要被换成占位符（改的是发给上游的字节），敏感度同级。
+        // 与指纹脱敏的区别（可逆 / 不可逆）见 api::masking 的模块头。
+        .route(
+            "/api/masking",
+            get(api::masking::get_masking).put(api::masking::put_masking),
+        )
         // ── 开发者角色兼容开关 ──
         // 与 /api/debug 同形的单开关端点（GET 读 / PUT 写），挂 protected：
         // 它决定出站请求里 developer 角色消息要不要归一成 system（改的是发给

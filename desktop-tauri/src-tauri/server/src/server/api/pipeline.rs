@@ -499,7 +499,10 @@ pub fn live_row_sink(
                 phase_started_at: snapshot.phase_started_at.or(Some(started_at)),
                 attempt_details: stored_attempt_details(&snapshot.attempts_detail),
                 route: snapshot.route.clone(),
-                sensitive_hits: stored_sensitive_hits(&snapshot.sensitive_hits),
+                sensitive_hits: stored_sensitive_hits(
+                    &snapshot.sensitive_hits,
+                    &snapshot.mask_hits,
+                ),
             },
         );
     }
@@ -540,14 +543,40 @@ fn stored_attempt_details(list: &[usage::AttemptDetail]) -> Vec<AttemptDetail> {
         .collect()
 }
 
-/// telemetry 的脱敏命中 → 落库形态（与 [`stored_attempt_details`] 同一理由）
-fn stored_sensitive_hits(list: &[usage::SensitiveHit]) -> Vec<SensitiveHit> {
-    list.iter()
+/// telemetry 的两份命中 → 落库形态（与 [`stored_attempt_details`] 同一理由）。
+///
+/// 两份来源：
+///   - `sanitize`：出站指纹脱敏（改写后不还原），`word` 是规则标签；
+///   - `mask`：可逆脱敏（请求侧换占位符、回复侧还原），`word` 是规则类型
+///     （`api_key` / `email` / `word`）。
+///
+/// 落库形状沿用 `sensitive_hits` 的 `{word, count}`：前端不需要为可逆脱敏
+/// 新增一套渲染，「敏」标签与悬停面板照常工作。**两份都不含原文**。
+fn stored_sensitive_hits(
+    sanitize: &[usage::SensitiveHit],
+    mask: &[(String, usize)],
+) -> Vec<SensitiveHit> {
+    let mut merged: Vec<SensitiveHit> = sanitize
+        .iter()
         .map(|hit| SensitiveHit {
             word: hit.word.clone(),
             count: hit.count,
         })
-        .collect()
+        .collect();
+    for (kind, count) in mask {
+        if *count == 0 {
+            continue;
+        }
+        let count = *count as i64;
+        match merged.iter_mut().find(|hit| hit.word == *kind) {
+            Some(hit) => hit.count += count,
+            None => merged.push(SensitiveHit {
+                word: kind.clone(),
+                count,
+            }),
+        }
+    }
+    merged
 }
 
 /// 记一条请求日志。
@@ -623,7 +652,7 @@ pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
     // 转换走 `stored_*` 两个函数：在途回写（`live_row_sink`）用的是同一份，
     // 两处各写一遍迟早会让进行中行与收尾行显示成两种样子。
     entry.attempt_details = stored_attempt_details(&snapshot.attempts_detail);
-    entry.sensitive_hits = stored_sensitive_hits(&snapshot.sensitive_hits);
+    entry.sensitive_hits = stored_sensitive_hits(&snapshot.sensitive_hits, &snapshot.mask_hits);
     // 选路决策快照：有采集才落（没走到选路的请求是 Null，前端不渲染那一段）
     entry.route = snapshot.route.unwrap_or(Value::Null);
     // 来源标记：入口带进来的事实，存储层据此排除报表聚合（见该字段的说明）

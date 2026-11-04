@@ -1304,3 +1304,49 @@ pub struct AutoContinuePatch {
     /// `AUTO_CONTINUE_MIN_ROUNDS..=AUTO_CONTINUE_MAX_ROUNDS` 校验过。
     pub max_rounds: Option<i64>,
 }
+
+// ─── 出站脱敏（maskSecrets / maskPii / maskWords）──────────────
+//
+// 与 `sanitize`（出站指纹脱敏，改写后**不还原**）不同，这里的脱敏是**可逆**的：
+// 请求侧把密钥 / 邮箱 / 自定义词换成占位符，回复侧再按同一份映射还原
+// （实现见 `core::masking`）。因此开关默认全关 —— 没有配置就没有理由改写
+// 用户请求体，关闭时出站字节与改造前逐字节一致。
+
+/// 密钥 / API Key 脱敏开关（`maskSecrets`，默认关）。
+pub const KEY_MASK_SECRETS: &str = "maskSecrets";
+/// 邮箱 / 个人信息脱敏开关（`maskPii`，默认关）。
+pub const KEY_MASK_PII: &str = "maskPii";
+/// 自定义脱敏词表（`maskWords`，默认空）。按字面匹配，超长词由规则层跳过。
+pub const KEY_MASK_WORDS: &str = "maskWords";
+
+/// 出站脱敏设置。
+///
+/// 三档互相独立：只开 `secrets` 就只盖密钥（邮箱原样上行），只开 `pii` 就只盖
+/// 邮箱。自定义词表非空本身也算「要脱敏」—— 否则用户填了词却发现没生效。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MaskSettings {
+    /// 密钥 / API Key
+    pub secrets: bool,
+    /// 邮箱 / 个人信息
+    pub pii: bool,
+    /// 自定义词（字面匹配；顺序即配置顺序，去重后保存）
+    pub words: Vec<String>,
+}
+
+impl MaskSettings {
+    /// 是否开启出站脱敏：任一开关打开或词表非空。
+    pub fn enabled(&self) -> bool {
+        self.secrets || self.pii || !self.words.is_empty()
+    }
+}
+
+/// 出站脱敏设置的**部分**更新入参（`None` = 该项不动）。
+#[derive(Clone, Debug, Default)]
+pub struct MaskPatch {
+    /// 密钥脱敏开关（`None` = 该项不动）
+    pub secrets: Option<bool>,
+    /// 个人信息脱敏开关（`None` = 该项不动）
+    pub pii: Option<bool>,
+    /// 自定义词表（`None` = 该项不动；`Some([])` = 清空）
+    pub words: Option<Vec<String>>,
+}
