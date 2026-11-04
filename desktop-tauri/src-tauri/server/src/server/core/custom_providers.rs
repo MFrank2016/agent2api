@@ -1701,24 +1701,49 @@ mod tests {
         assert_eq!(record["name"], "My OpenAI");
     }
 
-    /// 显式特判覆盖预置特判（含「显式清空」）：GLM 的 `?beta=true` / Anthropic-Beta
-    /// 必须被 payload 整体替换，`clientEmulation` 空串表示不伪装。
+    /// 显式特判覆盖预置特判（含「显式清空」）—— 四个键逐项覆盖，且每个都先断言
+    /// 预置侧确实有值，避免「键被整段丢掉也照样通过」的空断言：
+    ///   * GLM 预置带 `urlSuffix` + `headers` → 空串 / 新对象整体替换；
+    ///   * Minimax 预置带 `anthropicToolType="custom"` → 空串清掉；
+    ///   * OpenCode Zen 预置带 `clientEmulation="opencode"` → 空串关掉伪装。
     #[test]
     fn explicit_quirks_override_preset() {
-        let record = draft_of(json!({
+        // urlSuffix / headers（GLM：?beta=true + Anthropic-Beta）
+        let glm_default = draft_of(json!({ "presetId": "glm" })).unwrap();
+        assert_eq!(glm_default["urlSuffix"], "?beta=true");
+        assert_eq!(
+            glm_default["headers"]["Anthropic-Beta"],
+            "claude-code-20250219,interleaved-thinking-2025-05-14"
+        );
+        let glm = draft_of(json!({
             "presetId": "glm",
-            "name": "GLM Coding",
             "urlSuffix": "",
             "headers": { "X-A": "b" },
+        }))
+        .unwrap();
+        assert_eq!(glm["urlSuffix"], "", "显式空串要清掉预置的 ?beta=true");
+        assert_eq!(glm["headers"], json!({ "X-A": "b" }), "头族整体替换");
+        assert_eq!(glm["presetKey"], "glm");
+
+        // anthropicToolType（Minimax：预置写的是 custom）
+        let minimax_default = draft_of(json!({ "presetId": "minimax" })).unwrap();
+        assert_eq!(minimax_default["anthropicToolType"], TOOL_TYPE_CUSTOM);
+        let minimax = draft_of(json!({
+            "presetId": "minimax",
+            "anthropicToolType": "",
+        }))
+        .unwrap();
+        assert_eq!(minimax["anthropicToolType"], "", "显式空串要清掉 custom");
+
+        // clientEmulation（OpenCode Zen：预置写的是 opencode）
+        let zen_default = draft_of(json!({ "presetId": "opencode-zen" })).unwrap();
+        assert_eq!(zen_default["clientEmulation"], CLIENT_EMULATION_OPENCODE);
+        let zen = draft_of(json!({
+            "presetId": "opencode-zen",
             "clientEmulation": "",
         }))
         .unwrap();
-        assert_eq!(record["urlSuffix"], "", "显式空串要清掉预置的 ?beta=true");
-        assert_eq!(record["headers"], json!({ "X-A": "b" }), "头族整体替换");
-        assert_eq!(record["clientEmulation"], "", "显式空串要关掉伪装");
-        // GLM 本来没有工具 type 特判，缺省仍是空串；模板标识不受特判覆盖影响。
-        assert_eq!(record["anthropicToolType"], "");
-        assert_eq!(record["presetKey"], "glm");
+        assert_eq!(zen["clientEmulation"], "", "显式空串要关掉伪装");
     }
 
     /// 未收录的 presetId 一律 400（不静默回落到手动新建 —— 拼错 id 时那会
