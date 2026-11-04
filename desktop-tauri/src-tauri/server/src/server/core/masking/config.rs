@@ -33,42 +33,71 @@ use crate::server::config::MaskSettings;
 
 use super::RulesMasker;
 
-/// 脱敏开关的快照。
-#[derive(Clone, Debug, Default)]
+/// 脱敏开关与脱敏器的快照（**同一次配置读取**的产物）。
+///
+/// 两件事必须来自同一份设置：只读「开不开」再单独读「用哪个规则」，两次
+/// 读之间可能插进一次配置写入（开 → 关），于是门禁放行、规则却是另一份
+/// 快照的 —— 这正是 fail-closed 要避免的窗口。
+#[derive(Clone, Default)]
 pub struct MaskConfig {
     pub enabled: bool,
+    masker: Option<Arc<RulesMasker>>,
 }
 
-/// 当前的脱敏开关。
+impl MaskConfig {
+    /// 本次快照对应的脱敏器（`None` = 未开启，或配置读不到）。
+    ///
+    /// 读不到配置时 [`active`] 返回「开启 + 无脱敏器」，调用方据此 503。
+    pub fn masker(&self) -> Option<Arc<RulesMasker>> {
+        self.masker.clone()
+    }
+}
+
+/// 当前的脱敏开关与脱敏器。
 ///
 /// `enabled = maskSecrets || maskPii || !maskWords.is_empty()`：词表非空本身
 /// 也算开启，否则用户填了词却发现没生效。
+///
+/// ── 读不到配置时必须 **fail-closed** ───────────────────────────
+/// 配置读不到（未初始化 / 读锁中毒）时返回 `enabled: true` 且没有脱敏器，
+/// 而不是回落「全关」：后者会让用户明明开着脱敏、却因为一次读锁故障把明文
+/// 发给上游。开启后 [`super::mask_outbound`] 会取脱敏器，拿不到就返回 503、
+/// **一个字节都不发**。
+///
+/// ── 为什么关闭时不构造脱敏器 ─────────────────────────────────
+/// 关闭是默认态，热路径不该为它付一次规则缓存查找的代价。`enabled` 为
+/// false 时调用方直接放行，`masker` 留空。
 pub fn active() -> MaskConfig {
     #[cfg(test)]
     {
-        if let Some((config, _)) = testing::snapshot() {
+        if testing::unreadable_snapshot() {
+            return MaskConfig {
+                enabled: true,
+                masker: None,
+            };
+        }
+        if let Some(config) = testing::snapshot() {
             return config;
         }
     }
-    MaskConfig {
-        enabled: crate::server::config::mask_settings().enabled(),
+    match crate::server::config::mask_settings_checked() {
+        Some(settings) => {
+            let enabled = settings.enabled();
+            let masker = enabled.then(|| masker_for(settings));
+            MaskConfig { enabled, masker }
+        }
+        // 读不到配置：门禁按开启处理，但没有脱敏器 → 调用方 503（fail-closed）
+        None => MaskConfig {
+            enabled: true,
+            masker: None,
+        },
     }
 }
 
-/// 当前的脱敏器（`None` = 配置要求脱敏但读不到配置）。
+/// 按设置构造（并缓存）脱敏器。
 ///
-/// 按设置选择规则族（密钥 / 邮箱 / 自定义词，见
-/// [`RulesMasker::with_rules`]）。同一份设置的脱敏器会被缓存：规则编译
-/// （尤其自定义词的正则）不该落在每个请求的热路径上；设置一改，指纹不匹配
-/// 就重建。
-pub fn masker() -> Option<Arc<RulesMasker>> {
-    #[cfg(test)]
-    {
-        if let Some((_, masker)) = testing::snapshot() {
-            return masker;
-        }
-    }
-    let settings = crate::server::config::mask_settings_checked()?;
+/// 缓存以整份设置为指纹：改开关或词表都会重建；没改则只做一次 Arc 克隆。
+fn masker_for(settings: MaskSettings) -> Arc<RulesMasker> {
     static CACHE: std::sync::Mutex<Option<(MaskSettings, Arc<RulesMasker>)>> =
         std::sync::Mutex::new(None);
     let mut cache = CACHE
@@ -76,7 +105,7 @@ pub fn masker() -> Option<Arc<RulesMasker>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some((cached, masker)) = cache.as_ref() {
         if *cached == settings {
-            return Some(masker.clone());
+            return masker.clone();
         }
     }
     let masker = Arc::new(RulesMasker::with_rules(
@@ -85,21 +114,22 @@ pub fn masker() -> Option<Arc<RulesMasker>> {
         &settings.words,
     ));
     *cache = Some((settings, masker.clone()));
-    Some(masker)
+    masker
 }
 
 /// 测试专用覆盖（仅 `#[cfg(test)]` 构建可见）。
 #[cfg(test)]
 pub(crate) mod testing {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::sync::Arc;
 
     use super::{MaskConfig, RulesMasker};
 
-    type Override = (MaskConfig, Option<Arc<RulesMasker>>);
-
     thread_local! {
-        static OVERRIDE: RefCell<Option<Override>> = const { RefCell::new(None) };
+        static OVERRIDE: RefCell<Option<MaskConfig>> = const { RefCell::new(None) };
+        /// 「配置读不到」的覆盖：与 `OVERRIDE` 分开，因为它表达的是
+        /// `mask_settings_checked()` 返回 `None`，而不是某一组设置。
+        static UNREADABLE: Cell<bool> = const { Cell::new(false) };
     }
 
     /// 覆盖值的生命周期守卫：离开作用域即恢复默认，避免测试之间互相污染。
@@ -114,29 +144,74 @@ pub(crate) mod testing {
     }
 
     /// 当前线程的覆盖值（`None` = 没覆盖，走生产默认）。
-    pub(super) fn snapshot() -> Option<Override> {
+    pub(super) fn snapshot() -> Option<MaskConfig> {
         OVERRIDE.with(|slot| slot.borrow().clone())
+    }
+
+    /// 当前线程是否在模拟「配置读不到」。
+    pub(super) fn unreadable_snapshot() -> bool {
+        UNREADABLE.with(|flag| flag.get())
+    }
+
+    /// 模拟配置读不到（未初始化 / 读锁中毒）：`active()` 必须按开启处理，
+    /// 且不带脱敏器，于是 `mask_outbound` fail-closed。
+    pub(crate) fn unreadable() -> UnreadableGuard {
+        UNREADABLE.with(|flag| flag.set(true));
+        UnreadableGuard
+    }
+
+    /// 「配置读不到」覆盖的生命周期守卫。
+    pub(crate) struct UnreadableGuard;
+
+    impl Drop for UnreadableGuard {
+        fn drop(&mut self) {
+            UNREADABLE.with(|flag| flag.set(false));
+        }
     }
 
     /// 关闭脱敏（显式覆盖，便于在「生产默认也是关闭」时仍然锁定语义）。
     pub(crate) fn disabled() -> Guard {
-        set(MaskConfig { enabled: false }, None)
+        set(MaskConfig {
+            enabled: false,
+            masker: None,
+        })
     }
 
     /// 开启脱敏但没有可用脱敏器（fail-closed 用例）。
     pub(crate) fn enabled_without_masker() -> Guard {
-        set(MaskConfig { enabled: true }, None)
+        set(MaskConfig {
+            enabled: true,
+            masker: None,
+        })
     }
 
     /// 开启脱敏并指定脱敏器。
     pub(crate) fn enabled_with(masker: Arc<RulesMasker>) -> Guard {
-        set(MaskConfig { enabled: true }, Some(masker))
+        set(MaskConfig {
+            enabled: true,
+            masker: Some(masker),
+        })
     }
 
-    fn set(config: MaskConfig, masker: Option<Arc<RulesMasker>>) -> Guard {
+    fn set(config: MaskConfig) -> Guard {
         OVERRIDE.with(|slot| {
-            *slot.borrow_mut() = Some((config, masker));
+            *slot.borrow_mut() = Some(config);
         });
         Guard
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 配置读不到时门禁必须按开启处理，且不给出脱敏器 —— 两者合起来才是
+    /// fail-closed：`mask_outbound` 会因此返回 503，而不是静默放行明文。
+    #[test]
+    fn active_fails_closed_when_the_config_snapshot_is_unreadable() {
+        let _guard = testing::unreadable();
+        let config = active();
+        assert!(config.enabled, "读不到配置时必须按开启处理");
+        assert!(config.masker().is_none(), "读不到配置时不能给出脱敏器");
     }
 }

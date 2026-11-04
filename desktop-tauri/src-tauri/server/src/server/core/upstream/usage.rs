@@ -1259,7 +1259,6 @@ mod body_bytes_observation {
     }
 }
 
-
 #[cfg(test)]
 mod mask_hit_metadata {
     //! 可逆脱敏的命中元数据（只记类型 / 数量，不记原文）。

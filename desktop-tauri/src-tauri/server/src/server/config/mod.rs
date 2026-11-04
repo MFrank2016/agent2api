@@ -2747,7 +2747,6 @@ mod auto_continue_tests {
     }
 }
 
-
 #[cfg(test)]
 mod mask_settings_tests {
     //! 出站脱敏设置在**读写入口**这一层的形状：默认全关、setter 同时写底稿与

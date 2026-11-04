@@ -126,10 +126,14 @@ pub trait Masker {
 /// JSON、序列化失败）时返回错误文案，调用方必须**一个字节都不发**。宁可让
 /// 这一条请求 503，也不能把明文漏给上游。
 pub fn mask_outbound(payload: &str) -> Result<Option<(String, MaskSession, MaskReport)>, String> {
-    if !config::active().enabled {
+    // 一次读取同时拿到「开不开」与「用哪个脱敏器」：两读之间可能插进一次
+    // 配置写入，门禁与规则就会来自两份不同的快照（见 `config::active`）。
+    let config = config::active();
+    if !config.enabled {
         return Ok(None);
     }
-    let Some(masker) = config::masker() else {
+    // 读不到配置时 `active` 给出「开启 + 无脱敏器」→ 这里 fail-closed。
+    let Some(masker) = config.masker() else {
         return Err("脱敏已开启但脱敏器不可用，未发送任何请求".to_string());
     };
     let mut value: Value = serde_json::from_str(payload)
@@ -618,6 +622,21 @@ mod tests {
             payload,
             r#"{"model":"m","messages":[{"role":"user","content":"a@b.com"}]}"#
         );
+    }
+
+    /// 配置读不到（未初始化 / 读锁中毒）：必须 fail-closed，不能回落「全关」。
+    ///
+    /// 这是本次评审的回归点：`active()` 曾经用 `mask_settings()`（读不到时给
+    /// 默认全关），于是 `mask_outbound` 在调用 `masker()` 之前就 `Ok(None)`
+    /// 放行了明文。现在 `active()` 在同样情况下按开启处理，`masker()` 返回
+    /// `None`，请求以 503 收场。
+    #[test]
+    fn unreadable_config_fails_closed() {
+        let _guard = config::testing::unreadable();
+        match mask_outbound("{}") {
+            Err(error) => assert!(error.contains("未发送任何请求"), "{error}"),
+            Ok(_) => panic!("读不到配置时必须报错而不是放行明文"),
+        }
     }
 
     /// 开启但没有可用脱敏器：fail-closed，绝不把明文发出去。
