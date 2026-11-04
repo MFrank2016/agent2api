@@ -8,7 +8,7 @@
 //! 所以先把 429 判成 [`QuotaKind`]，再由上层决定 rest 时长与作用域。
 //!
 //! ── 判定口径 ───────────────────────────────────────────────
-//! 只看 `message` 词表 + 少量厂商特例（`provider` / `code`），**不猜**：
+//! 只看 `message` 词表 + 少量厂商特例（`vendor` / `code`），**不猜**：
 //! 命中哪一层的词就归哪一类，命中顺序即优先级（信用类最具体，先判）。
 //! 全都没命中时回落 [`QuotaKind::Quota`] —— 保守选择：宁可让该模型多休息
 //! 一会儿，也不要把额度类失败误判成分钟级限流而反复重试（见设计文档
@@ -61,15 +61,21 @@ const PLAN_WORDS: &[&str] = &[
 /// 人机验证文案。
 const VERIFY_WORDS: &[&str] = &["verify", "verification", "captcha", "验证"];
 
+/// 智谱系厂商身份：内置 provider id（`chatglm`）、自定义提供商的余额方案
+/// （`zhipu` / `zhipu_zai`）与 preset key（`glm` / `glm-cn`）都指向同一家。
+const ZHIPU_VENDORS: &[&str] = &["zhipu", "zhipu_zai", "glm", "glm-cn", "chatglm"];
+
 /// 把一次配额类失败判成 [`QuotaKind`]。
 ///
-/// `message` 是上游返回的原文（可为空）；`provider` 是 provider id，
-/// 用于少数厂商特例；`code` 是上游业务码，同样只用于厂商特例。
+/// `message` 是上游返回的原文（可为空）；`vendor` 是**厂商身份** —— 内置
+/// provider id，或自定义提供商的余额方案 / preset key（同一个上游在不同
+/// 接入形态下叫法不同，见 [`ZHIPU_VENDORS`]）；`code` 是上游业务码，
+/// 同样只用于厂商特例。
 pub fn classify_quota_kind(
     _status: u16,
     code: Option<i64>,
     message: &str,
-    provider: &str,
+    vendor: &str,
 ) -> QuotaKind {
     let text = message.to_ascii_lowercase();
     if CREDIT_WORDS.iter().any(|word| text.contains(word)) {
@@ -84,8 +90,11 @@ pub fn classify_quota_kind(
     if PLAN_WORDS.iter().any(|word| text.contains(word)) {
         return QuotaKind::Plan;
     }
-    // 厂商特例：Zhipu 1113 是额度不足，文案里不一定带词表关键词
-    if provider == "zhipu" && code == Some(1113) {
+    // 厂商特例：智谱 1113 是额度不足，文案里不一定带词表关键词。
+    // 这里认的是「厂商身份」而非单一 provider id：内置 `chatglm`、自定义
+    // 提供商的余额方案 `zhipu` / `zhipu_zai`、preset key `glm` / `glm-cn`
+    // 打的是同一家上游，业务码口径一致。
+    if ZHIPU_VENDORS.contains(&vendor) && code == Some(1113) {
         return QuotaKind::Credit;
     }
     QuotaKind::Quota
@@ -94,13 +103,20 @@ pub fn classify_quota_kind(
 /// 从响应头里取 `Retry-After`（秒）并转成毫秒。
 ///
 /// 头名大小写不敏感；值不是整数（如 HTTP-date 形式）或缺失时返回 `None`，
-/// 由上层回落到默认 rest 时长。负数按 0 处理（已可重试）。
+/// 由上层回落到默认 rest 时长。
+///
+/// `<= 0` 一律按「没给」处理（返回 `None`）：与本项目其它 `Retry-After`
+/// 消费点口径一致（`server/errors.rs` 不发 `Retry-After: 0`，
+/// `plugin_host/strict_errors.rs` 的 `retry_reset` 对 0 返回 `None`）。
+/// 若返回 `Some(0)`，上层会把它当成「立即恢复」而立刻重新派发 —— 正是
+/// 429 风暴要避免的。
 pub fn retry_after_ms(headers: &[(String, String)]) -> Option<i64> {
     headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
         .and_then(|(_, value)| value.trim().parse::<i64>().ok())
-        .map(|seconds| seconds.saturating_mul(1000).max(0))
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| seconds.saturating_mul(1000))
 }
 
 #[cfg(test)]
@@ -165,8 +181,30 @@ mod tests {
 
     #[test]
     fn zhipu_code_is_credit_without_words() {
+        // 自定义提供商接入时 `vendor` 是余额方案 / preset key。
         assert_eq!(
             classify_quota_kind(429, Some(1113), "", "zhipu"),
+            QuotaKind::Credit
+        );
+        assert_eq!(
+            classify_quota_kind(429, Some(1113), "", "zhipu_zai"),
+            QuotaKind::Credit
+        );
+        assert_eq!(
+            classify_quota_kind(429, Some(1113), "", "glm"),
+            QuotaKind::Credit
+        );
+        assert_eq!(
+            classify_quota_kind(429, Some(1113), "", "glm-cn"),
+            QuotaKind::Credit
+        );
+    }
+
+    #[test]
+    fn chatglm_code_is_credit_without_words() {
+        // 生产形态：内置 provider id 是 `chatglm`，不存在 id `zhipu`。
+        assert_eq!(
+            classify_quota_kind(429, Some(1113), "", "chatglm"),
             QuotaKind::Credit
         );
     }
@@ -176,5 +214,17 @@ mod tests {
         let headers = vec![("retry-after".to_string(), "soon".to_string())];
         assert_eq!(retry_after_ms(&headers), None);
         assert_eq!(retry_after_ms(&[]), None);
+    }
+
+    #[test]
+    fn retry_after_zero_or_negative_is_no_header() {
+        assert_eq!(
+            retry_after_ms(&[("retry-after".to_string(), "0".to_string())]),
+            None
+        );
+        assert_eq!(
+            retry_after_ms(&[("retry-after".to_string(), "-5".to_string())]),
+            None
+        );
     }
 }
