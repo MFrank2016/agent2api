@@ -420,6 +420,68 @@ fn quota_rest_verification_also_stops_the_whole_account() {
     );
 }
 
+/// 成功转发一次 ⇒ **立即**解除账号级硬休息（不等 24 小时截止）。
+///
+/// 三条成功出口（自定义 / 会话式 / 无状态）共用 `note_route_success`。
+/// 没有这条解除路径时：充值到账、验证过完、或者当初那条 429 本就是误判，
+/// 账号仍被硬停到截止时刻 —— 期间所有模型都被 `plan_route` 跳过，只能重启进程。
+#[test]
+fn a_successful_forward_lifts_the_account_rest() {
+    let (_dir, service, id) = temp_service();
+    rotate::mark_account_limited(
+        &service,
+        &id,
+        "m-credit",
+        429,
+        None,
+        None,
+        "上游返回 429: 余额不足或无可用资源包",
+        "custom-credit",
+        None,
+    );
+    assert!(
+        account_rest_until(&service, &id) > 0,
+        "前置：余额类应当硬停账号"
+    );
+    note_route_success(&service, &id);
+    assert_eq!(
+        account_rest_until(&service, &id),
+        0,
+        "成功一次应当立即解除账号级硬休息"
+    );
+}
+
+/// 账号页「清除限流」同样解除内存里的硬休息（不只是落库的 `rateLimits`）。
+///
+/// 端点清的是落库条目，硬休息在进程内存的另一张表；不一起清的话按钮看起来
+/// 「点了没反应」（转发仍被硬跳过）。
+#[test]
+fn the_manual_clear_lifts_the_account_rest() {
+    let (_dir, service, id) = temp_service();
+    rotate::mark_account_limited(
+        &service,
+        &id,
+        "m-credit",
+        429,
+        None,
+        None,
+        "上游返回 429: 余额不足或无可用资源包",
+        "custom-credit",
+        None,
+    );
+    assert!(
+        account_rest_until(&service, &id) > 0,
+        "前置：余额类应当硬停账号"
+    );
+    // 账号页「清除限流」→ `api::accounts::clear_rate_limits` 调的正是这个
+    service.clear_account_rest(&id);
+    assert_eq!(
+        account_rest_until(&service, &id),
+        0,
+        "手动清除应当解除账号级硬休息"
+    );
+}
+
 /// 分钟级限流 ⇒ **模型级**短 rest（`retryAfterMs` 或默认 60 秒），账号不休息；
 /// 落库的 `resetAt` 也必须是这 60 秒，而不是存储层的 10 分钟兜底。
 ///

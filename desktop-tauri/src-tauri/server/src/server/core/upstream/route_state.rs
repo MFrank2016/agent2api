@@ -475,6 +475,20 @@ impl RouteState {
         }
     }
 
+    /// 成功一次（或用户手动清除）→ 立即解除账号级硬休息。
+    ///
+    /// ── 为什么必须有这条解除路径 ────────────────────────────────
+    /// 硬休息的时长最长 24 小时（余额耗尽 / 需要验证的兜底），而它拦的是**所有
+    /// 模型**：只有写入路径时，充值到账、验证过完、或者当初那条 429 本就是误判，
+    /// 账号都要被钉到截止时刻（或进程重启）才能回到队列 —— 期间请求全被
+    /// `plan_route` 硬跳过。成功转发是「这个账号此刻确实能干活」的最强反证，
+    /// 与 [`Self::backoff_clear`] / [`Self::sink_clear`] 同一口径。
+    pub(super) fn account_rest_clear(&self, account_id: &str) {
+        if let Ok(mut table) = self.account_rest.lock() {
+            table.remove(account_id);
+        }
+    }
+
     /// 记一笔模型级 rest（只盖住 `(account_id, model)` 这一格）。
     ///
     /// 与 [`Self::backoff_mark`] 分开存：账号级退避由连续失败笔数决定时长，
@@ -830,6 +844,26 @@ mod tests {
         assert!(!expired
             .model_resting
             .contains_key(&("a".into(), "model-1".into())));
+    }
+
+    /// 账号级硬休息**可以立即解除**（成功转发 / 手动清除），不必等截止时刻。
+    ///
+    /// 改前只有写入路径：账号一旦被判成余额耗尽，充上值之后仍然被硬停到
+    /// 24 小时兜底 —— 期间所有模型都被跳过，用户只能重启进程。
+    #[test]
+    fn an_account_rest_can_be_lifted_immediately() {
+        let state = RouteState::new();
+        let now = 1_700_000_000_000i64;
+        state.account_rest_mark("a", now + 24 * 3600 * 1000);
+        assert!(
+            state.snapshot("", now, 0).account_resting.contains_key("a"),
+            "刚标记的账号应当在硬休息表里"
+        );
+        state.account_rest_clear("a");
+        assert!(
+            !state.snapshot("", now, 0).account_resting.contains_key("a"),
+            "清除后应当立刻回到队列"
+        );
     }
 
     /// `snapshot`（不点名模型）要带上整张模型级 rest 表 —— 转发路径用的是它，

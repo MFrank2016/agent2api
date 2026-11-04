@@ -1586,6 +1586,14 @@ pub fn clear_rate_limits(state: &ServerState, id: &str, body: &Bytes) -> Respons
         Some(model) => usize::from(state.store().clear_rate_limit(id, model)),
         None => state.store().clear_all_rate_limits(id),
     };
+    // 落库的 `rateLimits` 只是「本机推断出的冷却」，内存里还有一张**账号级硬
+    // 休息**表（余额耗尽 / 需要验证时写入，对所有模型生效）。只清落库那张的话，
+    // 用户点完「清除」界面上的限流没了，转发却仍被 `plan_route` 硬跳过 ——
+    // 这个按钮的语义就是「让本机立刻重新尝试」，所以两张表一起清。
+    //
+    // 逐模型清除时也清账号级：硬休息拦的是**所有**模型，只清一个模型而不解除它，
+    // 用户看到的仍然是「清了也没用」。
+    state.upstream().clear_account_rest(id);
     if cleared > 0 {
         logging::log(
             "[Accounts]",

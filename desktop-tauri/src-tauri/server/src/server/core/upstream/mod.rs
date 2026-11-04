@@ -337,6 +337,15 @@ impl UpstreamService {
         }
     }
 
+    /// 手动解除账号级硬休息（账号页「清除限流」按钮）。
+    ///
+    /// 那个端点清的是**落库**的 `rateLimits`，而硬休息是进程内存里的另一张表：
+    /// 不一起清的话，用户点完「清除」界面上限流没了，转发却仍被 `plan_route`
+    /// 硬跳过（最长 24 小时）—— 按钮看起来「没生效」。
+    pub fn clear_account_rest(&self, account_id: &str) {
+        self.route.account_rest_clear(account_id);
+    }
+
     pub fn route_sticky_sessions(&self, model: Option<&str>, now: i64) -> Vec<Value> {
         self.route.sticky_list(model, now, crate::server::core::routing::sticky_ttl_ms(
             crate::server::config::routing_settings().sticky,

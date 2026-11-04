@@ -686,8 +686,7 @@ async fn attempt_queue(
                             &conv_key, &model, account_id, sticky_source, logging::now_ms(),
                             config::routing_settings().sticky.ttl_ms().unwrap_or(0), sticky_generation,
                         );
-                        service.route.backoff_clear(account_id);
-                        service.route.sink_clear(account_id);
+                        note_route_success(service, account_id);
                     }
                     return Ok(outcome);
                 },
@@ -826,8 +825,7 @@ async fn attempt_queue(
                             &conv_key, &model, account_id, sticky_source, logging::now_ms(),
                             config::routing_settings().sticky.ttl_ms().unwrap_or(0), sticky_generation,
                         );
-                        service.route.backoff_clear(account_id);
-                        service.route.sink_clear(account_id);
+                        note_route_success(service, account_id);
                     }
                     return Ok(outcome);
                 },
@@ -1241,8 +1239,7 @@ async fn attempt_queue(
                                 .route
                                 .breaker_success(account_id, route_settings.breaker_success_threshold);
                         }
-                        service.route.backoff_clear(account_id);
-                        service.route.sink_clear(account_id);
+                        note_route_success(service, account_id);
                         // 这次转发成功 = 账号的登录态**此刻确实可用**：清掉可能
                         // 存在的「需要重新登录」标记（用户可能已经在别处重新登录
                         // 过，或者之前那次 401 是上游抖动）。
@@ -2110,6 +2107,19 @@ fn log_aggregated(aggregated: &super::aggregate::AggregatedCompletion) {
             aggregated.chunk_count
         ),
     );
+}
+
+/// 一次成功转发后的路由状态收尾：把「这个账号刚才不行」的三张表一起清。
+///
+/// ── 为什么收口成一个函数 ──────────────────────────────────────
+/// 三条成功出口（自定义 / 会话式 / 无状态）原本各写两行 `backoff_clear` +
+/// `sink_clear`。加第三张表（账号级硬休息）时漏掉任何一处都不会报错，症状是
+/// 「充值到账、也真的转发成功了，账号却仍被硬停到 24 小时截止」—— 所以让
+/// 「成功要清什么」只有一个落点，以后再加表也只改这里。
+fn note_route_success(service: &UpstreamService, account_id: &str) {
+    service.route.backoff_clear(account_id);
+    service.route.sink_clear(account_id);
+    service.route.account_rest_clear(account_id);
 }
 
 /// 200 + 正文配额拒绝的记账：冷却键必须是**上游真名**。
