@@ -1076,7 +1076,8 @@ body.queue-dragging * { cursor: grabbing; }
 
      · `.usage-pop-limit`  —— 滚动容器本身（与 .usage-pop-credit 同构，宽度同为
        320px；两者各留一份而不是共用一个类名：将来只改其中一处时不会连带改坏另一处）
-     · `.lp-pop-subline`   —— 行内第二行：左侧「恢复时刻 · 原因」，右侧「清除」按钮
+     · `.lp-pop-subline`   —— 行内第二行：左侧「原因 / 作用域标签 · 恢复时刻 · 上游原因」，
+                              右侧「清除」按钮
      · `.lp-pop-track`     —— **冷却进度**线（满格 = 马上恢复）
 
    ⚠️ `.lp-pop-track` 与余额明细的 `.usage-pop-track` 方向相反：那条画「剩余」
@@ -1105,6 +1106,26 @@ body.queue-dragging * { cursor: grabbing; }
   gap: 8px;
   margin-top: 3px;
   min-width: 0;
+}
+
+/* 原因 / 作用域两枚小标签（额度不足 · 模型级）：第二行最左。做成无描边的小底片
+   而不是状态列那种徽章 —— 这一行已经有「恢复时刻 · 上游原因」一段正文，再加两枚
+   带框徽章会把 320px 的弹层挤满；完整语义在整行的 title 里。 */
+.lp-pop-tags {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.lp-pop-tag {
+  padding: 0 4px;
+  border-radius: var(--r-xs);
+  background: var(--surface-2);
+  line-height: 1.6;
 }
 
 .lp-pop-reason {

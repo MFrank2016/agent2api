@@ -71,6 +71,18 @@ export type RateLimitInfo = {
    */
   at?: number
   message?: string
+  /**
+   * **触发原因**（后端 `QuotaKind` 的归类结果）：`credit` / `quota` / `rate` /
+   * `plan` / `verification`。旧版本落盘的记录没有这个键，读取侧按「限流」显示。
+   */
+  reason?: string
+  /**
+   * **冷却作用域**：`account`（整号停）/ `model`（只停这个模型）。旧版本没有这个键，
+   * 按历史行为当作 `model`。
+   */
+  scope?: string
+  /** 上游 `Retry-After` 折算的毫秒数；拿不到时后端写 `null`（旧记录无此键）。 */
+  retryAfterMs?: number | null
 }
 
 /**
