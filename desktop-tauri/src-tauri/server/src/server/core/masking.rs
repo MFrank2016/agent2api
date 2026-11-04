@@ -941,10 +941,6 @@ mod tests {
             !serialized.contains("a@b.com"),
             "普通文本仍必须脱敏（不能因为跳过二进制而整体失效）: {serialized}"
         );
-        assert_eq!(
-            report.hits.len(),
-            1,
-            "只应命中普通文本里的邮箱: {report:?}"
-        );
+        assert_eq!(report.hits.len(), 1, "只应命中普通文本里的邮箱: {report:?}");
     }
 }

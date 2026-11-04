@@ -189,7 +189,12 @@ fn mask_text_with(rules: &[CompiledRule], text: &str, state: &mut State) -> (Str
     (out, report)
 }
 
-fn mask_value(value: &mut Value, rules: &[CompiledRule], state: &mut State, in_media: bool) -> MaskReport {
+fn mask_value(
+    value: &mut Value,
+    rules: &[CompiledRule],
+    state: &mut State,
+    in_media: bool,
+) -> MaskReport {
     match value {
         Value::String(text) => {
             // ── 图片 / 多模态载荷不脱敏（2026-11 修）─────────────────
@@ -247,9 +252,9 @@ fn looks_like_binary_payload(text: &str) -> bool {
         return true;
     }
     text.len() > 128
-        && text
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_'))
+        && text.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_')
+        })
 }
 
 /// 单遍还原：只替换本映射表认识的占位符，不认识的（含残缺前缀）原样保留。
