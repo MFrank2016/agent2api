@@ -29,7 +29,8 @@
 //! 直接命中注册表，再走 `RoutingStrategy::from_config`（后者认不出新 id 会回落
 //! `priority`，不能当唯一入口）。
 //!   - `free-first`：模型 id 以 `:free` / `-free` 结尾的座位排在最前，免费组
-//!     与付费组内各自按 `(优先级, 加入时间)`；模型 id 的取法见 [`model_id_of`]。
+//!     与付费组内各自按 `(优先级, 加入时间)`；模型 id 取 `ctx.model`（其次
+//!     账号的 `model`，**不用展示名 `name`**），取法见 [`model_id_of`]。
 //!   - `drain`：按 `(优先级, 加入时间)` 的顺序逐条取用，每次调用把**池级**
 //!     游标推进一格（用完一轮回到队首）。游标键是 provider，**不按模型分**
 //!     —— 见 [`RoutingState::next_drain`]。
@@ -47,20 +48,26 @@ use super::{RoutingState, RoutingStrategy};
 
 /// `free-first` 判断「免费模型」用的模型 id。
 ///
-/// 账号公开形态里**没有**统一的模型字段（一个账号可以覆盖多个模型），所以按
-/// 下面的优先级取一个字符串：
-///   1. 账号记录上的 `model`（插件 / 自定义家可能带）；
-///   2. 账号记录上的 `name`（部分家把模型名放在这里）；
-///   3. 本次请求的模型名 `ctx.model`（绝大多数情况走这条）。
+/// 优先级：**`ctx.model`（本次请求真正要走的模型）优先**，其次账号记录上的
+/// `model`（插件 / 自定义家可能带）。
+///
+/// **不读账号的 `name`**：那是展示名，几乎每个账号都有。读它会让策略按标签
+/// 而不是按被路由的模型分类 —— 一个叫 `cline-free` 的账号会对所有模型都被
+/// 判成免费，而正常命名的账号请求 `llama:free` 反被判成付费。
 ///
 /// 判定只看后缀：以 `:free` 或 `-free` 结尾即视为免费（与 Cline 免费池的
 /// `poolside/laguna-s-2.1:free` 等模型 id 同形），大小写不敏感。
 fn model_id_of<'a>(seat: &'a Seat, requested: &'a str) -> &'a str {
-    let from_account = ["model", "name"]
-        .iter()
-        .find_map(|key| seat.account.get(*key).and_then(serde_json::Value::as_str))
-        .filter(|value| !value.trim().is_empty());
-    from_account.unwrap_or(requested)
+    // `ctx.model` 优先：它是本次请求真正要走的模型。
+    if !requested.trim().is_empty() {
+        return requested;
+    }
+    // 兜底：账号记录上的 `model`。没有就返回空串（不算免费）。
+    seat.account
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("")
 }
 
 fn is_free_model(model: &str) -> bool {
@@ -377,10 +384,14 @@ mod tests {
 
     /// `free-first`：模型 id 以 `:free` / `-free` 结尾的座位排在最前；免费组内
     /// 与付费组内都按 `(优先级, 加入时间)` 排（与 `compare_by_priority` 同口径）。
+    ///
+    /// 这里把 `ctx.model` 置空，让分类走「账号 `model`」兜底：请求模型非空时
+    /// 所有座位共享同一个分类（见下面的优先级用例）。
     #[test]
     fn free_first_sorts_free_models_first_then_priority_and_added_at() {
         let state = RoutingState::new();
-        let ctx = ctx(&state, true);
+        let mut ctx = ctx(&state, true);
+        ctx.model = "";
         let seats = vec![
             seat_model("paid_best", 1, 10, "gpt-4o"),
             seat_model("free_late", 100, 900, "llama:free"),
@@ -396,19 +407,51 @@ mod tests {
         );
     }
 
-    /// 账号记录本身不一定带 `model`：缺键时回落到本次请求的模型名
-    /// （`ctx.model`），仍缺时再看账号的 `name`。
+    /// `ctx.model` 是分类的**首选**来源：座位既没有 `model` 也没有 `name` 时
+    /// 只能靠它；账号自带 `model` 也不能盖过本次请求的模型。
     #[test]
-    fn free_first_falls_back_to_requested_model_and_account_name() {
+    fn free_first_uses_requested_model_for_seats_without_model_or_name() {
         let state = RoutingState::new();
         let mut ctx = ctx(&state, true);
         ctx.model = "llama:free";
-        let mut named = seat("named", 500, 5, 0);
-        named.account["name"] = json!("acme-free");
-        let seats = vec![seat_model("paid", 1, 10, "gpt-4o"), named];
+        let bare = seat("bare", 500, 5, 0);
+        // 既没有 model 也没有 name：分类只能来自 ctx.model
+        assert_eq!(model_id_of(&bare, ctx.model), "llama:free");
+        assert!(is_free_model(model_id_of(&bare, ctx.model)));
+
+        // ctx.model 优先于账号 model：账号写 gpt-4o 也按请求的免费模型分类
+        let paid_account = seat_model("paid_account", 1, 10, "gpt-4o");
+        let seats = vec![bare, paid_account];
         let order = lookup("free-first").order(&ctx, "p", &seats);
-        // `named` 没有 model，但 name 以 `-free` 结尾 → 免费；`paid` 是付费。
-        assert_eq!(ids_of(&order, &seats), vec!["named", "paid"]);
+        // 两者都判为免费 → 回落到 (priority, added_at)
+        assert_eq!(ids_of(&order, &seats), vec!["paid_account", "bare"]);
+    }
+
+    /// 账号的 `name` 是展示名，**不参与**分类：叫 `acme-free` 的账号在付费
+    /// 模型请求里不能被提升。
+    #[test]
+    fn free_first_does_not_use_account_display_name() {
+        let state = RoutingState::new();
+        let ctx = ctx(&state, true); // ctx.model = "m"（付费）
+        let mut named = seat("named_free", 500, 5, 0);
+        named.account["name"] = json!("acme-free");
+        let seats = vec![named, seat("plain", 1, 10, 0)];
+        let order = lookup("free-first").order(&ctx, "p", &seats);
+        assert_eq!(ids_of(&order, &seats), vec!["plain", "named_free"]);
+    }
+
+    /// 请求模型为空时（预演 / 无模型上下文的直接调用）回落到账号的 `model`。
+    #[test]
+    fn free_first_falls_back_to_account_model_when_request_is_empty() {
+        let state = RoutingState::new();
+        let mut ctx = ctx(&state, true);
+        ctx.model = "";
+        let seats = vec![
+            seat_model("acct_paid", 1, 10, "gpt-4o"),
+            seat_model("acct_free", 500, 5, "llama:free"),
+        ];
+        let order = lookup("free-first").order(&ctx, "p", &seats);
+        assert_eq!(ids_of(&order, &seats), vec!["acct_free", "acct_paid"]);
     }
 
     /// `drain`：按 `(优先级, 加入时间)` 的座位顺序逐条取用，每次调用把游标
