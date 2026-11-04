@@ -207,9 +207,15 @@ export type SharedWindow = {
     PROTOCOL_OPTIONS?: Array<{ value: string; label: string }>
   }
   wbPresetProviders?: {
+    /** 目录的**本地副本**（preset-providers.js 原地填充，同一数组实例） */
     list?: PresetRecord[]
     presetOf?: (key: string) => PresetRecord | null
     iconOf?: (key: string) => string
+    /**
+     * 拉一次 `GET /api/presets`（并发合并成一次；失败不 reject、返回空列表）。
+     * 目录随页面启动异步加载，弹窗打开时若还没到就靠它拿重画信号。
+     */
+    load?: () => Promise<PresetRecord[]>
   }
   /** 壳的原始 IPC：POST /api/accounts 在桥里没有具名方法，只能直连 */
   __TAURI_INTERNALS__?: { invoke?: (cmd: string, args: unknown) => Promise<unknown> }

@@ -114,6 +114,9 @@ function AddAccountModal({
     if (!(providers?.all?.() || []).length) void providers?.load?.().then(bump)
     // 自定义目录同理：切到「自定义」段时已建的家要显示出来
     void providers?.refreshCustom?.().then(bump)
+    // 预置目录来自 GET /api/presets，随页面启动异步加载：还没到位时补一次再重画，
+    // 否则「API 模板」段是一张空网格（load 并发合并，不会重复打接口）
+    if (!(shared().wbPresetProviders?.list || []).length) void shared().wbPresetProviders?.load?.().then(bump)
   }, [bump])
 
   const openNewCustomForm = React.useCallback(() => {
