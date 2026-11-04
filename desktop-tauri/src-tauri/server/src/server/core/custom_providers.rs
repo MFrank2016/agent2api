@@ -684,6 +684,7 @@ fn preset_of_record(
 ///
 /// ── `presetId` 的派生规则 ──────────────────────────────────
 /// 预置只是**表单的预填模板**，请求体里显式给出的字段永远优先：
+///   * `name`：显式值优先，否则取 `preset.name`（卡片展示名）；
 ///   * `protocol`：显式值优先，否则取 `preset.protocols[0].protocol`；
 ///   * `baseUrl`：显式值优先，否则取预置的非空 `base_url`；两边都没有时
 ///     报错 —— 自建面板（sub2api / newapi）的预置基址本来就是空串，落一条
@@ -697,7 +698,15 @@ fn preset_of_record(
 /// 「无需鉴权」），不是提供商记录里的字段；`noAuth` 属于账号，也不在这里。
 fn record_draft(object: &Map<String, Value>) -> Result<Value, String> {
     let preset = preset_of_record(object)?;
-    let name = normalize_name(object.get("name"))?;
+    // 展示名：显式值优先；没有就沿用预置卡的名字（表单预填的那一份）。
+    // 两边都没有才报错 —— 预置卡自带 name，所以 `{"presetId": "openai"}` 这种
+    // 只带 id 的请求也能建出一条名字正确的记录。
+    let name = match provided(object, "name") {
+        Some(value) => normalize_name(Some(value))?,
+        None => preset
+            .map(|preset| preset.name.to_string())
+            .ok_or_else(|| "缺少提供商名称".to_string())?,
+    };
 
     // 协议：显式值优先；没有预置时保持原来的「必须显式给」行为。
     let protocol = match provided(object, "protocol") {
@@ -1679,6 +1688,37 @@ mod tests {
             "https://my-gateway.example.com/anthropic"
         );
         assert_eq!(record["presetKey"], "openai");
+    }
+
+    /// 只给 `presetId` 也能建：名称取预置卡的名字（表单预填的那一份）；
+    /// 显式 `name` 仍然优先。
+    #[test]
+    fn create_from_preset_derives_name_and_explicit_name_wins() {
+        let record = draft_of(json!({ "presetId": "openai" })).unwrap();
+        assert_eq!(record["name"], "OpenAI");
+
+        let record = draft_of(json!({ "presetId": "openai", "name": "My OpenAI" })).unwrap();
+        assert_eq!(record["name"], "My OpenAI");
+    }
+
+    /// 显式特判覆盖预置特判（含「显式清空」）：GLM 的 `?beta=true` / Anthropic-Beta
+    /// 必须被 payload 整体替换，`clientEmulation` 空串表示不伪装。
+    #[test]
+    fn explicit_quirks_override_preset() {
+        let record = draft_of(json!({
+            "presetId": "glm",
+            "name": "GLM Coding",
+            "urlSuffix": "",
+            "headers": { "X-A": "b" },
+            "clientEmulation": "",
+        }))
+        .unwrap();
+        assert_eq!(record["urlSuffix"], "", "显式空串要清掉预置的 ?beta=true");
+        assert_eq!(record["headers"], json!({ "X-A": "b" }), "头族整体替换");
+        assert_eq!(record["clientEmulation"], "", "显式空串要关掉伪装");
+        // GLM 本来没有工具 type 特判，缺省仍是空串；模板标识不受特判覆盖影响。
+        assert_eq!(record["anthropicToolType"], "");
+        assert_eq!(record["presetKey"], "glm");
     }
 
     /// 未收录的 presetId 一律 400（不静默回落到手动新建 —— 拼错 id 时那会
