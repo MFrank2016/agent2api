@@ -31,7 +31,7 @@
 //! 与转发默认使用谁始终一致；仅当账号对某具体模型限额时，该模型的请求才会临时
 //! 降级到下一个候选 —— 那是按模型的一次性决策，不改写「当前账号」。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use serde_json::{json, Value};
@@ -250,6 +250,18 @@ pub fn max_accounts_of(account: &Value) -> u64 {
         .and_then(Value::as_u64)
         .unwrap_or(0)
         .min(MAX_ACCOUNTS_LIMIT)
+}
+
+/// 逐家的「储备位次」标记：前 `max_accounts` 个可用账号保持可用，其余为储备
+/// （前面的账号都不可用才轮到）。`max_accounts == 0` = **不限**，全 false。
+///
+/// 储备只影响**状态标注**，不改变排序 —— 转发仍按整条清单从头往后找，只是
+/// 界面把超出上限的位次标成「储备」。上限是逐家口径，见 [`PlanMeta::max_accounts`]。
+fn reserve_flags(len: usize, max_accounts: u64) -> Vec<bool> {
+    if max_accounts == 0 {
+        return vec![false; len];
+    }
+    (0..len).map(|index| index as u64 >= max_accounts).collect()
 }
 
 /// 账号在途已满时的排队上限（`queueLimit`）：0 = **不排队**（直接换号 / 429）。
@@ -569,7 +581,7 @@ pub struct PlanEntry {
     pub name: String,
     pub provider: String,
     /// 状态码：`usable` / `tried` / `disabled` / `cooldown` / `concurrency` /
-    /// `limiter` / `no-credentials`
+    /// `limiter` / `no-credentials` / `rpm`（RPM 超限）/ `reserve`（储备账号）
     pub state: &'static str,
     /// 一句「为什么排这 / 为什么跳过」（队列面板与请求详情直接展示）
     pub reason: String,
@@ -621,6 +633,16 @@ pub struct PlanMeta<'a> {
     pub open: &'a std::collections::HashSet<String>,
     /// 被限制器软跳过的账号（余额不足 / Token 限额，调用方判好传入）
     pub limiter_blocked: &'a std::collections::HashSet<String>,
+    /// 已达滚动 RPM 上限的账号 id（`maxRpm`）：直接跳过，等窗口滚动。
+    ///
+    /// 由调用方（`UpstreamService` 持有 `RpmWindow`）算好传入 —— 选路本身
+    /// 不维护计数器，保持「读一次快照、立刻决策」的纯函数语义。
+    pub rpm_blocked: &'a HashSet<String>,
+    /// provider id → 该家**同时使用**的账号数上限（`maxAccounts`；0 / 缺键 = 不限）。
+    ///
+    /// 用**逐家**表而非单个数字：跨家队列里一家的上限不能把另一家也算成储备。
+    /// 超出上限的位次只改状态（`reserve`），不改变排序。
+    pub max_accounts: &'a HashMap<String, u64>,
     /// 粘性命中的账号 id（`None` = 无命中）
     pub sticky_account: Option<&'a str>,
 }
@@ -708,6 +730,13 @@ pub fn plan_route(
                 "limiter",
                 "被限制器拦下（余额不足或 Token 周期用量到顶），自动恢复后回来".to_string(),
             ));
+            continue;
+        }
+        // 滚动 RPM 超限（`maxRpm`）：本窗口内已打满，等窗口滚动再回来。
+        // 与 `limiter` 分工：那边是余额 / Token 周期用量，这边是**每分钟**的
+        // 请求速率；计数由调用方的 `RpmWindow` 维护，选路只消费结果。
+        if meta.rpm_blocked.contains(&id) {
+            blocked.push(entry("rpm", "RPM 超限，等待窗口滚动后自动回来".to_string()));
             continue;
         }
         let reset_at = rate_limit_reset_at(account, keys, now);
@@ -817,7 +846,7 @@ pub fn plan_route(
         flags
     };
 
-    let ordered_entries: Vec<PlanEntry> = arranged
+    let mut ordered_entries: Vec<PlanEntry> = arranged
         .into_iter()
         .enumerate()
         .map(|(index, account)| {
@@ -881,6 +910,33 @@ pub fn plan_route(
             }
         })
         .collect();
+
+    // 储备账号（`maxAccounts`，**逐家**）：排序完成后按 provider 分组，每家的
+    // 前 N 个可用账号保持可用，其余只改状态、不挪位置 —— 「前面的账号都不可用
+    // 才轮到它」由转发按清单顺序自然实现，储备位次仍在队列里，只是界面标出来。
+    // 已进 `blocked` 的候选不在这张表里，因此不会被误标。
+    {
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        for (index, entry) in ordered_entries.iter().enumerate() {
+            groups
+                .entry(entry.provider.clone())
+                .or_default()
+                .push(index);
+        }
+        for (provider, indices) in groups {
+            let Some(limit) = meta.max_accounts.get(&provider).copied() else {
+                continue;
+            };
+            let flags = reserve_flags(indices.len(), limit);
+            for (index, reserve) in indices.into_iter().zip(flags) {
+                let entry = &mut ordered_entries[index];
+                if reserve && entry.state == "usable" {
+                    entry.state = "reserve";
+                    entry.reason = "储备账号：前面的账号都不可用才使用".to_string();
+                }
+            }
+        }
+    }
 
     RoutePlan {
         ordered: ordered_entries,
@@ -967,6 +1023,8 @@ mod plan_tests {
         // 账号级硬休息表在本 helper 里恒为空（要注入的用例自己建 `PlanMeta`，
         // 见 `account_rest_hard_blocks_every_model`）
         let account_resting = HashMap::new();
+        let rpm_blocked = HashSet::new();
+        let max_accounts = HashMap::new();
         let meta = PlanMeta {
             strategies: settings,
             state,
@@ -980,6 +1038,8 @@ mod plan_tests {
             open,
             limiter_blocked: &limiter,
             sticky_account: sticky,
+            rpm_blocked: &rpm_blocked,
+            max_accounts: &max_accounts,
         };
         plan_route(accounts, &keys, &counts, &[], 1_000, &meta)
     }
@@ -1138,6 +1198,8 @@ mod plan_tests {
         let counts = HashMap::new();
         let balances = HashMap::new();
         let limiter = HashSet::new();
+        let rpm_blocked = HashSet::new();
+        let max_accounts = HashMap::new();
         let meta = PlanMeta {
             strategies: &settings,
             state: &state,
@@ -1151,6 +1213,8 @@ mod plan_tests {
             open: &empty_s,
             limiter_blocked: &limiter,
             sticky_account: None,
+            rpm_blocked: &rpm_blocked,
+            max_accounts: &max_accounts,
         };
         let result = plan_route(&accounts, &keys, &counts, &[], 1_000, &meta);
         // a 被真名键挡住；若按请求名查（旧实现）它会留在队首
@@ -1209,6 +1273,8 @@ mod plan_tests {
             let counts = HashMap::new();
             let balances = HashMap::new();
             let limiter = HashSet::new();
+            let rpm_blocked = HashSet::new();
+            let max_accounts = HashMap::new();
             let meta = PlanMeta {
                 strategies: &settings,
                 state: &state,
@@ -1222,6 +1288,8 @@ mod plan_tests {
                 open: &empty_s,
                 limiter_blocked: &limiter,
                 sticky_account: None,
+                rpm_blocked: &rpm_blocked,
+                max_accounts: &max_accounts,
             };
             let result = plan_route(&accounts, &keys, &counts, &[], 1_000, &meta);
             assert_eq!(
@@ -1279,6 +1347,114 @@ mod plan_tests {
         let second = plan(&accounts, &settings, &state, true, &empty_i, &empty_i, &empty_s, None);
         assert_eq!(ids(&first), vec!["p1", "p2"]);
         assert_eq!(ids(&second), vec!["p2", "p1"]);
+    }
+
+    /// 只带 RPM / MaxAccounts 两张表的最小 helper（其余维度留空）。
+    fn plan_with_limits(
+        accounts: &[Value],
+        settings: &RoutingStrategySettings,
+        state: &RoutingState,
+        rpm_blocked: &HashSet<String>,
+        max_accounts: &HashMap<String, u64>,
+    ) -> RoutePlan {
+        let keys = CooldownKeys::new("m");
+        let counts = HashMap::new();
+        let balances = HashMap::new();
+        let limiter = HashSet::new();
+        let empty_i = HashMap::new();
+        let empty_s = HashSet::new();
+        let empty_m: HashMap<(String, String), i64> = HashMap::new();
+        let meta = PlanMeta {
+            strategies: settings,
+            state,
+            balances: &balances,
+            model: "m",
+            advance: false,
+            sunk: &empty_i,
+            resting: &empty_i,
+            account_resting: &empty_i,
+            model_resting: &empty_m,
+            open: &empty_s,
+            limiter_blocked: &limiter,
+            sticky_account: None,
+            rpm_blocked,
+            max_accounts,
+        };
+        plan_route(accounts, &keys, &counts, &[], 1_000, &meta)
+    }
+
+    /// `reserve_flags` 是「前 N 个可用、其余储备」的纯函数；0 = 不限。
+    #[test]
+    fn reserve_only_after_kept_fail() {
+        assert_eq!(reserve_flags(3, 2), vec![false, false, true]);
+        assert_eq!(reserve_flags(3, 0), vec![false, false, false]);
+    }
+
+    /// 达到 RPM 上限的账号直接进 `blocked`（state = `rpm`），不再参与排序。
+    #[test]
+    fn rpm_blocked_accounts_are_skipped() {
+        let accounts = vec![account("a", "p", 100), account("b", "p", 101)];
+        let settings = RoutingStrategySettings::default();
+        let state = RoutingState::new();
+        let mut rpm_blocked = HashSet::new();
+        rpm_blocked.insert("a".to_string());
+        let result = plan_with_limits(&accounts, &settings, &state, &rpm_blocked, &HashMap::new());
+        assert_eq!(ids(&result), vec!["b"], "RPM 超限的账号不应留在队列里");
+        let blocked = result
+            .blocked
+            .iter()
+            .find(|entry| entry.id == "a")
+            .expect("a 应因 RPM 超限被跳过");
+        assert_eq!(blocked.state, "rpm");
+        assert!(
+            blocked.reason.contains("RPM"),
+            "原因句应写明 RPM 超限：{}",
+            blocked.reason
+        );
+    }
+
+    /// `maxAccounts` 是**逐家**口径：p 家封顶 1、q 家封顶 2 时，两家的储备
+    /// 标记互不影响（跨家队列里不能因为 p 的上限把 q 也算成储备）。
+    #[test]
+    fn max_accounts_is_per_provider() {
+        let accounts = vec![
+            account("p1", "p", 100),
+            account("p2", "p", 101),
+            account("p3", "p", 102),
+            account("q1", "q", 200),
+            account("q2", "q", 201),
+        ];
+        let settings = RoutingStrategySettings::default();
+        let state = RoutingState::new();
+        let mut max_accounts = HashMap::new();
+        max_accounts.insert("p".to_string(), 1_u64);
+        max_accounts.insert("q".to_string(), 2_u64);
+        let result = plan_with_limits(&accounts, &settings, &state, &HashSet::new(), &max_accounts);
+        // 排序本身不变，只是把超出上限的位次标成储备
+        assert_eq!(ids(&result), vec!["p1", "p2", "p3", "q1", "q2"]);
+        let state_of = |id: &str| {
+            result
+                .ordered
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.state)
+                .expect("账号应在队列里")
+        };
+        assert_eq!(state_of("p1"), "usable");
+        assert_eq!(state_of("p2"), "reserve");
+        assert_eq!(state_of("p3"), "reserve");
+        assert_eq!(state_of("q1"), "usable");
+        assert_eq!(state_of("q2"), "usable", "q 家上限 2，不应被 p 家影响");
+        let reserve_reason = result
+            .ordered
+            .iter()
+            .find(|entry| entry.id == "p2")
+            .map(|entry| entry.reason.as_str())
+            .unwrap_or_default();
+        assert!(
+            reserve_reason.contains("储备账号"),
+            "储备位次的原因句应说明储备：{reserve_reason}"
+        );
     }
 }
 

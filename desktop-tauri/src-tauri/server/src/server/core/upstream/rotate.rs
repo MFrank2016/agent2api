@@ -39,7 +39,7 @@
 //! （`provider_loop::send_with_retry`），因为「重试几次、打什么日志」
 //! 是编排职责（架构文档 §4.3）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Value};
 
@@ -185,6 +185,9 @@ pub(super) async fn select_target_account(
     // 整轮选路取一次 —— 同一次请求的多次重挑用同一份规则与同一份状态。
     let state = service.routing();
     let balances = balance_snapshot();
+    // RPM 窗口与逐家账号上限由 Task 2.3 接入；此处先传空表（不启用）。
+    let rpm_blocked = HashSet::new();
+    let max_accounts = HashMap::new();
     let meta = routing::PlanMeta {
         strategies: &strategies,
         state: &state,
@@ -198,6 +201,8 @@ pub(super) async fn select_target_account(
         open: &snap.open,
         limiter_blocked: &balance_blocked_ids,
         sticky_account: snap.sticky_hit.as_deref(),
+        rpm_blocked: &rpm_blocked,
+        max_accounts: &max_accounts,
     };
     let plan = routing::plan_route(&candidates, keys, &counts, tried_ids, now, &meta);
     let mut decision = decision_json(&plan, &settings, &strategies, now);
@@ -780,6 +785,9 @@ pub(super) fn pick_next_account(
     // 顺延**不推进**有状态策略（游标 / LRU / 加权轮询沿用第一级的起点）
     let state = service.routing();
     let balances = balance_snapshot();
+    // RPM 窗口与逐家账号上限由 Task 2.3 接入；此处先传空表（不启用）。
+    let rpm_blocked = HashSet::new();
+    let max_accounts = HashMap::new();
     let meta = routing::PlanMeta {
         strategies: &strategies,
         state: &state,
@@ -793,6 +801,8 @@ pub(super) fn pick_next_account(
         open: &snap.open,
         limiter_blocked: &balance_blocked_ids,
         sticky_account: None,
+        rpm_blocked: &rpm_blocked,
+        max_accounts: &max_accounts,
     };
     let plan = routing::plan_route(&candidates, keys, &counts, tried_ids, now, &meta);
     plan.ordered.into_iter().next().map(|entry| entry.account)

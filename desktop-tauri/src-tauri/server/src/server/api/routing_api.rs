@@ -212,6 +212,9 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
     // —— 预演不该刷新任何会话的计时，也不该消耗下一次轮询
     let routing_state = state.upstream().routing();
     let facts = state.upstream().route_queue_facts(now);
+    // 队列面板是预演：RPM 窗口与逐家账号上限由 Task 2.3 接入，先传空表。
+    let rpm_blocked = HashSet::new();
+    let max_accounts = HashMap::new();
     let meta = routing::PlanMeta {
         strategies: &strategies,
         state: &routing_state,
@@ -225,6 +228,8 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
         open: &facts.open,
         limiter_blocked: &limiter_blocked,
         sticky_account: None,
+        rpm_blocked: &rpm_blocked,
+        max_accounts: &max_accounts,
     };
     let plan = routing::plan_route(&scoped, &keys, &counts, &[], now, &meta);
     let entry_json = |entry: &routing::PlanEntry| {
