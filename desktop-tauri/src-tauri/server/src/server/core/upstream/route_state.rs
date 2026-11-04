@@ -92,6 +92,13 @@ pub(super) struct RouteState {
     sink: Mutex<HashMap<String, i64>>,
     /// 熔断：账号 id → 状态
     breaker: Mutex<HashMap<String, BreakerEntry>>,
+    /// 模型级 rest：键 = (account_id, model)，与账号级 backoff 分开。
+    ///
+    /// 上游的 429 常常只针对一个模型（额度 / 分钟限额按模型计），把整个账号
+    /// 一起退避会白白浪费同账号其他模型的额度。账号级（`backoff`）与模型级
+    /// 各存一张表、互不覆盖：前者管「这个账号整体不对劲」，后者管「这个账号的
+    /// 这个模型现在不能答」。
+    model_rest: Mutex<HashMap<(String, String), i64>>,
 }
 
 /// 粘性 / 垫底 / 退避的快照（选路纯函数的输入）。
@@ -102,6 +109,11 @@ pub(super) struct RouteSnapshot {
     pub sunk: HashMap<String, i64>,
     /// 休息中的账号（值 = 休息截止时刻）
     pub resting: HashMap<String, i64>,
+    /// 模型级 rest：(账号 id, 模型) → 休息截止时刻。
+    ///
+    /// `snapshot`（不点名模型）装整张表，由 `plan_route` 按自己的 `meta.model`
+    /// 查；`snapshot_for_model` 只装该模型的条目。
+    pub model_resting: HashMap<(String, String), i64>,
     /// 熔断打开的账号
     pub open: std::collections::HashSet<String>,
 }
@@ -438,6 +450,20 @@ impl RouteState {
         entry.until
     }
 
+    /// 记一笔模型级 rest（只盖住 `(account_id, model)` 这一格）。
+    ///
+    /// 与 [`Self::backoff_mark`] 分开存：账号级退避由连续失败笔数决定时长，
+    /// 模型级 rest 的截止时刻由**调用方**（上游给的 `resetAt` / `retryAfter`）
+    /// 直接给出，本函数不做翻倍。
+    ///
+    /// Task 1.3 把它接到错误分类的收尾路径上；在那之前没有生产调用点。
+    #[allow(dead_code)]
+    pub(super) fn rest_mark(&self, account_id: &str, model: &str, until: i64) {
+        if let Ok(mut table) = self.model_rest.lock() {
+            table.insert((account_id.to_string(), model.to_string()), until);
+        }
+    }
+
     /// 成功一次 → 清退避记录（连续失败的链子断了）。
     pub(super) fn backoff_clear(&self, account_id: &str) {
         if let Ok(mut table) = self.backoff.lock() {
@@ -546,10 +572,27 @@ impl RouteState {
                     .collect()
             })
             .unwrap_or_default();
+        // 模型级 rest：`model` 为空（[`Self::snapshot`] 的「不点名模型」）时
+        // 装整张表，由 `plan_route` 按自己的 `meta.model` 查；点名时只装该模型
+        // 的条目（队列端点按模型预演时省掉无关的键）。到点自动失效，与
+        // resting / open 同款。
+        let model_resting = self
+            .model_rest
+            .lock()
+            .map(|table| {
+                table
+                    .iter()
+                    .filter(|(_, until)| **until > now)
+                    .filter(|((_, entry_model), _)| model.is_empty() || entry_model == model)
+                    .map(|(key, until)| (key.clone(), *until))
+                    .collect()
+            })
+            .unwrap_or_default();
         RouteSnapshot {
             sticky_hit,
             sunk,
             resting,
+            model_resting,
             open,
         }
     }
@@ -719,5 +762,55 @@ mod tests {
         state.sink_clear("a1");
         let snap = state.snapshot("", now, 0);
         assert!(!snap.sunk.contains_key("a1"), "成功后应当立刻解除垫底");
+    }
+
+    /// 模型级 rest **只**盖住被点名的那一个模型，同账号的其他模型照常可用。
+    ///
+    /// 这是「模型级冷却」的全部意义：上游的 429 常常只针对一个模型
+    /// （如某家的 `gpt-x` 额度耗尽），把整个账号一起退避会白白浪费其他模型的额度。
+    #[test]
+    fn model_rest_does_not_rest_siblings() {
+        let state = RouteState::new();
+        state.rest_mark("a", "model-1", 1_000);
+        let snap = state.snapshot_for_model("", "model-1", 500, 0);
+        assert!(snap
+            .model_resting
+            .contains_key(&("a".into(), "model-1".into())));
+        assert!(!snap
+            .model_resting
+            .contains_key(&("a".into(), "model-2".into())));
+    }
+
+    /// 模型级 rest 同样到点自动失效（与垫底 / 退避同口径，不需要成功转发来解除）。
+    #[test]
+    fn model_rest_expires_at_its_until() {
+        let state = RouteState::new();
+        state.rest_mark("a", "model-1", 1_000);
+        // 未到点：在快照里
+        let fresh = state.snapshot_for_model("", "model-1", 999, 0);
+        assert!(fresh
+            .model_resting
+            .contains_key(&("a".into(), "model-1".into())));
+        // 到点：自动消失
+        let expired = state.snapshot_for_model("", "model-1", 1_000, 0);
+        assert!(!expired
+            .model_resting
+            .contains_key(&("a".into(), "model-1".into())));
+    }
+
+    /// `snapshot`（不点名模型）要带上整张模型级 rest 表 —— 转发路径用的是它，
+    /// 而 `plan_route` 会按自己的 `meta.model` 去查。
+    #[test]
+    fn a_modelless_snapshot_carries_the_whole_model_rest_table() {
+        let state = RouteState::new();
+        state.rest_mark("a", "model-1", 1_000);
+        state.rest_mark("b", "model-2", 2_000);
+        let snap = state.snapshot("", 500, 0);
+        assert!(snap
+            .model_resting
+            .contains_key(&("a".into(), "model-1".into())));
+        assert!(snap
+            .model_resting
+            .contains_key(&("b".into(), "model-2".into())));
     }
 }

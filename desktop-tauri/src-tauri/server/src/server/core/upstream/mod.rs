@@ -292,6 +292,14 @@ pub(super) struct RouteTarget {
     pub decision: Option<Value>,
 }
 
+/// 队列端点要的只读事实：沉底 / 账号级休息 / 模型级休息 / 熔断。
+pub type RouteQueueFacts = (
+    HashMap<String, i64>,
+    HashMap<String, i64>,
+    HashMap<(String, String), i64>,
+    std::collections::HashSet<String>,
+);
+
 impl UpstreamService {
     pub fn new(store: AccountStore, auth: AuthService) -> Self {
         Self {
@@ -306,18 +314,17 @@ impl UpstreamService {
 
     /// 路由运行期状态的**只读快照**（`api::routing` 的队列端点用）。
     ///
-    /// 返回纯 std 容器（沉底表 / 休息表 / 熔断集合），不把本模块的私有类型
-    /// 漏出去；面板只看不写，粘性查找不在此做（预演不该刷新会话计时）。
-    pub fn route_queue_facts(
-        &self,
-        now: i64,
-    ) -> (
-        HashMap<String, i64>,
-        HashMap<String, i64>,
-        std::collections::HashSet<String>,
-    ) {
+    /// 返回纯 std 容器（沉底表 / 账号级休息表 / 模型级休息表 / 熔断集合），
+    /// 不把本模块的私有类型漏出去；面板只看不写，粘性查找不在此做（预演不该
+    /// 刷新会话计时）。
+    pub fn route_queue_facts(&self, now: i64) -> RouteQueueFacts {
         let snapshot = self.route.snapshot("", now, 0);
-        (snapshot.sunk, snapshot.resting, snapshot.open)
+        (
+            snapshot.sunk,
+            snapshot.resting,
+            snapshot.model_resting,
+            snapshot.open,
+        )
     }
 
     pub fn route_sticky_sessions(&self, model: Option<&str>, now: i64) -> Vec<Value> {

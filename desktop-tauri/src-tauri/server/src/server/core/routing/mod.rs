@@ -599,6 +599,11 @@ pub struct PlanMeta<'a> {
     pub sunk: &'a HashMap<String, i64>,
     /// 休息中的账号 → 休息截止时刻（失败退避）
     pub resting: &'a HashMap<String, i64>,
+    /// 模型级 rest：(账号 id, 模型) → 休息截止时刻。
+    ///
+    /// 与 `resting` 分工：`resting` 是**账号级**退避（对所有模型生效，只垫底），
+    /// `model_resting` 是**模型级**冷却（只跳过该模型的候选，硬过滤）。
+    pub model_resting: &'a HashMap<(String, String), i64>,
     /// 熔断打开的账号
     pub open: &'a std::collections::HashSet<String>,
     /// 被限制器软跳过的账号（余额不足 / Token 限额，调用方判好传入）
@@ -700,6 +705,19 @@ pub fn plan_route(
                     "对该模型限流冷却中，{} 恢复（恢复后自动回来）",
                     clock_text(reset_at, now)
                 ),
+            ));
+            continue;
+        }
+        // 模型级 rest：只跳过「这个账号 × 这个模型」这一格，同账号其他模型照常
+        // 参与。账号级 `resting` 不在这里 —— 它是退避，对所有模型统一垫底
+        // （见函数末尾的稳定修饰），不是硬跳过。
+        if let Some(until) = meta
+            .model_resting
+            .get(&(id.clone(), meta.model.to_string()))
+        {
+            blocked.push(entry(
+                "cooldown",
+                format!("模型限流至 {}（恢复后自动回来）", clock_text(*until, now)),
             ));
             continue;
         }
@@ -896,7 +914,27 @@ mod plan_tests {
         open: &HashSet<String>,
         sticky: Option<&str>,
     ) -> RoutePlan {
-        let keys = CooldownKeys::new("m");
+        let empty = HashMap::new();
+        plan_for_model(
+            accounts, settings, state, advance, sunk, resting, open, sticky, "m", &empty,
+        )
+    }
+
+    /// 同上，但点名模型并带上模型级 rest 表（`model_resting` 的用例需要）。
+    #[allow(clippy::too_many_arguments)]
+    fn plan_for_model(
+        accounts: &[Value],
+        settings: &RoutingStrategySettings,
+        state: &RoutingState,
+        advance: bool,
+        sunk: &HashMap<String, i64>,
+        resting: &HashMap<String, i64>,
+        open: &HashSet<String>,
+        sticky: Option<&str>,
+        model: &str,
+        model_resting: &HashMap<(String, String), i64>,
+    ) -> RoutePlan {
+        let keys = CooldownKeys::new(model);
         let counts = HashMap::new();
         let balances = HashMap::new();
         let limiter = HashSet::new();
@@ -904,10 +942,11 @@ mod plan_tests {
             strategies: settings,
             state,
             balances: &balances,
-            model: "m",
+            model,
             advance,
             sunk,
             resting,
+            model_resting,
             open,
             limiter_blocked: &limiter,
             sticky_account: sticky,
@@ -988,6 +1027,85 @@ mod plan_tests {
         resting.insert("b".to_string(), 10_000_i64);
         let result = plan(&accounts, &settings, &state, true, &empty_i, &resting, &empty_s, None);
         assert_eq!(ids(&result), vec!["a", "c", "b"]);
+    }
+
+    /// 模型级 rest：被 rest 的账号**只在该模型上**被跳过（`state = cooldown`），
+    /// 换一个模型照常排在队首 —— 这就是「不误伤同账号其他模型」。
+    #[test]
+    fn model_rest_blocks_only_the_rested_model() {
+        let accounts = vec![account("a", "p", 100), account("b", "p", 101)];
+        let settings = RoutingStrategySettings::default();
+        let state = RoutingState::new();
+        let empty_i = HashMap::new();
+        let empty_s = HashSet::new();
+        let mut model_resting = HashMap::new();
+        model_resting.insert(("a".to_string(), "model-1".to_string()), 10_000_i64);
+
+        let rested = plan_for_model(
+            &accounts,
+            &settings,
+            &state,
+            true,
+            &empty_i,
+            &empty_i,
+            &empty_s,
+            None,
+            "model-1",
+            &model_resting,
+        );
+        // 被 rest 的模型：a 进 blocked（cooldown），只剩 b
+        assert_eq!(ids(&rested), vec!["b"]);
+        let blocked = rested
+            .blocked
+            .iter()
+            .find(|entry| entry.id == "a")
+            .expect("a 应被模型级 rest 跳过");
+        assert_eq!(blocked.state, "cooldown");
+        assert!(
+            blocked.reason.contains("模型限流至"),
+            "原因句应写明模型限流：{}",
+            blocked.reason
+        );
+
+        // 同账号的另一个模型：a 仍是队首
+        let sibling = plan_for_model(
+            &accounts,
+            &settings,
+            &state,
+            true,
+            &empty_i,
+            &empty_i,
+            &empty_s,
+            None,
+            "model-2",
+            &model_resting,
+        );
+        assert_eq!(ids(&sibling), vec!["a", "b"]);
+    }
+
+    /// 账号级 rest（退避）仍然**跨模型**生效：同一条账号级事实不能因为模型
+    /// 不同就放行 —— 那正是模型级 rest 要区分的另一半。
+    #[test]
+    fn account_level_rest_still_applies_to_every_model() {
+        let accounts = vec![account("a", "p", 100), account("b", "p", 101)];
+        let settings = RoutingStrategySettings::default();
+        let state = RoutingState::new();
+        let empty_i = HashMap::new();
+        let empty_s = HashSet::new();
+        let empty_m: HashMap<(String, String), i64> = HashMap::new();
+        let mut resting = HashMap::new();
+        resting.insert("a".to_string(), 10_000_i64);
+        for model in ["model-1", "model-2"] {
+            let result = plan_for_model(
+                &accounts, &settings, &state, true, &empty_i, &resting, &empty_s, None, model,
+                &empty_m,
+            );
+            assert_eq!(
+                ids(&result),
+                vec!["b", "a"],
+                "账号级 rest 应对 {model} 同样生效"
+            );
+        }
     }
 
     #[test]
