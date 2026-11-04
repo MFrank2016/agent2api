@@ -22,11 +22,13 @@
 //! 边界是整条候选队列（跨家）—— 见 [`order_candidates`] 与枚举里那一档的说明。
 //!
 //! ── 运行时状态（[`RoutingState`]）───────────────────────────
-//! 四种策略需要**跨请求记忆**（进程内、重启即清零）：
+//! 五种策略需要**跨请求记忆**（进程内、重启即清零）：
 //!   - 轮询（家内）：`(provider, 请求名) → 游标`；
 //!   - 全局轮询：`请求名 → 游标`（整条候选队列一条环，跨家）；
 //!   - 最近最少使用：`账号 id → 上次被选中的时刻`；
-//!   - 平滑加权轮询（SWRR）：`账号 id → 当前权重`。
+//!   - 平滑加权轮询（SWRR）：`账号 id → 当前权重`；
+//!   - drain（用完为止）：`pool → 游标`（家内一条环，**不按模型分** ——
+//!     见 [`RoutingState::next_drain`]）。
 //! 全挂在一个 `Arc<Mutex<..>>` 上（与 `upstream::connections` 同一形态），
 //! 由 `UpstreamService` 持有、`service.routing()` 取用。挑选本身是**同步**的
 //! （不跨 `.await` 持锁）：进入时拿锁、算完即放。
@@ -206,6 +208,8 @@ struct RoutingInner {
     rr_cursor: HashMap<(String, String), usize>,
     /// `请求名 → 全局轮询游标`（整条候选队列一条环，跨家；见 `next_global_round_robin`）
     global_rr_cursor: HashMap<String, usize>,
+    /// `pool → drain 游标`（家内一条环，**不按模型分**；见 `next_drain`）
+    drain_cursor: HashMap<String, usize>,
     /// `账号 id → 上次被选中的毫秒时刻`
     last_selected: HashMap<String, i64>,
     /// `账号 id → 平滑加权轮询的当前权重`
@@ -254,6 +258,23 @@ impl RoutingState {
         }
         let mut inner = self.lock();
         let cursor = inner.global_rr_cursor.entry(model.to_string()).or_insert(0);
+        let index = *cursor % len;
+        *cursor = cursor.wrapping_add(1);
+        index
+    }
+
+    /// `drain`（用完为止）游标前进一格：返回本次应取的**组内下标**（`0..len`）。
+    ///
+    /// 与 [`Self::next_round_robin`] 的区别只在键：轮询按 `(provider, 请求名)`
+    /// 分，drain 按**池**（provider）一条环 —— 这一档的语义是「把一家的座位
+    /// 按优先级逐个用完再回头」，不随请求的模型名分叉。`len == 0` 是防御
+    /// （调用点不会用空组），返回 0。
+    pub fn next_drain(&self, pool: &str, len: usize) -> usize {
+        if len == 0 {
+            return 0;
+        }
+        let mut inner = self.lock();
+        let cursor = inner.drain_cursor.entry(pool.to_string()).or_insert(0);
         let index = *cursor % len;
         *cursor = cursor.wrapping_add(1);
         index
