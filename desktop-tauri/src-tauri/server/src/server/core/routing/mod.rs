@@ -42,6 +42,7 @@ use crate::server::core::account_store::store_crud::{
 };
 use crate::server::core::account_store::store_util::js_truthy;
 
+pub mod registry;
 pub mod seat;
 pub mod strategy;
 

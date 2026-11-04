@@ -303,6 +303,95 @@ impl Default for RoutingState {
     }
 }
 
+/// 按策略把一组**座位**排成先后，返回座位下标的排列。
+///
+/// 这是 [`order_group`] 的「座位形态」：两者语义逐条相同 ——
+///   - 入参不必先排序：内部先按 `(优先级, 加入时间)` 排出**基础序**（与
+///     [`super::compare_by_priority`] 同口径），所有策略都在这条基础序上施加；
+///   - `priority` 原样返回基础序；
+///   - `least-connections` 按在途数升序，并列回落到基础序；
+///   - 家内轮询 / LRU / 加权轮询在 `ctx.advance == false`（预演）时不写状态：
+///     轮询与加权轮询退化为基础序，LRU 仍按「上次选中时刻」排（只读）；
+///   - 座位数 ≤ 1 时原样返回，且**不推进任何游标**（与 `order_group` 一致：
+///     只有一个号的家不该被一条请求消耗掉一次轮询位）。
+///
+/// `global-round-robin` 的轮转**不在这一层**做：它是**池级**策略，轮转边界是
+/// 整条候选队列（跨家），由 [`order_candidates`] 在拼完所有组之后统一
+/// `rotate_left`（见那里的第 4 条）。组内因此退化为 `priority` 序 ——
+/// 在这里再转一次会变成「整表转一次 + 组内又转一次」，与上游 `rotate` 不等价。
+pub fn order_seats(
+    strategy: RoutingStrategy,
+    ctx: &super::registry::StrategyCtx<'_>,
+    pool: &str,
+    seats: &[super::seat::Seat],
+) -> Vec<usize> {
+    let len = seats.len();
+    if len <= 1 {
+        // 空表 / 单座位：不碰运行时状态（单账号的家不该消耗轮询游标）。
+        return (0..len).collect();
+    }
+    // 基础序 = `(优先级, 加入时间)` 升序（稳定排序，并列保持入参序）。
+    let mut order: Vec<usize> = (0..len).collect();
+    order.sort_by_key(|index| (seats[*index].priority, seats[*index].added_at));
+    match strategy {
+        // 基础序即答案
+        RoutingStrategy::Priority => order,
+        // 整表轮转在 `order_candidates` 层做（见函数文档），组内退化为优先级序。
+        RoutingStrategy::GlobalRoundRobin => order,
+        RoutingStrategy::LeastConnections => {
+            // 在途数升序；并列按 `(优先级, 加入时间)`（显式写出来，不依赖基础序）
+            order.sort_by_key(|index| {
+                let seat = &seats[*index];
+                (seat.in_flight, seat.priority, seat.added_at)
+            });
+            order
+        }
+        RoutingStrategy::RoundRobin => {
+            if !ctx.advance {
+                return order;
+            }
+            let start = ctx.state.next_round_robin(pool, ctx.model, len);
+            order.rotate_left(start % len);
+            order
+        }
+        RoutingStrategy::LeastRecentlyUsed => {
+            // 只读 `last_selected`：预演（`advance == false`）也按真实 LRU 排，
+            // 只是不记「这次选中了它」—— 写侧才是状态。
+            order.sort_by_key(|index| {
+                let seat = &seats[*index];
+                (
+                    ctx.state.last_selected(&seat.id).unwrap_or(i64::MIN),
+                    seat.priority,
+                    seat.added_at,
+                )
+            });
+            if ctx.advance {
+                if let Some(first) = order.first() {
+                    ctx.state.mark_selected(&seats[*first].id, ctx.now);
+                }
+            }
+            order
+        }
+        RoutingStrategy::BalanceWeighted | RoutingStrategy::PriorityWeighted => {
+            if !ctx.advance {
+                return order;
+            }
+            let (ids, weights) = match strategy {
+                RoutingStrategy::BalanceWeighted => balance_weights_of_seats(seats, &order),
+                _ => priority_weights_of_seats(seats, &order),
+            };
+            let picked = ctx.state.smooth_pick(&ids, &weights);
+            if picked == 0 {
+                return order;
+            }
+            // 选中者提到队首，其余保持基础序（与 `order_group` 的 SWRR 分支同形）
+            let chosen = order.remove(picked);
+            order.insert(0, chosen);
+            order
+        }
+    }
+}
+
 /// 带**策略**的账号挑选：过滤 → 分组 → 组内按该家策略挑一个。
 ///
 /// 它是 [`order_candidates`] 的「只取首位」形态 —— 两条路共用同一份排序，
@@ -541,20 +630,33 @@ fn best_priority_key(accounts: &[Value]) -> (i64, i64) {
 /// 未知余额的账号取**基线**（组内已知余额的中位数，一个都没有时 1.0）。
 /// 权重收成非负；全为 0 时退化成等权（各 1.0），保证组内没有账号被饿死。
 fn balance_weights(group: &[Value], balances: &HashMap<String, f64>) -> (Vec<String>, Vec<f64>) {
-    let ids: Vec<String> = group
+    let entries: Vec<(String, Option<f64>)> = group
         .iter()
-        .map(|account| account_id(account).unwrap_or_default().to_string())
+        .map(|account| {
+            let id = account_id(account).unwrap_or_default().to_string();
+            let balance = balances.get(&id).copied();
+            (id, balance)
+        })
         .collect();
-    let mut known: Vec<f64> = ids
+    balance_weight_table(&entries)
+}
+
+/// 余额加权的权重内核：`entries` 是 `(账号 id, 已知余额)`，顺序即输入顺序。
+///
+/// `Value` 形态（[`balance_weights`]）与座位形态（[`balance_weights_of_seats`]）
+/// 共用这一份计算 —— 两条路径的权重口径不可能分叉。
+fn balance_weight_table(entries: &[(String, Option<f64>)]) -> (Vec<String>, Vec<f64>) {
+    let ids: Vec<String> = entries.iter().map(|(id, _)| id.clone()).collect();
+    let mut known: Vec<f64> = entries
         .iter()
-        .filter_map(|id| balances.get(id).copied())
+        .filter_map(|(_, balance)| *balance)
         .filter(|value| value.is_finite() && *value > 0.0)
         .collect();
     let baseline = median(&mut known).unwrap_or(1.0);
-    let mut weights: Vec<f64> = ids
+    let mut weights: Vec<f64> = entries
         .iter()
-        .map(|id| {
-            let raw = balances.get(id).copied().unwrap_or(baseline);
+        .map(|(_, balance)| {
+            let raw = balance.unwrap_or(baseline);
             if raw.is_finite() && raw > 0.0 {
                 raw
             } else {
@@ -568,26 +670,71 @@ fn balance_weights(group: &[Value], balances: &HashMap<String, f64>) -> (Vec<Str
     (ids, weights)
 }
 
+/// 座位形态的余额加权表：按 `order`（座位下标的先后）取 id 与余额。
+fn balance_weights_of_seats(
+    seats: &[super::seat::Seat],
+    order: &[usize],
+) -> (Vec<String>, Vec<f64>) {
+    let entries: Vec<(String, Option<f64>)> = order
+        .iter()
+        .map(|index| {
+            let seat = &seats[*index];
+            (seat.id.clone(), seat.balance)
+        })
+        .collect();
+    balance_weight_table(&entries)
+}
+
 /// 优先级加权的权重表：把组内出现的优先级去重升序，第 `r` 名（0 起）权重 =
 /// `(去重总数 - r)` —— 数字越小权重越高，同级共享同一权重。下限 1.0。
 fn priority_weights(group: &[Value]) -> (Vec<String>, Vec<f64>) {
-    let ids: Vec<String> = group
+    let entries: Vec<(String, i64)> = group
         .iter()
-        .map(|account| account_id(account).unwrap_or_default().to_string())
+        .map(|account| {
+            (
+                account_id(account).unwrap_or_default().to_string(),
+                priority_key(account).0,
+            )
+        })
         .collect();
-    let mut distinct: Vec<i64> = group.iter().map(|account| priority_key(account).0).collect();
+    priority_weight_table(&entries)
+}
+
+/// 优先级加权的权重内核：`entries` 是 `(账号 id, 优先级)`，顺序即输入顺序。
+///
+/// 与 [`balance_weight_table`] 同一手法：`Value` 形态与座位形态共用这一份。
+fn priority_weight_table(entries: &[(String, i64)]) -> (Vec<String>, Vec<f64>) {
+    let ids: Vec<String> = entries.iter().map(|(id, _)| id.clone()).collect();
+    let mut distinct: Vec<i64> = entries.iter().map(|(_, priority)| *priority).collect();
     distinct.sort_unstable();
     distinct.dedup();
     let total = distinct.len() as f64;
-    let weights: Vec<f64> = group
+    let weights: Vec<f64> = entries
         .iter()
-        .map(|account| {
-            let priority = priority_key(account).0;
-            let rank = distinct.iter().position(|value| *value == priority).unwrap_or(0);
+        .map(|(_, priority)| {
+            let rank = distinct
+                .iter()
+                .position(|value| value == priority)
+                .unwrap_or(0);
             (total - rank as f64).max(1.0)
         })
         .collect();
     (ids, weights)
+}
+
+/// 座位形态的优先级加权表：按 `order`（座位下标的先后）取 id 与优先级。
+fn priority_weights_of_seats(
+    seats: &[super::seat::Seat],
+    order: &[usize],
+) -> (Vec<String>, Vec<f64>) {
+    let entries: Vec<(String, i64)> = order
+        .iter()
+        .map(|index| {
+            let seat = &seats[*index];
+            (seat.id.clone(), seat.priority)
+        })
+        .collect();
+    priority_weight_table(&entries)
 }
 
 /// 一组数字的中位数（排序后取中；偶数取中间两个的平均）。空表给 `None`。
