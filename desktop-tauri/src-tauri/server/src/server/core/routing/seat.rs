@@ -23,12 +23,12 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use super::{account_id, priority_key, provider_of, PlanMeta};
+use super::{account_id, priority_key, provider_of, CooldownKeys, PlanMeta};
 
 /// 一个候选账号在**本次请求**里的全部判定事实。
 ///
 /// 字段全部是「读一次快照」的标量 / 小对象：策略层只读它，不再回查 map。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Seat {
     /// 账号公开形态（转发最终要用的就是它）
     pub account: Value,
@@ -39,6 +39,12 @@ pub struct Seat {
     /// 归一后的优先级（与 [`super::strategy::order_candidates`] 的排序键同口径：
     /// `routingPriority` 投影优先，其次账号库里的 `priority`）
     pub priority: i64,
+    /// 加入时间（毫秒）。与 [`priority`] 一起构成**完整**的排序键 ——
+    /// 策略必须按 `(priority, added_at)` 升序排，才能与
+    /// [`super::compare_by_priority`] 逐字一致；只比 `priority` 会让同优先级的
+    /// 账号在 golden tests 里换位（`by_priority_order` 的次级键就是它）。
+    /// 缺键 / 非数字按 0（与 `priority_key` 的 `js_number(...).unwrap_or(0)` 同口径）。
+    pub added_at: i64,
     /// 已知剩余余额（未知 = `None`，不是 0）
     pub balance: Option<f64>,
     /// 当前在途请求数（快照里没有 = 0）
@@ -64,12 +70,14 @@ pub struct Seat {
 /// `counts` 是各账号当前在途请求数（账号 id → 数，`upstream::connections`
 /// 的快照）：`in_flight` 的唯一来源，缺键按 0 算。
 ///
-/// ── `model_resting` 的键约定（与 Task 1.2 对齐）──────────────
-/// 键是 `(账号 id, 模型名)`，模型名取 `meta.model`。Task 1.2 的
-/// `RouteState::rest_mark` 按**写入方给的模型名**落键，`plan_route` 查表时用
-/// `CooldownKeys::for_provider` 解析成该家的**上游真名**。因此调用 `seats_from`
-/// 时 `meta.model` 必须是同一口径的模型名（有映射的家要传真名，而不是请求名）；
-/// 用请求名查会在有映射时静默漏命中。
+/// `keys` 是请求名 → 各家**上游真名**的解析器（与 [`super::plan_route`] 同一个）。
+///
+/// ── `model_resting` 的键约定（与 Task 1.2 / 1.3 对齐）──────────
+/// 键是 `(账号 id, 上游真名)`：`RouteState::rest_mark` 在转发收尾时按真名落键，
+/// `plan_route` 也用 `CooldownKeys::for_provider` 解析真名再查。候选列表可以
+/// **跨多家**，而同一个请求名在不同家可能映射到不同的真名，所以这里逐家解析：
+/// 每家只算一次（`wires` 缓存），不是每个候选都跑一遍映射表。
+/// 直接用 `meta.model`（请求名）查会在有映射的家上静默漏命中。
 ///
 /// 没有 id 的候选（手工编辑出来的坏记录）不形成座位：没有 id 就既不能进
 /// 「已试过」集合，也不能作余额 / 粘性 / 计数表的键。
@@ -77,25 +85,33 @@ pub fn seats_from(
     candidates: &[Value],
     meta: &PlanMeta<'_>,
     counts: &HashMap<String, usize>,
+    keys: &CooldownKeys<'_>,
 ) -> Vec<Seat> {
+    // provider id → 该家的上游真名。候选跨家时每家只解析一次；`CooldownKeys`
+    // 自己也有缓存，这里再收一层是为了让本函数的循环里不再反复加锁 / 查表。
+    let mut wires: HashMap<String, String> = HashMap::new();
     candidates
         .iter()
         .filter_map(|account| {
             let id = account_id(account)?.to_string();
+            let provider = provider_of(account).to_string();
+            let wire = wires
+                .entry(provider.clone())
+                .or_insert_with(|| keys.for_provider(&provider))
+                .clone();
+            let (priority, added_at) = priority_key(account);
             Some(Seat {
                 account: account.clone(),
-                provider: provider_of(account).to_string(),
-                priority: priority_key(account).0,
+                provider,
+                priority,
+                added_at,
                 balance: meta.balances.get(&id).copied(),
                 in_flight: counts.get(&id).copied().unwrap_or(0),
                 resting: meta.resting.get(&id).copied(),
                 sunk: meta.sunk.get(&id).copied(),
                 limiter_blocked: meta.limiter_blocked.contains(&id),
                 sticky: meta.sticky_account == Some(id.as_str()),
-                model_resting: meta
-                    .model_resting
-                    .get(&(id.clone(), meta.model.to_string()))
-                    .copied(),
+                model_resting: meta.model_resting.get(&(id.clone(), wire)).copied(),
                 max_rpm_blocked: meta.rpm_blocked.contains(&id),
                 reserve: false,
                 id,
@@ -111,6 +127,7 @@ mod tests {
     use crate::server::core::routing::{PlanMeta, RoutingState, RoutingStrategy};
     use serde_json::{json, Value};
     use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::sync::Mutex;
 
     /// 测试用的一整套外部事实：自己持有各张表，`meta()` 再借用出来。
     ///
@@ -179,6 +196,7 @@ mod tests {
             "id": id,
             "provider": provider,
             "priority": priority,
+            "addedAt": priority,
             "enabled": true,
             "hasCredentials": true,
         })
@@ -191,6 +209,7 @@ mod tests {
             id: "a".to_string(),
             provider: "p".to_string(),
             priority: 1,
+            added_at: 1,
             balance: None,
             in_flight: 0,
             resting,
@@ -227,13 +246,15 @@ mod tests {
         counts.insert("a".to_string(), 3usize);
 
         let candidates = vec![account("a", "p", 1), account("b", "q", 2)];
-        let seats = seats_from(&candidates, &facts.meta(), &counts);
+        let keys = CooldownKeys::new("wire-model");
+        let seats = seats_from(&candidates, &facts.meta(), &counts, &keys);
         assert_eq!(seats.len(), 2);
 
         let first = &seats[0];
         assert_eq!(first.id, "a");
         assert_eq!(first.provider, "p");
         assert_eq!(first.priority, 1);
+        assert_eq!(first.added_at, 1);
         assert_eq!(first.balance, Some(12.5));
         assert_eq!(first.in_flight, 3);
         assert_eq!(first.resting, Some(5_000));
@@ -249,6 +270,7 @@ mod tests {
         assert_eq!(second.id, "b");
         assert_eq!(second.provider, "q");
         assert_eq!(second.priority, 2);
+        assert_eq!(second.added_at, 2);
         assert_eq!(second.balance, None);
         assert_eq!(second.in_flight, 0);
         assert_eq!(second.resting, None);
@@ -268,7 +290,8 @@ mod tests {
         // 没有 id 就既不能进 `tried` 也不能作粘性 / 余额的键。
         let candidates = vec![json!({"provider": "p"}), json!({"id": "solo"})];
 
-        let seats = seats_from(&candidates, &facts.meta(), &counts);
+        let keys = CooldownKeys::new("m");
+        let seats = seats_from(&candidates, &facts.meta(), &counts, &keys);
         assert_eq!(seats.len(), 1);
         let solo = &seats[0];
         assert_eq!(solo.id, "solo");
@@ -280,6 +303,7 @@ mod tests {
             solo.priority,
             crate::server::core::account_store::priority::DEFAULT_PRIORITY
         );
+        assert_eq!(solo.added_at, 0);
         assert_eq!(solo.balance, None);
         assert_eq!(solo.in_flight, 0);
         assert_eq!(solo.resting, None);
@@ -289,5 +313,67 @@ mod tests {
         assert_eq!(solo.model_resting, None);
         assert!(!solo.max_rpm_blocked);
         assert!(!solo.reserve);
+    }
+
+    /// `model_resting` 的键是**逐家的上游真名**：候选列表可以跨多家，同一个
+    /// 请求名在 p / q 两家可能解析出不同真名。这里注入 `CooldownKeys` 的解析
+    /// 缓存来模拟 `modelRules` 映射（与 `plan_tests::model_rest_uses_the_wire_model_key`
+    /// 同一手法）。若退回按 `meta.model`（请求名 `alias`）查，两条都会是 `None`。
+    #[test]
+    fn seats_from_uses_per_provider_wire_model_for_rest() {
+        let mut facts = Facts::new("alias");
+        // 写入侧（Task 1.3）按真名落键：p 家 target、q 家 other
+        facts
+            .model_resting
+            .insert(("a".to_string(), "target".to_string()), 10_000_i64);
+        facts
+            .model_resting
+            .insert(("b".to_string(), "other".to_string()), 20_000_i64);
+        let keys = CooldownKeys {
+            requested: "alias",
+            resolved: Mutex::new(HashMap::from([
+                ("p".to_string(), "target".to_string()),
+                ("q".to_string(), "other".to_string()),
+            ])),
+        };
+        let counts = HashMap::new();
+        let candidates = vec![account("a", "p", 1), account("b", "q", 2)];
+
+        let seats = seats_from(&candidates, &facts.meta(), &counts, &keys);
+        assert_eq!(seats[0].model_resting, Some(10_000));
+        assert_eq!(seats[1].model_resting, Some(20_000));
+    }
+
+    /// `priority` 单独不够：`compare_by_priority` 的第二键是 `addedAt`。
+    /// 同优先级、不同加入时间时，按 `(priority, added_at)` 排必须与旧排序逐字一致。
+    #[test]
+    fn seats_carry_added_at_tiebreak() {
+        let facts = Facts::new("m");
+        let counts = HashMap::new();
+        let keys = CooldownKeys::new("m");
+        let mut late = account("late", "p", 100);
+        late["addedAt"] = json!(900);
+        let mut early = account("early", "p", 100);
+        early["addedAt"] = json!(100);
+        let candidates = vec![late, early];
+
+        let seats = seats_from(&candidates, &facts.meta(), &counts, &keys);
+        assert_eq!(seats[0].added_at, 900);
+        assert_eq!(seats[1].added_at, 100);
+
+        // 新口径：策略按 (priority, added_at) 升序
+        let mut by_seat = seats.clone();
+        by_seat.sort_by_key(|seat| (seat.priority, seat.added_at));
+        // 旧口径：compare_by_priority（priority_key + by_priority_order）
+        let mut by_value = candidates.clone();
+        by_value.sort_by(super::super::compare_by_priority);
+
+        let seat_ids: Vec<&str> = by_seat.iter().map(|seat| seat.id.as_str()).collect();
+        let value_ids: Vec<&str> = by_value
+            .iter()
+            .map(|value| value.get("id").and_then(Value::as_str).unwrap_or(""))
+            .collect();
+        assert_eq!(seat_ids, vec!["early", "late"]);
+        assert_eq!(seat_ids, value_ids);
     }
 }
