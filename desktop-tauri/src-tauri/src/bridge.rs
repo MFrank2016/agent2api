@@ -666,6 +666,13 @@ const BRIDGE_JS: &str = r#"
     saveSanitize: patch => call('PUT', '/api/sanitize',
       typeof patch === 'boolean' ? { sanitizeBlacklistFingerprints: patch } : patch),
 
+    // ── 可逆出站脱敏（密钥 / 个人信息 / 自定义词）──
+    // 与 getSanitize / saveSanitize 同形：GET 读、PUT 写（允许部分字段），
+    // 响应体是生效后的全量值（PUT 另带 saved = 是否写库成功）。
+    // 与 web_shim.rs 的同名方法逐字同形 —— 少一边时另一半形态会报「桥接方法缺失」。
+    getMasking: () => call('GET', '/api/masking'),
+    saveMasking: patch => call('PUT', '/api/masking', patch),
+
     // ── 剥离响应开头的思考标签 ──
     // 与 getSanitize / saveSanitize 同形：GET 读、PUT 写，响应体就是新状态。
     // 与 web_shim.rs 的同名方法逐字同形（漏一侧的症状见 getCors 那段）。

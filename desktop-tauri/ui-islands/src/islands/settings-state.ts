@@ -57,6 +57,7 @@ import {
   type CaptchaSetting,
   type ClineHeadersData,
   type GatewayBlocks,
+  type MaskingPatch,
   type ModelsDevState,
   type NumberField,
   type PromptPatch,
@@ -88,6 +89,7 @@ export type BusyScope =
   | 'routing'
   | 'debug'
   | 'sanitize'
+  | 'masking'
   | 'thinkStrip'
   | 'providerOptions'
   | 'developerRoleCompat'
@@ -162,6 +164,20 @@ export type DeveloperRoleCompatState = { status: LoadStatus; on: boolean }
 
 /** 剥离响应开头思考标签的全局开关；与 SanitizeState 同形 */
 export type ThinkStripState = { status: LoadStatus; on: boolean }
+
+/**
+ * 可逆出站脱敏（`/api/masking`）：三项互相独立，任一开启即会改写出站副本。
+ *
+ * `saved = false` 表示这次 PUT 没写进库（只在本次运行内生效），界面要常驻提示；
+ * 读侧不可用时 status 为 unavailable，面板整体禁用但**不影响设置页其它块**。
+ */
+export type MaskingState = {
+  status: LoadStatus
+  secrets: boolean
+  pii: boolean
+  words: string[]
+  saved: boolean
+}
 
 /**
  * 逐家开关覆盖（`providerOptions`）：只含**显式设过**的家与键。
@@ -305,6 +321,8 @@ export type SettingsSnapshot = {
   routing: RoutingState
   debug: DebugState
   sanitize: SanitizeState
+  /** 可逆出站脱敏（密钥 / 个人信息 / 自定义词） */
+  masking: MaskingState
   /** 剥离响应开头思考标签（全局开关） */
   thinkStrip: ThinkStripState
   /** 逐家开关覆盖 */
@@ -446,6 +464,7 @@ const INITIAL: SettingsSnapshot = {
   routing: { status: 'loading', strategy: 'order', sticky: 'auto', failoverBackoff: true, sink: true, breakerEnabled: false },
   debug: { status: 'loading', on: false, count: null, limit: null },
   sanitize: INITIAL_SANITIZE,
+  masking: { status: 'loading', secrets: false, pii: false, words: [], saved: true },
   thinkStrip: { status: 'loading', on: false },
   providerOptions: { status: 'loading', overrides: {} },
   developerRoleCompat: { status: 'loading', on: false },
@@ -1815,6 +1834,86 @@ export async function saveThinkStrip(next: boolean): Promise<void> {
   }
 }
 
+/* ─── 可逆出站脱敏（密钥 / 个人信息 / 自定义词）── */
+
+/**
+ * 归一化 `maskWords`：只收字符串，去首尾空白、丢空项与重复项。
+ * 与后端 `parse_words` 同一口径 —— 界面上的草稿可以留空行，落库的永远是干净的词表。
+ */
+function maskWordsFrom(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return []
+  const words: string[] = []
+  for (const item of raw) {
+    if (typeof item !== 'string') continue
+    const word = item.trim()
+    if (!word || words.includes(word)) continue
+    words.push(word)
+  }
+  return words
+}
+
+export function renderMasking(data?: unknown): void {
+  if (data === undefined) return
+  if (!data || typeof data !== 'object') {
+    publish({ masking: { status: 'unavailable', secrets: false, pii: false, words: [], saved: true } })
+    return
+  }
+  const record = data as Record<string, unknown>
+  publish({
+    masking: {
+      status: 'ready',
+      secrets: record.maskSecrets === true,
+      pii: record.maskPii === true,
+      words: maskWordsFrom(record.maskWords),
+      // PUT 响应才带 saved；GET 不带，按「已保存」处理
+      saved: record.saved !== false,
+    },
+  })
+}
+
+/**
+ * 读设置。桥方法缺失（旧壳 / 网页端漏注册）时按 unavailable 处理，
+ * 面板禁用但不拖垮设置页的其它块。
+ */
+async function loadMasking(): Promise<void> {
+  const bridge = shared().workbuddyDesktop
+  if (!bridge?.getMasking) {
+    publish({ masking: { ...snapshot.masking, status: 'unavailable' } })
+    return
+  }
+  try {
+    renderMasking(await bridge.getMasking())
+  } catch (error) {
+    console.warn('读取出站脱敏设置失败:', errorMessage(error))
+    renderMasking(null)
+  }
+}
+
+/**
+ * 保存三项（全量）。响应体是生效后的全量值（PUT 另带 saved）；
+ * 失败时回读一次拿后端的真实值，与其它开关面板同一口径。
+ */
+export async function saveMasking(patch: MaskingPatch): Promise<void> {
+  if (busyScope) return
+  const bridge = shared().workbuddyDesktop
+  if (!bridge?.saveMasking) {
+    toast(t('当前环境不支持出站脱敏设置'), 'err')
+    return
+  }
+  beginBusy('masking')
+  try {
+    const saved = await bridge.saveMasking(patch)
+    if (saved === undefined) await loadMasking()
+    else renderMasking(saved)
+    toast(t('✅ 出站脱敏设置已保存'))
+  } catch (error) {
+    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
+    await loadMasking()
+  } finally {
+    endBusy()
+  }
+}
+
 /* ─── 逐家开关覆盖（providerOptions）── */
 
 /**
@@ -2783,6 +2882,7 @@ export async function load(): Promise<void> {
     loadCaptchaPool(),
     loadDebug(),
     loadSanitize(),
+    loadMasking(),
     loadThinkStrip(),
     loadProviderOptions(),
     loadDeveloperRoleCompat(),
@@ -2843,6 +2943,11 @@ export async function refreshDebug(): Promise<void> {
 export async function refreshSanitize(): Promise<void> {
   await loadSanitize()
   toast(t('指纹脱敏设置已刷新'))
+}
+
+export async function refreshMasking(): Promise<void> {
+  await loadMasking()
+  toast(t('出站脱敏设置已刷新'))
 }
 
 export async function refreshThinkStrip(): Promise<void> {

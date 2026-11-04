@@ -1930,6 +1930,12 @@ pub fn shim_js() -> &'static str {
         ? { sanitizeBlacklistFingerprints: patch } : patch);
     },
 
+    // ── 可逆出站脱敏（密钥 / 个人信息 / 自定义词）──
+    // 与桌面桥（src/bridge.rs 的 getMasking / saveMasking）同一映射：
+    // 两边接口名与签名必须一致，界面代码零改动地跑在两边。
+    getMasking: function () { return call('GET', '/api/masking'); },
+    saveMasking: function (patch) { return call('PUT', '/api/masking', patch); },
+
     // ── 剥离响应开头的思考标签 ──
     // 与桌面桥（src/bridge.rs 的 getThinkStrip / saveThinkStrip）同一映射：
     // 两边接口名与签名必须一致，界面代码零改动地跑在两边。
