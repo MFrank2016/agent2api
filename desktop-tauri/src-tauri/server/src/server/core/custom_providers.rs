@@ -69,6 +69,12 @@
 //! 保存，转发时报 400（见 `providers::custom::forward` 的分派骨架）。
 
 mod bindings;
+/// 预置提供商目录（新建自定义提供商表单的模板表）。
+///
+/// 纯编译期事实（表本身在 `preset_catalog::all()` 里），不读配置、不落库：
+/// 创建提供商时由 `presetId` 派生出 `protocol` / `baseUrl` / 特判与余额方案，
+/// 落库后就是一条普通自定义提供商（见模块头「条目形状」）。
+pub mod preset_catalog;
 mod presets;
 /// 自定义提供商**定义**的导入合并（账号导出文件里的 `customProviders` 段）。
 ///
