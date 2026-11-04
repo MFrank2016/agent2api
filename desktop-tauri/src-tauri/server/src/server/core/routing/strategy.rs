@@ -1114,4 +1114,270 @@ mod tests {
         assert_eq!(seq, vec![Some("p1".into()), Some("p2".into()), Some("q1".into())]);
     }
 
+
+    // ─── Task 4.3：旧 `order_group` vs 新 `order_seats` 的等价性 ─────────
+    //
+    // 用**表驱动**用例（不是生成出来的 JSON）：fixture 写在代码里，评审时能直接
+    // 看出「这一组数据在验什么」，也不会随实现悄悄漂移。
+    //
+    // 两条路径的入参形态不同，但语义必须逐条相同：
+    //   - `order_group` 拿 `Vec<Value>`，调用方（`order_candidates`）**已按
+    //     `(优先级, 加入时间)` 排好**；
+    //   - `order_seats` 拿 `&[Seat]`，**自己**做基础序。
+    // 所以这里给旧路径喂 `compare_by_priority` 排过的副本，给新路径喂同一批
+    // 账号构造的座位 —— 两边看到的是同一组事实、同一份基础序。
+    //
+    // 每个 (fixture × 策略 × advance) 组合都跑**两轮**：有状态策略（轮询 /
+    // LRU / SWRR）的游标 / 权重跨请求累积，只跑一轮看不出「状态推进是否分叉」。
+
+    use super::super::registry::StrategyCtx;
+    use super::super::seat::Seat;
+
+    /// 一组「账号 + 外部事实」的 fixture：两条路径都从这同一份数据出发。
+    struct Fixture {
+        name: &'static str,
+        accounts: Vec<Value>,
+        counts: HashMap<String, usize>,
+        balances: HashMap<String, f64>,
+        /// LRU 的「上次被选中」预置：`(账号 id, 时刻)`
+        prior: Vec<(&'static str, i64)>,
+    }
+
+    fn fixture(name: &'static str, accounts: Vec<Value>) -> Fixture {
+        Fixture {
+            name,
+            accounts,
+            counts: HashMap::new(),
+            balances: HashMap::new(),
+            prior: Vec::new(),
+        }
+    }
+
+    /// 覆盖控制器点名的几类代表集：并列 / 余额 / 在途 / 三账号轮询 /
+    /// LRU 历史 / 加权 / 单账号 / 综合。
+    fn fixtures() -> Vec<Fixture> {
+        let mut cases = Vec::new();
+
+        // 1. 优先级并列：同优先级靠 `addedAt` 兜底（新路径必须自带这次级键）。
+        cases.push(fixture(
+            "priority-ties",
+            vec![
+                account("late", "p", 100, 2),
+                account("early", "p", 100, 1),
+                account("worst", "p", 200, 3),
+            ],
+        ));
+
+        // 2. 余额不同 + 一个未知余额（走基线权重，不应被饿死）。
+        let mut case = fixture(
+            "different-balances",
+            vec![
+                account("rich", "p", 100, 1),
+                account("poor", "p", 101, 2),
+                account("unknown", "p", 102, 3),
+            ],
+        );
+        case.balances.insert("rich".to_string(), 9.0);
+        case.balances.insert("poor".to_string(), 1.0);
+        cases.push(case);
+
+        // 3. 在途数不同（`least-connections` 的分支：少者优先，并列回落优先级）。
+        let mut case = fixture(
+            "different-in-flight",
+            vec![
+                account("busy", "p", 100, 1),
+                account("idle", "p", 101, 2),
+                account("half", "p", 102, 3),
+            ],
+        );
+        case.counts.insert("busy".to_string(), 5);
+        case.counts.insert("idle".to_string(), 0);
+        case.counts.insert("half".to_string(), 2);
+        cases.push(case);
+
+        // 4. 三个账号的家内轮询：第二轮必须整体前移一格。
+        cases.push(fixture(
+            "round-robin-three",
+            vec![
+                account("a", "p", 100, 1),
+                account("b", "p", 101, 2),
+                account("c", "p", 102, 3),
+            ],
+        ));
+
+        // 5. LRU 带历史选中：a 最近、b 次之、c 从未 → c 先。
+        let mut case = fixture(
+            "lru-prior-selections",
+            vec![
+                account("a", "p", 100, 1),
+                account("b", "p", 101, 2),
+                account("c", "p", 102, 3),
+            ],
+        );
+        case.prior = vec![("a", 2_000), ("b", 1_000)];
+        cases.push(case);
+
+        // 6. 优先级加权：不同优先级 → 权重 3/2/1，两轮 SWRR 必须同步。
+        cases.push(fixture(
+            "priority-weighted",
+            vec![
+                account("a", "p", 100, 1),
+                account("b", "p", 200, 2),
+                account("c", "p", 300, 3),
+            ],
+        ));
+
+        // 7. 单账号：`len <= 1` 不该消耗任何游标 / 权重。
+        cases.push(fixture("single", vec![account("only", "p", 100, 1)]));
+
+        // 8. 综合：并列 + 余额 + 在途同时出现。
+        let mut case = fixture(
+            "mixed",
+            vec![
+                account("a", "p", 100, 1),
+                account("b", "p", 100, 2),
+                account("c", "p", 150, 3),
+            ],
+        );
+        case.balances.insert("a".to_string(), 2.0);
+        case.balances.insert("b".to_string(), 6.0);
+        case.counts.insert("a".to_string(), 3);
+        cases.push(case);
+
+        cases
+    }
+
+    /// 按 `seat_from` 的口径（`priority_key` + 在途 / 余额表）直接拼座位。
+    /// 不经过 `PlanMeta`：这些用例只关心策略读的那几个字段，其余给「无」。
+    fn seat_of(
+        account: &Value,
+        counts: &HashMap<String, usize>,
+        balances: &HashMap<String, f64>,
+    ) -> Seat {
+        let id = account_id(account).unwrap_or_default().to_string();
+        let (priority, added_at) = priority_key(account);
+        Seat {
+            account: account.clone(),
+            id: id.clone(),
+            provider: provider_of(account).to_string(),
+            priority,
+            added_at,
+            balance: balances.get(&id).copied(),
+            in_flight: counts.get(&id).copied().unwrap_or(0),
+            resting: None,
+            sunk: None,
+            limiter_blocked: false,
+            sticky: false,
+            model_resting: None,
+            max_rpm_blocked: false,
+            reserve: false,
+        }
+    }
+
+    fn ids_of_values(order: &[Value]) -> Vec<String> {
+        order
+            .iter()
+            .filter_map(|account| account_id(account).map(str::to_string))
+            .collect()
+    }
+
+    fn ids_of_seats(order: &[usize], seats: &[Seat]) -> Vec<String> {
+        order.iter().map(|index| seats[*index].id.clone()).collect()
+    }
+
+    /// 七档策略 × 8 组 fixture × 预演/推进 × 两轮：旧 `order_group` 与
+    /// 新 `order_seats` 的**账号 id 顺序**必须逐位相同。
+    ///
+    /// `global-round-robin` 在组内两边都交优先级序（整表轮转在
+    /// `order_candidates` 层，见 `order_seats` 文档），因此也在同一张表里比。
+    #[test]
+    fn order_golden_seats_match_group_for_every_strategy() {
+        for case in fixtures() {
+            // 旧路径的入参：`order_candidates` 传给 `order_group` 的那份基础序。
+            let mut base = case.accounts.clone();
+            base.sort_by(compare_by_priority);
+            let seats: Vec<Seat> = case
+                .accounts
+                .iter()
+                .map(|account| seat_of(account, &case.counts, &case.balances))
+                .collect();
+
+            for strategy in RoutingStrategy::ALL {
+                for advance in [false, true] {
+                    // 两条路径各自一份**全新**状态：只比排序，不比共享。
+                    let old_state = RoutingState::new();
+                    let new_state = RoutingState::new();
+                    for (id, at) in &case.prior {
+                        old_state.mark_selected(id, *at);
+                        new_state.mark_selected(id, *at);
+                    }
+
+                    for round in 0..2 {
+                        let old = order_group(
+                            base.clone(),
+                            strategy,
+                            "p",
+                            "m",
+                            &case.counts,
+                            &old_state,
+                            &case.balances,
+                            3_000,
+                            advance,
+                        );
+                        let ctx = StrategyCtx {
+                            state: &new_state,
+                            model: "m",
+                            now: 3_000,
+                            advance,
+                        };
+                        let new = order_seats(strategy, &ctx, "p", &seats);
+
+                        assert_eq!(
+                            ids_of_values(&old),
+                            ids_of_seats(&new, &seats),
+                            "策略 {} 在 fixture「{}」（advance = {}，第 {} 轮）上分叉",
+                            strategy.as_str(),
+                            case.name,
+                            advance,
+                            round + 1,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 预演（`advance = false`）在**两条路径**上都不写运行时状态 —— 这是
+    /// 「队列面板只画不消耗」承诺的结构性证据。
+    #[test]
+    fn order_golden_preview_does_not_write_state() {
+        let case = fixtures()
+            .into_iter()
+            .find(|case| case.name == "round-robin-three")
+            .expect("fixture 必须存在");
+        let seats: Vec<Seat> = case
+            .accounts
+            .iter()
+            .map(|account| seat_of(account, &case.counts, &case.balances))
+            .collect();
+        let state = RoutingState::new();
+        let ctx = StrategyCtx {
+            state: &state,
+            model: "m",
+            now: 3_000,
+            advance: false,
+        };
+        for strategy in [
+            RoutingStrategy::RoundRobin,
+            RoutingStrategy::LeastRecentlyUsed,
+            RoutingStrategy::BalanceWeighted,
+            RoutingStrategy::PriorityWeighted,
+        ] {
+            let _ = order_seats(strategy, &ctx, "p", &seats);
+        }
+        let inner = state.lock();
+        assert!(inner.rr_cursor.is_empty(), "预演不该消耗轮询游标");
+        assert!(inner.last_selected.is_empty(), "预演不该记 LRU 时刻");
+        assert!(inner.current_weight.is_empty(), "预演不该推进 SWRR 权重");
+    }
 }
