@@ -311,6 +311,13 @@ pub fn pick_account_by_priority(
 ///
 /// 过滤判据（与改造前逐字相同）：有非空 id、不在 `exclude_ids` 里、可用
 /// （启用 + 该模型未限流）、未达并发上限。
+///
+/// ⚠️ **不处理模型级 rest**：本函数拿不到 `RouteState`（没有 model /
+/// [`PlanMeta`] 入参），只做静态过滤。模型级 rest（[`PlanMeta::model_resting`]）
+/// 由 [`plan_route`] 在调用策略层之前统一过滤；生产转发与队列端点必须走
+/// [`plan_route`]，本函数只服务于旧的扁平优先级路径
+/// （[`pick_account_by_priority`]）与策略层内部的二次过滤，**不要**把它当作
+/// 新的选路入口。
 fn usable_candidates(
     accounts: &[Value],
     keys: &CooldownKeys<'_>,
@@ -709,11 +716,14 @@ pub fn plan_route(
             continue;
         }
         // 模型级 rest：只跳过「这个账号 × 这个模型」这一格，同账号其他模型照常
-        // 参与。账号级 `resting` 不在这里 —— 它是退避，对所有模型统一垫底
+        // 参与。键必须是**上游真名**（与 `rateLimits` / 模型级冷却同一口径）：
+        // Task 1.3 在转发收尾时按真名 `rest_mark`，而本函数的 `meta.model` 是
+        // 请求名 —— 用请求名查会在有映射时静默漏命中。
+        // 账号级 `resting` 不在这里 —— 它是退避，对所有模型统一垫底
         // （见函数末尾的稳定修饰），不是硬跳过。
         if let Some(until) = meta
             .model_resting
-            .get(&(id.clone(), meta.model.to_string()))
+            .get(&(id.clone(), keys.for_provider(&provider)))
         {
             blocked.push(entry(
                 "cooldown",
@@ -1081,6 +1091,56 @@ mod plan_tests {
             &model_resting,
         );
         assert_eq!(ids(&sibling), vec!["a", "b"]);
+    }
+
+    /// 模型级 rest 的键是**上游真名**，不是客户端请求名。
+    ///
+    /// Task 1.3 在 `provider_loop` 收尾时按真名 `rest_mark`（那里的注释明确
+    /// 冷却键是上游真名）；选路这边若用 `meta.model`（请求名）查，有模型映射时
+    /// 就会「写在一个键、查另一个键」—— 静默漏命中、已限流的账号被反复选中。
+    /// 这里直接注入 `CooldownKeys` 的解析缓存来模拟 `modelRules` 映射：
+    /// 请求 `alias` 在 `p` 家实际发出 `target`。
+    #[test]
+    fn model_rest_uses_the_wire_model_key() {
+        let accounts = vec![account("a", "p", 100), account("b", "p", 101)];
+        let settings = RoutingStrategySettings::default();
+        let state = RoutingState::new();
+        let empty_i = HashMap::new();
+        let empty_s = HashSet::new();
+        let mut model_resting = HashMap::new();
+        // 写入侧（Task 1.3）按真名记：("a", "target")
+        model_resting.insert(("a".to_string(), "target".to_string()), 10_000_i64);
+        // 请求名 alias 在 p 家解析为真名 target（缓存注入 = 映射已生效）
+        let keys = CooldownKeys {
+            requested: "alias",
+            resolved: Mutex::new(HashMap::from([("p".to_string(), "target".to_string())])),
+        };
+        let counts = HashMap::new();
+        let balances = HashMap::new();
+        let limiter = HashSet::new();
+        let meta = PlanMeta {
+            strategies: &settings,
+            state: &state,
+            balances: &balances,
+            model: "alias",
+            advance: true,
+            sunk: &empty_i,
+            resting: &empty_i,
+            model_resting: &model_resting,
+            open: &empty_s,
+            limiter_blocked: &limiter,
+            sticky_account: None,
+        };
+        let result = plan_route(&accounts, &keys, &counts, &[], 1_000, &meta);
+        // a 被真名键挡住；若按请求名查（旧实现）它会留在队首
+        assert_eq!(ids(&result), vec!["b"]);
+        let blocked = result
+            .blocked
+            .iter()
+            .find(|entry| entry.id == "a")
+            .expect("a 应被真名键的模型级 rest 跳过");
+        assert_eq!(blocked.state, "cooldown");
+        assert!(blocked.reason.contains("模型限流至"));
     }
 
     /// 账号级 rest（退避）仍然**跨模型**生效：同一条账号级事实不能因为模型
