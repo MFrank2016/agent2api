@@ -74,8 +74,13 @@ pub async fn get_presets() -> Response {
 
 /// 新建提供商 + 该家第一个账号；**或**往一个已有提供商里再加一个账号。
 ///
-/// body：`{name, protocol, baseUrl, apiKey?, providerId?}`（`apiKey` 落进账号
-/// 记录，`name` 同时作为账号的默认备注名）。
+/// body：`{name, protocol, baseUrl, apiKey?, providerId?, presetId?}`（`apiKey`
+/// 落进账号记录，`name` 同时作为账号的默认备注名）。
+///
+/// `presetId` 是新建表单里选中的预置卡 id：core 层据此派生协议 / 基址 / 特判 /
+/// 余额方案（显式字段优先，见 `core::custom_providers::record_draft`）。本层
+/// 只负责原样转发 —— 派生规则集中在 core，避免 HTTP 形状与记录语义两处各写一份。
+/// 复用已有提供商的路径（`providerId`）不消费它。
 ///
 /// ── `providerId`：多账号共用一个提供商 ─────────────────────
 /// 给了 `providerId` 就**不再新建提供商**，而是把账号挂到那一家名下：
