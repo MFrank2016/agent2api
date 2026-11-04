@@ -1164,3 +1164,118 @@ fn an_undeclared_provider_cannot_expand_into_newline_stripping() {
         "没有能力位的家配了开关也不许丢帧"
     );
 }
+
+// ── 滚动 RPM 的发送前闸门（Task 2.3）────────────────────────────────────────
+//
+// 选路层的 `rpm_blocked_accounts` 只**查**窗口（不占名额），真正的占名额发生
+// 在发送前这一道闸门里。分开的理由：一次请求可能选路多次（429 顺延、粘性命中、
+// 队列面板预演），若在选路里 `allow`，一条请求会吃掉好几份配额，而且面板刷新
+// 也会偷偷消耗额度。
+//
+// 这条用例钉住三件事：① 打满后返回 429；② 带 `Retry-After`（秒，向上取整）；
+// ③ 被拒的那次**不记账**（不会越拒越长），且 `maxRpm == 0` 恒放行。
+
+#[test]
+fn rpm_send_time_refusal_is_429_with_retry_after() {
+    use axum::http::header::RETRY_AFTER;
+    use crate::server::core::upstream::rpm::RpmWindow;
+
+    let rpm = RpmWindow::new();
+    let account = json!({"id": "a", "provider": "p", "enabled": true, "maxRpm": 1});
+    // 第一次：占一个名额
+    assert!(
+        rpm_gate(&rpm, Some("a"), Some(&account), 1_000).is_ok(),
+        "窗口空着时应当放行"
+    );
+    // 同一分钟内第二次：拒绝
+    let error = rpm_gate(&rpm, Some("a"), Some(&account), 2_000)
+        .expect_err("打满后必须拒绝");
+    assert_eq!(error.status_code, 429, "RPM 超限是 429");
+    // 1_000ms 那次命中要到 61_000 才滑出，此刻还差 59_000ms → 59 秒
+    assert_eq!(
+        error.retry_after_secs,
+        Some(59),
+        "Retry-After 必须是窗口剩余秒数（向上取整）"
+    );
+    let response = error.payload_response();
+    assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response.headers().get(RETRY_AFTER).and_then(|value| value.to_str().ok()),
+        Some("59"),
+        "响应必须带 Retry-After 头"
+    );
+    // 被拒的那次不记账：过了一分钟窗口，名额恰好回来一个（不是被拒次数拖长）
+    assert!(
+        rpm_gate(&rpm, Some("a"), Some(&account), 61_000).is_ok(),
+        "窗口滚动后名额应当回来"
+    );
+    // 不限速（maxRpm 缺键 = 0）恒放行，也不留痕
+    let unlimited = json!({"id": "b", "provider": "p", "enabled": true});
+    for now in 0..5 {
+        assert!(rpm_gate(&rpm, Some("b"), Some(&unlimited), now).is_ok());
+    }
+    assert_eq!(rpm.wait_ms("b", 0, 10), 0);
+}
+
+// ── 储备账号在循环里的次序（Task 2.3）──────────────────────────────────────
+//
+// 计划层（`plan_route`）已经把 `reserve` 全局后置；这里钉的是**循环层**：
+// 第一个候选是 kept（成功即返回，不会碰储备），只有 kept 进了 `tried_ids`
+// （失败顺延）之后，储备才会被提升并交出来。
+
+#[test]
+fn reserve_is_only_reached_after_the_kept_account_is_tried() {
+    // 用一个自定义 provider id（`custom-` 前缀）：内置家要装了插件才算「可见」，
+    // 而本用例只关心队列次序，不该依赖测试环境里装没装插件。
+    const PROVIDER: &str = "custom-loop-test";
+    let (_dir, service, _seed) = temp_service();
+    // 先加 kept、再加 reserve：`add_account` 按加入顺序排优先级（队尾），
+    // 于是 kept 是队首、reserve 是第 2 位。
+    let kept = service
+        .store
+        .add_account(
+            &json!({"auth": {"accessToken": "at1"}, "account": {"uid": "kept-1"}}),
+            None,
+            Some(PROVIDER),
+        )
+        .expect("kept 账号应当能建起来")["id"]
+        .as_str()
+        .expect("公开形态应带 id")
+        .to_string();
+    let second = service
+        .store
+        .add_account(
+            &json!({"auth": {"accessToken": "at2"}, "account": {"uid": "reserve-2"}}),
+            None,
+            Some(PROVIDER),
+        )
+        .expect("第二个账号应当能建起来");
+    let reserve = second["id"].as_str().expect("公开形态应带 id").to_string();
+    // 同一家两个账号、maxAccounts = 1：队首 kept 可用，后面的才是储备
+    for id in [&kept, &reserve] {
+        service
+            .store
+            .update_account(id, &json!({"maxAccounts": 1}))
+            .expect("上限应当能写进去");
+    }
+    let keys = rotate::CooldownKeys::new("m");
+    let providers = [PROVIDER];
+
+    let first = rotate::pick_next_account(&service, &providers, &keys, &[], None)
+        .expect("队首应当有可用账号");
+    assert_eq!(
+        first.get("id").and_then(Value::as_str),
+        Some(kept.as_str()),
+        "第一个候选必须是 kept（它成功就返回，轮不到储备）"
+    );
+
+    let after_failure =
+        rotate::pick_next_account(&service, &providers, &keys, &[kept.clone()], None)
+            .expect("kept 失败顺延后储备应当被提升");
+    assert_eq!(
+        after_failure.get("id").and_then(Value::as_str),
+        Some(reserve.as_str()),
+        "kept 已试过（失败）后才轮到储备"
+    );
+}
+

@@ -184,6 +184,15 @@ pub struct UpstreamService {
     /// 的只读快照 —— 状态只该被两条钩子路径改写。Arc 是给 `#[derive(Clone)]`
     /// 的：克隆服务句柄（入请求上下文）时状态必须仍是同一份。
     route: std::sync::Arc<route_state::RouteState>,
+    /// 滚动 60 秒的请求计数（`maxRpm`，见 `rpm.rs`）。
+    ///
+    /// 选路只 `wait_ms`（只查不占），真正的 `allow` 在发送前那一道闸门
+    /// （`provider_loop::rpm_gate`）—— 一次请求可能选路多次，在选路里占名额
+    /// 会让一条请求吃掉好几份配额。
+    ///
+    /// `Arc` 是给 `#[derive(Clone)]` 的：克隆服务句柄（入请求上下文）时窗口
+    /// 必须仍是同一份，否则每个克隆各记各的，限速就形同虚设。
+    rpm: Arc<rpm::RpmWindow>,
 }
 
 /// 一次转发的入参
@@ -319,7 +328,20 @@ impl UpstreamService {
             connections: Connections::new(),
             routing: crate::server::core::routing::RoutingState::new(),
             route: std::sync::Arc::new(route_state::RouteState::new()),
+            rpm: Arc::new(rpm::RpmWindow::new()),
         }
+    }
+
+    /// 选路用的「RPM 已打满」账号集合（只查不占，见 `rotate::rpm_blocked_accounts`）。
+    ///
+    /// 转发选路、429 顺延与队列面板必须用**同一份**判据，否则面板画的顺序与
+    /// 实际转发会分叉。`now` 由调用方传入（同一次选路共用一个时间点）。
+    pub fn rpm_blocked_accounts(
+        &self,
+        accounts: &[Value],
+        now: i64,
+    ) -> std::collections::HashSet<String> {
+        rotate::rpm_blocked_accounts(accounts, &self.rpm, now)
     }
 
     /// 路由运行期状态的**只读快照**（`api::routing` 的队列端点用）。

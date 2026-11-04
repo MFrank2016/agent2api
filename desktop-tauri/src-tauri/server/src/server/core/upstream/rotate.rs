@@ -52,6 +52,7 @@ use crate::server::logging;
 
 use super::{account_display, format_reset_text, has_access_token, priority_of, RouteTarget,
             UpstreamService};
+use super::rpm::RpmWindow;
 
 /// 取指定账号的会话；`account_id` 为 None 时回落到**该 provider 的**默认登录态。
 ///
@@ -185,9 +186,11 @@ pub(super) async fn select_target_account(
     // 整轮选路取一次 —— 同一次请求的多次重挑用同一份规则与同一份状态。
     let state = service.routing();
     let balances = balance_snapshot();
-    // RPM 窗口与逐家账号上限由 Task 2.3 接入；此处先传空表（不启用）。
-    let rpm_blocked = HashSet::new();
-    let max_accounts = HashMap::new();
+    // RPM 窗口（只查不占）与逐家账号上限：选路、429 顺延、队列面板共用同一份判据。
+    // 账号池用 `accounts`（含被限制器拦下的）：上限是**逐家配置**，不该因为
+    // 某个账号暂时被拦就从汇总里消失。
+    let rpm_blocked = rpm_blocked_accounts(&candidates, &service.rpm, now);
+    let max_accounts = routing::max_accounts_by_provider(&accounts);
     let meta = routing::PlanMeta {
         strategies: &strategies,
         state: &state,
@@ -262,8 +265,15 @@ pub(super) async fn select_target_account(
     // 服务的请求直接挡在门外，而强塞只意味着短暂超载 1-2 个（软上限口径见
     // `routing::max_concurrent_of`）。所以：能等就等（①），等不了就挤（②），
     // 永不因并发上限直接 503。
+    // ── 兜底次序（Task 2.3）────────────────────────────────────
+    // `plan.ordered` 只含**可用**账号（储备在末尾），被冷却 / 并发挡下的候选在
+    // `plan.blocked` 里 —— 而本级的用途正是「明知可能失败也再试一次」，所以
+    // 候选仍取自 `enabled`，但用 plan 给它们定次序：
+    //   · plan 里的 usable 位次最先（它们的恢复时刻最值得赌一次）；
+    //   · 其余非储备账号其次（冷却中 / 并发满的 kept 仍优先于储备）；
+    //   · 储备最后 —— 储备可能更空闲、恢复更早，但绝不能抢在 kept 前面。
     let mut best_effort: Option<Value> = None;
-    let mut best_reset = f64::INFINITY;
+    let mut best_key: Option<(u8, usize, i64)> = None;
     for account in &enabled {
         let Some(id) = routing::account_id(account) else {
             continue;
@@ -276,17 +286,20 @@ pub(super) async fn select_target_account(
         if limit > 0 && counts.get(id).copied().unwrap_or(0) >= limit as usize {
             continue;
         }
+        // 0 = 没有恢复时刻 → 最不值得等（同类里排最后）
         let reset = routing::rate_limit_reset_at(account, keys, now);
-        let reset = if reset > 0 { reset as f64 } else { f64::INFINITY };
-        if reset < best_reset {
-            best_reset = reset;
+        let reset = if reset > 0 { reset } else { i64::MAX };
+        let (class, rank) = fallback_class(&plan, id);
+        let key = (class, rank, reset);
+        if best_key.is_none_or(|current| key < current) {
+            best_key = Some(key);
             best_effort = Some(account.clone());
         }
     }
     if best_effort.is_none() {
         // ① 无果：在「全部达到并发上限」（或没有未尝试账号）时按余量挤占。
         // 挑出的账号走与 ① 同一条收尾（取会话 → 组装选路结果）。
-        if let Some(account) = squeeze_by_headroom(&enabled, &counts, tried_ids, keys, now) {
+        if let Some(account) = squeeze_by_headroom(&enabled, &counts, tried_ids, keys, now, &plan) {
             if let Some(id) = routing::account_id(&account).map(str::to_string) {
                 if let Some(entry) = service.store.get_session_by_id(&id) {
                     return Ok(with_proxy_notice(
@@ -669,9 +682,59 @@ fn earliest_limit_reset_at_in(
         .unwrap_or(0)
 }
 
+/// 选路用的「RPM 已打满」账号集合：`maxRpm > 0` 且窗口剩余等待 > 0 的账号。
+///
+/// ── 为什么只 `wait_ms`、不 `allow` ───────────────────────────
+/// 选路是**预演**：一次请求会选路多次（429 顺延、粘性命中、失败重挑），
+/// 队列面板还会额外预演一遍。若在这里 `allow`，一条请求会吃掉好几份配额，
+/// 面板刷新也会偷偷消耗真实额度。占名额只发生在发送前那一道闸门
+/// （`provider_loop::rpm_gate`），两处分工见 `rpm` 模块头。
+///
+/// `limit == 0`（不限速）的账号不进集合 —— `wait_ms` 对它恒为 0，这里提前
+/// 跳过只是为了少一次查表。
+pub(super) fn rpm_blocked_accounts(
+    accounts: &[Value],
+    rpm: &RpmWindow,
+    now: i64,
+) -> HashSet<String> {
+    accounts
+        .iter()
+        .filter_map(|account| {
+            let id = routing::account_id(account)?;
+            let limit = routing::max_rpm_of(account);
+            (limit > 0 && rpm.wait_ms(id, limit, now) > 0).then(|| id.to_string())
+        })
+        .collect()
+}
+
+/// 兜底候选的优先类：`(0, plan 位次)` = 本次 plan 的 `usable`；
+/// `(1, usize::MAX)` = 其它非储备账号（被冷却 / 并发挡下的，兜底仍可试一次）；
+/// `(2, plan 位次)` = 储备（`maxAccounts` 之外的位次）。
+///
+/// 类越小越优先，同类内按 plan 位次（其次由调用方按恢复时间 / 余量决定）。
+/// 这条次序兑现「储备只在 kept 全部不可用后才用」：储备可能比某个 kept
+/// 更空闲、恢复更早，但绝不能因此抢在 kept 前面被选中。
+fn fallback_class(plan: &routing::RoutePlan, id: &str) -> (u8, usize) {
+    plan.ordered
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| entry.id == id)
+        .map(|(index, entry)| {
+            if entry.state == "reserve" {
+                (2, index)
+            } else {
+                (0, index)
+            }
+        })
+        .unwrap_or((1, usize::MAX))
+}
+
 /// 全部账号达到并发上限时的**挤占**挑选：余量（`limit - count`）最大者优先。
 ///
 /// ── 排序口径（任务约定，改动前先读）──────────────────────────
+///   · **兜底优先类**（[`fallback_class`]）先于余量：usable 优先、储备最后 ——
+///     储备账号即便更空闲，也不能抢在 kept 前面被挤占（`maxAccounts` 的口径是
+///     「同时只用前 N 个」，挤占一个储备等于把在用的账号数抬过上限）；
 ///   · **不限（maxConcurrent == 0）= 无穷大余量**，永远排在有限上限之前 ——
 ///     用 `i64::MAX` 近似：任何真实的 `limit - count` 都比它小；
 ///   · 同余量挑**恢复最早**的（与 ① 的「恢复最早试一次」同一偏好：优先选
@@ -688,8 +751,10 @@ fn squeeze_by_headroom(
     tried_ids: &[String],
     keys: &routing::CooldownKeys<'_>,
     now: i64,
+    plan: &routing::RoutePlan,
 ) -> Option<Value> {
     let mut squeezed: Option<Value> = None;
+    let mut best_class = u8::MAX;
     let mut best_headroom = i64::MIN;
     let mut best_reset = f64::INFINITY;
     for account in enabled {
@@ -704,7 +769,12 @@ fn squeeze_by_headroom(
         let headroom = if limit > 0 { limit - count } else { i64::MAX };
         let reset = routing::rate_limit_reset_at(account, keys, now);
         let reset = if reset > 0 { reset as f64 } else { f64::INFINITY };
-        if headroom > best_headroom || (headroom == best_headroom && reset < best_reset) {
+        let (class, _) = fallback_class(plan, id);
+        let better = class < best_class
+            || (class == best_class
+                && (headroom > best_headroom || (headroom == best_headroom && reset < best_reset)));
+        if better {
+            best_class = class;
             best_headroom = headroom;
             best_reset = reset;
             squeezed = Some(account.clone());
@@ -785,9 +855,10 @@ pub(super) fn pick_next_account(
     // 顺延**不推进**有状态策略（游标 / LRU / 加权轮询沿用第一级的起点）
     let state = service.routing();
     let balances = balance_snapshot();
-    // RPM 窗口与逐家账号上限由 Task 2.3 接入；此处先传空表（不启用）。
-    let rpm_blocked = HashSet::new();
-    let max_accounts = HashMap::new();
+    // 顺延同样跳过 RPM 打满的账号（只查不占）—— 否则刚被限流的账号会立刻
+    // 被当成「下一个」再撞一次；储备账号的次序也由同一份 plan 决定。
+    let rpm_blocked = rpm_blocked_accounts(&candidates, &service.rpm, now);
+    let max_accounts = routing::max_accounts_by_provider(&accounts);
     let meta = routing::PlanMeta {
         strategies: &strategies,
         state: &state,
@@ -1023,6 +1094,68 @@ mod tests {
         let now = 1_000_000i64;
         let accounts = vec![limited("a", "modelscope", "other-model", now + 600_000)];
         assert_eq!(earliest_limit_reset_at_in(&accounts, &keys, now), 0);
+    }
+
+    /// 兜底次序的类：plan 里的 usable 最先、其它非储备账号其次、储备最后。
+    ///
+    /// 反了会怎样：储备可能更空闲 / 恢复更早，若只按恢复时间挑，它会抢在
+    /// 冷却中的 kept 前面被选中 —— 等于把 `maxAccounts` 的「只用前 N 个」作废。
+    #[test]
+    fn fallback_ranks_usable_before_kept_before_reserve() {
+        use super::fallback_class;
+        use crate::server::core::routing::{PlanEntry, RoutePlan};
+
+        let entry = |id: &str, state: &'static str| PlanEntry {
+            account: json!({"id": id, "provider": "p", "enabled": true}),
+            id: id.to_string(),
+            name: id.to_string(),
+            provider: "p".to_string(),
+            state,
+            reason: String::new(),
+            reset_at: 0,
+        };
+        let plan = RoutePlan {
+            ordered: vec![entry("u1", "usable"), entry("r1", "reserve")],
+            blocked: vec![],
+            sticky_hit: false,
+        };
+        assert_eq!(fallback_class(&plan, "u1"), (0, 0), "usable 是第 0 类");
+        assert_eq!(fallback_class(&plan, "r1"), (2, 1), "储备是第 2 类");
+        assert_eq!(
+            fallback_class(&plan, "cooling"),
+            (1, usize::MAX),
+            "冷却 / 并发挡下的非储备账号夹在中间（兜底仍可试一次）"
+        );
+    }
+
+    /// 选路用的 RPM 阻塞集合：只收 `maxRpm > 0` 且窗口已满的账号，且**只查不占**
+    /// —— 预演（选路 / 队列面板）不该吃掉一次真实配额。
+    #[test]
+    fn rpm_blocked_accounts_only_reports_full_windows_without_consuming() {
+        use super::rpm_blocked_accounts;
+        use crate::server::core::upstream::rpm::RpmWindow;
+        use std::collections::HashSet;
+
+        let rpm = RpmWindow::new();
+        let accounts = vec![
+            json!({"id": "a", "provider": "p", "enabled": true, "maxRpm": 1}),
+            json!({"id": "b", "provider": "p", "enabled": true}),
+            json!({"id": "c", "provider": "p", "enabled": true, "maxRpm": 2}),
+        ];
+        assert!(rpm.allow("a", 1, 1_000));
+        assert!(rpm.allow("c", 2, 1_000));
+
+        let blocked = rpm_blocked_accounts(&accounts, &rpm, 2_000);
+        assert_eq!(
+            blocked,
+            HashSet::from(["a".to_string()]),
+            "只有打满的 a 被挡；b 不限速、c 只用掉 1/2"
+        );
+        // 只查不占：重复预演结果不变，c 的名额也没被吃掉
+        assert_eq!(rpm_blocked_accounts(&accounts, &rpm, 2_000), blocked);
+        assert!(rpm.allow("c", 2, 2_000), "预演不该消耗 c 的第二个名额");
+        // 不限速的账号一次都不记（`max_rpm_of == 0`）
+        assert_eq!(rpm.wait_ms("b", 0, 2_000), 0);
     }
 
     /// 多账号时取全体最早（这条覆盖的是「取 min 而不是取第一个」）

@@ -23,10 +23,11 @@ export function RouteStateBadge({ state, children }: { state: string; children?:
   const label = state === 'usable' ? t('可用') : state === 'cooldown' ? t('冷却中')
     : state === 'concurrency' ? t('并发已满') : state === 'disabled' ? t('已禁用')
       : state === 'no-credentials' ? t('无凭证') : state === 'limiter' ? t('限制器跳过')
-        : state === 'excluded' ? t('未参与') : state === 'tried' ? t('已尝试') : t('未就绪')
+        : state === 'rpm' ? t('限流') : state === 'reserve' ? t('储备')
+          : state === 'excluded' ? t('未参与') : state === 'tried' ? t('已尝试') : t('未就绪')
   return <Badge shape='tag' variant={state === 'usable' ? 'success'
     : state === 'no-credentials' ? 'destructive'
-      : state === 'cooldown' || state === 'concurrency' || state === 'limiter' ? 'warning' : 'secondary'}>
+      : state === 'cooldown' || state === 'concurrency' || state === 'limiter' || state === 'rpm' ? 'warning' : 'secondary'}>
     {children || label}
   </Badge>
 }

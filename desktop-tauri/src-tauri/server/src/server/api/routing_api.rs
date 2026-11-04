@@ -212,9 +212,10 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
     // —— 预演不该刷新任何会话的计时，也不该消耗下一次轮询
     let routing_state = state.upstream().routing();
     let facts = state.upstream().route_queue_facts(now);
-    // 队列面板是预演：RPM 窗口与逐家账号上限由 Task 2.3 接入，先传空表。
-    let rpm_blocked = HashSet::new();
-    let max_accounts = HashMap::new();
+    // 队列面板是预演：RPM 只查不占（`rpm_blocked_accounts` 用 `wait_ms`），
+    // 不会因为刷新一次面板就吃掉真实配额；逐家账号上限与转发同一份汇总口径。
+    let rpm_blocked = state.upstream().rpm_blocked_accounts(&scoped, now);
+    let max_accounts = routing::max_accounts_by_provider(&scoped);
     let meta = routing::PlanMeta {
         strategies: &strategies,
         state: &routing_state,

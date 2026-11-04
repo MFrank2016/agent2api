@@ -550,6 +550,39 @@ fn filter_by_key_scope(
     .with_code("model_not_found"))
 }
 
+/// 发送前的滚动 RPM 闸门：能发就占一次名额，否则给出带 `Retry-After` 的 429。
+///
+/// ── 为什么只有这一处 `allow` ─────────────────────────────────
+/// 选路（`rotate::rpm_blocked_accounts`）只 `wait_ms` 查询，不占名额：一条请求
+/// 会选路多次（429 顺延、粘性命中、失败重挑），队列面板还会额外预演一遍 ——
+/// 在选路里占名额会让一条请求吃掉好几份配额，面板刷新也会偷偷消耗真实额度。
+/// 因此「记账」只发生在**真的要发出去**之前这一刻。
+///
+/// `account` 是选路带回来的账号记录（`maxRpm` 从它读）；`account_id` 为
+/// `None`（默认登录态 / 环境变量旁路）时没有账号可记账，直接放行。
+// 与全仓所有转发路径同一形状（`GatewayError` 是值类型）：不为绕过这个
+// lint 把错误装箱，那会让调用点的 `?` 与模式匹配都多一层。
+#[allow(clippy::result_large_err)]
+fn rpm_gate(
+    rpm: &super::rpm::RpmWindow,
+    account_id: Option<&str>,
+    account: Option<&Value>,
+    now: i64,
+) -> Result<(), GatewayError> {
+    let Some(account_id) = account_id else {
+        return Ok(());
+    };
+    let limit = account
+        .map(crate::server::core::routing::max_rpm_of)
+        .unwrap_or(0);
+    if limit == 0 || rpm.allow(account_id, limit, now) {
+        return Ok(());
+    }
+    Err(GatewayError::rate_limited_with_retry_after(
+        rpm.wait_ms(account_id, limit, now),
+    ))
+}
+
 /// 账号循环：每一轮从候选池里按全局优先级选一个账号，用它所属家的适配器发一次。
 ///
 /// 按 `is_stateful` 分流（架构文档 §4.2.1）：
@@ -665,6 +698,58 @@ async fn attempt_queue(
         // 那边回答「试了谁」，这边回答「当时为什么这么排」）。
         if let Some(decision) = target.decision.clone() {
             ctx.telemetry.set_route_decision(decision);
+        }
+        // ── 发送前的 RPM 闸门（唯一 `allow` 的地方，见 `rpm_gate`）────────
+        // 选路已经跳过窗口打满的账号（只查不占），这里处理两种竞态：
+        //   ① 并发请求在同一瞬间抢同一个账号的最后一个名额；
+        //   ② 兜底路径（全部冷却 / 并发满）故意挑了一个窗口已满的账号。
+        // 两种情况都不该发出去：把该账号记入 tried（本轮不再回试），按队列
+        // 顺延下一个；队列里再没有可试的账号时返回 429 + `Retry-After`
+        // （窗口剩余秒数），客户端据此合法退避而不是立刻再撞一次。
+        if let Some(account_id) = target.account_id.clone() {
+            let now = logging::now_ms();
+            if let Err(error) = rpm_gate(
+                &service.rpm,
+                Some(&account_id),
+                target.account.as_ref(),
+                now,
+            ) {
+                tried_ids.push(account_id.clone());
+                logging::console_line(
+                    "[Upstream]",
+                    &format!(
+                        "⚠️ 账号 {account_id} 已达每分钟请求上限（RPM），本轮跳过：{}",
+                        error.message
+                    ),
+                );
+                match rotate::pick_next_account(
+                    service,
+                    provider_ids,
+                    &cooldown_keys,
+                    &tried_ids,
+                    ctx.pinned_account,
+                ) {
+                    Some(next) => {
+                        // 换号额度用尽 → 队列里即使还有人也不再顺延，原样返回 429
+                        if !take_switch(&mut switches_left, switch_total) {
+                            return Err(error);
+                        }
+                        logging::console_line(
+                            "[Upstream]",
+                            &format!(
+                                "⚠️ RPM 顺延 → {}（优先级 {}）",
+                                account_display(&next),
+                                next.get("priority")
+                                    .and_then(Value::as_i64)
+                                    .map(|value| value.to_string())
+                                    .unwrap_or_else(|| "-".to_string()),
+                            ),
+                        );
+                        continue 'accounts;
+                    }
+                    None => return Err(error),
+                }
+            }
         }
         // 连接计数改绑到这一轮选中的账号：失败重试换账号时计数跟着走，
         // 于是「一个请求任意时刻只占一个账号」这条口径不需要每个分支各维护一次
