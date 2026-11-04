@@ -219,6 +219,31 @@ mod tests {
         assert_eq!(masker.restore(&text), "sk-abcdefgh@example.com");
     }
 
+    /// 部分重叠的 span 不能丢掉尾巴：邮箱先盖住 `a@b.sk` 后，密钥剩下的
+    /// `-abcdefgh` 必须单独盖掉，否则明文会漏出网关（fail-closed）。
+    #[test]
+    fn partially_overlapping_spans_mask_the_tail() {
+        let masker = RulesMasker::default();
+        let (text, report) = masker.mask_text("a@b.sk-abcdefgh");
+        assert!(!text.contains("abcdefgh"), "{text}");
+        assert!(!text.contains("sk-abcdefgh"), "{text}");
+        assert!(report.hits.len() >= 2, "{report:?}");
+        assert_eq!(masker.restore(&text), "a@b.sk-abcdefgh");
+    }
+
+    /// 超长自定义词跳过而不是 panic（配置来源不可信）。
+    #[test]
+    fn oversized_custom_words_are_skipped_not_fatal() {
+        let long_word = "x".repeat(10_000);
+        let masker = RulesMasker::with_words(&[long_word.clone()]);
+        let (text, report) = masker.mask_text(&format!("a {long_word} b"));
+        assert!(
+            text.contains(&long_word),
+            "oversized word should be left alone"
+        );
+        assert!(report.hits.is_empty(), "{report:?}");
+    }
+
     /// 对象键即使长得像邮箱也不能被脱敏（只动值）。
     #[test]
     fn mask_json_leaves_object_keys_alone() {

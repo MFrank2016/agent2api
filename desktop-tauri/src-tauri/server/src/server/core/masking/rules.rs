@@ -55,14 +55,22 @@ fn default_rules() -> &'static [CompiledRule] {
     })
 }
 
+/// 单个自定义词的最大长度：超长词直接跳过。自定义词来自配置，不能在请求
+/// 路径上因为正则编译失败而 panic（宁可少盖一个词，也不带走整个进程）。
+const MAX_WORD_CHARS: usize = 4096;
+
 /// 自定义词表：按字面匹配（`regex::escape`），不做大小写折叠。
 fn word_rules(words: &[String]) -> Vec<CompiledRule> {
     words
         .iter()
-        .filter(|word| !word.is_empty())
-        .map(|word| CompiledRule {
-            kind: "word",
-            regex: Regex::new(&regex::escape(word)).expect("字面量正则必须可编译"),
+        .filter(|word| !word.is_empty() && word.chars().count() <= MAX_WORD_CHARS)
+        .filter_map(|word| {
+            Regex::new(&regex::escape(word))
+                .ok()
+                .map(|regex| CompiledRule {
+                    kind: "word",
+                    regex,
+                })
         })
         .collect()
 }
@@ -157,7 +165,20 @@ fn mask_text_with(rules: &[CompiledRule], text: &str, state: &mut State) -> (Str
     let mut report = MaskReport::default();
     let mut cursor = 0;
     for span in spans {
+        if span.end <= cursor {
+            // 已被前面更靠前 / 更长的 span 完整覆盖。
+            continue;
+        }
         if span.start < cursor {
+            // 部分重叠：起点已被覆盖，但尾巴还在后面。只盖住未覆盖的那段，
+            // 否则 `a@b.sk-abcdefgh` 这种「邮箱先吃掉 `a@b.sk`」的场景会把
+            // 密钥剩下的 `-abcdefgh` 漏出去（必须 fail-closed）。
+            // 占位符映射到精确的尾巴原文，restore 仍能逐段拼回。
+            let tail = &text[cursor..span.end];
+            let placeholder = state.placeholder_for(span.kind, tail);
+            report.note(span.kind, &placeholder);
+            out.push_str(&placeholder);
+            cursor = span.end;
             continue;
         }
         out.push_str(&text[cursor..span.start]);
