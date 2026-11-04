@@ -42,6 +42,9 @@ use serde_json::Value;
 /// 占位符前缀。`restore` 只认这个前缀，避免误伤普通方括号文本。
 pub const PLACEHOLDER_PREFIX: &str = "[[A2A_MASK_";
 
+/// 占位符后缀：与前缀一起界定一个完整的占位符。
+pub const PLACEHOLDER_SUFFIX: &str = "]]";
+
 /// 一次命中的元数据：**只记类型与占位符，不记原文**。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaskHit {
@@ -117,6 +120,210 @@ pub fn mask_outbound(payload: &str) -> Result<Option<(String, MaskSession)>, Str
     let serialized = serde_json::to_string(&value)
         .map_err(|_| "脱敏后请求体序列化失败，未发送任何请求".to_string())?;
     Ok(Some((serialized, session)))
+}
+
+/// 跨分片还原的字节缓冲（流式回复用）。
+///
+/// ── 为什么需要它 ──────────────────────────────────────────────
+/// 上游按 TCP 分片吐字节，SSE 的 `data:` 事件本身也可能被切开；一个占位符
+/// `[[A2A_MASK_…]]` 完全可能横跨两个分片。逐片 `restore` 会把它当成普通文本
+/// 原样下发（客户端看到占位符而不是原文），因此这里按**字节**缓冲：
+///
+///   - 完整占位符立即还原；
+///   - 结尾可能是占位符前缀的片段（如 `[[A2A_M`）先压住，等下一片补齐；
+///   - 完整前缀已经出现但还没有 `]]` 时，从前缀起整段压住；
+///   - 只有 [`PlaceholderBuffer::finish`] 才把压住的字节原样吐出 —— 它本来就
+///     不是占位符（上游被切断 / 普通方括号文本），不能吞掉。
+///
+/// ── 为什么按字节而不是 `String` ───────────────────────────────
+/// 分片边界不保证落在 UTF-8 字符边界（中文正文很常见）。按字节扫描占位符、
+/// 其余字节原样搬运，就不会把半截汉字解码成 U+FFFD，也不会因为一片非法
+/// UTF-8 而 panic。
+///
+/// 压住的字节最多是一个前缀的长度（约 11 字节）+ 一个未闭合的占位符，
+/// **不会**缓冲整段回复：客户端看到的只是这一小段延迟。
+#[derive(Default)]
+pub struct PlaceholderBuffer {
+    /// 上一片结尾处还没判定完的字节（可能是半截前缀 / 未闭合占位符）
+    tail: Vec<u8>,
+}
+
+impl PlaceholderBuffer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 吃一片上游字节，返回这一片可以下发的字节（可能是空）。
+    ///
+    /// `restore` 通常是 `|text| session.restore(text)`；完整占位符按它还原，
+    /// 不认识的占位符由 `restore` 原样保留。
+    pub fn push(&mut self, chunk: &[u8], restore: &dyn Fn(&str) -> String) -> Vec<u8> {
+        self.tail.extend_from_slice(chunk);
+        let emit_len = split_point(&self.tail);
+        // 先把要下发的部分摘出来，再留下尾巴：`split_off` 返回后半段
+        let tail = self.tail.split_off(emit_len);
+        let emit = std::mem::replace(&mut self.tail, tail);
+        restore_placeholders(&emit, restore)
+    }
+
+    /// 流结束：把压住的字节原样下发（它们不是完整的占位符）。
+    pub fn finish(self, restore: &dyn Fn(&str) -> String) -> Vec<u8> {
+        restore_placeholders(&self.tail, restore)
+    }
+}
+
+/// 回复还原器：会话 + 跨分片缓冲。
+///
+/// `None` 会话表示未开启脱敏：`push` 返回 `None`，调用方**原样透传**这一片
+/// 字节（与接入前逐字节一致），`finish` 返回空。
+pub struct Restorer {
+    session: Option<MaskSession>,
+    buffer: PlaceholderBuffer,
+}
+
+impl Restorer {
+    pub fn new(session: Option<MaskSession>) -> Self {
+        Self {
+            session,
+            buffer: PlaceholderBuffer::new(),
+        }
+    }
+
+    /// 吃一片上游字节，返回要下发的字节；`None` = 未脱敏，原样透传。
+    pub fn push(&mut self, chunk: &[u8]) -> Option<Vec<u8>> {
+        let Self { session, buffer } = self;
+        let session = session.as_ref()?;
+        Some(buffer.push(chunk, &|text| session.restore(text)))
+    }
+
+    /// 流结束：冲刷压住的半截前缀；未脱敏时没有可冲刷的字节。
+    pub fn finish(&mut self) -> Vec<u8> {
+        let Self { session, buffer } = self;
+        let Some(session) = session.as_ref() else {
+            return Vec::new();
+        };
+        // `PlaceholderBuffer::finish` 按值消费；这里换一个空的出来（之后
+        // 本对象不会再被 push —— 调用方只在 EOF 时调一次）
+        let buffer = std::mem::take(buffer);
+        buffer.finish(&|text| session.restore(text))
+    }
+
+    /// 还原一份已经解析成 JSON 的响应体（非流式出口用）。
+    ///
+    /// ── 为什么非流式还要在 Value 上再来一遍 ──────────────────────
+    /// 流式还原作用在**原始字节**上，它能修好「一个占位符被 TCP 分片切开」，
+    /// 但修不好「占位符被上游拆进两个 `delta` 事件」—— 两个事件之间夹着
+    /// `"}]}\n\ndata: {…` 这样的 JSON 外壳，原始字节里已经不是连续的一段。
+    /// 聚合器把 `content` / `tool_calls.function.arguments` 拼回一个字符串之后，
+    /// 占位符重新变完整，所以非流式出口在**聚合完成的 body 上**再还原一次。
+    ///
+    /// 只改字符串值（对象键与 `mask_json` 同口径不动）；未脱敏时什么都不做。
+    pub fn restore_json(&self, value: &mut Value) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        restore_value(value, session);
+    }
+}
+
+/// 递归还原 JSON 里的全部字符串值（对象键不动）。
+fn restore_value(value: &mut Value, session: &MaskSession) {
+    match value {
+        Value::String(text) => {
+            let restored = session.restore(text);
+            if restored != *text {
+                *text = restored;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                restore_value(item, session);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                restore_value(item, session);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+/// 这一片里「要下发」与「先压住」的分界点（见 [`PlaceholderBuffer`]）。
+///
+/// 返回 `bytes.len()` 表示全部可以下发。两条规则（先命中先用）：
+///   1. 最后一个完整前缀之后还没有 `]]` → 从前缀起整段压住；
+///   2. 结尾是前缀的一段**真前缀**（如 `[[A2A_M`）→ 压住这段。
+fn split_point(bytes: &[u8]) -> usize {
+    let prefix = PLACEHOLDER_PREFIX.as_bytes();
+    if let Some(start) = rfind_bytes(bytes, prefix) {
+        let after = &bytes[start + prefix.len()..];
+        if find_bytes(after, PLACEHOLDER_SUFFIX.as_bytes()).is_none() {
+            return start;
+        }
+    }
+    for keep in (1..prefix.len()).rev() {
+        if bytes.ends_with(&prefix[..keep]) {
+            return bytes.len() - keep;
+        }
+    }
+    bytes.len()
+}
+
+/// 还原一段字节里的全部完整占位符；其余字节**原样搬运**。
+///
+/// 只对占位符本身做 UTF-8 解码（前缀 / 后缀都是 ASCII），因此非法 UTF-8 的
+/// 正文不会被改动，也不会 panic。
+fn restore_placeholders(bytes: &[u8], restore: &dyn Fn(&str) -> String) -> Vec<u8> {
+    let prefix = PLACEHOLDER_PREFIX.as_bytes();
+    let suffix = PLACEHOLDER_SUFFIX.as_bytes();
+    // 快路径：没有前缀就一个字节都不动（绝大多数分片走这里）
+    if find_bytes(bytes, prefix).is_none() {
+        return bytes.to_vec();
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while let Some(index) = find_bytes(rest, prefix) {
+        out.extend_from_slice(&rest[..index]);
+        let after = &rest[index..];
+        let Some(end) = find_bytes(&after[prefix.len()..], suffix) else {
+            // 不完整（只可能出现在 `finish`）：保留前缀，从它之后继续找，
+            // 不能吞掉后面的正文
+            out.extend_from_slice(prefix);
+            rest = &after[prefix.len()..];
+            continue;
+        };
+        let token_end = prefix.len() + end + suffix.len();
+        let token = &after[..token_end];
+        match std::str::from_utf8(token) {
+            Ok(text) => out.extend_from_slice(restore(text).as_bytes()),
+            // 占位符内部出现非法 UTF-8：原样保留，不做任何猜测
+            Err(_) => out.extend_from_slice(token),
+        }
+        rest = &after[token_end..];
+    }
+    out.extend_from_slice(rest);
+    out
+}
+
+/// 字节串里第一次出现 `needle` 的位置（`needle` 非空）。
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// 字节串里最后一次出现 `needle` 的位置（`needle` 非空）。
+fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
 }
 
 #[cfg(test)]
@@ -347,5 +554,100 @@ mod tests {
         let masker = std::sync::Arc::new(RulesMasker::default());
         let _guard = config::testing::enabled_with(masker);
         assert!(mask_outbound("not json").is_err());
+    }
+
+    // ── 回复还原（PlaceholderBuffer / Restorer，Task 5.3）────────────
+
+    /// 建一个会话并脱敏一段文本，返回（会话, 脱敏后的文本, 占位符）
+    fn masked(text: &str) -> (MaskSession, String, String) {
+        let session = RulesMasker::default().session();
+        let (masked, report) = session.mask_text(text);
+        let placeholder = report
+            .hits
+            .first()
+            .map(|hit| hit.placeholder.clone())
+            .unwrap_or_default();
+        (session, masked, placeholder)
+    }
+
+    /// 占位符横跨两个分片（`[[A2A_M` + `ASK_api_key_1]]`）时必须还原成原文，
+    /// 不能把占位符当普通文本下发给客户端。
+    #[test]
+    fn sse_placeholder_across_chunks() {
+        let (session, masked, placeholder) = masked("key sk-abc123");
+        assert!(!placeholder.is_empty(), "样例应当命中一条规则: {masked}");
+        let split = masked
+            .find(&placeholder)
+            .map(|index| index + 7) // `[[A2A_M` 之后
+            .unwrap_or(masked.len() / 2);
+        let (head, tail) = masked.split_at(split);
+
+        let mut buffer = PlaceholderBuffer::new();
+        let restore = |text: &str| session.restore(text);
+        let mut out = buffer.push(head.as_bytes(), &restore);
+        out.extend(buffer.push(tail.as_bytes(), &restore));
+        out.extend(buffer.finish(&restore));
+
+        let restored = String::from_utf8(out).expect("样例都是 UTF-8");
+        assert_eq!(restored, "key sk-abc123");
+        assert!(!restored.contains(PLACEHOLDER_PREFIX), "{restored}");
+    }
+
+    /// 占位符在任何字节边界被切开都要能还原（分片边界不保证落在占位符外）。
+    #[test]
+    fn placeholder_is_restored_at_every_chunk_boundary() {
+        let (session, masked, placeholder) = masked("mail a@b.com now");
+        let start = masked.find(&placeholder).expect("样例应当含占位符");
+        let end = start + placeholder.len();
+        for split in start..=end {
+            let (head, tail) = masked.split_at(split);
+            let mut buffer = PlaceholderBuffer::new();
+            let restore = |text: &str| session.restore(text);
+            let mut out = buffer.push(head.as_bytes(), &restore);
+            out.extend(buffer.push(tail.as_bytes(), &restore));
+            out.extend(buffer.finish(&restore));
+            let restored = String::from_utf8(out).expect("样例都是 UTF-8");
+            assert_eq!(restored, "mail a@b.com now", "在字节 {split} 处切开时失败");
+        }
+    }
+
+    /// 流结束时压着的半截前缀必须原样吐出 —— 它可能只是普通方括号文本，
+    /// 吞掉就是丢正文。
+    #[test]
+    fn sse_partial_prefix_at_end_is_not_emitted() {
+        let session = RulesMasker::default().session();
+        let restore = |text: &str| session.restore(text);
+        let mut buffer = PlaceholderBuffer::new();
+        let mut out = buffer.push(b"before [[A2A_M", &restore);
+        assert!(
+            out.is_empty() || out == b"before ",
+            "半截前缀不能先发出去: {out:?}"
+        );
+        out.extend(buffer.finish(&restore));
+        assert_eq!(
+            String::from_utf8(out).expect("样例都是 UTF-8"),
+            "before [[A2A_M"
+        );
+    }
+
+    /// 非法 UTF-8 原样透传（不 panic、不改字节）。
+    #[test]
+    fn invalid_utf8_passes_through() {
+        let session = RulesMasker::default().session();
+        let restore = |text: &str| session.restore(text);
+        let chunk = b"data: \xff\xfe broken\n\n";
+        let mut buffer = PlaceholderBuffer::new();
+        let mut out = buffer.push(chunk, &restore);
+        out.extend(buffer.finish(&restore));
+        assert_eq!(out, chunk);
+    }
+
+    /// 未开启脱敏（没有会话）：`Restorer` 明确表示「原样透传」，不做任何缓冲。
+    #[test]
+    fn disabled_masking_is_byte_identical() {
+        let chunk = b"data: {\"x\":\"[[A2A_MASK_email_1]]\"}\n\n";
+        let mut restorer = Restorer::new(None);
+        assert!(restorer.push(chunk).is_none());
+        assert!(restorer.finish().is_empty());
     }
 }

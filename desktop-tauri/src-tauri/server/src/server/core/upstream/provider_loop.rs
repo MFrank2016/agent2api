@@ -1136,8 +1136,9 @@ async fn attempt_queue(
         // 第三个元素是上游响应的协议（适配器在构造请求时给出）：chat 之外
         // 还要在下面套一层响应翻译，见 `UpstreamResponse` 的说明。第四个元素是
         // Antigravity 请求信封里的会话键（签名缓存兜底档的写入键，issue #291；
-        // 其余家是空串 —— 提取见循环内唯一那条成功 break）
-        let (response, wire_model, response_protocol, antigravity_session) = loop {
+        // 其余家是空串 —— 提取见循环内唯一那条成功 break）。第五个元素是**这次
+        // 成功的尝试**用的脱敏会话（Task 5.3：回复还原必须用它，不能跨尝试复用）。
+        let (response, wire_model, response_protocol, antigravity_session, mask_session) = loop {
             // 发送体在这一轮发送前取一次（同一家同池同降级状态下复用缓存项）：
             // 借用在本次迭代内有效，`continue`（401 刷新 / 内容拦截补救）时
             // 重新取 —— 于是「换了 body 的那次重试」拿到的一定是新的一份。
@@ -1283,7 +1284,7 @@ async fn attempt_queue(
                         .unwrap_or_else(|| "?".to_string()),
                 ),
             );
-            let transport = TransportRequest {
+            let mut transport = TransportRequest {
                 url: plan.url,
                 headers: plan.headers,
                 payload,
@@ -1300,6 +1301,9 @@ async fn attempt_queue(
             // 为 None，这一段完全不执行（零开销）。
             let capture = ctx.telemetry.capture();
             if let Some(capture) = capture.as_deref() {
+                // TODO(5.4): 开启脱敏后这里采集的是 `plan.body`（**脱敏前**的明文）。
+                // 调试报文必须与实际上行的字节一致，5.4 要改成用 `transport.payload`
+                // （脱敏后的报文），否则调试页会把明文密钥留在磁盘上。
                 capture.reset_request(&transport.url, provider_id, &transport.headers, &plan.body);
             }
             match send_with_retry(
@@ -1383,7 +1387,13 @@ async fn attempt_queue(
                     } else {
                         String::new()
                     };
-                    break (response, wire_model, plan.response, antigravity_session);
+                    break (
+                        response,
+                        wire_model,
+                        plan.response,
+                        antigravity_session,
+                        transport.mask_session.take(),
+                    );
                 }
                 Err(failure) => {
                     // ── 手动终止优先于一切重试动作 ────────────────────────
@@ -2109,6 +2119,7 @@ async fn attempt_queue(
                         connections.handoff(),
                         ctx.telemetry.clone(),
                         frame_policy_of(adapter, &model),
+                        mask_session,
                     )),
                 });
             }
@@ -2116,6 +2127,7 @@ async fn attempt_queue(
                 translated,
                 ctx.telemetry.clone(),
                 frame_policy_of(adapter, &model),
+                mask_session,
             )
             .await?;
             return Ok(ForwardOutcome::Completion {
@@ -2139,6 +2151,7 @@ async fn attempt_queue(
                             connections.handoff(),
                             ctx.telemetry.clone(),
                             frame_policy_of(adapter, &model),
+                            mask_session,
                         )),
                     });
                 }
@@ -2146,6 +2159,7 @@ async fn attempt_queue(
                     response,
                     ctx.telemetry.clone(),
                     frame_policy_of(adapter, &model),
+                    mask_session,
                 )
                 .await?;
                 log_aggregated(&aggregated);
@@ -2164,6 +2178,7 @@ async fn attempt_queue(
                             connections.handoff(),
                             ctx.telemetry.clone(),
                             frame_policy_of(adapter, &model),
+                            mask_session,
                         )),
                     });
                 }
@@ -2171,6 +2186,7 @@ async fn attempt_queue(
                     source,
                     ctx.telemetry.clone(),
                     frame_policy_of(adapter, &model),
+                    mask_session,
                 )
                 .await?;
                 log_aggregated(&aggregated);
@@ -2667,6 +2683,8 @@ async fn attempt_stateful(
                             super::sse::FramePolicy::with_rewrite(Some(super::sse::ModelRewrite {
                                 requested: model,
                             })),
+                            // 会话式路径不发 `TransportRequest`（没有出站脱敏会话）
+                            None,
                         )),
                     });
                 }

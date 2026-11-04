@@ -86,6 +86,8 @@ use self::sse::{FramePolicy, ReasoningCoalescer};
 
 #[cfg(test)]
 mod capture_tests;
+#[cfg(test)]
+mod restore_tests;
 
 /// 去重等待上限（对照 Node 的 INFLIGHT_WAIT_MS）
 const INFLIGHT_WAIT_MS: u64 = 45_000;
@@ -644,6 +646,12 @@ pub struct ForwardStream {
     /// **每个上游 chunk** 上，每次都加锁取一遍是纯浪费；而一条请求的采集器
     /// 在转发开始时就装好了，中途不会变。
     capture: Option<Arc<crate::server::core::debug_traffic::TrafficCapture>>,
+    /// 回复还原器（Task 5.3）：按本次尝试的脱敏会话把上游回显的占位符换回
+    /// 原文。`None` 会话时逐片原样透传（字节与接入前一致）。
+    ///
+    /// 位置在**采集之后、SSE 解析之前**：采集器拿到的仍是上游原样（含占位符，
+    /// 不含明文），而占位符即使被 TCP 分片切开也能在解析前拼回完整形态。
+    restorer: crate::server::core::masking::Restorer,
 }
 
 impl ForwardStream {
@@ -656,6 +664,7 @@ impl ForwardStream {
         connection: ConnectionGuard,
         telemetry: Arc<usage::RequestTelemetry>,
         policy: FramePolicy,
+        mask_session: Option<crate::server::core::masking::MaskSession>,
     ) -> Self {
         use futures::StreamExt;
         // wreq 错误在这里就地描述成文案（`describe_error_detail` 认的是
@@ -674,7 +683,8 @@ impl ForwardStream {
             ),
         );
         let capture = telemetry.capture();
-        let mut stream = Self::from_translated(guarded, slot, connection, telemetry, policy);
+        let mut stream =
+            Self::from_translated(guarded, slot, connection, telemetry, policy, mask_session);
         stream.capture = capture;
         stream
     }
@@ -691,6 +701,7 @@ impl ForwardStream {
         connection: ConnectionGuard,
         telemetry: Arc<usage::RequestTelemetry>,
         policy: FramePolicy,
+        mask_session: Option<crate::server::core::masking::MaskSession>,
     ) -> Self {
         // ── 手动终止的旁路流（本次新增）────────────────────────────
         // 把令牌的等待挂成一条「只产出一个错误项」的旁路：置位后 poll 立刻
@@ -717,6 +728,7 @@ impl ForwardStream {
             telemetry,
             // 原始字节已由翻译流采集，不能把生成的 chat 帧再次混入报文。
             capture: None,
+            restorer: crate::server::core::masking::Restorer::new(mask_session),
         }
     }
 }
@@ -740,6 +752,14 @@ impl Stream for ForwardStream {
                 std::task::Poll::Pending => return std::task::Poll::Pending,
                 std::task::Poll::Ready(None) => {
                     self.upstream_done = true;
+                    // 先把还原器压住的半截前缀吐出来（它本来就不是占位符），
+                    // 再冲刷合并器 —— 否则流尾那几个字节会被静默吞掉
+                    let tail = self.restorer.finish();
+                    if !tail.is_empty() {
+                        for frame in self.coalescer.push(&tail) {
+                            self.pending.push_back(frame);
+                        }
+                    }
                     for frame in self.coalescer.finish() {
                         self.pending.push_back(frame);
                     }
@@ -747,11 +767,26 @@ impl Stream for ForwardStream {
                 std::task::Poll::Ready(Some(Ok(bytes))) => {
                     // 调试模式：把**上游原始字节**旁路给采集器 —— 在合并器
                     // 之前，因为用户要看的是上游原样吐出来的东西，而不是
-                    // 我们改写 / 合并后的帧（那正是「上游到底发了什么」要回答的）
+                    // 我们改写 / 合并后的帧（那正是「上游到底发了什么」要回答的）。
+                    //
+                    // TODO(5.4): 采集口径要跟着脱敏走 —— 开启脱敏时这里采到的
+                    // 是含占位符的上游原文（明文不会进采集器，这一点是对的），
+                    // 但请求侧采集（provider_loop 的 `reset_request`）目前仍用
+                    // 脱敏前的 `plan.body`，必须在 5.4 一并改成脱敏后的报文。
                     if let Some(capture) = &self.capture {
                         capture.push(&bytes);
                     }
-                    for frame in self.coalescer.push(&bytes[..]) {
+                    // 回复还原：在 SSE 解析之前做（占位符可能横跨分片，
+                    // 解析后再拼就晚了）。未脱敏时 `None` ⇒ 原样透传。
+                    let restored = self.restorer.push(&bytes);
+                    let payload: &[u8] = match restored.as_deref() {
+                        Some(bytes) => bytes,
+                        None => bytes.as_ref(),
+                    };
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    for frame in self.coalescer.push(payload) {
                         self.pending.push_back(frame);
                     }
                 }
@@ -760,6 +795,13 @@ impl Stream for ForwardStream {
                     // 不 panic。先把已累积的 reasoning 冲刷出去，再补上
                     // 「错误帧 + [DONE]」收尾（与 Node 一致）。
                     self.upstream_done = true;
+                    // 压住的半截前缀先吐出来（宁可多几个字节，也不能吞掉正文）
+                    let tail = self.restorer.finish();
+                    if !tail.is_empty() {
+                        for frame in self.coalescer.push(&tail) {
+                            self.pending.push_back(frame);
+                        }
+                    }
                     for frame in self.coalescer.finish() {
                         self.pending.push_back(frame);
                     }

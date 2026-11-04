@@ -7,13 +7,11 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use regex::Regex;
 use serde_json::Value;
 
-use super::{MaskReport, Masker, PLACEHOLDER_PREFIX};
+use super::{MaskReport, Masker, PLACEHOLDER_PREFIX, PLACEHOLDER_SUFFIX};
 
 /// `RulesMasker` 自身（非 session）映射表的上限。它只用于单测 / 单次调用；
 /// 生产请求路径一律用 [`RulesMasker::session`]，映射随请求释放，见父模块模块头。
 const MAX_SHARED_ENTRIES: usize = 1024;
-
-const PLACEHOLDER_SUFFIX: &str = "]]";
 
 /// 进程内全局递增的占位符序号：跨会话也不重复，避免「同号不同值」的歧义。
 static NEXT_PLACEHOLDER: AtomicU64 = AtomicU64::new(1);

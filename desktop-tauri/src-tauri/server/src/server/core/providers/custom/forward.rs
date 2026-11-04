@@ -303,7 +303,7 @@ pub(crate) async fn forward(
             if quirks.emulate_opencode { " 伪装=opencode" } else { "" },
         ),
     );
-    let transport = TransportRequest {
+    let mut transport = TransportRequest {
         url,
         headers,
         payload,
@@ -315,6 +315,9 @@ pub(crate) async fn forward(
     let response = send_chat_request(&transport)
         .await
         .map_err(|error| error.to_gateway_error())?;
+    // 回复还原要用**这一次成功尝试**的会话（Task 5.3）：发送已经完成，
+    // 会话从传输层取出来交给响应侧（`None` = 未脱敏，逐字节透传）。
+    let mask_session = transport.mask_session.take();
 
     // ── 响应：2xx 打包 outcome；非 2xx 分类（见模块头）────────────────
     let status = response.status().as_u16();
@@ -348,6 +351,7 @@ pub(crate) async fn forward(
                 connections.handoff(),
                 telemetry.clone(),
                 policy(),
+                mask_session,
             )),
         })
     } else {
@@ -357,6 +361,7 @@ pub(crate) async fn forward(
             response,
             telemetry.clone(),
             policy(),
+            mask_session,
         )
         .await?;
         Ok(ForwardOutcome::Completion {
@@ -637,7 +642,7 @@ async fn forward_translated(
             describe_proxy(egress.primary()),
         ),
     );
-    let transport = TransportRequest {
+    let mut transport = TransportRequest {
         url,
         headers,
         payload,
@@ -649,6 +654,9 @@ async fn forward_translated(
     let response = send_chat_request(&transport)
         .await
         .map_err(|error| error.to_gateway_error())?;
+    // 回复还原要用**这一次成功尝试**的会话（Task 5.3）：发送已经完成，
+    // 会话从传输层取出来交给响应侧（`None` = 未脱敏，逐字节透传）。
+    let mask_session = transport.mask_session.take();
 
     // ── 响应：2xx 打包 outcome；非 2xx 分类（与 chat 分支同一套）──────
     // 两种协议的错误体形状不同（responses 是 {error:{message}}、anthropic
@@ -689,6 +697,7 @@ async fn forward_translated(
                 connections.handoff(),
                 telemetry.clone(),
                 policy(),
+                mask_session,
             )),
         })
     } else {
@@ -696,6 +705,7 @@ async fn forward_translated(
             translated,
             telemetry.clone(),
             policy(),
+            mask_session,
         )
         .await?;
         Ok(ForwardOutcome::Completion { body: aggregated.body })

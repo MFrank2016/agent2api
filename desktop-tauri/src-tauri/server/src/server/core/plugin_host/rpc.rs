@@ -1580,6 +1580,9 @@ impl RpcAdapter {
                 Box::pin(source),
                 telemetry.clone(),
                 policy,
+                // 插件路径的出站请求由插件自己发（不经 `TransportRequest`），
+                // 没有脱敏会话可还原 —— 与接入前逐字节一致。
+                None,
             )
             .await;
             // 输入流在聚合器丢弃 HTTP/业务元数据前保存错误；不重造聚合规则。

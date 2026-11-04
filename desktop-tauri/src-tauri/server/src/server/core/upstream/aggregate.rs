@@ -64,10 +64,14 @@ pub struct AggregatedCompletion {
 /// 开头 think 块的剥离同样走 `policy`：流式在 `ReasoningCoalescer` 里剥，
 /// 非流式在这里（`into_completion`）剥 —— **两条路径都要改**，只改一条会让
 /// 一半响应保留标签（见 `core::middleware::think_tags`）。
+///
+/// `mask_session` 是**这一次尝试**的脱敏会话（Task 5.3）：开启脱敏时上游
+/// 回显的是占位符，聚合前按它还原；`None` 表示未脱敏，字节与接入前一致。
 pub async fn aggregate_sse_completion(
     response: wreq::Response,
     telemetry: Arc<RequestTelemetry>,
     policy: FramePolicy,
+    mask_session: Option<crate::server::core::masking::MaskSession>,
 ) -> Result<AggregatedCompletion, GatewayError> {
     // 与 `ForwardStream::new` 同款：wreq 错误在这里就地描述成文案折进
     // io::Error（`describe_error_detail` 只认 wreq::Error）
@@ -81,7 +85,7 @@ pub async fn aggregate_sse_completion(
         }
         item
     });
-    aggregate_frame_stream(Box::pin(stream), telemetry, policy).await
+    aggregate_frame_stream(Box::pin(stream), telemetry, policy, mask_session).await
 }
 
 /// 聚合一条**标准 chat SSE** 字节流（不限定来源）。
@@ -96,6 +100,7 @@ pub async fn aggregate_frame_stream(
     stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
     telemetry: Arc<RequestTelemetry>,
     policy: FramePolicy,
+    mask_session: Option<crate::server::core::masking::MaskSession>,
 ) -> Result<AggregatedCompletion, GatewayError> {
     // 非流式响应总超时（设置页「请求超时」第四项）：**一次性计时、不重置**
     // —— 与流式的空闲超时是两种语义（那是「两次数据之间」，这里读完整份
@@ -105,8 +110,11 @@ pub async fn aggregate_frame_stream(
     let budget = std::time::Duration::from_millis(
         crate::server::config::timeout_settings().body_ms(),
     );
-    match tokio::time::timeout(budget, aggregate_frame_stream_inner(stream, telemetry, policy))
-        .await
+    match tokio::time::timeout(
+        budget,
+        aggregate_frame_stream_inner(stream, telemetry, policy, mask_session),
+    )
+    .await
     {
         Ok(result) => result,
         Err(_elapsed) => Err(GatewayError::with_status(
@@ -121,6 +129,7 @@ async fn aggregate_frame_stream_inner(
     stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
     telemetry: Arc<RequestTelemetry>,
     policy: FramePolicy,
+    mask_session: Option<crate::server::core::masking::MaskSession>,
 ) -> Result<AggregatedCompletion, GatewayError> {
     // ── 手动终止的旁路流（与 `ForwardStream::from_translated` 同一手法）──
     // 聚合是 `while let Some(item) = stream.next().await` 的拉取循环：没有
@@ -136,6 +145,10 @@ async fn aggregate_frame_stream_inner(
     // 非流式总超时（默认 300 秒）才报 502（详见 `cancellable` 的说明）。
     let mut stream = cancellation::cancellable(stream, telemetry.cancel_token());
     let mut buffer = String::new();
+    // 回复还原器（Task 5.3）：按本次尝试的脱敏会话把占位符换回原文。
+    // 位置在采集之后、SSE 逐行解析之前 —— 占位符可能横跨分片，解析后再拼
+    // 就晚了。`None` 会话时逐片原样透传（字节与接入前一致）。
+    let mut restorer = crate::server::core::masking::Restorer::new(mask_session);
     let mut acc = CompletionAccumulator {
         rewrite: policy.rewrite,
         strip_newline_chunks: policy.strip_newline_chunks,
@@ -169,19 +182,24 @@ async fn aggregate_frame_stream_inner(
             telemetry.note_first_frame();
         }
         // 原始字节由输入侧（HTTP 字节流或协议翻译流）采集，聚合器只消费 chat 帧。
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        // 逐行消费（只处理到最后一个 '\n' 之前的内容）
-        while let Some(index) = buffer.find('\n') {
-            let line = buffer[..index].trim().to_string();
-            buffer.drain(..=index);
-            if line.is_empty() {
-                continue;
-            }
-            acc.consume_line(&line, &telemetry)?;
-        }
+        // 还原必须在逐行解析之前：占位符可能被分片切开（见 `masking::PlaceholderBuffer`）。
+        let restored = restorer.push(&chunk);
+        let payload: &[u8] = match restored.as_deref() {
+            Some(bytes) => bytes,
+            None => chunk.as_ref(),
+        };
+        buffer.push_str(&String::from_utf8_lossy(payload));
+        drain_lines(&mut buffer, &mut acc, &telemetry)?;
         if buffer.len() > MAX_LINE_BYTES {
             return Err(GatewayError::with_status(502, "上游返回的单行数据过大，已中断"));
         }
+    }
+    // 流结束：先把还原器压住的半截前缀原样吐出（它本来就不是占位符），
+    // 再按原有规则处理最后一段没有换行结尾的尾行
+    let rest = restorer.finish();
+    if !rest.is_empty() {
+        buffer.push_str(&String::from_utf8_lossy(&rest));
+        drain_lines(&mut buffer, &mut acc, &telemetry)?;
     }
     // 尾行（上游没以换行结尾）
     let tail = buffer.trim().to_string();
@@ -189,7 +207,32 @@ async fn aggregate_frame_stream_inner(
         acc.consume_line(&tail, &telemetry)?;
     }
 
-    Ok(acc.into_completion())
+    let mut completion = acc.into_completion();
+    // 非流式出口的第二次还原：占位符若被上游拆进两个 delta 事件，原始字节
+    // 里已经夹着 JSON 外壳（见 `Restorer::restore_json` 的说明），聚合把字符串
+    // 拼回来之后在这里统一还原（含 `tool_calls[].function.arguments`）。
+    restorer.restore_json(&mut completion.body);
+    Ok(completion)
+}
+
+/// 把 `buffer` 里已经完整的行逐条喂给聚合器（只消费到最后一个 `\n`）。
+///
+/// 抽成函数是为了让「每片」与「流尾冲刷」两条路径用同一份逐行逻辑 ——
+/// 两份实现一改一漏，就会出现「分片内能聚合、流尾那行被忽略」的静默差异。
+fn drain_lines(
+    buffer: &mut String,
+    acc: &mut CompletionAccumulator,
+    telemetry: &RequestTelemetry,
+) -> Result<(), GatewayError> {
+    while let Some(index) = buffer.find('\n') {
+        let line = buffer[..index].trim().to_string();
+        buffer.drain(..=index);
+        if line.is_empty() {
+            continue;
+        }
+        acc.consume_line(&line, telemetry)?;
+    }
+    Ok(())
 }
 
 /// 聚合状态（Node 的局部变量集中到这里，便于 `consume_line` 返回 Result）
