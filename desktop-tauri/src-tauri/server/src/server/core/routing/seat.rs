@@ -65,6 +65,47 @@ pub struct Seat {
     pub reserve: bool,
 }
 
+impl Seat {
+    /// **排序用**的最小座位：只填策略排序真正会读的事实。
+    ///
+    /// [`seats_from`] 是选路阶段的完整快照（连休息 / 垫底 / 熔断 / 粘性 /
+    /// RPM / 储备一起装），因为那一层要拿座位做过滤与修饰。而
+    /// [`super::strategy::order_candidates`] 只关心**顺序**：优先级与加入时间
+    /// （基础序）、在途数（`least-connections`）、余额（`balance-weighted`）。
+    /// 其余字段在排序层恒为「无」/ `false` —— 它们是**过滤事实**，不该在
+    /// 排序里再参与一次判定（否则同一条候选会被判两遍，且两处口径可能分叉）。
+    ///
+    /// `provider` 由调用方传入：候选已经按家分好组，组里每家解析一次即可，
+    /// 不必每个座位再从 `Value` 里读一遍。
+    pub fn for_ordering(
+        account: &Value,
+        provider: &str,
+        counts: &HashMap<String, usize>,
+        balances: &HashMap<String, f64>,
+    ) -> Self {
+        let id = account_id(account).unwrap_or_default().to_string();
+        // 与 `compare_by_priority` 同一投影：`priority` / `added_at` 是基础序的
+        // 全部输入（见 `priority_key`）。
+        let (priority, added_at) = priority_key(account);
+        Seat {
+            account: account.clone(),
+            balance: balances.get(&id).copied(),
+            in_flight: counts.get(&id).copied().unwrap_or(0),
+            id,
+            provider: provider.to_string(),
+            priority,
+            added_at,
+            resting: None,
+            sunk: None,
+            limiter_blocked: false,
+            sticky: false,
+            model_resting: None,
+            max_rpm_blocked: false,
+            reserve: false,
+        }
+    }
+}
+
 /// 把候选账号映射成座位（顺序与 `candidates` 一致）。
 ///
 /// `counts` 是各账号当前在途请求数（账号 id → 数，`upstream::connections`

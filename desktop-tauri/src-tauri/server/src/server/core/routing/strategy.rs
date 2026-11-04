@@ -45,7 +45,14 @@ use serde_json::Value;
 use crate::server::config::RoutingStrategySettings;
 use crate::server::core::account_store::priority::by_priority_order;
 
-use super::{account_id, compare_by_priority, priority_key, provider_of, usable_candidates, CooldownKeys};
+use super::{
+    compare_by_priority, priority_key, provider_of, registry, seat::Seat, usable_candidates,
+    CooldownKeys,
+};
+// `account_id` 只被 `#[cfg(test)]` 的对照实现（`order_group` / 两份 `Value` 形态
+// 权重表）用到，生产路径读的是 `Seat.id` —— 非测试构建里导入它就是未使用导入。
+#[cfg(test)]
+use super::account_id;
 
 /// 一家的账号挑选规则（配置值就是字符串，见 `config::KEY_ROUTING_STRATEGY`）。
 ///
@@ -494,9 +501,13 @@ pub fn order_candidates(
             .iter()
             .any(|(provider, _)| settings.resolve(provider) == RoutingStrategy::GlobalRoundRobin);
     let mut ordered: Vec<Value> = Vec::with_capacity(candidates.len());
-    for (index, (provider, mut group)) in groups.into_iter().enumerate() {
-        // 组内先按优先级排好：所有策略的并列兜底与轮询顺序都基于它
-        group.sort_by(compare_by_priority);
+    for (index, (provider, group)) in groups.into_iter().enumerate() {
+        // 组内座位：只装**排序**要读的事实（优先级 / 加入时间 / 在途 / 余额），
+        // 其余判定事实由过滤阶段负责（见 [`Seat::for_ordering`] 的说明）。
+        let seats: Vec<Seat> = group
+            .iter()
+            .map(|account| Seat::for_ordering(account, &provider, counts, balances))
+            .collect();
         let strategy = settings.resolve(&provider);
         // `global-round-robin` 的轮转发生在**整表**层面（见上），组内退化成优先级序；
         // 其余有状态策略（游标 / LRU / SWRR）只在**队首组**推进：后面的组只是兜底顺序，
@@ -506,10 +517,16 @@ pub fn order_candidates(
         } else {
             strategy
         };
-        let group_advance = advance && index == 0;
-        ordered.extend(order_group(
-            group, group_strategy, &provider, model, counts, state, balances, now, group_advance,
-        ));
+        let ctx = super::registry::StrategyCtx {
+            state,
+            model,
+            now,
+            advance: advance && index == 0,
+        };
+        // 排序逻辑只有一份：按策略 id 从注册表取实现，它内部委托给
+        // [`order_seats`]（与旧 `order_group` 逐字同语义，见 golden test）。
+        let order = registry::lookup(group_strategy.as_str()).order(&ctx, &provider, &seats);
+        ordered.extend(order.into_iter().map(|index| seats[index].account.clone()));
     }
     if whole_rotate && !ordered.is_empty() {
         let len = ordered.len();
@@ -521,8 +538,10 @@ pub fn order_candidates(
 
 /// 组内排序：按该家策略把一组（已按优先级排好）账号排成先后。
 ///
-/// 有状态策略（轮询 / LRU / 加权轮询）在 `advance == false` 时退化为优先级序，
-/// 且不写任何运行时状态。
+/// **只给测试用**：生产路径已经改走注册表（`registry::lookup(..).order(..)` →
+/// [`order_seats`]）。保留这份 `Value` 形态是为了当 golden test 的**对照实现**
+/// （Task 4.3 的等价性断言），两条路径一旦分叉就会在测试里报出来。
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn order_group(
     group: Vec<Value>,
@@ -629,6 +648,9 @@ fn best_priority_key(accounts: &[Value]) -> (i64, i64) {
 ///
 /// 未知余额的账号取**基线**（组内已知余额的中位数，一个都没有时 1.0）。
 /// 权重收成非负；全为 0 时退化成等权（各 1.0），保证组内没有账号被饿死。
+///
+/// `Value` 形态只剩测试用（生产走座位形态，见 [`balance_weights_of_seats`]）。
+#[cfg(test)]
 fn balance_weights(group: &[Value], balances: &HashMap<String, f64>) -> (Vec<String>, Vec<f64>) {
     let entries: Vec<(String, Option<f64>)> = group
         .iter()
@@ -687,6 +709,9 @@ fn balance_weights_of_seats(
 
 /// 优先级加权的权重表：把组内出现的优先级去重升序，第 `r` 名（0 起）权重 =
 /// `(去重总数 - r)` —— 数字越小权重越高，同级共享同一权重。下限 1.0。
+///
+/// `Value` 形态只剩测试用（生产走座位形态，见 [`priority_weights_of_seats`]）。
+#[cfg(test)]
 fn priority_weights(group: &[Value]) -> (Vec<String>, Vec<f64>) {
     let entries: Vec<(String, i64)> = group
         .iter()
