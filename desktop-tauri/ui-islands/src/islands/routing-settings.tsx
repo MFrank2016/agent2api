@@ -17,6 +17,19 @@ export function RoutingSettingsDialog({ workspace, onClose, protectionOnly = fal
   const [draft, setDraft] = React.useState<RouteSettings>(() => ({ ...workspace.settings }))
   const [busy, setBusy] = React.useState(false)
   const [error, setError] = React.useState('')
+  // workspace.settings.routingStrategy 是有损的 3 档展示值；7 档下拉必须从
+  // 本地权威面（/api/routing-strategy 的 default）初始化，否则会把
+  // least-connections 等显示成「顺序优先」并在保存时静默降级。
+  React.useEffect(() => {
+    let alive = true
+    void bridge().getRoutingStrategy()
+      .then(data => {
+        if (!alive || typeof data?.default !== 'string' || !data.default) return
+        setDraft(current => ({ ...current, routingStrategy: data.default as string }))
+      })
+      .catch(() => { /* 权威端点不可用时保留展示值，不下发错误档位 */ })
+    return () => { alive = false }
+  }, [])
   const update = <K extends keyof RouteSettings>(key: K, value: RouteSettings[K]) => setDraft(current => ({ ...current, [key]: value }))
   const save = async () => {
     if (!Number.isInteger(draft.routingBreakerThreshold) || draft.routingBreakerThreshold < 1 || draft.routingBreakerThreshold > 20

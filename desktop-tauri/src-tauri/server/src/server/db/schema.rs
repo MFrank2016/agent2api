@@ -1300,11 +1300,14 @@ mod tests {
         }
     }
 
-    /// B（fix round 2）：v17 已经回填过 `account_limiter_events`，v21 不得再插
+    /// B（fix round 3）：v17 已经回填过 `account_limiter_events`，v21 不得再插
     /// 一遍 `legacy:<row_id>` —— 否则同一批请求被计两次，限额提前熔断。
     ///
-    /// 夹具模拟「已经走过上游 v17、且 limiter::counter::note 又用 request_id
-    /// 写过新行」的库：跑完 v21 后事件总数必须原样不变。
+    /// **判别性夹具**：3 条 requests 在 v17 之前插入（v17 回填成 legacy:1..3），
+    /// 之后**再插入一条全新的 r4** 并让 `limiter::counter::note` 用 `id='r4'`
+    /// 写一条事件。此时若 V21_SCHEMA 仍带那条重复 INSERT，回放会为 r4 生成
+    /// 一个全新的 `legacy:4`（不与任何已有 id 冲突，INSERT OR IGNORE 拦不住），
+    /// 事件数 4 → 5；删掉重复 INSERT 后必须保持 4。
     #[test]
     fn v21_does_not_double_limiter_events_after_v17() {
         let conn = Connection::open_in_memory().expect("内存库应当能建起来");
@@ -1333,40 +1336,55 @@ mod tests {
         )
         .expect("v16 fixture 应当能建起来");
 
-        // 模拟上游 v17：建表 + 历史回填（3 条 status != 0 且 attempts > 0）。
+        // 模拟上游 v17：建表 + 历史回填（3 条 legacy:1..3）。
         conn.execute_batch(V17_SCHEMA).expect("v17 应当能建表并回填");
-        // 模拟 v17 之后 limiter::counter::note 用 request_id 作为 id 写过的新行。
-        conn.execute(
-            "INSERT INTO account_limiter_events (id, account_id, ts, tokens, requests) \
-             VALUES ('r1', 'acc-1', 1000, 100, 1)",
-            [],
+
+        // v17 **之后**才发生的新请求：它不在 v17 的回填快照里。
+        conn.execute_batch(
+            "INSERT INTO requests (id, account_id, status, attempts, total_tokens)
+             VALUES ('r4', 'acc-1', 200, 1, 999);
+             INSERT INTO account_limiter_events (id, account_id, ts, tokens, requests)
+             VALUES ('r4', 'acc-1', 2000, 999, 1);",
         )
-        .expect("note 写入的事件应当能插入");
+        .expect("v17 之后的新请求与 note 事件应当能插入");
+
         let before: i64 = conn
             .query_row("SELECT COUNT(*) FROM account_limiter_events", [], |row| row.get(0))
             .expect("事件数应当可读");
-
-        // 走到 v21（这里只跑 v21 的动作，避免 migrate() 连带 v18~v23 需要更多表）。
-        migrate_v21(&conn).expect("v21 应当成功");
-
-        let after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM account_limiter_events", [], |row| row.get(0))
-            .expect("事件数应当可读");
-        assert_eq!(after, before, "v21 重放历史回填会把事件数翻倍");
-
-        let legacy: i64 = conn
+        assert_eq!(before, 4, "v17 的 3 条 legacy + 1 条 note = 4");
+        let legacy_before: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM account_limiter_events WHERE id LIKE 'legacy:%'",
                 [], |row| row.get(0),
             )
             .expect("legacy 事件数应当可读");
-        assert_eq!(legacy, 3, "v17 的三条历史回填应原样保留，不应被 v21 再插一份");
+        assert_eq!(legacy_before, 3, "v17 只回填了 3 条 legacy");
 
-        // 条件 Key 回填仍然生效（fork 线的 key_id 不能丢）。
+        // 走到 v21（只跑 v21 动作，避免 migrate() 连带 v18~v23 需要更多表）。
+        migrate_v21(&conn).expect("v21 应当成功");
+
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM account_limiter_events", [], |row| row.get(0))
+            .expect("事件数应当可读");
+        assert_eq!(
+            after, before,
+            "v21 重放历史回填会为 r4 生成新的 legacy:4，把事件数 4 顶到 5"
+        );
+
+        let legacy_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_limiter_events WHERE id LIKE 'legacy:%'",
+                [], |row| row.get(0),
+            )
+            .expect("legacy 事件数应当可读");
+        assert_eq!(legacy_after, 3, "v21 不得新增任何 legacy:% 行");
+
+        // 条件 Key 回填仍然生效（fork 线的 key_id 不能丢）；本夹具 key_id 为空，不应误回填。
         let mapped: i64 = conn
             .query_row("SELECT COUNT(*) FROM requests WHERE api_key_source = 'key'", [], |row| row.get(0))
             .expect("回填结果应当可读");
         assert_eq!(mapped, 0, "本夹具 key_id 为空，不应误回填");
     }
+
 
 }
