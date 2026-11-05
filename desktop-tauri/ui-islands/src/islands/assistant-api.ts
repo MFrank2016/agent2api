@@ -39,87 +39,77 @@
  * `x-api-key`，本机会话不能替代 Key，也不改变 Key 的模型或提供商限制。
  */
 
-import { t } from "../i18n";
+import { t } from '../i18n'
 
-const FALLBACK_PORT = 3065;
+const FALLBACK_PORT = 3065
 
 /** 网关基址缓存（每次进对话页最多问一次壳） */
-let cachedBase: string | null = null;
+let cachedBase: string | null = null
 
-type BackendStatus = { port?: number };
+type BackendStatus = { port?: number }
 type DesktopBridge = {
-  platform?: string;
-  getBackendStatus?: () => Promise<BackendStatus | null | undefined>;
-  waitForBackend?: () => Promise<BackendStatus | null | undefined>;
-  /** 直连网关的管理凭证（桌面为本机会话；模型 Key 单独选择） */
-  directCredentials?: () => Promise<unknown>;
-};
+  platform?: string
+  getBackendStatus?: () => Promise<BackendStatus | null | undefined>
+  waitForBackend?: () => Promise<BackendStatus | null | undefined>
+  /** 当前管理凭证；网页端 refresh=true 时先静默续期，桌面端由壳自行换证。 */
+  directCredentials?: (refresh?: boolean) => Promise<unknown>
+}
 
 function bridge(): DesktopBridge | undefined {
-  return (window as unknown as { workbuddyDesktop?: DesktopBridge })
-    .workbuddyDesktop;
+  return (window as unknown as { workbuddyDesktop?: DesktopBridge }).workbuddyDesktop
 }
 
 /** 当前该用哪个基址发请求（见模块头两条路） */
 export async function gatewayBase(force = false): Promise<string> {
-  if (cachedBase && !force) return cachedBase;
-  const api = bridge();
+  if (cachedBase && !force) return cachedBase
+  const api = bridge()
   // 登录页会在 web bridge 初始化前就调用 gatewayBase（更新检查）：这时 api 还是
   // undefined，不能只认 api.platform === 'web'，否则会错误回退到 127.0.0.1，
   // 浏览器按 PNA/CORS 拦截公网页面到 loopback 的请求。
   const isWebPage =
-    typeof window !== "undefined" &&
+    typeof window !== 'undefined' &&
     /^https?:$/.test(window.location.protocol) &&
-    window.location.hostname !== "tauri.localhost" &&
-    !(window as unknown as { __TAURI_INTERNALS__?: unknown })
-      .__TAURI_INTERNALS__;
-  if (api?.platform === "web" || (isWebPage && api?.platform !== "desktop")) {
-    const origin = typeof window === "undefined" ? "" : window.location?.origin;
-    if (origin && origin !== "null") {
-      cachedBase = origin;
-      return cachedBase;
+    window.location.hostname !== 'tauri.localhost' &&
+    !(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__
+  if (api?.platform === 'web' || (isWebPage && api?.platform !== 'desktop')) {
+    const origin = typeof window === 'undefined' ? '' : window.location?.origin
+    if (origin && origin !== 'null') {
+      cachedBase = origin
+      return cachedBase
     }
   }
-  let port = 0;
+  let port = 0
   try {
-    const status = await api?.getBackendStatus?.();
-    const value = Number(status?.port);
-    if (Number.isFinite(value) && value > 0) port = value;
-  } catch {
-    /* 壳没就绪：走下面的默认端口路径 */
-  }
+    const status = await api?.getBackendStatus?.()
+    const value = Number(status?.port)
+    if (Number.isFinite(value) && value > 0) port = value
+  } catch { /* 壳没就绪：走下面的默认端口路径 */ }
   if (port > 0) {
-    cachedBase = `http://127.0.0.1:${port}`;
-    return cachedBase;
+    cachedBase = `http://127.0.0.1:${port}`
+    return cachedBase
   }
   // 端口还没上报（壳仍在启动）：先用默认端口，但**不缓存** —— 下一次调用会
   // 重新问一次壳，端口一就位就自动纠正。缓存住一个猜的端口，会让「面板刚起来
   // 那几秒先点了助手页」变成此后一直打错端口的顽固故障
-  return `http://127.0.0.1:${FALLBACK_PORT}`;
+  return `http://127.0.0.1:${FALLBACK_PORT}`
 }
 
-/** 桥返回的管理凭证缓存；明确的管理会话失效时重新获取一次。 */
-const CREDENTIALS: RequestCredentials = "same-origin";
-let cachedAuthHeaders: Record<string, string> | null = null;
+/** 同源请求照常带 cookie；跨源桌面请求由当前会话头表达凭证。 */
+const CREDENTIALS: RequestCredentials = 'same-origin'
 
 /** 桥返回的凭证表 → 只保留值为非空字符串的项（形状校验，防老壳/异常值） */
 function asHeaderTable(value: unknown): Record<string, string> {
-  const table: Record<string, string> = {};
-  if (!value || typeof value !== "object") return table;
+  const table: Record<string, string> = {}
+  if (!value || typeof value !== 'object') return table
   for (const [name, raw] of Object.entries(value as Record<string, unknown>)) {
-    if (typeof raw === "string" && raw) table[name] = raw;
+    if (typeof raw === 'string' && raw) table[name] = raw
   }
-  return table;
+  return table
 }
 
-async function directAuthHeaders(
-  force = false,
-): Promise<Record<string, string>> {
-  if (cachedAuthHeaders && !force) return cachedAuthHeaders;
-  const api = bridge();
-  const table = asHeaderTable(await api?.directCredentials?.());
-  cachedAuthHeaders = table;
-  return table;
+/** 不跨请求缓存：桌面壳会提前换证，网页端也可能已在另一标签页完成续期。 */
+async function directAuthHeaders(refresh = false): Promise<Record<string, string>> {
+  return asHeaderTable(await bridge()?.directCredentials?.(refresh))
 }
 
 /**
@@ -130,70 +120,43 @@ async function directAuthHeaders(
  * `Error` 的 message 只会得到一句 `[object Object]`，所以这里把三种形态都捋一遍。
  */
 function describeError(value: unknown, status: number): string {
-  if (typeof value === "string" && value.trim()) return value.trim();
-  if (value && typeof value === "object") {
-    const message = (value as { message?: unknown }).message;
-    if (typeof message === "string" && message.trim()) return message.trim();
-    try {
-      return JSON.stringify(value);
-    } catch {
-      /* 循环引用等：走下面的兜底 */
-    }
+  if (typeof value === 'string' && value.trim()) return value.trim()
+  if (value && typeof value === 'object') {
+    const message = (value as { message?: unknown }).message
+    if (typeof message === 'string' && message.trim()) return message.trim()
+    try { return JSON.stringify(value) } catch { /* 循环引用等：走下面的兜底 */ }
   }
-  return `HTTP ${status}`;
+  return `HTTP ${status}`
 }
 
 export class AssistantRequestError extends Error {
-  constructor(
-    message: string,
-    readonly status: number,
-    readonly code: string,
-  ) {
-    super(message);
-    this.name = "AssistantRequestError";
+  constructor(message: string, readonly status: number, readonly code: string) {
+    super(message)
+    this.name = 'AssistantRequestError'
   }
 }
 
-export function requestError(
-  parsed: unknown,
-  status: number,
-  method: string,
-  path: string,
-): AssistantRequestError {
-  const envelope =
-    parsed && typeof parsed === "object"
-      ? (parsed as { error?: unknown; code?: unknown })
-      : null;
-  const raw = envelope?.error ?? parsed;
-  const detail =
-    raw && typeof raw === "object" ? (raw as { code?: unknown }) : null;
-  const code =
-    typeof detail?.code === "string"
-      ? detail.code
-      : typeof envelope?.code === "string"
-        ? envelope.code
-        : "";
-  const message = describeError(raw, status);
+export function requestError(parsed: unknown, status: number, method: string, path: string): AssistantRequestError {
+  const envelope = parsed && typeof parsed === 'object'
+    ? parsed as { error?: unknown; code?: unknown } : null
+  const raw = envelope?.error ?? parsed
+  const detail = raw && typeof raw === 'object' ? raw as { code?: unknown } : null
+  const code = typeof detail?.code === 'string' ? detail.code
+    : typeof envelope?.code === 'string' ? envelope.code : ''
+  const message = describeError(raw, status)
   // 只有路由兜底才表示接口缺失，模型和会话的业务错误也可能是 404。
   if (status === 404 && message === `Not found: ${method} ${path}`) {
-    return new AssistantRequestError(
-      t(
-        "这一版网关还没有 AI 助手接口（HTTP 404）：后端还是旧的，重新编译 / 重启客户端后再试。{message}",
-        { message },
-      ),
-      status,
-      "api_not_found",
-    );
+    return new AssistantRequestError(t('这一版网关还没有 AI 助手接口（HTTP 404）：后端还是旧的，重新编译 / 重启客户端后再试。{message}', { message }), status, 'api_not_found')
   }
-  return new AssistantRequestError(message, status, code);
+  return new AssistantRequestError(message, status, code)
 }
 
 /** 把 fetch 的网络层失败包成带网关地址的 Error。
  *  浏览器对连接不上的回应只有一句 `TypeError: Failed to fetch`，不带任何上下文
  *  —— 把「连的是哪个地址」拼进去，用户对着侧栏的网关端口一眼就能看出对不对。 */
 function wrapFetchError(error: unknown, base: string): Error {
-  const message = error instanceof Error ? error.message : String(error);
-  return new Error(t("连接网关失败（{base}）：{message}", { base, message }));
+  const message = error instanceof Error ? error.message : String(error)
+  return new Error(t('连接网关失败（{base}）：{message}', { base, message }))
 }
 
 /**
@@ -203,31 +166,24 @@ function wrapFetchError(error: unknown, base: string): Error {
  * 不带体 —— 与原先每个调用点自己拼 headers/body 相比，凭证合并、Content-Type
  * 与重试策略都只有这一处实现。
  *
- * 桌面端只在明确的管理会话失效时清掉缓存重试一次，模型 Key 错误不重试。
+ * 明确的管理会话失效时重新获取凭证，网页端同时续期；最多重试一次，模型 Key 错误不重试。
  */
 export async function requestDirect(
   path: string,
-  options: {
-    method: string;
-    body?: unknown;
-    signal?: AbortSignal;
-    apiKey?: string;
-  },
+  options: { method: string; body?: unknown; signal?: AbortSignal; apiKey?: string },
   retried = false,
 ): Promise<Response> {
-  const api = bridge();
-  if (api?.platform !== "web" && api?.waitForBackend)
-    await api.waitForBackend();
-  const base = await gatewayBase();
-  const headers: Record<string, string> = { ...(await directAuthHeaders()) };
+  const api = bridge()
+  if (api?.platform !== 'web' && api?.waitForBackend) await api.waitForBackend()
+  const base = await gatewayBase()
+  const headers: Record<string, string> = { ...(await directAuthHeaders(retried)) }
   if (options.apiKey !== undefined) {
-    headers["x-api-key"] = options.apiKey;
-    headers.Authorization = `Bearer ${options.apiKey}`;
+    headers['x-api-key'] = options.apiKey
+    headers.Authorization = `Bearer ${options.apiKey}`
   }
-  const payload =
-    options.body === undefined ? undefined : JSON.stringify(options.body);
-  if (payload !== undefined) headers["Content-Type"] = "application/json";
-  let response: Response;
+  const payload = options.body === undefined ? undefined : JSON.stringify(options.body)
+  if (payload !== undefined) headers['Content-Type'] = 'application/json'
+  let response: Response
   try {
     response = await fetch(base + path, {
       method: options.method,
@@ -235,64 +191,38 @@ export async function requestDirect(
       body: payload,
       signal: options.signal,
       credentials: CREDENTIALS,
-    });
+    })
   } catch (error) {
     // 用户主动停止（abort）不是故障，原样交回 —— 调用方按 signal.aborted 区分
-    if (options.signal?.aborted) throw error;
-    throw wrapFetchError(error, base);
+    if (options.signal?.aborted) throw error
+    throw wrapFetchError(error, base)
   }
   if (response.status === 401 && !retried) {
-    type AuthFailure = { error?: { type?: string; code?: string } };
-    let rejected: AuthFailure | null = null;
-    try {
-      rejected = (await response.clone().json()) as AuthFailure;
-    } catch {
-      /* 非 JSON 不触发会话恢复 */
-    }
-    const kind = rejected?.error?.type || rejected?.error?.code;
-    const desktopRecovery =
-      api?.platform !== "web" &&
-      (kind === "panel_login_required" ||
-        (kind === "invalid_api_key" && options.apiKey === undefined));
-    const webRetry =
-      api?.platform === "web" &&
-      options.apiKey === undefined &&
-      (options.method === "GET" || !path.startsWith("/api/assistant/images/"));
+    type AuthFailure = { error?: { type?: string; code?: string } }
+    let rejected: AuthFailure | null = null
+    try { rejected = await response.clone().json() as AuthFailure } catch { /* 非 JSON 不触发会话恢复 */ }
+    const kind = rejected?.error?.type || rejected?.error?.code
+    const desktopRecovery = api?.platform !== 'web' && (kind === 'panel_login_required'
+      || kind === 'invalid_api_key' && options.apiKey === undefined)
+    const webRetry = api?.platform === 'web' && kind === 'panel_login_required' && options.apiKey === undefined
+      && (options.method === 'GET' || !path.startsWith('/api/assistant/images/'))
     if (desktopRecovery || webRetry) {
-      await response.text().catch(() => "");
-      cachedAuthHeaders = null;
-      return requestDirect(path, options, true);
+      await response.text().catch(() => '')
+      return requestDirect(path, options, true)
     }
   }
-  return response;
+  return response
 }
 
-export async function callJson<T>(
-  method: string,
-  path: string,
-  body?: unknown,
-  signal?: AbortSignal,
-  apiKey?: string,
-): Promise<T> {
-  const response = await requestDirect(path, { method, body, signal, apiKey });
-  const text = await response.text();
-  let parsed: unknown = null;
-  try {
-    parsed = text ? JSON.parse(text) : null;
-  } catch {
-    parsed = null;
-  }
-  const envelope = parsed as {
-    success?: boolean;
-    data?: unknown;
-    error?: unknown;
-  } | null;
+export async function callJson<T>(method: string, path: string, body?: unknown, signal?: AbortSignal, apiKey?: string): Promise<T> {
+  const response = await requestDirect(path, { method, body, signal, apiKey })
+  const text = await response.text()
+  let parsed: unknown = null
+  try { parsed = text ? JSON.parse(text) : null } catch { parsed = null }
+  const envelope = parsed as { success?: boolean; data?: unknown; error?: unknown } | null
   if (!response.ok || envelope?.success === false) {
-    throw requestError(parsed, response.status, method, path);
+    throw requestError(parsed, response.status, method, path)
   }
-  const payload =
-    envelope && typeof envelope === "object" && "data" in envelope
-      ? envelope.data
-      : parsed;
-  return payload as T;
+  const payload = envelope && typeof envelope === 'object' && 'data' in envelope ? envelope.data : parsed
+  return payload as T
 }

@@ -354,7 +354,7 @@ pub fn is_reserved(key: &str) -> bool {
 ///   · 幂等补建 `assistant_sessions.title_generated`（先查 `pragma_table_info`，
 ///     上游 v21 已建过则跳过）；
 ///   · 清掉模型目录刷新在旧成败判据下累积的假失败冷却（`reset_model_refresh_cooldown`）。
-pub const SCHEMA_VERSION: i64 = 23;
+pub const SCHEMA_VERSION: i64 = 24;
 
 /// ── 版本 22：清掉模型目录刷新的假失败冷却（[`reset_model_refresh_cooldown`]）
 /// 这是一次**纯数据修复**（无 DDL）：旧成败判据把「任一家失败」当成整轮失败，
@@ -367,6 +367,8 @@ pub const SCHEMA_VERSION: i64 = 23;
 /// 请求日志新增「积分」列读它。与 token 四列刻意不同：这一列**可空 REAL** ——
 /// `NULL` = 这一家没上报（旧行 / 不提供该读数），0 = 确实零消耗；用 0 兜底会
 /// 把「没读到」画成「花了 0 积分」，比缺一列更难排查。
+
+
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -1146,6 +1148,7 @@ fn apply_version(
         22 => migrate_v22(conn),
         // v23：requests 补「积分消耗」一列（请求日志的积分列，见 V23_SCHEMA）
         23 => conn.execute_batch(V23_SCHEMA),
+        24 => conn.execute_batch(include_str!("schema_client_identification.sql")),
         _ => Ok(()),
     }
 }
@@ -1215,7 +1218,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("user_version 应当可读");
-        assert_eq!(version, 23);
+        assert_eq!(version, 24);
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))

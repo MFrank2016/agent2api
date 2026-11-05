@@ -82,6 +82,8 @@ pub mod checkin_records;
 pub mod checkin_schedules;
 pub mod cline_headers;
 pub mod codearts_welfare;
+pub mod compact_routes;
+pub mod client_identification;
 pub mod config_api;
 // WorkBuddy 成长任务（查询 / 执行 / 开学季 / 猫猫旅行）：从参考项目
 // workbuddy2api 的 task_runner.py 移植，见该文件模块头
@@ -162,6 +164,7 @@ pub mod routing_api;
 // `routing_api` 是它的兼容别名 + 队列可见化端点
 pub mod routing_strategy;
 pub mod routing_flow;
+pub mod routing_groups;
 pub mod routing_trace;
 pub mod routing_workspace;
 pub mod sanitize;
@@ -189,6 +192,7 @@ pub mod zcode_captcha;
 // 令牌池的**补货节奏**设置（目标 / 轮询间隔 / 单轮上限），见该文件模块头
 pub mod zcode_captcha_pool;
 pub mod zcode_claim;
+pub mod zcode_claim_verification;
 // ZCode 客户端版本号（设置页可改）：上游按它决定活动套餐下不下发，
 // 落后时的症状是**静默空列表**，见该文件模块头
 pub mod zcode_version;

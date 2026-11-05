@@ -25,6 +25,15 @@ pub(crate) fn try_update_raw_field<T, E>(
             crate::server::core::model_rules::ModelRules::from_raw(&next.raw),
         );
     }
+    if key == super::KEY_ROUTING_PROFILES {
+        next.routing_profiles = super::routing_profiles::from_raw(&next.raw);
+    }
+    if key == super::compact_routes::KEY_COMPACT_ROUTES {
+        next.compact_routes = super::compact_routes::from_raw(&next.raw);
+    }
+    if key == super::client_identification::KEY_CLIENT_IDENTIFICATION {
+        next.client_identification = super::client_identification::from_raw(&next.raw);
+    }
     if !save_raw(&next.raw) {
         return Err(storage_error());
     }
