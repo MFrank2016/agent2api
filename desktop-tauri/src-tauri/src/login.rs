@@ -661,10 +661,7 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // 见 `providers::officeace::oauth` 的模块头），所以这里没有 CodeArts 那种
         // loopback 回调要放行；但「不设限」仍是必须显式写出的选择（落进默认分支
         // 会拿到 WorkBuddy 的白名单 → 窗口白屏）。
-        // Nous（Nous Research Portal）同样不设限：OAuth 设备码流程把用户带到官方
-        // 的 verification_uri，主机由上游给、不可穷举（与 Qoder / ZCode / Cline 同一
-        // 情形）；落进默认分支会拿到 WorkBuddy 的白名单 → 授权窗口白屏。
-        //
+//
         // OrcaTerm（腾讯云遨驰终端）同样不设限：登录窗口开在官方 OAuth 授权页
         // （`orcaterm.com/oauth/authorize`），它会 302 到 `open.weixin.qq.com`
         // 的微信二维码（`qrconnect`），沿途还会拉 `res.wx.qq.com` 的样式与
@@ -684,9 +681,15 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // 导航一旦被白名单拦下，症状就是用户明明授权成功、网关永远等不到码，
         // 而日志里什么都看不出（与 CodeArts / Trae 的 loopback 回调同一情形）。
         // 授权页本身在 `lobsterai.youdao.com`，沿途还可能有微信登录的第三方主机。
-        "catpaw" | "qoder" | "qoder-intl" | "cline-free" | "cline-pass" | "autoclaw"
+        // 千问办公两版的授权页在 `qwenwork.cn` / `.ai`（它会 302 到站点自己的
+        // 标准登录页 `/biz/signin`，沿途主机不可穷举）；2026-11-03 起它还有一条
+        // **本机回环回调**（`http://127.0.0.1:<插件端口>/callback`，见插件
+        // `providers/qoder/authorize.rs`）—— 那条导航被拦下的症状同样是
+        // 「授权成功但永远收不到码」。与 Qoder 同组，必须是 None。
+        "catpaw" | "qoder" | "qoder-intl" | "qwenwork" | "qwenwork-intl" | "cline-free"
+        | "cline-pass" | "autoclaw"
         | "autoclaw-intl" | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae"
-        | "kuku" | "antigravity" | "officeace" | "orcaterm" | "atomcode" | "lobsterai" | "nous" => None,
+        | "kuku" | "antigravity" | "officeace" | "orcaterm" | "atomcode" | "lobsterai" => None,
         // WorkBuddy 的两个地区共用这一张表（表里 `workbuddy.ai` 那一行就是国际站
         // 的登录域）。**显式列出**而不是靠下面的默认分支：上面那条警告要求
         // 「新 provider 落到默认分支」必须是有意的选择，写出来才看得出是选过的
@@ -706,6 +709,9 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
 /// `social_restore` 勾选时对 WorkBuddy 国际版额外放行 [`SOCIAL_IDENTITY_HOSTS`]：
 /// 恢复出来的 Google / GitHub 按钮做的是顶层跳转，不放行就会白屏（理由见该常量）。
 fn host_allowed(url: &url::Url, provider: &str, social_restore: bool) -> bool {
+    if provider == "deepseek-web" {
+        return url.as_str() == "about:blank" || crate::deepseek_login::allowed(url);
+    }
     if provider == "doubaowork" {
         return url.as_str() == "about:blank" || crate::doubaowork_login::allowed(url);
     }
@@ -793,6 +799,12 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // 壳侧只透传 provider id，地区由后端按 id 反查（与 ZCode 同款）。
         "qoder" => Ok("qoder"),
         "qoder-intl" => Ok("qoder-intl"),
+        // 千问办公两版：**与 Qoder 同一套设备授权协议**（授权地址由插件按站点
+        // 现拼、轮询设备令牌取凭据，见 `providers::qoder::oauth`），所以同样是
+        // 壳侧只透传 provider id、站点由插件按 id 反查。**这一条不能少** ——
+        // 少了两版的「网页登录」点下去就是「不支持网页登录的提供商：qwenwork」。
+        "qwenwork" => Ok("qwenwork"),
+        "qwenwork-intl" => Ok("qwenwork-intl"),
         "catpaw" => Ok("catpaw"),
         "cline-free" => Ok("cline-free"),
         "cline-pass" => Ok("cline-pass"),
@@ -852,10 +864,6 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // 与轮询 —— 与 ZCode / CodeArts 同一条路。它的授权码由网关**轮询云端**
         // 取回（云端回调页不往本机跳），所以窗口最后停在云端页上也不影响登录判定。
         "officeace" => Ok("officeace"),
-        // Nous（Nous Research Portal）：OAuth 设备码 —— 授权地址（verification_uri）
-        // 由**后端适配器**问上游拿，壳侧只负责开窗口与轮询，与 Qoder / ZCode / Cline
-        // 的设备授权同一条路（授权结果由服务端记录，不依赖窗口捕获回调）。
-        "nous" => Ok("nous"),
         // OrcaTerm（腾讯云遨驰终端）：地址由**后端适配器**返回（官方 OAuth 授权页，
         // 它会 302 到微信二维码），壳侧负责开窗口并把回调
         // `orcaterm://oauth_callback?session_id=…` 交回网关换令牌
@@ -1070,6 +1078,17 @@ pub async fn start_with_options(
     options: Option<Value>,
 ) -> Result<Value, String> {
     let dynamic = options.as_ref().is_some_and(|value| value.get("methodIndex").is_some());
+    if provider.trim() == "deepseek-web" {
+        if current_login(app).is_some() {
+            return Err("已有登录流程在进行，请先完成当前登录或等待超时".into());
+        }
+        if mode == "external" {
+            return Err("DeepSeek 自动网页登录需要桌面内嵌窗口；系统浏览器登录后请使用粘贴令牌。".into());
+        }
+        let mut options = options.unwrap_or_else(|| json!({}));
+        if !dynamic { options["methodIndex"] = json!(1); }
+        return crate::deepseek_login::start(app, &options).await;
+    }
     if !dynamic {
         // 旧入口也能带登录代理：界面上的代理选择器对内置家同样生效
         // （antigravity 这类上游在无头服务器上只有应用内代理能出网）。
@@ -1193,20 +1212,60 @@ fn emit_login_progress(app: &AppHandle, flow: &str, started: &Value, instruction
 struct DynamicNavigation {
     hosts: Vec<String>,
     callbacks: Vec<url::Url>,
+    /// 插件申报的**本机登录页**（`127.0.0.1:<port>` 这类）。
+    ///
+    /// ── 为什么需要单独一列 ──────────────────────────────────
+    /// 网关原先只允许「HTTPS 授权页」与「授权地址里登记的回环回调」两种
+    /// 地址。有些插件（AStudio）的登录页本身就是回环 HTTP 页面（要跑极验
+    /// 滑块），既不是 HTTPS 也不是回调；不单独放行的话点「登录」直接报
+    /// 「登录链接不是允许的 HTTPS 站点或合法本机回调地址」。
+    /// 只接受**带显式端口的回环主机**，且必须由插件在 `allowedHosts` 里
+    /// 明确申报，不放宽任何非回环地址。
+    loopback_pages: Vec<(String, u16)>,
+}
+
+/// `127.0.0.1:1234` / `localhost:1234` / `[::1]:1234` → (host, port)。
+fn loopback_page(value: &str) -> Option<(String, u16)> {
+    let text = value.trim().to_ascii_lowercase();
+    for host in ["127.0.0.1", "localhost", "[::1]"] {
+        if let Some(rest) = text.strip_prefix(host) {
+            if let Some(port) = rest.strip_prefix(':') {
+                if let Ok(port) = port.parse::<u16>() {
+                    if port > 0 {
+                        return Some((host.to_string(), port));
+                    }
+                }
+            }
+            return None;
+        }
+    }
+    None
 }
 
 impl DynamicNavigation {
     fn new(auth: &url::Url, started: &Value) -> Result<Self, String> {
-        let hosts = match started.get("allowedHosts") {
+        let raw = match started.get("allowedHosts") {
             None | Some(Value::Null) => Vec::new(),
             Some(Value::Array(items)) => items.iter().map(|value| {
-                let host = value.as_str().ok_or("登录域名白名单格式无效")?
-                    .trim().trim_start_matches("*.").trim_end_matches('.').to_ascii_lowercase();
-                if host.is_empty() { return Err("登录域名白名单含有空主机".to_string()); }
-                Ok(host)
+                value.as_str().ok_or("登录域名白名单格式无效".to_string())
+                    .map(|text| text.trim().to_string())
             }).collect::<Result<Vec<_>, String>>()?,
             Some(_) => return Err("登录域名白名单格式无效".into()),
         };
+        let mut hosts = Vec::new();
+        let mut loopback_pages = Vec::new();
+        for item in raw {
+            if let Some(page) = loopback_page(&item) {
+                loopback_pages.push(page);
+                continue;
+            }
+            let host = item
+                .trim_start_matches("*.")
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            if host.is_empty() { return Err("登录域名白名单含有空主机".to_string()); }
+            hosts.push(host);
+        }
         let mut callbacks = Vec::new();
         let mut capture = |key: &str, value: &str| {
             if matches!(key, "redirect_uri" | "redirect" | "redirect_url" | "callback_url"
@@ -1223,13 +1282,21 @@ impl DynamicNavigation {
         if let Some((_, query)) = auth.fragment().and_then(|fragment| fragment.split_once('?')) {
             for (key, value) in url::form_urlencoded::parse(query.as_bytes()) { capture(&key, &value); }
         }
-        Ok(Self { hosts, callbacks })
+        Ok(Self { hosts, callbacks, loopback_pages })
     }
 
     fn is_callback(&self, url: &url::Url) -> bool {
         if matches!(url.scheme(), "file" | "javascript" | "data" | "about" | "blob") { return false; }
         if matches!(url.scheme(), "https" | "http") && !self.allows(url) { return false; }
         self.matches_callback(url)
+    }
+
+    fn matches_loopback_page(&self, url: &url::Url) -> bool {
+        let Some(host) = url.host_str() else { return false; };
+        let Some(port) = url.port_or_known_default() else { return false; };
+        self.loopback_pages.iter().any(|(page_host, page_port)| {
+            host.eq_ignore_ascii_case(page_host) && port == *page_port
+        })
     }
 
     fn matches_callback(&self, url: &url::Url) -> bool {
@@ -1246,9 +1313,11 @@ impl DynamicNavigation {
             "https" => self.hosts.is_empty() || self.hosts.iter().any(|item| {
                 host.eq_ignore_ascii_case(item) || host.to_ascii_lowercase().ends_with(&format!(".{item}"))
             }),
-            // HTTP 只用于授权地址实际登记的回环 callback；仅白名单写 localhost 不够。
+            // HTTP 只用于授权地址实际登记的回环 callback，或插件明确申报的
+            // 本机登录页；仅白名单写 localhost 不够。
             "http" => matches!(host, "localhost" | "127.0.0.1" | "[::1]")
-                && self.matches_callback(url) && (self.hosts.is_empty() || self.hosts.iter().any(|item| {
+                && (self.matches_callback(url) || self.matches_loopback_page(url))
+                && (self.hosts.is_empty() || self.hosts.iter().any(|item| {
                     host.eq_ignore_ascii_case(item) || host.to_ascii_lowercase().ends_with(&format!(".{item}"))
                 })),
             _ => false,
@@ -1406,6 +1475,9 @@ pub async fn start(
         // 归属已经在 provider id 里 —— 与 ZCode 同款，不再读 edition 形参。
         "qoder" => "cn",
         "qoder-intl" => "intl",
+        // 千问办公两版同理（两张卡片、没有地区下拉）
+        "qwenwork" => "cn",
+        "qwenwork-intl" => "intl",
         // ZCode 的两个地区由 **provider 本身**决定（界面上是两张卡片，
         // 没有地区下拉，因此面板不会传 `edition`）。不看 `edition` 形参的
         // 后果只是标题里的「国内版/国际版」四个字，但既然信息已经在
@@ -1478,6 +1550,8 @@ pub async fn start(
         // Qoder 两家品牌名自带地区（两张卡片、无地区下拉），标题不拼后缀
         "qoder" => "Qoder 中国版",
         "qoder-intl" => "Qoder 国际版",
+        "qwenwork" => "千问办公 国内版",
+        "qwenwork-intl" => "千问办公 国际版",
         "cline-free" => "Cline Free",
         "cline-pass" => "Cline Pass",
         "catpaw" => "CatPaw",
@@ -1499,8 +1573,6 @@ pub async fn start(
         // OfficeAce 只有一家（自助 OAuth 一条链，没有地区/版本概念），品牌名里
         // 不需要地区
         "officeace" => "OfficeAce 果办",
-        // Nous 只有一家（OAuth 设备码一条链，没有地区/版本概念），品牌名里不需要地区
-        "nous" => "Nous",
         "lobsterai" => "LobsterAI",
         // AtomCode 只有一家（AtomGit / GitCode 的编码 Agent，没有地区/版本概念），
         // 品牌名里不需要地区
@@ -1513,7 +1585,8 @@ pub async fn start(
     let title = if matches!(
         provider,
         "cline-free" | "cline-pass" | "zcode" | "zcode-intl" | "codearts" | "trae" | "qoder"
-        | "qoder-intl" | "antigravity" | "officeace" | "lobsterai" | "atomcode" | "nous"
+        | "qoder-intl" | "qwenwork" | "qwenwork-intl" | "antigravity" | "officeace" | "lobsterai"
+        | "atomcode"
     ) {
         format!("登录 {provider_label} 账号")
     } else {
@@ -1881,13 +1954,27 @@ pub(crate) async fn run_cookie_login(
     title: &str,
     flow: &str,
 ) -> Result<serde_json::Value, String> {
+    run_cookie_login_with_proxy(app, provider, auth_url, title, flow, None).await
+}
+
+pub(crate) async fn run_cookie_login_with_proxy(
+    app: &AppHandle,
+    provider: &'static str,
+    auth_url: &str,
+    title: &str,
+    flow: &str,
+    proxy: Option<url::Url>,
+) -> Result<serde_json::Value, String> {
     {
         let state = app.state::<crate::state::AppState>();
         let mut guard = state.login.lock().map_err(|_| "登录状态锁不可用")?;
+        if guard.is_some() {
+            return Err("已有登录流程在进行，请先完成当前登录或等待超时".into());
+        }
         *guard = Some(ActiveLogin { state: flow.into(), edition: String::new(), mode: "embedded".into(), provider: provider.into() });
     }
     emit_login_state(app, LoginState { active: true, mode: Some("embedded".into()), edition: None, provider: Some(provider.into()) });
-    let result = run_embedded(app, provider, auth_url, title, flow, false, None, false).await;
+    let result = run_embedded_with_proxy(app, provider, auth_url, title, flow, false, None, false, proxy).await;
     clear_active_login(app, flow);
     result
 }
@@ -1919,6 +2006,20 @@ async fn run_embedded(
     social_restore: bool,
     kuku_phone: Option<&str>,
     start_hidden: bool,
+) -> Result<serde_json::Value, String> {
+    run_embedded_with_proxy(app, provider, auth_url, title, login_state, social_restore, kuku_phone, start_hidden, None).await
+}
+
+async fn run_embedded_with_proxy(
+    app: &AppHandle,
+    provider: &'static str,
+    auth_url: &str,
+    title: &str,
+    login_state: &str,
+    social_restore: bool,
+    kuku_phone: Option<&str>,
+    start_hidden: bool,
+    proxy: Option<url::Url>,
 ) -> Result<serde_json::Value, String> {
     let window_label = login_window_label(login_state);
     // ── 每次登录一个独立环境（修复：第二次添加账号会看到上一个账号的登录态）──
@@ -1963,6 +2064,7 @@ async fn run_embedded(
     // 密集重试只会延长风控窗口。
     let mut kuku_retry_block_until: Option<tokio::time::Instant> = None;
     let mut doubaowork_submitted = false;
+    let mut deepseek_submitted = false;
 
     // 导航拦截与弹窗拦截**共用同一个标志**：两种入口收到的可能是同一个回调
     // （页面先改 location、再被 WebView2 派生出一条弹窗请求），分开各一个标志
@@ -1982,6 +2084,10 @@ async fn run_embedded(
         .min_inner_size(760.0, 560.0)
         .visible(!start_hidden)
         .center();
+    let window = match proxy {
+        Some(proxy) => window.proxy_url(proxy),
+        None => window,
+    };
 
     // 恢复第三方登录入口：登录页按上游开关把 Google / GitHub / X 隐藏了，
     // 注入脚本持续摘掉那段样式（理由与边界见 social_restore_script）。
@@ -2059,6 +2165,9 @@ async fn run_embedded(
         // 同属一个 WebView2 数据目录、共享 Cookie 存储，弹窗里登录成功后
         // 等待循环照样能从 Cookie 读到 BDUSS）。
         .on_new_window(move |url, _features| {
+            if provider == "deepseek-web" && crate::deepseek_login::allowed(&url) {
+                return tauri::webview::NewWindowResponse::Allow;
+            }
             if provider == "doubaowork" && crate::doubaowork_login::allowed(&url) {
                 return tauri::webview::NewWindowResponse::Allow;
             }
@@ -2189,6 +2298,18 @@ async fn run_embedded(
         // `on_new_window` 拦下并交给后端换令牌，成功与否统一走 `/wait`。
         // 初版那套「读窗口 cookie 找 ot_session」已删除：那条 Cookie 在
         // SPA 内扫码登录时根本不会被写出（见模块头的实测对照）。
+        if provider == "deepseek-web" && !deepseek_submitted {
+            match crate::deepseek_login::credentials(&window).await {
+                Ok(Some(credentials)) if login_is_current(app, login_state) => {
+                    deepseek_submitted = true;
+                    submit_callback(login_state, &credentials).await;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("[login] {error}");
+                }
+            }
+        }
         if provider == "doubaowork" && !doubaowork_submitted {
             match crate::doubaowork_login::cookie(&window).await {
                 Ok(Some(cookie)) => {

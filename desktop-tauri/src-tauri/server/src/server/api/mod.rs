@@ -12,7 +12,6 @@
 //!   stats_api.rs  GET /api/stats/summary、/api/stats/requests、DELETE /api/stats/requests、
 //!                 GET/PUT /api/retention
 //!   retry_api.rs  GET/PUT /api/retry（请求重试设置，转发层退避的次数 / 间隔）
-//!   routing_strategy.rs GET/POST /api/routing-strategy（账号选路策略：全局默认 + 逐家覆盖）
 //!   queue_api.rs  GET/PUT /api/queue（排队等待：次数与单次时长）
 //!   accounts.rs   /api/accounts*（对照 workbuddy-account-routes.mjs）
 //!   proxies.rs    /api/proxies*（Clash 读取 + 出口测试）
@@ -50,6 +49,11 @@ pub mod accounts_usage;
 pub mod assistant;
 pub mod assistant_history;
 pub mod assistant_images;
+// 工具服务（「工具服务」页）：列表 / 开关 / 超时 / 上游提供商 / 视觉配置 /
+// 本机接入的管理面，以及对外运行时端点（Skill / MCP / REST）。上游配置与
+// 编排在 `core::tool_services`，见那两个文件模块头
+pub mod tools;
+pub mod tool_runtime;
 mod image_input;
 // 整库备份 / 恢复（设置页「整库备份 / 恢复」，SQL 文本形态；核心在
 // `db::backup`，替换语义与账号 JSON 导入的 merge 是两条独立通道）
@@ -101,12 +105,10 @@ pub mod import_sources;
 pub mod images;
 mod image_assets;
 mod image_output;
-// 流式请求「首字节等待」的 SSE 保活（转发超过宽限期仍没就绪时先回保活流，
-// 见该文件模块头）—— 与 disconnect_guard 同属 handler 生命周期上的兜底件；
-// 同一文件还承载「保活换行丢弃开关」（`/api/keepalive-strip`，与 `/api/sanitize`、
-// `/api/debug` 同形的单开关端点，理由见该模块头）。
-pub mod keepalive;
 pub mod keys_api;
+/// 保活换行丢弃开关（`/api/keepalive-strip`）：与 `/api/sanitize`、`/api/debug`
+/// 同形的单开关端点，独立成文件而不是塞进 config_api —— 理由见该模块头。
+pub mod keepalive;
 pub mod logs_api;
 pub mod model_manage;
 pub(crate) mod model_access;
@@ -121,6 +123,8 @@ pub mod models;
 pub mod onboarding;
 pub mod panel;
 pub mod pipeline;
+mod live_progress;
+mod record_persist;
 // 提供商插件包的管理面（列表 / 安装 / 卸载 / 启停）：插件是用户安装的，
 // 这一组端点就是「装插件」的唯一入口，见该文件模块头
 pub mod plugins;
@@ -132,19 +136,24 @@ pub mod plugin_ui;
 pub mod plugin_theme;
 pub mod prompt;
 pub mod protocol;
-// 每 provider 的行为开关（`providerOptions`）的读写入口：
-// `GET/PUT /api/provider-options`。存储与读取在 `core::provider_options`，
-// 本模块只补上写侧 `set()` 一直缺失的生产调用方，见该文件模块头
+// 逐家开关覆盖（GET/PUT /api/provider-options）：存储与读取在
+// `core::provider_options`，见该文件模块头
 pub mod provider_options;
 pub mod proxies;
 pub mod qoder_umid;
 pub mod queue_api;
+// 会话图片压缩设置（GET/PUT /api/image-compress）：开关 + 长边 / 质量 / 阈值三项，
+// 实施点在 `core::upstream::payload` 的 send_body（只作用在对话链路，生图不经过），
+// 见该文件模块头
+pub mod image_compress;
 pub mod retry_api;
+pub(crate) mod request_prepare;
 // 开发者角色兼容开关（GET/PUT /api/developer-role-compat）：与 /api/sanitize
 // 同形的单开关端点，转换实施点在 `core::upstream::payload` 的 send_body，
 // 见该文件模块头
 pub mod role_compat;
 pub mod routing_api;
+pub mod routing_flow;
 // 统一的路由设置端点（选路策略 + 粘性 / 退避 / 垫底 / 熔断）；
 // `routing_api` 是它的兼容别名 + 队列可见化端点
 pub mod routing_strategy;
@@ -158,10 +167,10 @@ pub mod session;
 pub mod sidebar_layout;
 pub mod stats_api;
 pub mod storage_api;
-pub mod timeouts_api;
-// 剥离响应开头思考标签的开关（GET/PUT /api/think-strip）：与 /api/keepalive-strip
-// 同形的单开关端点，判据与执行链在 `core::middleware::think_tags`，见该文件模块头
+// 剥离响应开头思考标签的开关（GET/PUT /api/think-strip）：判据与执行链在
+// `core::middleware::think_tags`，见该文件模块头
 pub mod think_strip;
+pub mod timeouts_api;
 // 派猫猫旅行（CN WorkBuddy 运营活动）：per-account 只读状态 + 手动跑一次，
 // 见该文件模块头
 pub mod travel;

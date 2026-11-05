@@ -165,35 +165,6 @@ pub const KEY_CORS_ENABLED: &str = "corsEnabled";
 /// —— Docker 部署想从第一次启动就打开的，不必先进面板点一次。
 pub const KEY_STRIP_NEWLINE_KEEPALIVE: &str = "stripNewlineKeepalive";
 
-/// 「剥离响应开头的思考标签」开关的键（config.json 键，见
-/// `core::middleware::think_tags`）。
-///
-/// 打开后，下发给客户端的正文若以 `<think>…</think>`（以及 `THINK_TAGS` 里的
-/// 另外三组）**开头**，就把那一块连同标签一起剥掉；正文中间的标签一律不动
-/// （那是用户内容）。只做**开头**这一块：它与 Qoder 那台「把正文中间标签转成
-/// reasoning delta」的机器语义不同，不要互相替代。
-///
-/// **默认关闭**：关着时下发字节与接入前逐字一致。开着才会改写上游原样字节，
-/// 而上游到底会不会这么发是**按家**不同的 —— 所以真正决定开不开的是
-/// `providerOptions`（`core::provider_options::is_enabled`），本键只提供全局
-/// 默认值。键不存在 = 跟随本键（缺省 false）。
-///
-/// ── 覆盖面：所有内置家与自定义家都已接通 ────────────────────
-/// 两层实现，语义相同（都复用 `core::middleware::think_tags` 的
-/// `LeadingThinkFilter`，跨帧安全）：
-///   - **标准下发链**（`ReasoningCoalescer` 流式 + `CompletionAccumulator`
-///     非流式）：绝大多数内置家与自定义家走这条；
-///   - **自建 translator / sniffer 的三家**（`qoder` / `accio` / `codearts`）：
-///     它们不经过标准链，各自在自己的唯一出口处接了一次 ——
-///     qoder/accio 在 delta→JSON 的那一步（`delta_json_filtered`），
-///     codearts 在字节级的 `StreamFixer`（`ThinkRestorer`）。
-/// 因此「开了就全生效」现在是成立的。三家自建流的实现见各自模块里
-/// `think_strip` / `with_think_strip` 的说明。
-///
-/// **只剥正文**：`reasoning_content` 通道（模型自己的思考）与工具调用的
-/// `arguments` 一律不动 —— 那不是「正文里混进了思考」这个问题的目标。
-pub const KEY_STRIP_LEADING_THINK: &str = "stripLeadingThink";
-
 /// 机器人校验开关的键（config.json 键，ALTCHA proof-of-work，见 `server::altcha`）。
 ///
 /// **默认开启**：登录 / 注册是公开的认证边界，脚本可以无限打（暴破密码、
@@ -840,7 +811,7 @@ impl TimeoutSettings {
 
     /// 传输层 read_timeout 的后备上限：取「等响应头」与「流空闲」两者的大者。
     ///
-    /// wreq 的 `read_timeout` 作用于每一次读（既覆盖首包前、也覆盖数据块
+    /// reqwest 的 `read_timeout` 作用于每一次读（既覆盖首包前、也覆盖数据块
     /// 之间），而这两个阶段是分开的旋钮 —— 后备值取大者，保证它**永不**成为
     /// 哪个旋钮的隐藏天花板（真正的判定在各阶段自己的计时器，见
     /// `upstream::request` 与 `upstream::ForwardStream`）。
@@ -944,69 +915,6 @@ pub struct QueuePatch {
     pub wait_seconds: Option<i64>,
 }
 
-// ─── 账号选路策略（routingStrategy：全局默认 + 逐家覆盖）──────────────
-
-/// 选路策略的配置键（config.json / kv 表）。
-///
-/// 形状：`{ "default": "<策略>", "providers": { "<providerId>": "<策略>" } }`。
-/// 取值见 [`crate::server::core::routing::RoutingStrategy`]；**默认 `priority`**
-/// （与改造前行为逐字相同）。逐家覆盖是**稀疏表**：只写想单独配置的家，
-/// 其余一律沿用 `default`（与 `promptProviders` 同一取向）。
-///
-/// ── 未知 provider id 与非法策略值 ─────────────────────────
-///   - 未知 provider id：允许存在，选路时**忽略**（那家没有账号自然轮不到它）；
-///   - 非法策略值：读侧**回落到 `priority`**（不报错、不影响启动，见模块头
-///     「写坏回落」）；走接口写入的非法值由 `api::routing_strategy` 拦成 400。
-///
-/// ── 兼容上游 v3.0.2 的旧字符串形态 ─────────────────────────
-/// 旧版本把 `routingStrategy` 直接写成字符串（`"order"` / `"rotate"` /
-/// `"provider"` / `"usage"`）。读侧（`config::parse::routing_strategy_from`）在读取
-/// 时把它迁移成上面的对象形态（`order`→`priority`、`rotate`→`global-round-robin`、
-/// `provider`→`round-robin`、`usage`→`balance-weighted`、认不出→`priority`），
-/// **不丢数据**。迁移表本体在 `core::routing::RoutingStrategy::from_config`（唯一一处）。
-pub const KEY_ROUTING_STRATEGY: &str = "routingStrategy";
-/// `routingStrategy` 里的全局默认子键（值 = 策略字符串）
-pub const KEY_ROUTING_STRATEGY_DEFAULT: &str = "default";
-/// `routingStrategy` 里的逐家覆盖子键（值 = `{ "<providerId>": "<策略>" }`）
-pub const KEY_ROUTING_STRATEGY_PROVIDERS: &str = "providers";
-
-/// 账号选路策略设置（设置页「网关 → 选路策略」）。
-///
-/// 与 `PromptSettings` 同一取舍：`default` + 逐家覆盖总是一起用（转发层每次
-/// 选路取一次），打包成一个值让调用方一次拿到；`BTreeMap` 而不是 `HashMap`
-/// —— 接口响应与界面都要有稳定顺序（同一份配置每次渲染的行序不同，用户会
-/// 以为设置被改动过）。
-#[derive(Clone, Debug)]
-pub struct RoutingStrategySettings {
-    /// 未单独配置的家用的那一档（缺省 = `priority`）
-    pub default: crate::server::core::routing::RoutingStrategy,
-    /// 逐家覆盖（只含被明确配置过的家）
-    pub providers: BTreeMap<String, crate::server::core::routing::RoutingStrategy>,
-}
-
-impl RoutingStrategySettings {
-    /// 某一家实际生效的策略：逐家覆盖优先，缺省用全局 `default`。
-    ///
-    /// 未知 / 未配置的家都返回 `default` —— 「未知 provider id 允许存在但
-    /// 选路时忽略」这条由此自然成立：那家没有候选账号，`resolve` 的结果
-    /// 根本用不上。
-    pub fn resolve(&self, provider_id: &str) -> crate::server::core::routing::RoutingStrategy {
-        self.providers
-            .get(provider_id)
-            .copied()
-            .unwrap_or(self.default)
-    }
-}
-
-impl Default for RoutingStrategySettings {
-    fn default() -> Self {
-        Self {
-            default: crate::server::core::routing::RoutingStrategy::default(),
-            providers: BTreeMap::new(),
-        }
-    }
-}
-
 // ─── ZCode 验证码令牌池（活动套餐通道的补货节奏，见 api/zcode_captcha）──
 
 /// 令牌池的库存目标（`zcodeCaptchaPoolTarget`）：库存低于它前端铸造器才补铸。
@@ -1062,17 +970,6 @@ impl Default for CaptchaPoolSettings {
     }
 }
 
-/// 选路策略的**部分**更新入参（`None` = 该项不动）。
-///
-/// `providers` 出现即**整体替换**（不是逐键合并）：界面改一家的策略时整份回传，
-/// 「某一家改回跟随默认」= 从表里删掉它 —— 只有整体替换能表达删除（与前端
-/// `saveRoutingProvider` 的语义一致）。未带 `providers` 则这张表原样不动。
-#[derive(Clone, Debug, Default)]
-pub struct RoutingStrategyPatch {
-    pub default: Option<crate::server::core::routing::RoutingStrategy>,
-    pub providers: Option<BTreeMap<String, crate::server::core::routing::RoutingStrategy>>,
-}
-
 /// 验证码令牌池的**部分**更新入参（`None` = 该项不动）。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CaptchaPoolPatch {
@@ -1081,11 +978,106 @@ pub struct CaptchaPoolPatch {
     pub max_per_round: Option<i64>,
 }
 
-// ─── 账号路由（会话粘性 / 失败退避 / 限流垫底 / 熔断）─────────
-//
-// 策略维度（候选怎么排序）是**逐家**的，见上面的 `RoutingStrategySettings`；
-// 这里只放**策略之外的四个维度**（上游 v3.0.2 引入），语义与默认值原样保留。
+// ─── 会话图片压缩（转发前把内嵌 base64 大图压小，设置页「网关 → 图片压缩」）──
 
+/// 图片压缩总开关（`imageCompressEnabled`，**默认开**）。
+///
+/// 解析口径：**只有字面 `false` 才算关**（见 `parse::image_compress_from`），
+/// 键缺失或写成别的值都按开 —— 于是升级上来的老配置（没有这个键）一启动就是
+/// 开启状态。
+///
+/// 为什么默认开：它改的是**发给上游的字节**，收益（更小的请求体、更低的上游
+/// 计费）对绝大多数对话都成立，属于「默认就该有」的能力；本项目有「自定义
+/// 提供商透传」这类把请求体原样送出的家，压过之后未必符合每个用户的预期，
+/// 所以把它做成**默认开、可一键关**的开关，关掉即回到「请求体一个字节都不动」。
+pub const KEY_IMAGE_COMPRESS_ENABLED: &str = "imageCompressEnabled";
+/// 图片长边像素上限（`imageCompressMaxEdge`）：超过则等比缩小。
+pub const KEY_IMAGE_COMPRESS_MAX_EDGE: &str = "imageCompressMaxEdge";
+/// JPEG 重编码质量（`imageCompressQuality`，40~95）。
+pub const KEY_IMAGE_COMPRESS_QUALITY: &str = "imageCompressQuality";
+/// 触发阈值 KB（`imageCompressThresholdKb`）：解码后小于它保持原样（0 = 全部处理）。
+pub const KEY_IMAGE_COMPRESS_THRESHOLD_KB: &str = "imageCompressThresholdKb";
+
+/// 长边上限默认值：2048（**照抄 OmniProxy 的默认值**）。
+///
+/// 多数视觉模型推荐的长边上限量级；默认取值口径与 OmniProxy 逐字一致，
+/// 用户要更省流量可在设置页调小（参考 CatPaw 上游限制用的 1568）。
+pub const DEFAULT_IMAGE_COMPRESS_MAX_EDGE: i64 = 2048;
+/// 重编码质量默认值：80（照抄 OmniProxy）。
+pub const DEFAULT_IMAGE_COMPRESS_QUALITY: i64 = 80;
+/// 触发阈值默认值：512 KB（照抄 OmniProxy）—— 解码后小于 512KB 的图不处理。
+pub const DEFAULT_IMAGE_COMPRESS_THRESHOLD_KB: i64 = 512;
+
+/// 长边上限的合法范围 256~8192：下限以下缩得连图看不清，上限以上等于不缩。
+pub const IMAGE_COMPRESS_MIN_MAX_EDGE: i64 = 256;
+pub const IMAGE_COMPRESS_MAX_MAX_EDGE: i64 = 8192;
+/// 质量范围 40~95：低于 40 画面明显劣化，高于 95 体积收益几乎为零。
+pub const IMAGE_COMPRESS_MIN_QUALITY: i64 = 40;
+pub const IMAGE_COMPRESS_MAX_QUALITY: i64 = 95;
+/// 触发阈值范围 0~10240 KB：0 = 不设阈值、全部候选图都过一遍。
+pub const IMAGE_COMPRESS_MIN_THRESHOLD_KB: i64 = 0;
+pub const IMAGE_COMPRESS_MAX_THRESHOLD_KB: i64 = 10240;
+
+/// 会话图片压缩设置（设置页「网关 → 图片压缩」区域）。
+///
+/// 与 `QueueSettings` 同一取舍：四个值总是一起用（每次发送前取一份快照），
+/// 打包成一个 `Copy` 值让调用方一次拿到 —— 转发链把这份快照随请求借下去。
+///
+/// ── 它作用在哪 ──────────────────────────────────────────────
+/// 只在**对话链路**（chat / responses / anthropic 三个入口归一后的 Chat 请求体）
+/// 生效；生图与图片编辑走独立分支，在 `send_body` 里提前返回，天然不经过这里。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageCompressSettings {
+    /// 总开关（关 = 出站请求体一个字节都不动）
+    pub enabled: bool,
+    /// 长边像素上限（超过等比缩小，不放大）
+    pub max_edge: i64,
+    /// JPEG 重编码质量
+    pub quality: i64,
+    /// 触发阈值（KB，解码后小于它保持原样）
+    pub threshold_kb: i64,
+}
+
+impl Default for ImageCompressSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_edge: DEFAULT_IMAGE_COMPRESS_MAX_EDGE,
+            quality: DEFAULT_IMAGE_COMPRESS_QUALITY,
+            threshold_kb: DEFAULT_IMAGE_COMPRESS_THRESHOLD_KB,
+        }
+    }
+}
+
+/// 会话图片压缩的**部分**更新入参（`None` = 该项不动）。
+///
+/// 形状与 `AutoContinuePatch` 相同（开关 + 若干有界整数一起写），理由也一样：
+/// **一次 PUT 只落一次盘**，避免出现「开关开了、参数还是旧的」半套状态。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImageCompressPatch {
+    /// 开关（`None` = 该项不动）
+    pub enabled: Option<bool>,
+    /// 长边上限（`None` = 该项不动）。调用方须先按
+    /// `IMAGE_COMPRESS_MIN_MAX_EDGE..=IMAGE_COMPRESS_MAX_MAX_EDGE` 校验过。
+    pub max_edge: Option<i64>,
+    /// 质量（`None` = 该项不动）。调用方须先按
+    /// `IMAGE_COMPRESS_MIN_QUALITY..=IMAGE_COMPRESS_MAX_QUALITY` 校验过。
+    pub quality: Option<i64>,
+    /// 触发阈值 KB（`None` = 该项不动）。调用方须先按
+    /// `IMAGE_COMPRESS_MIN_THRESHOLD_KB..=IMAGE_COMPRESS_MAX_THRESHOLD_KB` 校验过。
+    pub threshold_kb: Option<i64>,
+}
+
+// ─── 账号路由（策略 / 会话粘性 / 失败退避 / 限流垫底 / 熔断）─────────
+
+/// 路由策略：候选账号怎么排序（`routingStrategy`）。
+///
+///   - `Order`：队列位次（优先级数字）就是一切 —— 现状行为；
+///   - `Rotate`：每条请求轮换到下一位（新会话的起点由位次决定），均摊用量；
+///   - `Usage`：用量占比最低的先用（没有读数的账号按位次排在有读数的后面）。
+///
+/// 智能按窗口重置、手动固定两档讨论后**不做**（用户拍板：只留三种）。
+pub const KEY_ROUTING_STRATEGY: &str = "routingStrategy";
 /// 会话粘性：同一会话尽量跟住答过它的账号（`routingSticky`）。
 ///
 ///   - `Auto`：跟住，直到上游缓存不值得续（约 5 分钟无往来）；
@@ -1111,6 +1103,14 @@ pub const KEY_ROUTING_BREAKER_TIMEOUT: &str = "routingBreakerTimeoutSeconds";
 /// 恢复阈值：熔断放行后要连续成功几次才算恢复（`routingBreakerSuccessThreshold`）
 pub const KEY_ROUTING_BREAKER_SUCCESS: &str = "routingBreakerSuccessThreshold";
 
+pub const ROUTING_STRATEGY_ORDER: &str = "order";
+pub const ROUTING_STRATEGY_ROTATE: &str = "rotate";
+/// 家内轮询（`provider`）：家之间按优先级，同一家内部轮流用各账号。
+///
+/// 与「负载均衡」的差别在**轮转的边界**：这里家的先后固定（由优先级定），
+/// 只有家内换人 —— 适合「想优先用某几家、又不愿把某一家的某个账号焊死」。
+pub const ROUTING_STRATEGY_PROVIDER: &str = "provider";
+
 pub const STICKY_OFF: &str = "off";
 pub const STICKY_TURN: &str = "turn";
 pub const STICKY_SESSION: &str = "session";
@@ -1125,6 +1125,42 @@ pub const ROUTING_BREAKER_MAX_TIMEOUT: i64 = 600;
 /// 恢复阈值合法范围：1~10 次
 pub const ROUTING_BREAKER_MIN_SUCCESS: i64 = 1;
 pub const ROUTING_BREAKER_MAX_SUCCESS: i64 = 10;
+
+/// 路由策略（`RouteStrategy` 的 Rust 形态；配置里存 `as_str`）
+///
+/// 三档：顺序优先（队列第 1 位接走所有请求）、负载均衡（逐请求轮换）、
+/// 家内轮询（家之间按优先级、同一家内部轮流用各账号）。
+/// 「余额优先（usage）」已下线（2026-10，按用户要求移除）—— 见 `from_id` 的兜底说明。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteStrategy {
+    Order,
+    Rotate,
+    /// 家内轮询（本仓新增，上游没有）：轮转的边界收在「家」里面
+    Provider,
+}
+
+impl RouteStrategy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Order => ROUTING_STRATEGY_ORDER,
+            Self::Rotate => ROUTING_STRATEGY_ROTATE,
+            Self::Provider => ROUTING_STRATEGY_PROVIDER,
+        }
+    }
+
+    /// 配置值 → 策略。**未知值一律回落顺序优先**（与旧行为一致）。
+    ///
+    /// 已下线的 `"usage"`（余额优先）单独归到**负载均衡**而不是默认档：那种配置是
+    /// 用户当初显式选的「谁空谁上」，语义上最接近的是「把负载摊开」（rotate），
+    /// 静默退回「排第 1 的接走所有请求」会与他的本意相反。
+    pub fn from_id(value: &str) -> Self {
+        match value {
+            ROUTING_STRATEGY_PROVIDER => Self::Provider,
+            ROUTING_STRATEGY_ROTATE | "usage" => Self::Rotate,
+            _ => Self::Order,
+        }
+    }
+}
 
 /// 会话粘性档位（`StickyMode`）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1164,12 +1200,11 @@ impl StickyMode {
     }
 }
 
-/// 账号路由设置（设置页「路由」区域）：会话粘性 / 失败退避 / 限流垫底 / 熔断。
-///
-/// 转发层逐请求取一次快照（`Copy`），改完设置下一个请求立即生效 —— 与超时 /
-/// 重试同一模式。策略维度**不在这里**：它是逐家的，见 `RoutingStrategySettings`。
+/// 账号路由设置（账号页「路由」区域）。转发层逐请求取一次快照
+/// （`Copy`），改完设置下一个请求立即生效 —— 与超时 / 重试同一模式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoutingSettings {
+    pub strategy: RouteStrategy,
     pub sticky: StickyMode,
     pub failover_backoff: bool,
     pub sink: bool,
@@ -1182,6 +1217,7 @@ pub struct RoutingSettings {
 impl Default for RoutingSettings {
     fn default() -> Self {
         Self {
+            strategy: RouteStrategy::Order,
             sticky: StickyMode::Auto,
             failover_backoff: true,
             sink: true,
@@ -1196,6 +1232,7 @@ impl Default for RoutingSettings {
 /// 路由设置的**部分**更新入参（`None` = 该项不动）
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RoutingPatch {
+    pub strategy: Option<RouteStrategy>,
     pub sticky: Option<StickyMode>,
     pub failover_backoff: Option<bool>,
     pub sink: Option<bool>,
@@ -1279,4 +1316,62 @@ pub struct AutoContinuePatch {
     /// 轮数上限（`None` = 该项不动）。调用方须先按
     /// `AUTO_CONTINUE_MIN_ROUNDS..=AUTO_CONTINUE_MAX_ROUNDS` 校验过。
     pub max_rounds: Option<i64>,
+}
+
+// ─── 本地独有（beta）：逐家选路策略 + 剥离开头 think 开关 ───────────────
+// 与上游 3.4.1 的 RouteStrategy / ImageCompress 并存：上游键 routingStrategy
+// 仍由 RouteStrategy 解析；本地读侧 routing_strategy_from 兼容对象/旧字符串形态。
+pub const KEY_STRIP_LEADING_THINK: &str = "stripLeadingThink";
+
+
+pub const KEY_ROUTING_STRATEGY_DEFAULT: &str = "default";
+/// `routingStrategy` 里的逐家覆盖子键（值 = `{ "<providerId>": "<策略>" }`）
+pub const KEY_ROUTING_STRATEGY_PROVIDERS: &str = "providers";
+
+/// 账号选路策略设置（设置页「网关 → 选路策略」）。
+///
+/// 与 `PromptSettings` 同一取舍：`default` + 逐家覆盖总是一起用（转发层每次
+/// 选路取一次），打包成一个值让调用方一次拿到；`BTreeMap` 而不是 `HashMap`
+/// —— 接口响应与界面都要有稳定顺序（同一份配置每次渲染的行序不同，用户会
+/// 以为设置被改动过）。
+#[derive(Clone, Debug)]
+pub struct RoutingStrategySettings {
+    /// 未单独配置的家用的那一档（缺省 = `priority`）
+    pub default: crate::server::core::routing::RoutingStrategy,
+    /// 逐家覆盖（只含被明确配置过的家）
+    pub providers: BTreeMap<String, crate::server::core::routing::RoutingStrategy>,
+}
+
+impl RoutingStrategySettings {
+    /// 某一家实际生效的策略：逐家覆盖优先，缺省用全局 `default`。
+    ///
+    /// 未知 / 未配置的家都返回 `default` —— 「未知 provider id 允许存在但
+    /// 选路时忽略」这条由此自然成立：那家没有候选账号，`resolve` 的结果
+    /// 根本用不上。
+    pub fn resolve(&self, provider_id: &str) -> crate::server::core::routing::RoutingStrategy {
+        self.providers
+            .get(provider_id)
+            .copied()
+            .unwrap_or(self.default)
+    }
+}
+
+impl Default for RoutingStrategySettings {
+    fn default() -> Self {
+        Self {
+            default: crate::server::core::routing::RoutingStrategy::default(),
+            providers: BTreeMap::new(),
+        }
+    }
+}
+
+/// 选路策略的**部分**更新入参（`None` = 该项不动）。
+///
+/// `providers` 出现即**整体替换**（不是逐键合并）：界面改一家的策略时整份回传，
+/// 「某一家改回跟随默认」= 从表里删掉它 —— 只有整体替换能表达删除（与前端
+/// `saveRoutingProvider` 的语义一致）。未带 `providers` 则这张表原样不动。
+#[derive(Clone, Debug, Default)]
+pub struct RoutingStrategyPatch {
+    pub default: Option<crate::server::core::routing::RoutingStrategy>,
+    pub providers: Option<BTreeMap<String, crate::server::core::routing::RoutingStrategy>>,
 }

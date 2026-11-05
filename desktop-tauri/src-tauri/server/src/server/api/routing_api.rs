@@ -1,12 +1,9 @@
-//! GET/PUT `/api/routing` + GET `/api/routing/queue` —— 账号路由设置的**兼容别名**
-//! 与**队列可见化**。
+//! GET/PUT /api/routing + GET /api/routing/queue —— 账号路由的设置与**队列可见化**。
 //!
-//! ── /api/routing（统一端点 `/api/routing-strategy` 的别名）─────────
-//! 读写的是同一份配置（`api::routing_strategy::apply_object`）。GET 返回统一的
-//! JSON，额外附一个旧字符串字段 `routingStrategy`（`order` / `rotate` / `provider` / `usage`）
-//! 供旧读取方；PUT 接受统一的 patch，也接受旧形态的 `routingStrategy` 字符串
-//! （翻成统一的 `default`）。**新界面一律走 `/api/routing-strategy`**，这条别名
-//! 只为兼容而保留。
+//! ── /api/routing（与 /api/timeouts 同一模式）─────────────────
+//! 独立端点、允许部分字段、返回生效后的全量值、无副作用（不重启进程）。
+//! 保存后对下一个请求立即生效（转发层逐请求读 `config::routing_settings()`
+//! 内存快照，不读盘）。
 //!
 //! ── /api/routing/queue（队列可见化，账号页面板的数据源）────────
 //! 回答「按当前策略，这个模型的候选账号会怎么排、谁被跳过、为什么」。
@@ -29,96 +26,134 @@ use axum::extract::{Query, State};
 use axum::response::Response;
 use serde_json::{json, Value};
 
-use crate::server::config;
+use crate::server::config::{self, RoutingPatch, RoutingSettings};
 use crate::server::core::providers::router;
-use crate::server::core::routing::{self, RoutingStrategy};
+use crate::server::core::routing;
 use crate::server::errors;
 use crate::server::http::{ok_json, parse_body};
 use crate::server::ServerState;
 
-/// GET /api/routing —— 统一端点 `/api/routing-strategy` 的兼容别名。
+/// GET /api/routing
 pub async fn get_routing(State(_state): State<ServerState>) -> Response {
-    ok_json(with_legacy_strategy(super::routing_strategy::routing_json()))
+    ok_json(routing_json(config::routing_settings()))
 }
 
-/// PUT /api/routing —— 统一 patch，另接受旧形态的 `routingStrategy` 字符串。
+/// PUT /api/routing —— body 各键全部可选（不给 = 不动）
 pub async fn put_routing(State(_state): State<ServerState>, body: Bytes) -> Response {
     let payload = match parse_body(&body) {
         Ok(value) => value,
         Err(error) => return errors::management_error(400, error.message),
     };
-    let Some(source) = payload.as_object() else {
+    let Some(object) = payload.as_object() else {
         return errors::management_error(400, "请求体必须是 JSON 对象");
     };
-    let mut object = source.clone();
-    // 旧形态：`routingStrategy` 是字符串（`order` / `rotate` / `usage` 或新档位 id）
-    // → 翻成统一的 `default`。未知值当场 400（与统一端点同一口径）。
-    if let Some(value) = object.remove(config::KEY_ROUTING_STRATEGY) {
-        if !value.is_null() {
-            let Some(text) = value.as_str() else {
-                return errors::management_error(
-                    400,
-                    format!("{} 必须是字符串", config::KEY_ROUTING_STRATEGY),
-                );
-            };
-            let Some(mapped) = legacy_strategy(text) else {
-                return errors::management_error(400, format!("未知的路由策略「{text}」"));
-            };
-            object.insert(
-                config::KEY_ROUTING_STRATEGY_DEFAULT.to_string(),
-                Value::String(mapped.as_str().to_string()),
+    let mut patch = RoutingPatch::default();
+    if let Some(value) = object.get(config::KEY_ROUTING_STRATEGY) {
+        let Some(text) = value.as_str() else {
+            return errors::management_error(400, "strategy 必须是字符串");
+        };
+        let known = [
+            config::ROUTING_STRATEGY_ORDER,
+            config::ROUTING_STRATEGY_ROTATE,
+            config::ROUTING_STRATEGY_PROVIDER,
+        ];
+        if !known.contains(&text) {
+            return errors::management_error(
+                400,
+                format!("未知的路由策略「{text}」（只支持 {}）", known.join(" / ")),
             );
         }
+        patch.strategy = Some(config::RouteStrategy::from_id(text));
     }
-    if let Err(message) = super::routing_strategy::apply_object(&object) {
-        return errors::management_error(400, message);
+    if let Some(value) = object.get(config::KEY_ROUTING_STICKY) {
+        let Some(text) = value.as_str() else {
+            return errors::management_error(400, "sticky 必须是字符串");
+        };
+        let known = [
+            config::STICKY_AUTO,
+            config::STICKY_SESSION,
+            config::STICKY_TURN,
+            config::STICKY_OFF,
+        ];
+        if !known.contains(&text) {
+            return errors::management_error(
+                400,
+                format!("未知的会话粘性档位「{text}」（只支持 {}）", known.join(" / ")),
+            );
+        }
+        patch.sticky = Some(config::StickyMode::from_id(text));
     }
-    ok_json(with_legacy_strategy(super::routing_strategy::routing_json()))
-}
-
-/// 旧字符串 → 策略（写侧口径：未知给 `None`，由调用方报 400）。
-///
-/// 迁移表与读侧（`RoutingStrategy::from_config`）**同一份**：`rotate` 是上游的
-/// 「整表轮转」→ `global-round-robin`，`provider` 是「家内轮询」→ `round-robin`
-/// —— 两个轮询边界必须分开，早先 `rotate`→`round-robin` 把全局轮转降级成了家内轮转。
-fn legacy_strategy(text: &str) -> Option<RoutingStrategy> {
-    match text.trim().to_ascii_lowercase().as_str() {
-        "order" => Some(RoutingStrategy::Priority),
-        "rotate" => Some(RoutingStrategy::GlobalRoundRobin),
-        "provider" => Some(RoutingStrategy::RoundRobin),
-        "usage" => Some(RoutingStrategy::BalanceWeighted),
-        _ => RoutingStrategy::parse(text),
-    }
-}
-
-/// 在统一 JSON 上补一个旧字符串字段 `routingStrategy`（旧界面 / 旧脚本读它）。
-/// 只映射 `priority` → `order`、`round-robin` → `provider`、`global-round-robin`
-/// → `rotate`，其余给新档位 id（与 `legacy_strategy` 对称）。
-fn with_legacy_strategy(mut value: Value) -> Value {
-    let default = config::routing_strategy_settings().default;
-    let legacy = match default {
-        RoutingStrategy::Priority => "order",
-        RoutingStrategy::RoundRobin => "provider",
-        RoutingStrategy::GlobalRoundRobin => "rotate",
-        other => other.as_str(),
+    let bool_field = |key: &str| -> Result<Option<bool>, Response> {
+        match object.get(key) {
+            None => Ok(None),
+            Some(Value::Bool(value)) => Ok(Some(*value)),
+            Some(_) => Err(errors::management_error(400, format!("{key} 必须是布尔值"))),
+        }
     };
-    if let Some(object) = value.as_object_mut() {
-        object.insert(
-            config::KEY_ROUTING_STRATEGY.to_string(),
-            Value::String(legacy.to_string()),
-        );
+    let failover_backoff = match bool_field(config::KEY_ROUTING_FAILOVER_BACKOFF) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let sink = match bool_field(config::KEY_ROUTING_SINK) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let breaker_enabled = match bool_field(config::KEY_ROUTING_BREAKER_ENABLED) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    patch.failover_backoff = failover_backoff;
+    patch.sink = sink;
+    patch.breaker_enabled = breaker_enabled;
+    let int_field = |key: &str, min: i64, max: i64| -> Result<Option<i64>, Response> {
+        match object.get(key) {
+            None => Ok(None),
+            Some(value) => match value.as_i64() {
+                Some(count) if (min..=max).contains(&count) => Ok(Some(count)),
+                _ => Err(errors::management_error(
+                    400,
+                    format!("{key} 必须是 {min}~{max} 的整数"),
+                )),
+            },
+        }
+    };
+    patch.breaker_threshold = match int_field(
+        config::KEY_ROUTING_BREAKER_THRESHOLD,
+        config::ROUTING_BREAKER_MIN_THRESHOLD,
+        config::ROUTING_BREAKER_MAX_THRESHOLD,
+    ) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    patch.breaker_timeout_seconds = match int_field(
+        config::KEY_ROUTING_BREAKER_TIMEOUT,
+        config::ROUTING_BREAKER_MIN_TIMEOUT,
+        config::ROUTING_BREAKER_MAX_TIMEOUT,
+    ) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    patch.breaker_success_threshold = match int_field(
+        config::KEY_ROUTING_BREAKER_SUCCESS,
+        config::ROUTING_BREAKER_MIN_SUCCESS,
+        config::ROUTING_BREAKER_MAX_SUCCESS,
+    ) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let previous_sticky = config::routing_settings().sticky;
+    if !config::set_routing(patch) {
+        return errors::management_error(500, "路由设置落盘失败");
     }
-    value
+    if previous_sticky != config::routing_settings().sticky {
+        _state.upstream().clear_route_sticky(None, None);
+    }
+    ok_json(routing_json(config::routing_settings()))
 }
 
-/// 路由附加维度的 JSON（`/api/routing/workspace` 的 `settings` 字段）。
-///
-/// 本地 `RoutingSettings` 不含策略维度（策略是逐家的
-/// `RoutingStrategySettings`），所以策略从 `routing_strategy_settings().default`
-/// 取 —— 与统一端点 `/api/routing-strategy` 的默认档位保持一致。
-pub(crate) fn routing_json(settings: config::RoutingSettings) -> Value {
+pub(crate) fn routing_json(settings: RoutingSettings) -> Value {
     json!({
-        config::KEY_ROUTING_STRATEGY: config::routing_strategy_settings().default.as_str(),
+        config::KEY_ROUTING_STRATEGY: settings.strategy.as_str(),
         config::KEY_ROUTING_STICKY: settings.sticky.as_str(),
         config::KEY_ROUTING_FAILOVER_BACKOFF: settings.failover_backoff,
         config::KEY_ROUTING_SINK: settings.sink,
@@ -132,7 +167,7 @@ pub(crate) fn routing_json(settings: config::RoutingSettings) -> Value {
 /// GET /api/routing/queue?model=
 pub async fn get_routing_queue(
     State(state): State<ServerState>,
-    Query(params): Query<HashMap<String, String>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let model = params
         .get("model")
@@ -142,7 +177,6 @@ pub async fn get_routing_queue(
     ok_json(queue_json(&state, model))
 }
 
-/// 候选队列的 JSON（`/api/routing/queue` 与工作台共用同一份实现）。
 pub(crate) fn queue_json(state: &ServerState, model: Option<String>) -> Value {
     let accounts = routing::accounts_of(&state.store().list_visible_accounts());
     queue_for_accounts(state, model, &accounts)
@@ -157,23 +191,17 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
         None => Vec::new(),
     };
     let scoped: Vec<Value> = match model.as_deref() {
-        Some(_) => accounts
-            .iter()
+        Some(_) => accounts.iter()
             .filter(|account| providers.contains(&routing::provider_of(account).to_string()))
             .cloned().collect(),
         None => accounts.to_vec(),
     };
     let scoped = crate::server::core::routing_scope::apply_accounts(
-        &scoped,
-        model.as_deref().unwrap_or(""),
+        &scoped, model.as_deref().unwrap_or(""),
     );
-    let routable: Vec<Value> = scoped
-        .iter()
-        .filter(|account| {
-            !crate::server::core::providers::readiness::gated(routing::provider_of(account))
-        })
-        .cloned()
-        .collect();
+    let routable: Vec<Value> = scoped.iter()
+        .filter(|account| !crate::server::core::providers::readiness::gated(routing::provider_of(account)))
+        .cloned().collect();
     let scoped = if routable.is_empty() { scoped } else { routable };
     let now = crate::server::logging::now_ms();
     let counts: HashMap<String, usize> = state
@@ -189,26 +217,18 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
     let limiter_counts = crate::server::core::limiter::counter::facts();
     let limiter_blocked: HashSet<String> = scoped
         .iter()
-        .filter(|account| {
-            crate::server::core::limiter::evaluate::blocked(
-                account,
-                &keys.for_account(account),
-                &facts,
-                &limiter_counts,
-                now,
-            )
-        })
+        .filter(|account| crate::server::core::limiter::evaluate::blocked(
+            account, &keys.for_account(account), &facts, &limiter_counts, now,
+        ))
         .filter_map(|account| routing::account_id(account).map(str::to_string))
         .collect();
-    let settings = config::routing_settings();
+    let settings = config::routing_settings_for_model(model.as_deref().unwrap_or(""));
+    // 本地独有：逐家 6 档策略 + 运行时状态 + 余额事实表（面板预演不推进策略）。
     let strategies = config::routing_strategy_settings();
-    // 余额事实表：余额加权的权重来源（未知余额的账号不在表里）
     let balances: HashMap<String, f64> = crate::server::core::usage_records::balance_facts()
         .into_iter()
         .filter_map(|(id, fact)| fact.remaining.map(|remaining| (id, remaining)))
         .collect();
-    // 面板只**看**当前状态，不做粘性查找、不推进有状态策略（游标 / LRU / 加权轮询）
-    // —— 预演不该刷新任何会话的计时，也不该消耗下一次轮询
     let routing_state = state.upstream().routing();
     let (sunk, resting, open) = state.upstream().route_queue_facts(now);
     let meta = routing::PlanMeta {
@@ -237,7 +257,7 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
         })
     };
     json!({
-        "strategy": strategies.default.as_str(),
+        "strategy": settings.strategy.as_str(),
         "sticky": settings.sticky.as_str(),
         "model": model.clone().map(Value::String).unwrap_or(Value::Null),
         "modelKnown": model.as_ref().map(|_| !providers.is_empty()),

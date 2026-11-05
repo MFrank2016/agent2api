@@ -767,6 +767,10 @@ impl AccountStore {
             let current = record.enabled();
             if next != current {
                 record.set_enabled(next);
+                if next && !record.get("upstreamCooldownUntil").and_then(Value::as_i64)
+                    .is_some_and(|until| until > logging::now_ms()) {
+                    record.remove("upstreamBlockedReason");
+                }
                 changes.push(if next { "已启用".to_string() } else { "已禁用".to_string() });
                 // 用户手动改动启用状态：清掉「余额不足自动禁用」标记（只有
                 // **真的变化**时才清，设置弹窗把当前 enabled 原样回传不算手动

@@ -34,6 +34,8 @@ import * as React from 'react'
 import {
   CATEGORIES,
   CAPTCHA_POOL_FIELDS,
+  IMAGE_COMPRESS_ENABLED_KEY,
+  IMAGE_COMPRESS_FIELDS,
   NO_RETRY_CODES_KEY,
   PROMPT_MODES,
   QUEUE_FIELDS,
@@ -84,6 +86,7 @@ export type BusyScope =
   | 'codes'
   | 'timeouts'
   | 'queue'
+  | 'imageCompress'
   | 'captchaPool'
   | 'routing'
   | 'debug'
@@ -159,6 +162,17 @@ export type DebugState = {
 
 /** 开发者角色兼容开关 */
 export type DeveloperRoleCompatState = { status: LoadStatus; on: boolean }
+
+/**
+ * 会话图片压缩：一个开关 + 三项参数。`values` 为 null（loading / unavailable）
+ * 时三个输入框保持禁用；`enabled` 在读到之前按关显示（与 developerRoleCompat
+ * 同款降级口径）。
+ */
+export type ImageCompressState = {
+  status: LoadStatus
+  enabled: boolean
+  values: Record<string, number> | null
+}
 
 /** 剥离响应开头思考标签的全局开关；与 SanitizeState 同形 */
 export type ThinkStripState = { status: LoadStatus; on: boolean }
@@ -300,6 +314,8 @@ export type SettingsSnapshot = {
   retryCodes: number[] | null
   timeouts: NumericState
   queue: NumericState
+  /** 会话图片压缩：开关 + 三项参数（长边 / 质量 / 阈值） */
+  imageCompress: ImageCompressState
   captchaPool: NumericState
   /** 账号路由：策略 + 会话粘性（「路由」分类） */
   routing: RoutingState
@@ -442,6 +458,7 @@ const INITIAL: SettingsSnapshot = {
   retryCodes: null,
   timeouts: { status: 'loading', values: null },
   queue: { status: 'loading', values: null },
+  imageCompress: { status: 'loading', enabled: true, values: null },
   captchaPool: { status: 'loading', values: null },
   routing: { status: 'loading', strategy: 'order', sticky: 'auto', failoverBackoff: true, sink: true, breakerEnabled: false },
   debug: { status: 'loading', on: false, count: null, limit: null },
@@ -1377,7 +1394,7 @@ async function commitRetention(field: RetentionField, value: number, shrinking: 
  * 直接换号」名单）由各自的代码实现，在数据到达 / 不可用时被回调一次。
  */
 type NumericPanel = {
-  scope: 'retry' | 'timeouts' | 'queue' | 'captchaPool'
+  scope: 'retry' | 'timeouts' | 'queue' | 'imageCompress' | 'captchaPool'
   fields: NumberField[]
   consoleLabel: string
   /** 取数 / 写回：桥不在时给 undefined（各调用点按「读不到」处理） */
@@ -1459,6 +1476,64 @@ export async function loadQueue(): Promise<void> {
 
 export async function saveQueueField(field: NumberField, raw: string): Promise<void> {
   await saveNumericField(queuePanel, field, raw)
+}
+
+/* ─── 会话图片压缩（开关 + 三项参数）────────────── */
+
+/** 从响应里读开关（非对象 / 字段不是字面 true 都算关，与后端「只认字面 true」一致） */
+function imageCompressEnabledFlag(data: unknown): boolean {
+  if (!data || typeof data !== 'object') return false
+  return (data as Record<string, unknown>)[IMAGE_COMPRESS_ENABLED_KEY] === true
+}
+
+/**
+ * 图片压缩面板：三项数字复用数字面板的取数 / 写入 / 回滚流程；开关另走一条
+ * 只改一个布尔值的保存路径（与 developerRoleCompat 同款）。两者共用同一条
+ * `/api/image-compress` 端点，响应里同时带开关与三项参数。
+ */
+const imageCompressPanel: NumericPanel = {
+  scope: 'imageCompress',
+  fields: IMAGE_COMPRESS_FIELDS,
+  consoleLabel: '读取会话图片压缩设置',
+  get: () => shared().workbuddyDesktop?.getImageCompress(),
+  save: patch => shared().workbuddyDesktop?.saveImageCompress(patch),
+  read: () => ({ status: snapshot.imageCompress.status, values: snapshot.imageCompress.values }),
+  write: state => publish({
+    imageCompress: { ...snapshot.imageCompress, status: state.status, values: state.values },
+  }),
+  // 同一份响应里还带开关；数字面板不认布尔值，这里顺手回写
+  syncExtras: data => {
+    publish({ imageCompress: { ...snapshot.imageCompress, enabled: imageCompressEnabledFlag(data) } })
+  },
+}
+
+export function renderImageCompress(data?: unknown): void {
+  renderNumericPanel(imageCompressPanel, data)
+}
+
+export async function loadImageCompress(): Promise<void> {
+  await loadNumericPanel(imageCompressPanel)
+}
+
+export async function saveImageCompressField(field: NumberField, raw: string): Promise<void> {
+  await saveNumericField(imageCompressPanel, field, raw)
+}
+
+/** 开关的保存路径（只改一个布尔值；失败回滚到后端真实值） */
+export async function saveImageCompressEnabled(next: boolean): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('imageCompress')
+  publish({ imageCompress: { ...snapshot.imageCompress, enabled: next } })
+  try {
+    const saved = await shared().workbuddyDesktop?.saveImageCompress({ [IMAGE_COMPRESS_ENABLED_KEY]: next })
+    renderImageCompress(saved)
+    toast(next ? t('✅ 会话图片压缩已开启') : t('已关闭会话图片压缩'))
+  } catch (error) {
+    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
+    await loadImageCompress() // 回滚到后端的真实值
+  } finally {
+    endBusy()
+  }
 }
 
 /* ─── 验证码令牌池 ─────────────────────────── */
@@ -1773,121 +1848,6 @@ export async function saveSanitizeConfig(patch: SanitizePatch, message?: string)
   } catch (error) {
     toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
     return false
-  } finally {
-    endBusy()
-  }
-}
-
-/* ─── 剥离响应开头的思考标签（全局开关）── */
-
-export function renderThinkStrip(data?: unknown): void {
-  if (data === undefined) return
-  if (!data || typeof data !== 'object') {
-    publish({ thinkStrip: { status: 'unavailable', on: false } })
-    return
-  }
-  const record = data as Record<string, unknown>
-  publish({ thinkStrip: { status: 'ready', on: record.stripLeadingThink === true } })
-}
-
-async function loadThinkStrip(): Promise<void> {
-  try {
-    renderThinkStrip(await shared().workbuddyDesktop?.getThinkStrip())
-  } catch (error) {
-    console.warn('读取思考标签剥离设置失败:', errorMessage(error))
-    renderThinkStrip(null)
-  }
-}
-
-export async function saveThinkStrip(next: boolean): Promise<void> {
-  if (busyScope) { repaint(); return }
-  beginBusy('thinkStrip')
-  publish({ thinkStrip: { status: 'ready', on: next } })
-  try {
-    const saved = await shared().workbuddyDesktop?.saveThinkStrip(next)
-    renderThinkStrip(saved)
-    toast(next ? t('✅ 已开启剥离响应开头的思考标签') : t('已关闭剥离响应开头的思考标签'))
-  } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadThinkStrip() // 回滚到后端的真实值
-  } finally {
-    endBusy()
-  }
-}
-
-/* ─── 逐家开关覆盖（providerOptions）── */
-
-/**
- * 归一化 `{providerOptions: {"<id>": {"<key>": true|false}}}`。
- *
- * 只收布尔值：后端 `set` 写进去的一定是布尔，别的东西（未来多出来的键）
- * 界面认不得就不渲染 —— 宁可少一行，也不要拿它去猜一个开关的状态。
- */
-export function renderProviderOptions(data?: unknown): void {
-  if (data === undefined) return
-  if (!data || typeof data !== 'object') {
-    publish({ providerOptions: { status: 'unavailable', overrides: {} } })
-    return
-  }
-  const record = data as Record<string, unknown>
-  publish({ providerOptions: { status: 'ready', overrides: providerOptionOverrides(record.providerOptions) } })
-}
-
-function providerOptionOverrides(raw: unknown): Record<string, Record<string, boolean>> {
-  if (!raw || typeof raw !== 'object') return {}
-  const out: Record<string, Record<string, boolean>> = {}
-  for (const [providerId, value] of Object.entries(raw as Record<string, unknown>)) {
-    if (!providerId || !value || typeof value !== 'object') continue
-    const entry: Record<string, boolean> = {}
-    for (const [key, flag] of Object.entries(value as Record<string, unknown>)) {
-      if (typeof flag === 'boolean') entry[key] = flag
-    }
-    if (Object.keys(entry).length) out[providerId] = entry
-  }
-  return out
-}
-
-async function loadProviderOptions(): Promise<void> {
-  try {
-    renderProviderOptions(await shared().workbuddyDesktop?.getProviderOptions())
-  } catch (error) {
-    console.warn('读取逐家开关覆盖失败:', errorMessage(error))
-    renderProviderOptions(null)
-  }
-}
-
-/**
- * 写一家的一项覆盖。`value` 为 `null` = 删掉这项覆盖、回到「跟随全局」。
- */
-export async function saveProviderOption(
-  providerId: string,
-  key: string,
-  value: boolean | null,
-  providerLabel?: string,
-  keyLabel?: string,
-): Promise<void> {
-  if (busyScope) { repaint(); return }
-  beginBusy('providerOptions')
-  const optimistic: Record<string, Record<string, boolean>> = { ...snapshot.providerOptions.overrides }
-  const entry: Record<string, boolean> = { ...(optimistic[providerId] ?? {}) }
-  if (value === null) delete entry[key]
-  else entry[key] = value
-  if (Object.keys(entry).length) optimistic[providerId] = entry
-  else delete optimistic[providerId]
-  publish({ providerOptions: { status: 'ready', overrides: optimistic } })
-  const provider = providerLabel || providerId
-  const label = keyLabel || key
-  try {
-    const saved = await shared().workbuddyDesktop?.saveProviderOption(providerId, key, value)
-    renderProviderOptions(saved)
-    toast(value === null
-      ? t('✅ {provider} 的「{key}」已回到跟随全局', { provider, key: label })
-      : value
-        ? t('✅ {provider} 的「{key}」已设为开', { provider, key: label })
-        : t('✅ {provider} 的「{key}」已设为关', { provider, key: label }))
-  } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadProviderOptions() // 回滚到后端的真实值
   } finally {
     endBusy()
   }
@@ -2780,11 +2740,10 @@ export async function load(): Promise<void> {
     loadRetry(),
     loadTimeouts(),
     loadQueue(),
+    loadImageCompress(),
     loadCaptchaPool(),
     loadDebug(),
     loadSanitize(),
-    loadThinkStrip(),
-    loadProviderOptions(),
     loadDeveloperRoleCompat(),
     loadClineHeaders(),
     loadZcodeVersion(),
@@ -2825,6 +2784,11 @@ export async function refreshQueue(): Promise<void> {
   toast(t('排队等待设置已刷新'))
 }
 
+export async function refreshImageCompress(): Promise<void> {
+  await loadImageCompress()
+  toast(t('会话图片压缩设置已刷新'))
+}
+
 export async function refreshCaptchaPool(): Promise<void> {
   await loadCaptchaPool()
   toast(t('验证码令牌池设置已刷新'))
@@ -2845,16 +2809,6 @@ export async function refreshSanitize(): Promise<void> {
   toast(t('指纹脱敏设置已刷新'))
 }
 
-export async function refreshThinkStrip(): Promise<void> {
-  await loadThinkStrip()
-  toast(t('思考标签剥离设置已刷新'))
-}
-
-export async function refreshProviderOptions(): Promise<void> {
-  await loadProviderOptions()
-  toast(t('逐家开关覆盖已刷新'))
-}
-
 export async function refreshDeveloperRoleCompat(): Promise<void> {
   await loadDeveloperRoleCompat()
   toast(t('开发者角色兼容设置已刷新'))
@@ -2873,4 +2827,130 @@ export async function refreshPrompt(): Promise<void> {
 export async function refreshStorage(): Promise<void> {
   await loadStorage()
   toast(t('存储概况已刷新'))
+}
+
+/* ─── 本地独有（beta）：think-strip / 逐家开关覆盖 ─────────────── */
+/* ─── 剥离响应开头的思考标签（全局开关）── */
+
+export function renderThinkStrip(data?: unknown): void {
+  if (data === undefined) return
+  if (!data || typeof data !== 'object') {
+    publish({ thinkStrip: { status: 'unavailable', on: false } })
+    return
+  }
+  const record = data as Record<string, unknown>
+  publish({ thinkStrip: { status: 'ready', on: record.stripLeadingThink === true } })
+}
+
+async function loadThinkStrip(): Promise<void> {
+  try {
+    renderThinkStrip(await shared().workbuddyDesktop?.getThinkStrip())
+  } catch (error) {
+    console.warn('读取思考标签剥离设置失败:', errorMessage(error))
+    renderThinkStrip(null)
+  }
+}
+
+export async function saveThinkStrip(next: boolean): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('thinkStrip')
+  publish({ thinkStrip: { status: 'ready', on: next } })
+  try {
+    const saved = await shared().workbuddyDesktop?.saveThinkStrip(next)
+    renderThinkStrip(saved)
+    toast(next ? t('✅ 已开启剥离响应开头的思考标签') : t('已关闭剥离响应开头的思考标签'))
+  } catch (error) {
+    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
+    await loadThinkStrip() // 回滚到后端的真实值
+  } finally {
+    endBusy()
+  }
+}
+
+/* ─── 逐家开关覆盖（providerOptions）── */
+
+/**
+ * 归一化 `{providerOptions: {"<id>": {"<key>": true|false}}}`。
+ *
+ * 只收布尔值：后端 `set` 写进去的一定是布尔，别的东西（未来多出来的键）
+ * 界面认不得就不渲染 —— 宁可少一行，也不要拿它去猜一个开关的状态。
+ */
+export function renderProviderOptions(data?: unknown): void {
+  if (data === undefined) return
+  if (!data || typeof data !== 'object') {
+    publish({ providerOptions: { status: 'unavailable', overrides: {} } })
+    return
+  }
+  const record = data as Record<string, unknown>
+  publish({ providerOptions: { status: 'ready', overrides: providerOptionOverrides(record.providerOptions) } })
+}
+
+function providerOptionOverrides(raw: unknown): Record<string, Record<string, boolean>> {
+  if (!raw || typeof raw !== 'object') return {}
+  const out: Record<string, Record<string, boolean>> = {}
+  for (const [providerId, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!providerId || !value || typeof value !== 'object') continue
+    const entry: Record<string, boolean> = {}
+    for (const [key, flag] of Object.entries(value as Record<string, unknown>)) {
+      if (typeof flag === 'boolean') entry[key] = flag
+    }
+    if (Object.keys(entry).length) out[providerId] = entry
+  }
+  return out
+}
+
+async function loadProviderOptions(): Promise<void> {
+  try {
+    renderProviderOptions(await shared().workbuddyDesktop?.getProviderOptions())
+  } catch (error) {
+    console.warn('读取逐家开关覆盖失败:', errorMessage(error))
+    renderProviderOptions(null)
+  }
+}
+
+/**
+ * 写一家的一项覆盖。`value` 为 `null` = 删掉这项覆盖、回到「跟随全局」。
+ */
+export async function saveProviderOption(
+  providerId: string,
+  key: string,
+  value: boolean | null,
+  providerLabel?: string,
+  keyLabel?: string,
+): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('providerOptions')
+  const optimistic: Record<string, Record<string, boolean>> = { ...snapshot.providerOptions.overrides }
+  const entry: Record<string, boolean> = { ...(optimistic[providerId] ?? {}) }
+  if (value === null) delete entry[key]
+  else entry[key] = value
+  if (Object.keys(entry).length) optimistic[providerId] = entry
+  else delete optimistic[providerId]
+  publish({ providerOptions: { status: 'ready', overrides: optimistic } })
+  const provider = providerLabel || providerId
+  const label = keyLabel || key
+  try {
+    const saved = await shared().workbuddyDesktop?.saveProviderOption(providerId, key, value)
+    renderProviderOptions(saved)
+    toast(value === null
+      ? t('✅ {provider} 的「{key}」已回到跟随全局', { provider, key: label })
+      : value
+        ? t('✅ {provider} 的「{key}」已设为开', { provider, key: label })
+        : t('✅ {provider} 的「{key}」已设为关', { provider, key: label }))
+  } catch (error) {
+    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
+    await loadProviderOptions() // 回滚到后端的真实值
+  } finally {
+    endBusy()
+  }
+}
+
+export async function refreshThinkStrip(): Promise<void> {
+  await loadThinkStrip()
+  toast(t('思考标签剥离设置已刷新'))
+}
+
+export async function refreshProviderOptions(): Promise<void> {
+  await loadProviderOptions()
+  toast(t('逐家开关覆盖已刷新'))
 }

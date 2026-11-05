@@ -11,13 +11,13 @@ import { t } from '../i18n'
 import {
   allAccounts, bump, findAccount, getStore, isPicked, patch,
 } from './accounts-store'
-import { proxyPoolSnapshot, refreshProxyPool } from './proxy-pool-cache'
+import { invalidateProxyPoolCache, proxyPoolSnapshot, refreshProxyPool } from './proxy-pool-cache'
 import { installListRefresh, refreshList } from './accounts-refresh'
 import { syncAccountSorting } from './accounts-sort'
 import { confirmBatchResult, refreshSavedAccounts, updateAccountConfirmed } from './accounts-update'
 import {
   applyBalances, pruneUsageCache, queryAllUsage, queryUsageFor, refreshUsageAfterCheckin,
-  syncBalancesSnapshot, tokenUsageOf, usageEntryOf, usageFailureOf as usageFailureOfBase,
+  syncBalancesSnapshot, tokenUsageOf, usageEntryOf,
 } from './accounts-usage'
 
 export * from './accounts-usage'
@@ -27,33 +27,6 @@ export { refreshList } from './accounts-refresh'
 // 状态层原样再导出：视图侧（accounts-page / panels / dialogs）只认本文件这一条路径
 export * from './accounts-store'
 export { saveGroupSortRules as setGroupSortRules } from './accounts-sort'
-
-/**
- * 「凭据已被上游作废、刷新也救不回来」的标记（与后端
- * `providers::adapter::USAGE_CREDENTIAL_DEAD_CODE` 逐字一致）。
- *
- * 本地分支保留：与「未配置」同属非故障，账号本身没问题，
- * 只是需要用户重新登录，所以不该渲染成红色「查询失败」。
- * 后端自动查询对这条 code 退避 1 小时（见 `USAGE_CREDENTIAL_DEAD_BACKOFF_MS`）。
- */
-export const CREDENTIAL_DEAD_CODE = 'usage_credential_dead'
-
-/**
- * 余额失败结论的分类。上游 beta.6 把 `usageFailureOf` 拆到 accounts-usage-cache，
- * 这里在其结果上补回本地分支的 `credentialDead` 判定。
- */
-export function usageFailureOf(entry: UsageEntry): {
-  message: string
-  notConfigured: boolean
-  credentialDead: boolean
-} | null {
-  const failure = usageFailureOfBase(entry)
-  if (!failure) return null
-  return {
-    ...failure,
-    credentialDead: typeof entry === 'object' && entry !== null && entry.code === CREDENTIAL_DEAD_CODE,
-  }
-}
 
 /* ─── 代理池（「网络代理」页的命名代理，账号页的代理下拉）─── */
 
@@ -327,26 +300,8 @@ export const PROXY_CUSTOM_EDIT = '__proxy_custom_edit__'
  *
  * ZCode 的「领套餐」同一场收敛：账号页那颗按钮已撤（套餐明细与逐份领取在
  * 签到中心的「活动福利」卡，那一行点开的就是同一个 `wbZcodePlans` 弹窗），
- * 本地分支的 checkin-page 仍直接调用 `openZcodePlans`，故保留下面这个中转（上游 beta.4 已删）。
+ * 原先只服务它的 `openZcodePlans` 一并删掉。
  */
-
-/**
- * 打开 ZCode「套餐明细」弹窗（本地分支保留；上游 beta.4 已把入口整体迁到签到中心）。
- *
- * 账号页不再有这颗按钮，但签到中心的「活动福利」卡仍走同一个 `wbZcodePlans` 弹窗，
- * 本地 checkin-page 直接调用本函数，所以这里保留中转。
- */
-export function openZcodePlans(id: string, name?: string): void {
-  const account = findAccount(id)
-  if (!account) { toast(t('账号不存在，请刷新后重试'), 'err'); return }
-  const modal = shared().wbZcodePlans
-  if (!modal?.open) {
-    // 岛还没挂上（构建产物没更新 / 加载失败）：如实说一句，别静默什么都不做
-    toast(t('套餐明细弹窗未加载，请重启应用后重试'), 'err')
-    return
-  }
-  modal.open({ id, name: name || account.name })
-}
 
 /* ─── 对外契约（window）────────────────────── */
 
@@ -521,7 +476,28 @@ export function installAccountsApi(): void {
     closeBatch: closeDialog,
     /** 「添加账号」弹窗打开时可用：按 providers 摘要重建选项并复位到 WorkBuddy */
     syncAddProvider: () => shared().wbAccountAddForms?.syncAddProvider?.(),
-
-    invalidate: () => { void refreshProxyPool() },
+    
+    // 只失效缓存，不立刻出网：refresh() 每次轮询都会调这里，而代理池只有
+    // 账号页真正用得到。切到账号页时 showPage 会调 refreshProxyPool() 强制重读。
+    invalidate: () => { invalidateProxyPoolCache() },
   }
+}
+
+/* ─── 本地独有（beta）：签到中心活动福利卡 → ZCode 套餐弹窗 ───────────── */
+
+/**
+ * 打开 ZCode「套餐明细」弹窗（本地分支保留；上游 3.4.1 已把入口整体迁到签到中心）。
+ *
+ * 账号页不再有这颗按钮，但签到中心的「活动福利」卡仍走同一个 `wbZcodePlans` 弹窗，
+ * 本地 checkin-page 直接调用本函数，所以这里保留中转。
+ */
+export function openZcodePlans(id: string, name?: string): void {
+  const account = findAccount(id)
+  if (!account) { toast(t('账号不存在，请刷新后重试'), 'err'); return }
+  const modal = shared().wbZcodePlans
+  if (!modal?.open) {
+    toast(t('套餐明细弹窗未加载，请重启应用后重试'), 'err')
+    return
+  }
+  modal.open({ id, name: name || account.name })
 }
