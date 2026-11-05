@@ -58,7 +58,6 @@ mod payload;
 mod provider_loop;
 mod rotate;
 mod route_state;
-mod route_context;
 mod conversation_ids;
 mod route_sticky;
 pub mod sse;
@@ -397,11 +396,6 @@ impl UpstreamService {
         if cancel.as_ref().is_some_and(|token| token.is_cancelled()) {
             return Err(cancellation::cancelled_error());
         }
-        let route_model = request.body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
-        let route_store = self.store.clone();
-        let routing = crate::server::core::blocking::run(move || {
-            route_context::RequestRouting::capture(&route_model, &route_store)
-        }).await?;
         let mut slot = self.begin_slot(&request.dedupe_key, cancel.as_ref()).await;
         // 账号级活跃连接计数：**本请求**的凭证，随选路改绑到实际使用的账号。
         // 建在这里（而不是选路处）是因为它必须活到响应体发完 —— 流式路径由
@@ -455,7 +449,6 @@ impl UpstreamService {
         let proxy_override = request.proxy_override;
         let context = payload::ProviderContext {
             body: &upstream_body,
-            routing,
             stream: request.stream,
             images,
             client_headers: &request.client_headers,

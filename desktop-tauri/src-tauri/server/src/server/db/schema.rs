@@ -883,6 +883,44 @@ SELECT 'legacy:' || row_id, account_id,
        ts, MAX(total_tokens, 0), 1
 FROM requests WHERE account_id != '' AND status != 0 AND attempts > 0;
 ";
+/// 版本 21：fork 线 Key 身份归并到上游 `api_key_*`（schema v21）。
+///
+/// 见 [`SCHEMA_VERSION`] 的 v21 段。可重复执行：建表 / 建索引用
+/// `IF NOT EXISTS`，回填用 `WHERE ... = ''`，旧索引用 `DROP INDEX IF EXISTS`。
+const V21_SCHEMA: &str = "
+-- ── 补建上游 v17 的限额事件表（停在 fork v17 的库跳过了该分支）──
+CREATE TABLE IF NOT EXISTS account_limiter_events (
+  row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  account_id TEXT NOT NULL,
+  model TEXT NOT NULL DEFAULT '',
+  channel TEXT NOT NULL DEFAULT '',
+  ts INTEGER NOT NULL,
+  tokens INTEGER NOT NULL DEFAULT 0,
+  requests INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_limiter_events_account_time ON account_limiter_events(account_id, ts, channel);
+INSERT OR IGNORE INTO account_limiter_events (id, account_id, model, ts, tokens, requests)
+SELECT 'legacy:' || row_id, account_id,
+       CASE WHEN upstream_model != '' THEN upstream_model ELSE model END,
+       ts, MAX(total_tokens, 0), 1
+FROM requests WHERE account_id != '' AND status != 0 AND attempts > 0;
+-- ── fork 线旧索引已被 v18 的 idx_requests_api_key_ts 取代 ──
+DROP INDEX IF EXISTS idx_requests_key_ts;
+";
+
+/// v21 的**条件回填**：仅当 `requests` 还带 fork 线的 `key_id` 列时执行。
+///
+/// 上游线（v17～v20）根本没有这两列，直接跑这条 SQL 会报 `no such column`；
+/// 是否执行由 [`migrate_v21`] 先查 `pragma_table_info` 决定。
+const V21_LEGACY_KEY_BACKFILL: &str = "
+UPDATE requests SET api_key_id = key_id, api_key_source = 'key'
+WHERE api_key_id = '' AND key_id != '';
+UPDATE requests SET api_key_name = key_name
+WHERE api_key_name = '' AND key_name != '';
+";
+
+
 
 /// 版本 23：requests 补「积分消耗」一列（schema v23）。
 ///
@@ -1067,9 +1105,11 @@ fn apply_version(
         18 => conn.execute_batch(include_str!("schema_source_stats.sql")),
         19 => conn.execute_batch(include_str!("schema_assistant_images.sql")),
         20 => conn.execute_batch(include_str!("schema_debug_raw.sql")),
-        21 => conn.execute_batch(include_str!("schema_assistant_title.sql")),
-        // v22：清掉「模型目录刷新」在旧成败判据下累积的假失败冷却（见 V22 注释）
-        22 => reset_model_refresh_cooldown(conn),
+        // v21：上游 assistant_sessions.title_generated + 本地 fork 线 Key 身份
+        // 归并（补建限额事件表 / 清旧索引 / api_key_* 条件回填）。两者都幂等。
+        21 => migrate_v21(conn),
+        // v22：清掉模型目录刷新的假失败冷却；无 kv 表的极简库跳过数据修复。
+        22 => migrate_v22(conn),
         // v23：requests 补「积分消耗」一列（请求日志的积分列，见 V23_SCHEMA）
         23 => conn.execute_batch(V23_SCHEMA),
         _ => Ok(()),
@@ -1101,6 +1141,47 @@ fn apply_version(
 ///
 /// 失败不致命：状态是 `kv.backgroundTaskState` 里的一份 JSON，读不到 / 解析不出
 /// 就当作「没有要修的」，不让它挡住整个升级。
+/// v21 并集：上游 3.4.1 的 `assistant_sessions.title_generated`（其 v21）与
+/// 本 fork 的「Key 身份归并 + 补建上游 v17 限额事件表」（fork v21）都执行。
+/// 全部幂等，停在 fork v17 的库不会丢 Key 明细。
+fn migrate_v21(conn: &Connection) -> rusqlite::Result<()> {
+    let sessions_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'assistant_sessions'",
+        [], |row| row.get(0),
+    )?;
+    if sessions_exists > 0 {
+        let has_title: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('assistant_sessions') WHERE name = 'title_generated'",
+            [], |row| row.get(0),
+        )?;
+        if has_title == 0 {
+            conn.execute_batch(include_str!("schema_assistant_title.sql"))?;
+        }
+    }
+    conn.execute_batch(V21_SCHEMA)?;
+    let legacy_key_column: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('requests') WHERE name = 'key_id'",
+        [], |row| row.get(0),
+    )?;
+    if legacy_key_column > 0 {
+        conn.execute_batch(V21_LEGACY_KEY_BACKFILL)?;
+    }
+    Ok(())
+}
+
+/// v22：清掉模型目录刷新的假失败冷却。无 kv 表（测试夹具 / 极简库）时跳过，
+/// 避免 `no such table: kv` 挡住整个升级。
+fn migrate_v22(conn: &Connection) -> rusqlite::Result<()> {
+    let kv_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'kv'",
+        [], |row| row.get(0),
+    )?;
+    if kv_exists > 0 {
+        reset_model_refresh_cooldown(conn)?;
+    }
+    Ok(())
+}
+
 fn reset_model_refresh_cooldown(conn: &Connection) -> rusqlite::Result<()> {
     use rusqlite::OptionalExtension;
     use serde_json::{json, Map, Value};
@@ -1132,4 +1213,86 @@ fn reset_model_refresh_cooldown(conn: &Connection) -> rusqlite::Result<()> {
         rusqlite::params![encoded],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v20 存量库的最小形态：上游 v18 已建好 `api_key_*` 列，但 fork 线留下的
+    /// `key_id` / `key_name` 里还躺着 3 把 Key 的身份。v21 只该做映射回填。
+    ///
+    /// 实际承载 Key 身份的表是 `requests`（没有单独的 `keys` 表）——
+    /// 每行一次请求，`key_id` / `key_name` 是那次请求命中的 Key 快照。
+    fn open_v20_fixture() -> Connection {
+        let conn = Connection::open_in_memory().expect("内存库应当能建起来");
+        conn.execute_batch(
+            "CREATE TABLE requests (
+                row_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                id             TEXT NOT NULL,
+                ts             INTEGER NOT NULL DEFAULT 0,
+                model          TEXT NOT NULL DEFAULT '',
+                upstream_model TEXT NOT NULL DEFAULT '',
+                account_id     TEXT NOT NULL DEFAULT '',
+                status         INTEGER NOT NULL DEFAULT 0,
+                attempts       INTEGER NOT NULL DEFAULT 1,
+                total_tokens   INTEGER NOT NULL DEFAULT 0,
+                key_id         TEXT NOT NULL DEFAULT '',
+                key_name       TEXT NOT NULL DEFAULT '',
+                api_key_id     TEXT NOT NULL DEFAULT '',
+                api_key_name   TEXT NOT NULL DEFAULT '',
+                api_key_source TEXT NOT NULL DEFAULT ''
+            );
+            INSERT INTO requests (id, key_id, key_name) VALUES
+                ('r1', 'k-1', 'Key One'),
+                ('r2', 'k-2', 'Key Two'),
+                ('r3', 'k-3', 'Key Three');
+            PRAGMA user_version = 20;",
+        )
+        .expect("v20 fixture 应当能建起来");
+        conn
+    }
+
+    #[test]
+    fn migrates_v20_to_v21_without_losing_keys() {
+        let conn = open_v20_fixture();
+        migrate(&conn).expect("v20 → v21 迁移应当成功");
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("user_version 应当可读");
+        assert_eq!(version, 23);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))
+            .expect("明细行数应当可读");
+        assert_eq!(count, 3, "迁移不能丢任何一行 Key 明细");
+
+        let mut statement = conn
+            .prepare(
+                "SELECT key_id, api_key_id, key_name, api_key_name, api_key_source \
+                 FROM requests ORDER BY id",
+            )
+            .expect("回填结果应当可查");
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .expect("回填结果应当可读")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("回填结果应当可收集");
+
+        assert_eq!(rows.len(), 3);
+        for (key_id, api_key_id, key_name, api_key_name, api_key_source) in rows {
+            assert_eq!(api_key_id, key_id, "api_key_id 必须由 key_id 映射而来");
+            assert_eq!(api_key_name, key_name, "api_key_name 必须由 key_name 映射而来");
+            assert_eq!(api_key_source, "key", "回填行的来源必须是 key");
+        }
+    }
 }

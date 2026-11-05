@@ -525,11 +525,11 @@ pub(super) fn image_compress_from(map: &Map<String, Value>) -> ImageCompressSett
 /// 选路拿到一个必然坏事的值（例如阈值 0 会让熔断第一个失败就打开）。
 pub(super) fn routing_from(map: &Map<String, Value>) -> RoutingSettings {
     let defaults = RoutingSettings::default();
-    let strategy = map
-        .get(KEY_ROUTING_STRATEGY)
-        .and_then(Value::as_str)
-        .map(RouteStrategy::from_id)
-        .unwrap_or(defaults.strategy);
+    // 本地混合架构：`routingStrategy` 的唯一权威形态是本地六档对象
+    // （`routing_strategy_from`），上游 RouteStrategy 三档只作展示用。这里
+    // 不再单独读那个键（否则全局保存会把对象形态覆写成字符串、丢掉逐家覆盖），
+    // 而是把本地权威默认值映射成展示档位。见 config/mod.rs 的写入口径。
+    let strategy = route_strategy_display(routing_strategy_from(map).default);
     let sticky = map
         .get(KEY_ROUTING_STICKY)
         .and_then(Value::as_str)
@@ -765,6 +765,19 @@ mod tests {
             resolve_auto_continue(None, env_auto_continue()),
             "文件里的字符串 true 不可用，落点必须与「文件没这项」逐字相同"
         );
+    }
+}
+
+/// 本地权威策略 → 上游展示档位（三档）。`RouteStrategy` 仅用于
+/// `GET /api/routing` 的展示，不参与选路，也不写回 `routingStrategy` 键。
+pub(super) fn route_strategy_display(
+    strategy: crate::server::core::routing::RoutingStrategy,
+) -> RouteStrategy {
+    use crate::server::core::routing::RoutingStrategy as Local;
+    match strategy {
+        Local::GlobalRoundRobin | Local::BalanceWeighted => RouteStrategy::Rotate,
+        Local::RoundRobin => RouteStrategy::Provider,
+        _ => RouteStrategy::Order,
     }
 }
 

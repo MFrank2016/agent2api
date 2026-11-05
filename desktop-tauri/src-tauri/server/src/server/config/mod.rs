@@ -1808,10 +1808,12 @@ pub fn set_routing(patch: RoutingPatch) -> bool {
     update(|config| {
         let mut next = config.routing;
         if let Some(strategy) = patch.strategy {
-            config
-                .raw
-                .insert(KEY_ROUTING_STRATEGY.to_string(), Value::from(strategy.as_str()));
-            next.strategy = strategy;
+            // 规范写法：把上游三档展示值翻译成本地六档，写回唯一的
+            // 权威对象形态（保留逐家覆盖），并同步两份内存快照。
+            let mut canonical = config.routing_strategy.clone();
+            canonical.default = crate::server::core::routing::RoutingStrategy::from_config(strategy.as_str());
+            write_routing_strategy_canonical(config, &canonical);
+            next.strategy = config.routing.strategy;
         }
         if let Some(sticky) = patch.sticky {
             config
@@ -2708,14 +2710,25 @@ pub fn set_routing_strategy(patch: RoutingStrategyPatch) -> bool {
         if let Some(providers) = &patch.providers {
             next.providers = providers.clone();
         }
-        config.raw.insert(
-            KEY_ROUTING_STRATEGY.to_string(),
-            routing_strategy_value(&next),
-        );
-        config.routing_strategy = next;
+        write_routing_strategy_canonical(config, &next);
     })
 }
 
+
+/// `routingStrategy` 的**唯一写入口**（本地混合架构）：raw 底稿恒为本地六档
+/// 对象形态，两份内存快照（本地 `routing_strategy` 与上游展示用 `routing`）
+/// 一起更新，任何 setter 都不得绕过它单独写字符串。
+pub(crate) fn write_routing_strategy_canonical(
+    config: &mut RuntimeConfig,
+    settings: &RoutingStrategySettings,
+) {
+    config.raw.insert(
+        KEY_ROUTING_STRATEGY.to_string(),
+        routing_strategy_value(settings),
+    );
+    config.routing_strategy = settings.clone();
+    config.routing.strategy = route_strategy_display(settings.default);
+}
 
 /// 把选路策略设置编成 raw 底稿里的形态：`{ "default": "...", "providers": {...} }`。
 /// 逐家表为空时不写 `providers` 键（配置里不留没意义的空对象，与

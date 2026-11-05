@@ -121,7 +121,7 @@ pub fn clear_providers() {
 }
 
 pub(crate) use leased_stream::hold_adapter;
-pub(crate) use stream::RpcStream;
+pub(crate) use stream::{LeadingThinkStream, RpcStream};
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};

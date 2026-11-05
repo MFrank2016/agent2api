@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use agent2api_provider_protocol as proto;
 use axum::http::HeaderMap;
+use bytes::Bytes;
 use serde_json::Value;
 
 use crate::server::core::account_store::AccountStore;
@@ -1651,14 +1652,15 @@ impl RpcAdapter {
         // 同一份 `aggregate_frame_stream`）。插件作者因此只写一条路径，
         // 不必再实现一份「聚合成本」—— 两份规则迟早分叉，而症状是
         // 「流式与非流式的正文不一样」，极难排查。
+        // 本地独有：剥离开头 think 块按逐家开关取值（插件协议暂无
+        // capabilities.think_strip，统一按「未申报」处理）。非流式走聚合器里的
+        // FramePolicy，流式走 LeadingThinkStream —— 两条路径共用同一个判据。
+        let strip_leading_think = crate::server::core::provider_options::is_enabled(
+            self.id,
+            crate::server::config::KEY_STRIP_LEADING_THINK,
+            crate::server::config::strip_leading_think(),
+        );
         if !stream {
-            // 本地独有：剥离开头 think 块按逐家开关取值（插件协议暂无
-            // capabilities.think_strip，统一按「未申报」处理）。
-            let strip_leading_think = crate::server::core::provider_options::is_enabled(
-                self.id,
-                crate::server::config::KEY_STRIP_LEADING_THINK,
-                crate::server::config::strip_leading_think(),
-            );
             let policy = crate::server::core::upstream::sse::FramePolicy::assembled_for_plugin(
                 self.metadata().capabilities
                     .sse_model_rewrite
@@ -1712,7 +1714,17 @@ impl RpcAdapter {
             };
         }
 
-        Ok(ForwardOutcome::Stream { status, stream: Box::new(source) })
+        // ── 流式：R41 回归修复（本地独有）────────────────────────────
+        // 插件流式路径原先直接把 `RpcStream` 交给客户端，绕过核心的
+        // `LeadingThinkFilter`（非流式走聚合器所以不受影响）。开关打开时
+        // 在这里套上跨帧剥离；关着时原样下发，字节与接入前一致。
+        let stream: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin> =
+            if strip_leading_think {
+                Box::new(super::LeadingThinkStream::new(source))
+            } else {
+                Box::new(source)
+            };
+        Ok(ForwardOutcome::Stream { status, stream })
     }
 }
 

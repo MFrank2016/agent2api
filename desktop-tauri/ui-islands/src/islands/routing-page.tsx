@@ -39,6 +39,7 @@ export function RoutingPage() {
     | { kind: 'sticky' }
     | { kind: 'account' | 'sort'; id: string }
     | { kind: 'protection'; workspace: RoutingWorkspace }
+    | { kind: 'strategy'; workspace: RoutingWorkspace }
     | { kind: 'model' }
     | null
   >(null)
@@ -100,6 +101,10 @@ export function RoutingPage() {
       ]} />
       <span className='routing-page-policy'>{settings ? `${strategyLabel(settings.routingStrategy)} · ${t('粘滞 {mode}', { mode: stickyLabel(settings.routingSticky) })}` : ''}</span>
       <div className='routing-page-actions'>
+        {settings ? <Button variant='ghost' size='sm' onClick={() => {
+          const workspace = editor.draft?.workspace || replay.workspace
+          if (workspace) setModal({ kind: 'strategy', workspace })
+        }}><RouteIcon name='settings' />{t('统一路由设置')}</Button> : null}
         <Button variant='ghost' size='sm' onClick={() => setModal({ kind: 'sticky' })}>
           <RouteIcon name='lock' />{t('会话粘滞')}{replay.sticky.length ? ` · ${replay.sticky.length}` : ''}
         </Button>
@@ -150,6 +155,7 @@ export function RoutingPage() {
 
     {modal?.kind === 'sticky' ? <RoutingStickyDialog model={mode === 'config' ? editor.scope || replay.model : replay.model} onClose={close} /> : null}
     {modal?.kind === 'protection' ? <RoutingSettingsDialog protectionOnly workspace={modal.workspace} onClose={close} /> : null}
+    {modal?.kind === 'strategy' ? <RoutingSettingsDialog workspace={modal.workspace} onClose={close} /> : null}
     {modal?.kind === 'sort' ? <GroupSettingsDialog provider={modal.id} onClose={close} /> : null}
     {modal?.kind === 'account' ? <AccountSettingsDialog id={modal.id} initialAccount={editor.draft?.workspace.accounts.find(account => account.id === modal.id) || replay.workspace?.accounts.find(account => account.id === modal.id)} onClose={close} /> : null}
     {modal?.kind === 'model' && editor.draft ? <AddRouteModelDialog workspace={editor.draft.workspace} onClose={() => setModal(null)}

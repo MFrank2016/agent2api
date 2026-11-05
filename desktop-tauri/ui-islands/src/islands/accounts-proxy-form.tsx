@@ -2,8 +2,8 @@
 
 import * as React from 'react'
 import {
-  Button, Checkbox, Input, Label, MultiSelect, SegmentedControl,
-  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+  Button, Checkbox, Input, Label, MultiSelect, RadioGroup, RadioGroupItem,
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Switch,
   Field, FieldGroup, FieldLabel,
 } from '@ui'
 import { t } from '../i18n'
@@ -12,7 +12,6 @@ import {
   type AccountRecord, type PoolItem,
 } from './accounts-shared'
 import { proxyPoolOptions } from './accounts-data'
-import { DIALOG_SEG_CLASS } from './dialog-segmented'
 import type { ClashProxySnapshot } from '../../../ui-shared/clash-proxy'
 
 /** 每条候选都会真实出网，一轮最多测 8 条。 */
@@ -23,10 +22,11 @@ export type ProxyPayload =
   | { source: 'pool'; proxyId: string }
   | { source: 'rotate'; all: boolean; proxyIds?: string[] }
   | { source: 'clash'; listenerUid: string }
-  | { source: 'custom'; protocol: 'http' | 'socks5'; host: string; port: number; username: string; password: string }
+  | { source: 'custom'; protocol: 'http' | 'socks5'; host: string; port: number; username: string; password: string; noReuse?: boolean }
+  | { source: 'pool-rotate'; group: string; proxyIds: string[]; strategy: 'round-robin' | 'random' | 'least-latency'; onError: 'next' | 'none' }
 
 export type ProxyDraft = {
-  mode: 'none' | 'pool' | 'rotate' | 'clash' | 'custom' | 'retired'
+  mode: 'none' | 'pool' | 'rotate' | 'clash' | 'custom' | 'pool-rotate' | 'retired'
   listenerUid: string
   /** 池条目 id（mode === 'pool'） */
   proxyId: string
@@ -39,6 +39,16 @@ export type ProxyDraft = {
   port: string
   username: string
   password: string
+  /** 每请求换出口 IP（不复用连接池） */
+  noReuse: boolean
+  /** 轮询组名（mode === 'pool-rotate'） */
+  group: string
+  /** pool-rotate 的显式成员 id（导入时写入；UI 不编辑，保存时原样保留） */
+  proxyIds: string[]
+  /** 轮询策略（mode === 'pool-rotate'；缺省 round-robin） */
+  strategy: 'round-robin' | 'random' | 'least-latency'
+  /** 失败自动换出口（mode === 'pool-rotate'；缺省 next） */
+  onError: 'next' | 'none'
 }
 
 /** 账号 proxy 字段 → 表单草稿（形态与后端 workbuddy-proxy.mjs 一致） */
@@ -46,10 +56,18 @@ export function draftOfProxy(proxy: AccountRecord['proxy']): ProxyDraft {
   const source = proxy?.config?.source || proxy?.source
   const config = proxy?.config || null
   const rotate = source === 'rotate'
+  // 后端 pool-rotate 支持显式成员 id（proxyIds）：UI 不提供编辑，但要原样带过保存，
+  // 否则「按 id 引用」的账号（可能只有 proxyIds、没有 group）会在任何一次保存时被丢掉
+  const rawProxyIds = (config as { proxyIds?: unknown } | null)?.proxyIds
+  const proxyIds = Array.isArray(rawProxyIds)
+    ? rawProxyIds.filter((item): item is string => typeof item === 'string')
+    : []
   return {
     mode: source === 'pool' ? 'pool'
       : rotate ? 'rotate'
-        : source === 'clash' ? 'clash' : source === 'custom' ? 'custom' : source === 'subscription' ? 'retired' : 'none',
+        : source === 'clash' ? 'clash' : source === 'custom' ? 'custom'
+          : source === 'pool-rotate' ? 'pool-rotate'
+            : source === 'subscription' ? 'retired' : 'none',
     listenerUid: source === 'clash' ? String(config?.listenerUid || '') : '',
     proxyId: source === 'pool' ? String(config?.proxyId || '') : '',
     // `all` 缺键按「全部」读（后端同一个口径：那是这一档的默认语义）
@@ -60,6 +78,11 @@ export function draftOfProxy(proxy: AccountRecord['proxy']): ProxyDraft {
     port: config?.port === undefined || config?.port === null ? '' : String(config.port),
     username: config?.username || '',
     password: config?.password || '',
+    noReuse: config?.noReuse === true,
+    group: source === 'pool-rotate' ? String(config?.group || '') : '',
+    proxyIds,
+    strategy: config?.strategy === 'random' || config?.strategy === 'least-latency' ? config.strategy : 'round-robin',
+    onError: config?.onError === 'none' ? 'none' : 'next',
   }
 }
 
@@ -81,6 +104,12 @@ export function readProxyDraft(draft: ProxyDraft): ProxyPayload {
     if (!draft.rotateIds.length) throw new Error(t('轮询至少要选择一条代理（或改选「全部」）'))
     return { source: 'rotate', all: false, proxyIds: [...draft.rotateIds] }
   }
+  if (draft.mode === 'pool-rotate') {
+    const group = draft.group.trim()
+    // 仅当组名与显式成员 id 都为空才算非法：只带 proxyIds 的账号必须仍可保存
+    if (!group && !draft.proxyIds.length) throw new Error('请填写轮询组名（或从已有分组中选择）')
+    return { source: 'pool-rotate', group, proxyIds: draft.proxyIds, strategy: draft.strategy, onError: draft.onError }
+  }
   const host = draft.host.trim()
   const port = Number(draft.port)
   if (!host) throw new Error(t('请填写代理主机地址'))
@@ -92,6 +121,7 @@ export function readProxyDraft(draft: ProxyDraft): ProxyPayload {
     port,
     username: draft.username.trim(),
     password: draft.password,
+    noReuse: draft.noReuse,
   }
 }
 
@@ -113,13 +143,18 @@ export function ProxyForm({
 }) {
   const [testing, setTesting] = React.useState(false)
   const [testResult, setTestResult] = React.useState<React.ReactNode>(null)
-  /** 池列表：「已保存的代理」与「轮询」两档共用的选项（模块级缓存，见 accounts-data） */
+  /** 池列表：「已保存的代理」「轮询组」与「轮询」三档共用的选项（模块级缓存，见 accounts-data） */
   const [pool, setPool] = React.useState<PoolItem[] | null>(null)
   const [poolError, setPoolError] = React.useState('')
   const [clash, setClash] = React.useState<ClashProxySnapshot | null>(null)
   const [clashError, setClashError] = React.useState('')
   const options = clash?.options || []
   const set = (patch: Partial<ProxyDraft>): void => onChange({ ...draft, ...patch })
+  /** 池里出现过的分组名（轮询组的快捷选择；按名字去重，去掉空值） */
+  const groupNames = React.useMemo(
+    () => [...new Set((pool ?? []).map(item => item.group).filter((name): name is string => Boolean(name)))],
+    [pool],
+  )
 
   const loadClash = React.useCallback((): void => {
     setClashError('')
@@ -146,7 +181,7 @@ export function ProxyForm({
   // 只有选中（或初始就是）引用池的那两档时才真正去读 —— 其余档的用户不必为一次
   // 多余的请求买单；读完缓存住，切到这一档不会再打网络
   React.useEffect(() => {
-    if ((draft.mode === 'pool' || draft.mode === 'rotate') && pool === null) loadPool()
+    if ((draft.mode === 'pool' || draft.mode === 'rotate' || draft.mode === 'pool-rotate') && pool === null) loadPool()
   }, [draft.mode, pool, loadPool])
 
   /**
@@ -257,30 +292,33 @@ export function ProxyForm({
   }
 
   return (
-    <div className='acct-proxy-form flex flex-col'>
+    <div className='flex flex-col'>
       {draft.mode === 'retired' ? <p className='mb-3 text-xs text-destructive'>{t('原代理来源已下线，请选择已保存的代理、自定义地址或直连')}</p> : null}
-      {/* 出网方式：档位一行。走组件库的分段控件（与添加账号弹窗同一档尺寸）——
-          这里原先拿 RadioGroup 拼了一套自己的观感，跟别处的分段对不上。 */}
-      <SegmentedControl<ProxyDraft['mode']>
-        aria-label={t('代理方式')}
-        className={DIALOG_SEG_CLASS}
-        value={draft.mode}
-        onValueChange={value => set({ mode: value })}
-        options={[
-          { value: 'none', label: t('无代理（直连）') },
-          { value: 'pool', label: t('已保存的代理') },
-          // 轮询档只对 OpenCode Zen 出现（见 allowRotate 的说明）
-          ...(allowRotate ? [{
-            value: 'rotate' as const,
-            label: t('轮询（换 IP）'),
-            title: t('逐请求轮换出口（换 IP）：OpenCode Zen 免费档按 IP 限流，单个 IP 的额度用完会对它一律 429'),
-          }] : []),
-          // Clash Verge 档已下线：只有现存配置还停在它上面时才补出这一项，
-          // 让用户能看见当前值、并有机会改成别的（补出来就没法切走了）
-          ...(draft.mode === 'clash' ? [{ value: 'clash' as const, label: 'Clash Verge' }] : []),
-          { value: 'custom', label: t('自定义') },
-        ]}
-      />
+      <RadioGroup value={draft.mode} onValueChange={value => set({ mode: value as ProxyDraft['mode'] })}
+        className='flex-row flex-wrap items-center gap-5' aria-label={t('代理方式')}>
+        <Label className='inline-flex cursor-pointer items-center gap-2 font-normal'>
+          <RadioGroupItem value='none' />{t('无代理（直连）')}
+        </Label>
+        <Label className='inline-flex cursor-pointer items-center gap-2 font-normal'>
+          <RadioGroupItem value='pool' />{t('已保存的代理')}
+        </Label>
+        <Label className='inline-flex cursor-pointer items-center gap-2 font-normal'>
+          <RadioGroupItem value='pool-rotate' />{t('轮询组（多出口）')}
+        </Label>
+        {/* 轮询档只对 OpenCode Zen 出现（见 allowRotate 的说明） */}
+        {allowRotate ? (
+          <Label className='inline-flex cursor-pointer items-center gap-2 font-normal'
+            title={t('逐请求轮换出口（换 IP）：OpenCode Zen 免费档按 IP 限流，单个 IP 的额度用完会对它一律 429')}>
+            <RadioGroupItem value='rotate' />{t('轮询（换 IP）')}
+          </Label>
+        ) : null}
+        {draft.mode === 'clash' ? <Label className='inline-flex cursor-pointer items-center gap-2 font-normal'>
+          <RadioGroupItem value='clash' />Clash Verge
+        </Label> : null}
+        <Label className='inline-flex cursor-pointer items-center gap-2 font-normal'>
+          <RadioGroupItem value='custom' />{t('自定义')}
+        </Label>
+      </RadioGroup>
 
       {draft.mode === 'pool' ? (
         <div className='mt-3'>
@@ -319,6 +357,61 @@ export function ProxyForm({
                   ? t('地址与端口由「网络代理」页管理：那边改一次、测一次，所有引用它的账号一起生效')
                   : t('「网络代理」页还没有出口 —— 去那里添加手动地址或同步 Clash Verge 的端点')}
           </div>
+        </div>
+      ) : null}
+
+      {draft.mode === 'pool-rotate' ? (
+        <div className='mt-3'>
+          <Field orientation='horizontal' className='field-row'>
+            <FieldLabel htmlFor={`${idPrefix}-rotate-group`}>{t('分组')}</FieldLabel>
+            <Input id={`${idPrefix}-rotate-group`} className='min-w-[180px]' placeholder={t('例如：kilo')}
+              autoComplete='off' spellCheck={false}
+              value={draft.group} onChange={event => set({ group: event.currentTarget.value })} />
+            {groupNames.length ? (
+              <span className='inline-flex flex-wrap items-center gap-1.5'>
+                {groupNames.map(name => (
+                  <Button key={name} variant='outline' size='sm'
+                    onClick={() => set({ group: name })}>{name}</Button>
+                ))}
+              </span>
+            ) : null}
+            <Button variant='outline' size='sm' onClick={() => loadPool(true)}>{t('重新读取')}</Button>
+          </Field>
+          <Field orientation='horizontal' className='field-row mt-2.5'>
+            <FieldLabel htmlFor={`${idPrefix}-rotate-strategy`}>{t('策略')}</FieldLabel>
+            <Select value={draft.strategy} onValueChange={value => set({ strategy: value as ProxyDraft['strategy'] })}>
+              <SelectTrigger id={`${idPrefix}-rotate-strategy`} className='min-w-[150px]'>
+                <SelectValue>{{ 'round-robin': t('轮询'), random: t('随机'), 'least-latency': t('最低延迟') }[draft.strategy]}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value='round-robin'>{t('轮询')}</SelectItem>
+                <SelectItem value='random'>{t('随机')}</SelectItem>
+                <SelectItem value='least-latency'>{t('最低延迟')}</SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+          <Field orientation='horizontal' className='field-row mt-2.5'>
+            <Label className='inline-flex cursor-pointer items-center gap-2.5 font-normal'>
+              <Switch checked={draft.onError === 'next'}
+                onCheckedChange={next => set({ onError: next ? 'next' : 'none' })}
+                aria-label={t('失败自动换出口')} />
+              <span className='text-xs text-subtle'>{t('失败自动换出口（连不上时依次尝试组内其它出口）')}</span>
+            </Label>
+          </Field>
+          <div className='detail mt-1.5'>
+            {poolError
+              ? t('读取失败：{error}', { error: poolError })
+              : pool === null
+                ? t('正在读取代理列表…')
+                : groupNames.length
+                  ? t('本账号按策略在该组全部启用出口间轮换；出口与分组在「网络代理」页管理')
+                  : t('「网络代理」页还没有带分组的出口 —— 去那里给出口填一个「分组」标签')}
+          </div>
+          {draft.proxyIds.length ? (
+            <p className='detail mt-1.5'>
+              {t('该账号还带有 {n} 个显式成员 id（导入时写入）：保存时会原样保留。', { n: draft.proxyIds.length })}
+            </p>
+          ) : null}
         </div>
       ) : null}
 
@@ -431,6 +524,12 @@ export function ProxyForm({
                 value={draft.password} onChange={event => set({ password: event.currentTarget.value })} />
             </Field>
           </FieldGroup>
+          <div className='field-row mt-2.5'>
+            <label htmlFor={`${idPrefix}-noreuse`}>{t('每请求换出口 IP')}</label>
+            <input id={`${idPrefix}-noreuse`} type='checkbox' checked={draft.noReuse}
+              onChange={event => set({ noReuse: event.currentTarget.checked })} />
+            <span className='detail'>{t('不复用连接（代理出口每条请求新建隧道，适合会轮换出口的代理）')}</span>
+          </div>
         </div>
       ) : null}
 

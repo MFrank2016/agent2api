@@ -27,8 +27,8 @@ services:
     # 可选：给容器设内存上限。超限时内核杀掉进程，再由上面的 restart 策略拉起 ——
     # 表现为「重启一次」，而不是把宿主机（或同机其它服务）拖垮。小内存机器
     # （512M~1G 的 VPS / NAS）建议开，按实际并发量从 1g 起调。
-    #   普通 `docker compose` 用 mem_limit：
-    # mem_limit: 1g
+    #   普通 `docker compose` 用 mem_limit（本机部署约定：实际生效，非注释）：
+    mem_limit: 1g
     #   swarm / `docker compose --compatibility` 用 deploy 的形式：
     # deploy:
     #   resources:
@@ -58,3 +58,10 @@ services:
     volumes:
       # 全部状态（SQLite 库、配置、日志）都在这一个卷里
       - ./data:/data
+    networks:
+      # 加入 Caddy 的外部网络，Caddy 按容器名 agent2api 反代
+      - caddy_caddy_net
+
+networks:
+  caddy_caddy_net:
+    external: true

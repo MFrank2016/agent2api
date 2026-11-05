@@ -63,7 +63,12 @@ pub fn save_workspace(
         }
         let mut global = profile;
         if let Some(profile) = &mut global {
-            if let Some(strategy) = profile.strategy.take() { next.routing.strategy = super::RouteStrategy::from_id(&strategy); next.raw.insert(super::KEY_ROUTING_STRATEGY.into(), strategy.into()); }
+            if let Some(strategy) = profile.strategy.take() {
+                // 规范写法：上游三档展示值 → 本地六档对象形态（保留逐家覆盖）。
+                let mut canonical = next.routing_strategy.clone();
+                canonical.default = routing::RoutingStrategy::from_config(&strategy);
+                super::write_routing_strategy_canonical(&mut next, &canonical);
+            }
             if let Some(sticky) = profile.sticky.take() { next.routing.sticky = super::StickyMode::from_id(&sticky); next.raw.insert(super::KEY_ROUTING_STICKY.into(), sticky.into()); }
             profile.account_order.clear();
         }
