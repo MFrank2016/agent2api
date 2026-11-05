@@ -27,6 +27,7 @@
 //!   models          ← 模型目录（切片 4 起为真实清单，含远程刷新结果）
 //!   sanitizeBlacklistFingerprints ← 出站指纹脱敏开关（与 GET /api/sanitize 同源）
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -1491,6 +1492,21 @@ pub async fn login_oauth_captcha_config(State(state): State<ServerState>, body: 
     }
 }
 
+/// 管理界面里的浏览器是否与网关在同一台机器上（决定 OAuth 回调该不该占本机
+/// 登记端口）。判据逐字沿用插件化迁移前的 `login_oauth_start`：桌面壳恒 true，
+/// headless 回落按监听地址是不是 loopback。
+fn oauth_local_browser(local_panel: bool, host: &IpAddr) -> bool {
+    local_panel || host.is_loopback()
+}
+
+/// 远程形态下交给上游的回调基址。回调路由挂在管理面那套路由上
+/// （`http.rs::panel_router`），分端口时必须用面板端口，否则监听器转发目标
+/// 会落进主端口的 404。
+fn oauth_navigate_base(port: u16, panel_port: Option<u16>) -> String {
+    let api_port = panel_port.filter(|p| *p != port).unwrap_or(port);
+    format!("http://localhost:{api_port}")
+}
+
 /// `POST /api/session/login/oauth/start` —— 带验证码参数发起 OAuth 登录。
 ///
 /// body `{provider, vendor, captchaVerifyParam}` → `{state, authUrl, provider,
@@ -1533,12 +1549,19 @@ pub async fn login_oauth_start(State(state): State<ServerState>, body: Bytes) ->
             ),
         );
     }
+    let local_browser = oauth_local_browser(state.local_panel, &state.host);
+    let navigate_base = oauth_navigate_base(state.port, state.panel_port);
     let started = match adapter
         .admin_action(
             state.store(),
             "",
             "login.oauth-start",
-            &json!({ "vendor": vendor, "captchaVerifyParam": captcha }),
+            &json!({
+                "vendor": vendor,
+                "captchaVerifyParam": captcha,
+                "localBrowser": local_browser,
+                "navigateBase": navigate_base,
+            }),
         )
         .await
     {
@@ -1913,5 +1936,36 @@ pub async fn auth_login(State(_state): State<ServerState>, body: Bytes) -> Respo
             }
             Err(error) => return management_error(error.status_code, error.message),
         }
+    }
+}
+
+#[cfg(test)]
+mod autoclaw_oauth_start_vectors {
+    use super::{oauth_local_browser, oauth_navigate_base};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn local_browser_flag_desktop_shell_with_lan_access_is_local() {
+        assert!(oauth_local_browser(true, &IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
+    }
+    #[test]
+    fn local_browser_flag_headless_bound_to_loopback_is_local() {
+        assert!(oauth_local_browser(false, &IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    }
+    #[test]
+    fn local_browser_flag_container_on_all_interfaces_is_remote() {
+        assert!(!oauth_local_browser(false, &IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
+    }
+    #[test]
+    fn navigate_base_uses_the_main_port_by_default() {
+        assert_eq!("http://localhost:3065", oauth_navigate_base(3065, None));
+    }
+    #[test]
+    fn navigate_base_uses_the_panel_port_when_split() {
+        assert_eq!("http://localhost:3066", oauth_navigate_base(3065, Some(3066)));
+    }
+    #[test]
+    fn navigate_base_ignores_a_panel_port_equal_to_main() {
+        assert_eq!("http://localhost:3065", oauth_navigate_base(3065, Some(3065)));
     }
 }
