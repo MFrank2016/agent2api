@@ -1319,8 +1319,9 @@ pub struct AutoContinuePatch {
 }
 
 // ─── 本地独有（beta）：逐家选路策略 + 剥离开头 think 开关 ───────────────
-// 与上游 3.4.1 的 RouteStrategy / ImageCompress 并存：上游键 routingStrategy
-// 仍由 RouteStrategy 解析；本地读侧 routing_strategy_from 兼容对象/旧字符串形态。
+// `routingStrategy` 的唯一权威形态是下面的 RoutingStrategySettings（对象）：
+// default + 逐家覆盖。上游 RouteStrategy 三档仅作展示，从本对象映射得到；
+// ImageCompress 是另一组独立设置，与策略维度无关。
 pub const KEY_STRIP_LEADING_THINK: &str = "stripLeadingThink";
 
 

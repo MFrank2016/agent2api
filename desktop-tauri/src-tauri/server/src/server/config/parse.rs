@@ -781,7 +781,7 @@ pub(super) fn route_strategy_display(
     }
 }
 
-// ─── 本地独有（beta）：逐家选路策略解析（与上游 routing_from 并存）──────
+// ─── 本地独有（beta）：逐家选路策略解析（routingStrategy 的唯一权威读侧）──
 pub(super) fn routing_strategy_from(map: &Map<String, Value>) -> RoutingStrategySettings {
     use crate::server::core::routing::RoutingStrategy;
 

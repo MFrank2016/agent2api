@@ -113,12 +113,16 @@ fn with_legacy_strategy(mut value: Value) -> Value {
 
 /// 路由附加维度的 JSON（`/api/routing/workspace` 的 `settings` 字段）。
 ///
-/// 本地 `RoutingSettings` 不含策略维度（策略是逐家的
-/// `RoutingStrategySettings`），所以策略从 `routing_strategy_settings().default`
-/// 取 —— 与统一端点 `/api/routing-strategy` 的默认档位保持一致。
+/// **这个面是上游 profile 契约**：`RoutingProfile::validate_shape` 只接受
+/// `order` / `rotate` / `provider`，所以这里必须给映射后的展示档位，不能直接
+/// 给本地 7 档 id（否则 `PUT /api/routing/profile` 一律 400）。权威策略仍由
+/// `/api/routing-strategy`（对象形态）与 `/api/routing`（`with_legacy_strategy`）
+/// 承载，二者互不影响。
 pub(crate) fn routing_json(settings: config::RoutingSettings) -> Value {
     json!({
-        config::KEY_ROUTING_STRATEGY: config::routing_strategy_settings().default.as_str(),
+        config::KEY_ROUTING_STRATEGY: config::routing_strategy_display_id(
+            config::routing_strategy_settings().default,
+        ),
         config::KEY_ROUTING_STICKY: settings.sticky.as_str(),
         config::KEY_ROUTING_FAILOVER_BACKOFF: settings.failover_backoff,
         config::KEY_ROUTING_SINK: settings.sink,
@@ -231,4 +235,46 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
         "ordered": plan.ordered.iter().map(entry_json).collect::<Vec<_>>(),
         "blocked": plan.blocked.iter().map(entry_json).collect::<Vec<_>>(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::config;
+    use crate::server::core::routing::RoutingStrategy;
+
+    /// A（fix round 2）：workspace/profile 面上的策略值必须永远是上游
+    /// `validate_shape` 认可的三档，不能漏出本地 7 档 id（否则
+    /// `PUT /api/routing/profile` 对存量默认配置一律 400）。
+    #[test]
+    fn workspace_strategy_is_always_upstream_display_value() {
+        let allowed = ["order", "rotate", "provider"];
+        for strategy in RoutingStrategy::ALL {
+            let shown = config::routing_strategy_display_id(strategy);
+            assert!(
+                allowed.contains(&shown),
+                "本地档位 {strategy:?} 映射成了 {shown}，profile 会 400"
+            );
+        }
+    }
+
+    /// A（fix round 2）：本地 7 档在统一端点 / 别名端点上仍可往返 ——
+    /// `GET /api/routing-strategy` 给 `default: <7 档 id>`，`PUT /api/routing`
+    /// 的 `legacy_strategy` 与 `RoutingStrategy::parse` 必须能原样读回。
+    #[test]
+    fn local_strategy_ids_round_trip_through_legacy_alias() {
+        for strategy in RoutingStrategy::ALL {
+            let id = strategy.as_str();
+            assert_eq!(
+                RoutingStrategy::parse(id),
+                Some(strategy),
+                "统一端点 default={id} 应能 parse 回原档位"
+            );
+            assert_eq!(
+                legacy_strategy(id),
+                Some(strategy),
+                "/api/routing 别名应把 {id} 翻回原档位"
+            );
+        }
+    }
 }

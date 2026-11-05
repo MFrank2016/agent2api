@@ -148,8 +148,10 @@ pub struct RuntimeConfig {
     queue: QueueSettings,
     /// 账号选路策略（本地独有：逐家 6 档；设置页「网关 → 选路策略」）。
     ///
-    /// 与上游 `RouteStrategy` 三档并存：上游 `routing_from` 读字符串形态，
-    /// 本地 `routing_strategy_from` 读对象形态（含旧字符串迁移），互不覆盖。
+    /// **唯一权威**：`routingStrategy` 配置键恒为本对象形态（default + 逐家覆盖），
+    /// 由 `routing_strategy_from` 解析（含旧字符串单向迁移）。上游
+    /// `RouteStrategy` / `RoutingSettings.strategy` 只是展示档位，由
+    /// `routing_from` 从本对象映射而来，不参与选路、也不写回该键。
     routing_strategy: RoutingStrategySettings,
     /// ZCode 验证码令牌池的补货节奏（设置页「网关 → 验证码令牌池」区域）。
     ///
@@ -2668,7 +2670,7 @@ mod auto_continue_tests {
     }
 }
 
-// ─── 本地独有（beta）：逐家选路策略 / think-strip 读写（与上游骨架并存）──
+// ─── 本地独有（beta）：逐家选路策略（唯一权威写入口）/ think-strip 读写 ──
 pub fn strip_leading_think() -> bool {
     with_raw(|raw| {
         raw.get(KEY_STRIP_LEADING_THINK)
@@ -2728,6 +2730,17 @@ pub(crate) fn write_routing_strategy_canonical(
     );
     config.routing_strategy = settings.clone();
     config.routing.strategy = route_strategy_display(settings.default);
+}
+
+/// 本地权威策略 → 上游**展示档位字符串**（`order` / `rotate` / `provider`）。
+///
+/// 供 `/api/routing/workspace` 的 profile 契约使用：`RoutingProfile::validate_shape`
+/// 只认这三档，直接把本地 7 档 id 塞进去会让全局保存一律 400。与
+/// `parse::route_strategy_display` 共用同一份映射（唯一权威仍是本地对象形态）。
+pub fn routing_strategy_display_id(
+    strategy: crate::server::core::routing::RoutingStrategy,
+) -> &'static str {
+    route_strategy_display(strategy).as_str()
 }
 
 /// 把选路策略设置编成 raw 底稿里的形态：`{ "default": "...", "providers": {...} }`。
