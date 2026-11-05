@@ -352,7 +352,7 @@ impl RulesMasker {
     pub fn session(&self) -> MaskSession {
         MaskSession {
             rules: Arc::clone(&self.rules),
-            state: Mutex::new(State::default()),
+            state: Arc::new(Mutex::new(State::default())),
         }
     }
 }
@@ -361,9 +361,12 @@ impl RulesMasker {
 ///
 /// 拥有规则（`Arc` 克隆），因此可以独立于 [`RulesMasker`] 存活 —— 出站
 /// 请求把会话放进传输层、回复侧再取出来还原（见父模块模块头）。
+#[derive(Clone)]
 pub struct MaskSession {
     rules: Arc<[CompiledRule]>,
-    state: Mutex<State>,
+    /// `Arc` 让 `TransportRequest` 可以 Clone（备用入口会克隆整份请求）：
+    /// 克隆出的会话与原始会话**共享同一份映射**，回复还原不会串。
+    state: Arc<Mutex<State>>,
 }
 
 impl Masker for RulesMasker {

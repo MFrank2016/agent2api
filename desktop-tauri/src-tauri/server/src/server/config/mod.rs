@@ -68,29 +68,34 @@ use crate::server::db::Db;
 mod account_sort;
 mod assistant_config;
 mod github_access;
+mod mutations;
+pub(crate) use mutations::try_update_raw_field;
 pub(crate) mod parse;
 mod routing_profiles;
+pub(crate) mod routing_workspace;
 mod sanitize_config;
 pub(crate) mod sql;
 mod types;
 mod update_policy;
 
 pub use account_sort::{
-    account_sort_settings, save_account_sort, validate_account_sort, AccountSortRule, AccountSortSettings,
-    AddedSortDirection, CreditSortDirection,
+    account_sort_settings, save_account_sort, validate_account_sort, AccountSortRule,
+    AccountSortSettings, AddedSortDirection, CreditSortDirection,
 };
 pub use assistant_config::*;
 pub use github_access::{
-    github_access, set_github_access, GithubAccessMode, GithubAccessPatch,
-    GithubAccessSettings, DEFAULT_GITHUB_MIRROR,
+    github_access, set_github_access, GithubAccessMode, GithubAccessPatch, GithubAccessSettings,
+    DEFAULT_GITHUB_MIRROR,
+};
+pub use routing_profiles::{
+    normalize_model as normalize_routing_model, routing_profiles, routing_snapshot,
+    save_routing_profile, settings_for_model as routing_settings_for_model,
+    validate_shape as validate_routing_profile, RoutingProfile, RoutingProfiles,
+    RoutingProviderScope, KEY_ROUTING_PROFILES,
 };
 pub use sanitize_config::{
     set_sanitize_settings, SanitizePatch, SanitizeSettings, KEY_SANITIZE_PROVIDERS,
     KEY_SANITIZE_RULES, MAX_SANITIZE_PROVIDERS,
-};
-pub use routing_profiles::{
-    normalize_model as normalize_routing_model, routing_profiles, save_routing_profile,
-    validate_shape as validate_routing_profile, RoutingProfile, RoutingProfiles,
 };
 pub use types::*;
 pub use update_policy::{
@@ -146,6 +151,12 @@ pub struct RuntimeConfig {
     /// 与 queue 同一理由：stats 端点**每次被铸造器轮询**都要取它（改完设置
     /// 下一轮就生效，不重启进程），解析一次存下来最省事。
     captcha_pool: CaptchaPoolSettings,
+    /// 会话图片压缩（设置页「网关 → 图片压缩」区域）。
+    ///
+    /// 与 timeouts 同一理由：转发层**每次发送前**都要取它（改完设置下一个
+    /// 请求就生效，不重启进程），解析一次存下来最省事。默认开，见
+    /// `KEY_IMAGE_COMPRESS_ENABLED` 的取舍说明。
+    image_compress: ImageCompressSettings,
     /// 账号路由的策略 / 粘性 / 退避 / 垫底 / 熔断（账号页「路由」区域）。
     ///
     /// 与 timeouts 同一理由：转发层**每次选路**都要取它（改完设置下一个
@@ -159,6 +170,7 @@ pub struct RuntimeConfig {
     mask: MaskSettings,
     routing_profiles: std::sync::Arc<RoutingProfiles>,
     account_sort: std::sync::Arc<AccountSortSettings>,
+    model_rules: std::sync::Arc<crate::server::core::model_rules::ModelRules>,
     /// 事件日志的保存目录（原始配置值；None = 未设置，用配置目录）。
     /// 低频字段（启动 + 设置页读写），不值得为它发明解析层，存原始值即可。
     log_dir: Option<String>,
@@ -318,6 +330,11 @@ impl RuntimeConfig {
     /// 开发者角色兼容是否开启（转发层每次发送前判一次，见字段说明）
     pub fn developer_role_compat(&self) -> bool {
         self.developer_role_compat
+    }
+
+    /// 会话图片压缩设置（转发层每次发送前取一份 `Copy` 快照，见字段说明）
+    pub fn image_compress_settings(&self) -> &ImageCompressSettings {
+        &self.image_compress
     }
 
     /// 网关面（`/v1/*`）跨域访问是否开启（CORS 中间件逐请求判一次，见字段说明）
@@ -562,6 +579,8 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
     let queue = queue_from(&raw);
     let captcha_pool = captcha_pool_from(&raw);
     let routing_strategy = routing_strategy_from(&raw);
+
+    let image_compress = image_compress_from(&raw);
     let routing = routing_from(&raw);
     let mask = mask_from(&raw);
     RuntimeConfig {
@@ -573,7 +592,8 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         locale: env_text("WORKBUDDY_LOCALE")
             .or_else(|| string_field(&raw, "locale"))
             .unwrap_or_else(|| DEFAULT_LOCALE.to_string()),
-        default_model: env_text("WORKBUDDY_DEFAULT_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+        default_model: env_text("WORKBUDDY_DEFAULT_MODEL")
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
         last_request_model: string_field(&raw, "lastRequestModel"),
         retention,
         scheduled,
@@ -582,16 +602,24 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         queue,
         captcha_pool,
         routing_strategy,
+
+        image_compress,
         routing,
         mask,
         routing_profiles: routing_profiles::from_raw(&raw),
         account_sort: account_sort::from_raw(&raw),
+        model_rules: std::sync::Arc::new(crate::server::core::model_rules::ModelRules::from_raw(
+            &raw,
+        )),
         log_dir: string_field(&raw, KEY_LOG_DIR),
         request_stats_dir: string_field(&raw, KEY_REQUEST_STATS_DIR),
         debug_dir: string_field(&raw, KEY_DEBUG_DIR),
         // 只有字面 `true` 算开启（手改文件写 "1" / "yes" 一律当关）：与
         // 「写坏回落」同一取向 —— 这个开关控制是否把凭据落盘，宁可少采
-        debug_mode: raw.get(KEY_DEBUG_MODE).and_then(Value::as_bool).unwrap_or(false),
+        debug_mode: raw
+            .get(KEY_DEBUG_MODE)
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         sanitize: sanitize_config::from_raw(&raw),
         // 只有字面 `false` 算关闭：**默认开**（缺失 → true）。改写语义无损
         // （developer 与 system 在 OpenAI 语义上等价），而默认关会让发 developer
@@ -642,11 +670,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         // 取值链（分端键 → 旧单开关 → 环境变量 → 默认开）：升级前用户只改过
         // `captchaEnabled`，那个值必须同时成为两端的新默认值 —— 否则老用户
         // 关掉的开关会在升级后自己打开。`env_captcha_enabled` 仍只作最终兜底。
-        captcha_desktop: captcha_switch_from(
-            &raw,
-            KEY_CAPTCHA_DESKTOP,
-            env_captcha_enabled(),
-        ),
+        captcha_desktop: captcha_switch_from(&raw, KEY_CAPTCHA_DESKTOP, env_captcha_enabled()),
         captcha_web: captcha_switch_from(&raw, KEY_CAPTCHA_WEB, env_captcha_enabled()),
         // 只有字面 `false` 算关闭：**默认开**（理由见 KEY_MODELS_DEV_ENABLED）。
         // 没有环境变量兜底：它不是「部署时才知道要不要开」的东西（Docker 与
@@ -665,8 +689,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
             .cloned(),
         update_channels: UpdateChannels::from_raw(&raw),
         // GitHub 令牌信封：空串按未设置处理（手改库写出的空值不该被当成密文）
-        github_token: string_field(&raw, KEY_GITHUB_TOKEN)
-            .filter(|envelope| !envelope.is_empty()),
+        github_token: string_field(&raw, KEY_GITHUB_TOKEN).filter(|envelope| !envelope.is_empty()),
         raw,
     }
 }
@@ -677,7 +700,10 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
 /// （头值只会是文本，手改库写出的数字/布尔没有意义），整体不是对象 = 没配。
 fn cline_headers_from(raw: &Map<String, Value>) -> std::collections::BTreeMap<String, String> {
     let mut table = std::collections::BTreeMap::new();
-    let Some(object) = raw.get(KEY_CLINE_UPSTREAM_HEADERS).and_then(Value::as_object) else {
+    let Some(object) = raw
+        .get(KEY_CLINE_UPSTREAM_HEADERS)
+        .and_then(Value::as_object)
+    else {
         return table;
     };
     for (key, value) in object {
@@ -739,7 +765,9 @@ fn gateway_text_from(
         if id.is_empty() {
             continue;
         }
-        let Some(entry) = value.as_object() else { continue };
+        let Some(entry) = value.as_object() else {
+            continue;
+        };
         let mut blocks = crate::server::core::prompt::GatewayBlocks::default();
         for field in crate::server::core::prompt::GatewayBlocks::FIELDS {
             if let Some(text) = entry.get(field).and_then(Value::as_str) {
@@ -798,7 +826,9 @@ fn providers_from(raw: &Map<String, Value>) -> std::collections::BTreeMap<String
         if id.is_empty() {
             continue;
         }
-        let Some(entry) = value.as_object() else { continue };
+        let Some(entry) = value.as_object() else {
+            continue;
+        };
         let mode = entry
             .get(KEY_PROMPT_MODE)
             .and_then(Value::as_str)
@@ -877,7 +907,11 @@ fn resolve_choice(
         source: PromptSource::BuiltIn,
         file_error: None,
     };
-    let Some(path) = file.as_deref().map(str::trim).filter(|text| !text.is_empty()) else {
+    let Some(path) = file
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    else {
         return built_in();
     };
     match read_prompt_file(path) {
@@ -889,7 +923,10 @@ fn resolve_choice(
             source: PromptSource::File,
             file_error: None,
         },
-        Err(error) => ResolvedChoice { file_error: Some(error), ..built_in() },
+        Err(error) => ResolvedChoice {
+            file_error: Some(error),
+            ..built_in()
+        },
     }
 }
 
@@ -914,9 +951,9 @@ pub fn read_prompt_file(path: &str) -> Result<String, String> {
         return Err("提示词文件路径为空".to_string());
     }
     match std::fs::read_to_string(trimmed) {
-        Ok(text) if text.trim().is_empty() => {
-            Err(format!("提示词文件是空的：{trimmed}（已回落内置默认提示词）"))
-        }
+        Ok(text) if text.trim().is_empty() => Err(format!(
+            "提示词文件是空的：{trimmed}（已回落内置默认提示词）"
+        )),
         Ok(text) => Ok(text),
         Err(error) => Err(format!("读不到提示词文件 {trimmed}: {error}")),
     }
@@ -946,9 +983,11 @@ pub fn init(db: Option<Db>) -> RuntimeConfig {
     });
     let _ = DB.set(db);
     let snapshot = build(read_raw());
+    crate::server::core::providers::catalog::invalidate();
     if let Ok(mut guard) = CONFIG.write() {
         *guard = Some(snapshot.clone());
     }
+    crate::server::core::providers::catalog::invalidate();
     snapshot
 }
 
@@ -964,9 +1003,11 @@ pub fn init(db: Option<Db>) -> RuntimeConfig {
 /// 没有任何旧文件时不必多读一次库。
 pub fn reload() -> RuntimeConfig {
     let snapshot = build(read_raw());
+    crate::server::core::providers::catalog::invalidate();
     if let Ok(mut guard) = CONFIG.write() {
         *guard = Some(snapshot.clone());
     }
+    crate::server::core::providers::catalog::invalidate();
     snapshot
 }
 
@@ -993,6 +1034,18 @@ pub fn current() -> RuntimeConfig {
         }
     }
     build(Map::new())
+}
+
+pub(crate) fn model_rules_snapshot() -> std::sync::Arc<crate::server::core::model_rules::ModelRules>
+{
+    if let Some(rules) = CONFIG
+        .read()
+        .ok()
+        .and_then(|config| config.as_ref().map(|config| config.model_rules.clone()))
+    {
+        return rules;
+    }
+    std::sync::Arc::new(crate::server::core::model_rules::ModelRules::default())
 }
 
 /// 在配置读锁内跑一个**只读、短小**的闭包，只借出快照的 `raw` 表（**不克隆**）。
@@ -1250,15 +1303,36 @@ where
     F: FnOnce(&mut RuntimeConfig),
 {
     // 读改写必须串行，否则两个模型的独立配置会互相覆盖。
-    let _update_guard = CONFIG_UPDATE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _update_guard = CONFIG_UPDATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut next = current();
+    let previous = next.clone();
     let before = synced_fingerprint(&next.raw);
     mutate(&mut next);
+    if previous
+        .raw()
+        .get(crate::server::core::model_rules::KEY_MODEL_RULES)
+        != next
+            .raw()
+            .get(crate::server::core::model_rules::KEY_MODEL_RULES)
+    {
+        next.model_rules = std::sync::Arc::new(
+            crate::server::core::model_rules::ModelRules::from_raw(&next.raw),
+        );
+    }
     let saved = save_raw(&next.raw);
     // 先算改动后的指纹再交出所有权：`next` 要移进内存快照
     let changed = before != synced_fingerprint(&next.raw);
+    let catalog_changed = crate::server::core::providers::catalog::config_changed(&previous, &next);
+    if catalog_changed {
+        crate::server::core::providers::catalog::invalidate();
+    }
     if let Ok(mut guard) = CONFIG.write() {
         *guard = Some(next);
+    }
+    if catalog_changed {
+        crate::server::core::providers::catalog::invalidate();
     }
     // 云同步的自动上传：只有**同步范围内的键**真的变了才发信号。
     //
@@ -1371,7 +1445,9 @@ pub fn set_api_key(api_key: Option<String>) -> Result<bool, String> {
         // 见 `set_update_proxy` / `set_prompt` 的「与 set_api_key(None) 同一语义」）。
         // 这条路不经过加密，因此 `Err` 不可能出现
         return Ok(update(|config| {
-            config.raw.remove(crate::server::core::api_keys::KEY_API_KEY);
+            config
+                .raw
+                .remove(crate::server::core::api_keys::KEY_API_KEY);
             config.api_key = None;
         }));
     };
@@ -1397,10 +1473,13 @@ pub fn set_api_key(api_key: Option<String>) -> Result<bool, String> {
 /// 环境变量注入的 Key 不在文件里，`active_api_keys` 仍会把它算进去）。
 pub fn replace_api_keys(list: Value) -> bool {
     update(move |config| {
+        config.raw.insert(
+            crate::server::core::api_keys::KEY_API_KEYS.to_string(),
+            list.clone(),
+        );
         config
             .raw
-            .insert(crate::server::core::api_keys::KEY_API_KEYS.to_string(), list.clone());
-        config.raw.remove(crate::server::core::api_keys::KEY_API_KEY);
+            .remove(crate::server::core::api_keys::KEY_API_KEY);
         config.api_key = None;
     })
 }
@@ -1409,7 +1488,9 @@ pub fn replace_api_keys(list: Value) -> bool {
 pub fn set_locale(locale: &str) -> bool {
     let locale = locale.to_string();
     update(|config| {
-        config.raw.insert("locale".to_string(), Value::String(locale.clone()));
+        config
+            .raw
+            .insert("locale".to_string(), Value::String(locale.clone()));
         config.locale = locale.clone();
     })
 }
@@ -1432,6 +1513,13 @@ pub fn remember_request_model(model: &str) {
 /// 写入 config.json 里任意字段（其他字段原样保留）。低频路径专用。
 pub fn update_raw_field(key: &str, value: Value) -> bool {
     update_raw_field_with(key, move |current| *current = value)
+}
+
+/// 一次改动多个配置键（整份 raw 交给调用方）。用于启动期一次性迁移：
+/// 逐键 `update_raw_field` 会每键落一次库，且派生快照只重建被点名的几项；
+/// 批量改完由调用方补一次 `reload()`，让所有派生快照与库对齐。
+pub(crate) fn update_raw_fields(mutate: impl FnOnce(&mut Map<String, Value>)) -> bool {
+    update(move |config| mutate(&mut config.raw))
 }
 
 pub(crate) fn update_raw_field_with(key: &str, mutate: impl FnOnce(&mut Value)) -> bool {
@@ -1473,7 +1561,11 @@ pub fn set_retention(patch: RetentionPatch) -> bool {
             }
         };
         apply(KEY_LOG_RETENTION_DAYS, patch.log_days, &mut next.log_days);
-        apply(KEY_LOG_RETENTION_COUNT, patch.log_count, &mut next.log_count);
+        apply(
+            KEY_LOG_RETENTION_COUNT,
+            patch.log_count,
+            &mut next.log_count,
+        );
         apply(
             KEY_REQUEST_RETENTION_DAYS,
             patch.request_days,
@@ -1484,7 +1576,11 @@ pub fn set_retention(patch: RetentionPatch) -> bool {
             patch.request_count,
             &mut next.request_count,
         );
-        apply(KEY_DAILY_RETENTION_DAYS, patch.daily_days, &mut next.daily_days);
+        apply(
+            KEY_DAILY_RETENTION_DAYS,
+            patch.daily_days,
+            &mut next.daily_days,
+        );
         config.retention = next;
     })
 }
@@ -1502,12 +1598,7 @@ pub fn set_retention(patch: RetentionPatch) -> bool {
 /// 与 `set_retention` 同一模式：内存快照与 raw 底稿一起改 —— 前者让正在跑的
 /// 循环下一轮就用新间隔（不必重启进程），后者保证写盘时不吃掉兄弟字段
 /// （只改一条任务时，`scheduledTasks` 下其余各条必须原样保留）。
-pub fn set_scheduled_task(
-    key: &str,
-    patch: IntervalTaskPatch,
-    min: i64,
-    max: i64,
-) -> bool {
+pub fn set_scheduled_task(key: &str, patch: IntervalTaskPatch, min: i64, max: i64) -> bool {
     let key = key.to_string();
     update(move |config| {
         // 先在 raw 里把这条任务的子对象取出来（不存在就建一个），再逐项写入。
@@ -1565,13 +1656,16 @@ pub fn set_retry(patch: RetryPatch) -> bool {
     update(|config| {
         let mut next = config.retry.clone();
         if let Some(count) = patch.count {
-            config.raw.insert(KEY_RETRY_COUNT.to_string(), Value::from(count));
+            config
+                .raw
+                .insert(KEY_RETRY_COUNT.to_string(), Value::from(count));
             next.count = count;
         }
         if let Some(count) = patch.account_switch_count {
-            config
-                .raw
-                .insert(KEY_RETRY_ACCOUNT_SWITCH_COUNT.to_string(), Value::from(count));
+            config.raw.insert(
+                KEY_RETRY_ACCOUNT_SWITCH_COUNT.to_string(),
+                Value::from(count),
+            );
             next.account_switch_count = count;
         }
         if let Some(seconds) = patch.interval_seconds {
@@ -1622,10 +1716,18 @@ pub fn set_timeouts(patch: TimeoutPatch) -> bool {
             *slot = value;
         };
         if let Some(seconds) = patch.connect_seconds {
-            write(KEY_TIMEOUT_CONNECT_SECONDS, seconds, &mut next.connect_seconds);
+            write(
+                KEY_TIMEOUT_CONNECT_SECONDS,
+                seconds,
+                &mut next.connect_seconds,
+            );
         }
         if let Some(seconds) = patch.headers_seconds {
-            write(KEY_TIMEOUT_HEADERS_SECONDS, seconds, &mut next.headers_seconds);
+            write(
+                KEY_TIMEOUT_HEADERS_SECONDS,
+                seconds,
+                &mut next.headers_seconds,
+            );
         }
         if let Some(seconds) = patch.stream_idle_seconds {
             write(
@@ -1767,6 +1869,58 @@ pub fn set_captcha_pool(patch: CaptchaPoolPatch) -> bool {
 
 // ─── 账号路由（routingSticky / 退避 / 垫底 / 熔断）──
 
+// ─── 会话图片压缩（imageCompressEnabled / MaxEdge / Quality / ThresholdKb）──
+
+/// 只取图片压缩设置（**不克隆整份 raw**）。
+///
+/// 与 `timeout_settings()` 同一取舍：转发层每次发送前都要取一次，读锁取一份
+/// `Copy` 快照即可。未初始化时给默认值（**关**）。
+pub fn image_compress_settings() -> ImageCompressSettings {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.image_compress;
+        }
+    }
+    ImageCompressSettings::default()
+}
+
+/// 更新会话图片压缩设置（`None` = 该项不动），返回是否写盘成功。
+///
+/// 调用方（`api::image_compress::put_image_compress`）**必须先校验范围**：本函数
+/// 按「已合法」处理，越界值会被 `bounded_int_field` 的回读逻辑丢弃。与
+/// `set_captcha_pool` 同一模式：内存快照与 raw 底稿一起改。
+pub fn set_image_compress(patch: ImageCompressPatch) -> bool {
+    update(|config| {
+        let mut next = config.image_compress;
+        if let Some(enabled) = patch.enabled {
+            config
+                .raw
+                .insert(KEY_IMAGE_COMPRESS_ENABLED.to_string(), Value::Bool(enabled));
+            next.enabled = enabled;
+        }
+        let mut write_int = |key: &str, value: i64, slot: &mut i64| {
+            config.raw.insert(key.to_string(), Value::from(value));
+            *slot = value;
+        };
+        if let Some(max_edge) = patch.max_edge {
+            write_int(KEY_IMAGE_COMPRESS_MAX_EDGE, max_edge, &mut next.max_edge);
+        }
+        if let Some(quality) = patch.quality {
+            write_int(KEY_IMAGE_COMPRESS_QUALITY, quality, &mut next.quality);
+        }
+        if let Some(threshold_kb) = patch.threshold_kb {
+            write_int(
+                KEY_IMAGE_COMPRESS_THRESHOLD_KB,
+                threshold_kb,
+                &mut next.threshold_kb,
+            );
+        }
+        config.image_compress = next;
+    })
+}
+
+// ─── 账号路由（routingStrategy / routingSticky / 退避 / 垫底 / 熔断）──
+
 /// 只取路由设置的轻量读取（**不克隆整份 raw**）。
 ///
 /// 与 `timeout_settings()` 同一取舍：转发层每次选路都要取一次，读锁取一份
@@ -1789,6 +1943,24 @@ pub fn routing_settings() -> RoutingSettings {
 pub fn set_routing(patch: RoutingPatch) -> bool {
     update(|config| {
         let mut next = config.routing;
+        if let Some(strategy) = patch.strategy {
+            // 逐模型三档覆盖映射到本仓逐家 7 档的 `default`，并写回对象形态：
+            // 直接把 `strategy.as_str()` 塞进 KEY_ROUTING_STRATEGY 会把
+            // `{default, providers}` 覆盖成裸字符串、丢掉逐家表。
+            use crate::server::core::routing::RoutingStrategy;
+            let mut next_strategy = config.routing_strategy.clone();
+            next_strategy.default = match strategy {
+                RouteStrategy::Order => RoutingStrategy::Priority,
+                RouteStrategy::Rotate => RoutingStrategy::GlobalRoundRobin,
+                RouteStrategy::Provider => RoutingStrategy::RoundRobin,
+            };
+            config.raw.insert(
+                KEY_ROUTING_STRATEGY.to_string(),
+                routing_strategy_value(&next_strategy),
+            );
+            config.routing_strategy = next_strategy;
+            next.strategy = strategy;
+        }
         if let Some(sticky) = patch.sticky {
             config
                 .raw
@@ -1800,24 +1972,34 @@ pub fn set_routing(patch: RoutingPatch) -> bool {
             *slot = value;
         };
         if let Some(enabled) = patch.failover_backoff {
-            write_bool(KEY_ROUTING_FAILOVER_BACKOFF, enabled, &mut next.failover_backoff);
+            write_bool(
+                KEY_ROUTING_FAILOVER_BACKOFF,
+                enabled,
+                &mut next.failover_backoff,
+            );
         }
         if let Some(enabled) = patch.sink {
             write_bool(KEY_ROUTING_SINK, enabled, &mut next.sink);
         }
         if let Some(enabled) = patch.breaker_enabled {
-            write_bool(KEY_ROUTING_BREAKER_ENABLED, enabled, &mut next.breaker_enabled);
+            write_bool(
+                KEY_ROUTING_BREAKER_ENABLED,
+                enabled,
+                &mut next.breaker_enabled,
+            );
         }
         if let Some(count) = patch.breaker_threshold {
-            config
-                .raw
-                .insert(KEY_ROUTING_BREAKER_THRESHOLD.to_string(), Value::from(count));
+            config.raw.insert(
+                KEY_ROUTING_BREAKER_THRESHOLD.to_string(),
+                Value::from(count),
+            );
             next.breaker_threshold = count;
         }
         if let Some(seconds) = patch.breaker_timeout_seconds {
-            config
-                .raw
-                .insert(KEY_ROUTING_BREAKER_TIMEOUT.to_string(), Value::from(seconds));
+            config.raw.insert(
+                KEY_ROUTING_BREAKER_TIMEOUT.to_string(),
+                Value::from(seconds),
+            );
             next.breaker_timeout_seconds = seconds;
         }
         if let Some(count) = patch.breaker_success_threshold {
@@ -2004,9 +2186,7 @@ pub fn set_cors_enabled(enabled: bool) -> bool {
 pub fn set_assistant_config(config: AssistantConfig) -> bool {
     let value = config.to_value();
     update(|current| {
-        current
-            .raw
-            .insert(KEY_ASSISTANT_CONFIG.to_string(), value);
+        current.raw.insert(KEY_ASSISTANT_CONFIG.to_string(), value);
         current.assistant = config;
     })
 }
@@ -2021,9 +2201,10 @@ pub fn set_assistant_config(config: AssistantConfig) -> bool {
 /// 这件事必须在日志里查得到。
 pub fn set_strip_newline_keepalive(enabled: bool) -> bool {
     update(|config| {
-        config
-            .raw
-            .insert(KEY_STRIP_NEWLINE_KEEPALIVE.to_string(), Value::Bool(enabled));
+        config.raw.insert(
+            KEY_STRIP_NEWLINE_KEEPALIVE.to_string(),
+            Value::Bool(enabled),
+        );
         config.strip_newline_keepalive = enabled;
     })
 }
@@ -2077,9 +2258,10 @@ pub fn set_auto_continue_patch(patch: AutoContinuePatch) -> bool {
             config.auto_continue = enabled;
         }
         if let Some(rounds) = patch.max_rounds {
-            config
-                .raw
-                .insert(KEY_AUTO_CONTINUE_MAX_ROUNDS.to_string(), Value::from(rounds));
+            config.raw.insert(
+                KEY_AUTO_CONTINUE_MAX_ROUNDS.to_string(),
+                Value::from(rounds),
+            );
             config.auto_continue_max_rounds = rounds;
         }
     })
@@ -2114,11 +2296,7 @@ pub fn set_auto_continue_max_rounds(rounds: i64) -> bool {
 /// 旧单开关只当「默认值」用，不参与写入 —— 分端键一旦写过，它就不再影响
 /// 这一端。这样升级前后的行为连续（老用户关着就还是关着），而用户在新界面
 /// 里改某一端时也不会顺手把另一端改掉。
-fn captcha_switch_from(
-    raw: &serde_json::Map<String, Value>,
-    key: &str,
-    fallback: bool,
-) -> bool {
+fn captcha_switch_from(raw: &serde_json::Map<String, Value>, key: &str, fallback: bool) -> bool {
     raw.get(key)
         .and_then(Value::as_bool)
         .or_else(|| raw.get(KEY_CAPTCHA_ENABLED).and_then(Value::as_bool))
@@ -2227,16 +2405,16 @@ pub fn github_token_envelope() -> Option<String> {
 /// 与校验。与 `set_update_proxy` 同一模式：内存立即生效（下一次检查更新就用
 /// 新令牌），写盘时不吃掉其它字段。
 pub fn set_github_token_envelope(envelope: Option<String>) -> bool {
-    update(move |config| {
-        match envelope.clone() {
-            Some(value) => {
-                config.raw.insert(KEY_GITHUB_TOKEN.to_string(), Value::String(value));
-                config.github_token = envelope.clone();
-            }
-            None => {
-                config.raw.remove(KEY_GITHUB_TOKEN);
-                config.github_token = None;
-            }
+    update(move |config| match envelope.clone() {
+        Some(value) => {
+            config
+                .raw
+                .insert(KEY_GITHUB_TOKEN.to_string(), Value::String(value));
+            config.github_token = envelope.clone();
+        }
+        None => {
+            config.raw.remove(KEY_GITHUB_TOKEN);
+            config.github_token = None;
         }
     })
 }
@@ -2261,9 +2439,10 @@ pub fn set_prompt(
     inline: Option<String>,
 ) -> bool {
     update(|config| {
-        config
-            .raw
-            .insert(KEY_PROMPT_MODE.to_string(), Value::String(mode.as_str().to_string()));
+        config.raw.insert(
+            KEY_PROMPT_MODE.to_string(),
+            Value::String(mode.as_str().to_string()),
+        );
         match file.filter(|text| !text.trim().is_empty()) {
             Some(path) => {
                 config
@@ -2608,7 +2787,9 @@ mod auto_continue_tests {
     pub(super) static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     pub(super) fn hold_config() -> std::sync::MutexGuard<'static, ()> {
-        CONFIG_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        CONFIG_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// 一份只含给定几项的原始底稿。
@@ -2628,7 +2809,11 @@ mod auto_continue_tests {
     fn an_empty_backup_means_off_and_three_rounds_without_seeding_defaults() {
         let fresh = build(Map::new());
         // 差分形式：空底稿 ≡ 「文件没给」，那一级只能由环境变量说话
-        assert_eq!(fresh.auto_continue(), env_auto_continue(), "空底稿的开关落点必须只由环境变量决定");
+        assert_eq!(
+            fresh.auto_continue(),
+            env_auto_continue(),
+            "空底稿的开关落点必须只由环境变量决定"
+        );
         assert_eq!(
             fresh.auto_continue_max_rounds(),
             auto_continue_rounds_from(&Map::new()),
@@ -2644,7 +2829,10 @@ mod auto_continue_tests {
                 "文件与环境变量都没配 → 必须是默认 3 轮"
             );
         }
-        assert!(fresh.raw().is_empty(), "默认值只进解析字段，不许写进写盘底稿");
+        assert!(
+            fresh.raw().is_empty(),
+            "默认值只进解析字段，不许写进写盘底稿"
+        );
     }
 
     /// 底稿给了值就以它为准 —— 包括「写 `false` 关掉」与「写 1 / 8 这两个边界」。
@@ -2666,15 +2854,26 @@ mod auto_continue_tests {
         );
 
         let off = build(raw_of(&[(KEY_AUTO_CONTINUE, json!(false))]));
-        assert!(!off.auto_continue(), "文件写了 false 就必须是关（关掉要能被表达）");
+        assert!(
+            !off.auto_continue(),
+            "文件写了 false 就必须是关（关掉要能被表达）"
+        );
 
         for bound in [AUTO_CONTINUE_MIN_ROUNDS, AUTO_CONTINUE_MAX_ROUNDS] {
             let at_edge = build(raw_of(&[(KEY_AUTO_CONTINUE_MAX_ROUNDS, json!(bound))]));
-            assert_eq!(at_edge.auto_continue_max_rounds(), bound, "边界值 {bound} 必须是可用值");
+            assert_eq!(
+                at_edge.auto_continue_max_rounds(),
+                bound,
+                "边界值 {bound} 必须是可用值"
+            );
         }
 
         let too_many = build(raw_of(&[(KEY_AUTO_CONTINUE_MAX_ROUNDS, json!(99))]));
-        assert_ne!(too_many.auto_continue_max_rounds(), 99, "越界的值不许原样生效");
+        assert_ne!(
+            too_many.auto_continue_max_rounds(),
+            99,
+            "越界的值不许原样生效"
+        );
         assert_ne!(
             too_many.auto_continue_max_rounds(),
             AUTO_CONTINUE_MAX_ROUNDS,
@@ -2692,7 +2891,10 @@ mod auto_continue_tests {
             (KEY_AUTO_CONTINUE_MAX_ROUNDS, json!("8")),
         ]));
         assert_eq!(junk.auto_continue(), build(Map::new()).auto_continue());
-        assert_eq!(junk.auto_continue_max_rounds(), build(Map::new()).auto_continue_max_rounds());
+        assert_eq!(
+            junk.auto_continue_max_rounds(),
+            build(Map::new()).auto_continue_max_rounds()
+        );
     }
 
     /// `set_auto_continue` / `set_auto_continue_max_rounds` 必须同时落到底稿与
@@ -2716,10 +2918,24 @@ mod auto_continue_tests {
         });
 
         let saved = set_auto_continue(true);
-        assert_eq!(saved, db().is_some(), "返回值只该由「落库成不成功」决定（测试进程里没有库）");
-        assert!(auto_continue(), "开关必须能被在线打开（轻量读取走的是解析字段）");
-        assert_eq!(current().raw()[KEY_AUTO_CONTINUE], json!(true), "底稿里必须带上这一项，否则写盘写不出它");
-        assert!(current().auto_continue(), "快照 getter 与轻量读取必须是同一个值");
+        assert_eq!(
+            saved,
+            db().is_some(),
+            "返回值只该由「落库成不成功」决定（测试进程里没有库）"
+        );
+        assert!(
+            auto_continue(),
+            "开关必须能被在线打开（轻量读取走的是解析字段）"
+        );
+        assert_eq!(
+            current().raw()[KEY_AUTO_CONTINUE],
+            json!(true),
+            "底稿里必须带上这一项，否则写盘写不出它"
+        );
+        assert!(
+            current().auto_continue(),
+            "快照 getter 与轻量读取必须是同一个值"
+        );
         assert_eq!(
             auto_continue_rounds_from(current().raw()),
             DEFAULT_AUTO_CONTINUE_MAX_ROUNDS,
@@ -2727,9 +2943,20 @@ mod auto_continue_tests {
         );
 
         set_auto_continue_max_rounds(AUTO_CONTINUE_MAX_ROUNDS);
-        assert_eq!(auto_continue_max_rounds(), AUTO_CONTINUE_MAX_ROUNDS, "上限必须能被在线收到边界值");
-        assert_eq!(current().raw()[KEY_AUTO_CONTINUE_MAX_ROUNDS], json!(8), "底稿里要落成一个 JSON 数字");
-        assert!(auto_continue(), "改上限时开关必须保持原样（部分更新不是整份替换）");
+        assert_eq!(
+            auto_continue_max_rounds(),
+            AUTO_CONTINUE_MAX_ROUNDS,
+            "上限必须能被在线收到边界值"
+        );
+        assert_eq!(
+            current().raw()[KEY_AUTO_CONTINUE_MAX_ROUNDS],
+            json!(8),
+            "底稿里要落成一个 JSON 数字"
+        );
+        assert!(
+            auto_continue(),
+            "改上限时开关必须保持原样（部分更新不是整份替换）"
+        );
 
         // 两项一起写（PUT 的形状）：一次 update 就该把两项都对齐
         set_auto_continue_patch(AutoContinuePatch {

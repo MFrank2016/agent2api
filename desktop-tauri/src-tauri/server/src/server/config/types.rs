@@ -914,12 +914,15 @@ pub struct QueueSettings {
 impl QueueSettings {
     /// 等待次数预算（负值按 0：读侧已保证范围，这里是防御性的）
     pub fn wait_budget(&self) -> usize {
-        self.max_waits.clamp(QUEUE_MIN_MAX_WAITS, QUEUE_MAX_MAX_WAITS) as usize
+        self.max_waits
+            .clamp(QUEUE_MIN_MAX_WAITS, QUEUE_MAX_MAX_WAITS) as usize
     }
 
     /// 强制单次等待时长（毫秒）；`None` = 跟随上游建议
     pub fn forced_wait_ms(&self) -> Option<u64> {
-        let seconds = self.wait_seconds.clamp(QUEUE_MIN_WAIT_SECONDS, QUEUE_MAX_WAIT_SECONDS);
+        let seconds = self
+            .wait_seconds
+            .clamp(QUEUE_MIN_WAIT_SECONDS, QUEUE_MAX_WAIT_SECONDS);
         if seconds > 0 {
             Some(seconds as u64 * 1000)
         } else {
@@ -1081,10 +1084,133 @@ pub struct CaptchaPoolPatch {
     pub max_per_round: Option<i64>,
 }
 
-// ─── 账号路由（会话粘性 / 失败退避 / 限流垫底 / 熔断）─────────
+// ─── 上游逐模型路由策略（RouteStrategy：order / rotate / provider）────────────
 //
-// 策略维度（候选怎么排序）是**逐家**的，见上面的 `RoutingStrategySettings`；
-// 这里只放**策略之外的四个维度**（上游 v3.0.2 引入），语义与默认值原样保留。
+// 与本仓 `RoutingStrategySettings`（逐家 7 档）并存：这里是上游 3.4.x
+// 「逐模型覆盖」用的三档，`routing_profiles.rs` / `route_context.rs` 读写它；
+// 选路本身仍由 `RoutingState` + `advance` 承担，两者不会重复推进轮转。
+pub const ROUTING_STRATEGY_ORDER: &str = "order";
+pub const ROUTING_STRATEGY_ROTATE: &str = "rotate";
+pub const ROUTING_STRATEGY_PROVIDER: &str = "provider";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteStrategy {
+    Order,
+    Rotate,
+    /// 家内轮询（轮转边界收在「家」里面）
+    Provider,
+}
+
+impl RouteStrategy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Order => ROUTING_STRATEGY_ORDER,
+            Self::Rotate => ROUTING_STRATEGY_ROTATE,
+            Self::Provider => ROUTING_STRATEGY_PROVIDER,
+        }
+    }
+
+    /// 配置值 → 策略。未知值一律回落顺序优先（与上游旧行为一致）。
+    pub fn from_id(value: &str) -> Self {
+        match value {
+            ROUTING_STRATEGY_PROVIDER => Self::Provider,
+            ROUTING_STRATEGY_ROTATE | "usage" => Self::Rotate,
+            _ => Self::Order,
+        }
+    }
+}
+
+// ─── 会话图片压缩（转发前把内嵌 base64 大图压小，设置页「网关 → 图片压缩」）──
+
+/// 图片压缩总开关（`imageCompressEnabled`，**默认开**）。
+///
+/// 解析口径：**只有字面 `false` 才算关**（见 `parse::image_compress_from`），
+/// 键缺失或写成别的值都按开 —— 于是升级上来的老配置（没有这个键）一启动就是
+/// 开启状态。
+///
+/// 为什么默认开：它改的是**发给上游的字节**，收益（更小的请求体、更低的上游
+/// 计费）对绝大多数对话都成立，属于「默认就该有」的能力；本项目有「自定义
+/// 提供商透传」这类把请求体原样送出的家，压过之后未必符合每个用户的预期，
+/// 所以把它做成**默认开、可一键关**的开关，关掉即回到「请求体一个字节都不动」。
+pub const KEY_IMAGE_COMPRESS_ENABLED: &str = "imageCompressEnabled";
+/// 图片长边像素上限（`imageCompressMaxEdge`）：超过则等比缩小。
+pub const KEY_IMAGE_COMPRESS_MAX_EDGE: &str = "imageCompressMaxEdge";
+/// JPEG 重编码质量（`imageCompressQuality`，40~95）。
+pub const KEY_IMAGE_COMPRESS_QUALITY: &str = "imageCompressQuality";
+/// 触发阈值 KB（`imageCompressThresholdKb`）：解码后小于它保持原样（0 = 全部处理）。
+pub const KEY_IMAGE_COMPRESS_THRESHOLD_KB: &str = "imageCompressThresholdKb";
+
+/// 长边上限默认值：2048（**照抄 OmniProxy 的默认值**）。
+///
+/// 多数视觉模型推荐的长边上限量级；默认取值口径与 OmniProxy 逐字一致，
+/// 用户要更省流量可在设置页调小（参考 CatPaw 上游限制用的 1568）。
+pub const DEFAULT_IMAGE_COMPRESS_MAX_EDGE: i64 = 2048;
+/// 重编码质量默认值：80（照抄 OmniProxy）。
+pub const DEFAULT_IMAGE_COMPRESS_QUALITY: i64 = 80;
+/// 触发阈值默认值：512 KB（照抄 OmniProxy）—— 解码后小于 512KB 的图不处理。
+pub const DEFAULT_IMAGE_COMPRESS_THRESHOLD_KB: i64 = 512;
+
+/// 长边上限的合法范围 256~8192：下限以下缩得连图看不清，上限以上等于不缩。
+pub const IMAGE_COMPRESS_MIN_MAX_EDGE: i64 = 256;
+pub const IMAGE_COMPRESS_MAX_MAX_EDGE: i64 = 8192;
+/// 质量范围 40~95：低于 40 画面明显劣化，高于 95 体积收益几乎为零。
+pub const IMAGE_COMPRESS_MIN_QUALITY: i64 = 40;
+pub const IMAGE_COMPRESS_MAX_QUALITY: i64 = 95;
+/// 触发阈值范围 0~10240 KB：0 = 不设阈值、全部候选图都过一遍。
+pub const IMAGE_COMPRESS_MIN_THRESHOLD_KB: i64 = 0;
+pub const IMAGE_COMPRESS_MAX_THRESHOLD_KB: i64 = 10240;
+
+/// 会话图片压缩设置（设置页「网关 → 图片压缩」区域）。
+///
+/// 与 `QueueSettings` 同一取舍：四个值总是一起用（每次发送前取一份快照），
+/// 打包成一个 `Copy` 值让调用方一次拿到 —— 转发链把这份快照随请求借下去。
+///
+/// ── 它作用在哪 ──────────────────────────────────────────────
+/// 只在**对话链路**（chat / responses / anthropic 三个入口归一后的 Chat 请求体）
+/// 生效；生图与图片编辑走独立分支，在 `send_body` 里提前返回，天然不经过这里。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageCompressSettings {
+    /// 总开关（关 = 出站请求体一个字节都不动）
+    pub enabled: bool,
+    /// 长边像素上限（超过等比缩小，不放大）
+    pub max_edge: i64,
+    /// JPEG 重编码质量
+    pub quality: i64,
+    /// 触发阈值（KB，解码后小于它保持原样）
+    pub threshold_kb: i64,
+}
+
+impl Default for ImageCompressSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_edge: DEFAULT_IMAGE_COMPRESS_MAX_EDGE,
+            quality: DEFAULT_IMAGE_COMPRESS_QUALITY,
+            threshold_kb: DEFAULT_IMAGE_COMPRESS_THRESHOLD_KB,
+        }
+    }
+}
+
+/// 会话图片压缩的**部分**更新入参（`None` = 该项不动）。
+///
+/// 形状与 `AutoContinuePatch` 相同（开关 + 若干有界整数一起写），理由也一样：
+/// **一次 PUT 只落一次盘**，避免出现「开关开了、参数还是旧的」半套状态。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImageCompressPatch {
+    /// 开关（`None` = 该项不动）
+    pub enabled: Option<bool>,
+    /// 长边上限（`None` = 该项不动）。调用方须先按
+    /// `IMAGE_COMPRESS_MIN_MAX_EDGE..=IMAGE_COMPRESS_MAX_MAX_EDGE` 校验过。
+    pub max_edge: Option<i64>,
+    /// 质量（`None` = 该项不动）。调用方须先按
+    /// `IMAGE_COMPRESS_MIN_QUALITY..=IMAGE_COMPRESS_MAX_QUALITY` 校验过。
+    pub quality: Option<i64>,
+    /// 触发阈值 KB（`None` = 该项不动）。调用方须先按
+    /// `IMAGE_COMPRESS_MIN_THRESHOLD_KB..=IMAGE_COMPRESS_MAX_THRESHOLD_KB` 校验过。
+    pub threshold_kb: Option<i64>,
+}
+
+// ─── 账号路由（策略 / 会话粘性 / 失败退避 / 限流垫底 / 熔断）─────────
 
 /// 会话粘性：同一会话尽量跟住答过它的账号（`routingSticky`）。
 ///
@@ -1190,6 +1316,8 @@ impl StickyMode {
 /// 重试同一模式。策略维度**不在这里**：它是逐家的，见 `RoutingStrategySettings`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoutingSettings {
+    /// 上游逐模型路由策略覆盖（3 档）；本仓逐家 7 档见 `RoutingStrategySettings`。
+    pub strategy: RouteStrategy,
     pub sticky: StickyMode,
     pub failover_backoff: bool,
     pub sink: bool,
@@ -1205,6 +1333,7 @@ pub struct RoutingSettings {
 impl Default for RoutingSettings {
     fn default() -> Self {
         Self {
+            strategy: RouteStrategy::Order,
             sticky: StickyMode::Auto,
             failover_backoff: true,
             sink: true,
@@ -1221,6 +1350,7 @@ impl Default for RoutingSettings {
 /// 路由设置的**部分**更新入参（`None` = 该项不动）
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RoutingPatch {
+    pub strategy: Option<RouteStrategy>,
     pub sticky: Option<StickyMode>,
     pub failover_backoff: Option<bool>,
     pub sink: Option<bool>,

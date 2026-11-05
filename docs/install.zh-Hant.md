@@ -207,11 +207,32 @@ services:
 | `AGENT2API_ALLOW_NO_KEY` | 設 `1` 關閉 fail-closed（未設 Key 也放行 `/v1`，僅限純內網） |
 | `AGENT2API_CAPTCHA_ENABLED` | 登入頁人機驗證元件：預設 `1` 開啟，`0` 關閉 |
 | `AGENT2API_SELF_UPDATE` | 容器內的更新入口：預設 `1` 開啟（面板可「下載並更新」）；設 `0` 關閉，只走手動升級 |
+| `AGENT2API_IMAGE_CACHE_MB` | 生成圖片的下載記憶體快取上限（MiB，預設 `128`，範圍 8~4096）。寫壞 / 越界回落預設值 |
+| `AGENT2API_IMAGE_COMPRESS_CACHE_MB` | 工作階段圖片壓縮結果的記憶體快取上限（MiB，預設 `128`，範圍 8~4096，口徑同上） |
 | `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | 進階：把「檢查更新 / 下載更新」換成自建源。前者換儲存庫（預設跟上游 `aimod-cc/Agent2API`，fork 後可改），後者換 API 根（預設 `https://api.github.com`，需返回與 GitHub 同形的 release JSON）。配了自建源後，下載白名單只額外放行**該源自己的網域**（按源的 scheme：配 `http://` 就允許明文下載，僅建議本地演練 / 內網映像用） |
 
 從原始碼建置：先建立 Caddy 外部網路，再建置啟動 —— `docker network create caddy_caddy_net 2>/dev/null || true`，然後 `docker compose up -d --build`（映像裡只有閘道與面板，不含 Rust 工具鏈）。
 
 儲存庫自帶的 `docker-compose.yml` 是按「本機 + Caddy 反向代理」加固過的版本：連接埠只綁 `127.0.0.1:3065:3065`（公網入口交給 Caddy，容器加入外部網路 `caddy_caddy_net`，按容器名 `agent2api` 反向代理；該網路需先建立，見上），啟用 `no-new-privileges`，並設 `mem_limit: 1g`。映像本身以非 root 使用者 `65532:65532` 執行，`/usr/local/bin`、`/app` 與 `/data` 都歸該 UID 所有，因此容器內「下載並更新」仍可替換可執行檔與介面（`AGENT2API_SELF_UPDATE=1`）；bind mount 的 `./data` 必須屬於 65532，否則啟動時無法寫入資料庫。從原始碼建置時 Cargo 預設 `CARGO_BUILD_JOBS=2`（每個編譯單元峰值記憶體可達數百 MB 至約 1 GB，記憶體緊張的宿主可再調低），需要更快可加 `--build-arg CARGO_BUILD_JOBS=N`。上面的 `docker run` 同樣是 65532 非 root，啟動前記得先 `chown` 資料目錄。
+
+### 記憶體佔用
+
+映像裡的閘道（Linux 目標）已內建 jemalloc 記憶體配置器。長時間執行、多帳號並行轉發時，它比系統內建的配置器更不容易產生記憶體碎片、RSS 也不容易緩慢成長 —— 這正是小記憶體機器最常被拖垮或 OOM 的一環。
+
+小記憶體機器建議給容器設一個記憶體上限：超限時核心會終止行程，再由 `restart: unless-stopped` 拉起，表現為「重啟一次」，而不是把主機（或同機其它服務）拖垮。
+
+```bash
+# docker run
+docker run -d --name agent2api --restart unless-stopped --memory=1g \
+  -p 3065:3065 -v ./data:/data \
+  aimodcc/agent2api:latest
+```
+
+compose 使用者在服務裡加一行 `mem_limit: 1g`（`docker-compose.yml` 已附註解示例）；swarm 或 `docker compose --compatibility` 用 `deploy.resources.limits.memory`。1g 只是起點，依實際併發量調整。
+
+兩處常駐記憶體的圖片快取上限都能用環境變數調小（預設各 `128` MiB）：`AGENT2API_IMAGE_CACHE_MB`（生成圖片的下載快取）、`AGENT2API_IMAGE_COMPRESS_CACHE_MB`（工作階段圖片壓縮結果快取）。寫壞或越界會回落預設值，不會讓服務起不來。
+
+`MALLOC_ARENA_MAX=2` 這類 glibc 配置器調校，只對**沒有內建 jemalloc 的形態**有意義（舊版映像、自行編譯的伺服器端、桌面端）；本映像已不需要設定它。
 
 **網頁面板的功能差異**（源於「沒有本機桌面客戶端」）：網頁登入（WorkBuddy / Qoder / Cline）、手機驗證碼、貼上憑證完全可用；需要本機回呼的網頁登入（AutoClaw / CatPaw / Accio / CodeArts / Trae）與「匯入本機登入狀態」不可用，請改用貼上憑證。桌面端開著「同時開放網頁管理面板」時，用瀏覽器存取該面板也是這一套差異 —— 同一份介面、同一套判定。
 

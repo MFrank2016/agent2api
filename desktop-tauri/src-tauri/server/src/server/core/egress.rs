@@ -359,18 +359,34 @@ pub fn image_download_client(
     host: &str,
     addresses: &[std::net::SocketAddr],
 ) -> Result<wreq::Client, String> {
+    resolved_client(proxy, system_proxy_when_unset, host, addresses)
+}
+
+/// 用「已解析的候选地址」构造出站客户端（`network_fallback` 换备用入口时用）。
+/// 与 `image_download_client` 同源，但保留上游的端口校验与空地址保护。
+pub fn resolved_client(
+    proxy: Option<&ResolvedProxy>,
+    system_proxy_when_unset: bool,
+    host: &str,
+    addresses: &[std::net::SocketAddr],
+) -> Result<wreq::Client, String> {
     let timeouts = crate::server::config::timeout_settings();
     let mut builder = base_builder(&timeouts)
-        .redirect(wreq::redirect::Policy::none())
-        .resolve_to_addrs(host.to_string(), addresses.iter().copied());
+        .redirect(wreq::redirect::Policy::none());
+    if !addresses.is_empty() {
+        builder = builder.resolve_to_addrs(host.to_string(), addresses.iter().copied());
+    }
     if let Some(proxy) = proxy {
+        if proxy.port.is_none_or(|port| port == 0) {
+            return Err("代理端口无效".to_string());
+        }
         let parsed = wreq::Proxy::all(build_proxy_url(proxy))
-            .map_err(|_| "图片下载代理无效".to_string())?;
-        builder = builder.proxy(parsed);
+            .map_err(|_| "代理地址无效".to_string())?;
+        builder = builder.no_proxy().proxy(parsed);
     } else if !system_proxy_when_unset {
         builder = builder.no_proxy();
     }
-    builder.build().map_err(|_| "无法创建图片下载连接".to_string())
+    builder.build().map_err(|_| "无法创建出站连接".to_string())
 }
 
 pub fn client_for_github(proxy: Option<&ResolvedProxy>) -> Result<Arc<wreq::Client>, String> {

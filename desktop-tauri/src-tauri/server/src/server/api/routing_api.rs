@@ -201,7 +201,7 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
         })
         .filter_map(|account| routing::account_id(account).map(str::to_string))
         .collect();
-    let settings = config::routing_settings();
+    let settings = config::routing_settings_for_model(model.as_deref().unwrap_or(""));
     let strategies = config::routing_strategy_settings();
     // 余额事实表：余额加权的权重来源（未知余额的账号不在表里）
     let balances: HashMap<String, f64> = crate::server::core::usage_records::balance_facts()
@@ -216,6 +216,7 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
     // 不会因为刷新一次面板就吃掉真实配额；逐家账号上限与转发同一份汇总口径。
     let rpm_blocked = state.upstream().rpm_blocked_accounts(&scoped, now);
     let max_accounts = routing::max_accounts_by_provider(&scoped);
+
     let meta = routing::PlanMeta {
         strategies: &strategies,
         state: &routing_state,

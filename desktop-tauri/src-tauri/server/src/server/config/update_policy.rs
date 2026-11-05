@@ -93,12 +93,14 @@ pub(crate) fn sync_installed_update_channel(version: &str) -> bool {
         return false;
     }
     // 连续升级 beta 保留用户手动关闭通道的选择。
-    let entering_beta = is_prerelease_version(version)
-        && !previous.as_deref().is_some_and(is_prerelease_version);
+    let entering_beta =
+        is_prerelease_version(version) && !previous.as_deref().is_some_and(is_prerelease_version);
     let changed = entering_beta && !update_channels().beta;
     let saved = update(|config| {
         if changed {
-            config.raw.insert(KEY_UPDATE_BETA.to_string(), Value::Bool(true));
+            config
+                .raw
+                .insert(KEY_UPDATE_BETA.to_string(), Value::Bool(true));
             config.update_channels.beta = true;
         }
         config.raw.insert(

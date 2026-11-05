@@ -1522,12 +1522,14 @@ async fn stateful_provider_refuses_to_send_when_masking_is_enabled() {
     );
     let ctx = ProviderContext {
         body: &body,
+        routing: crate::server::core::upstream::route_context::RequestRouting::capture("m", &service.store),
         stream: false,
         images: None,
         client_headers: &headers,
         telemetry: &telemetry,
         sanitize: &sanitize,
         developer_role_compat: true,
+        image_compress: crate::server::config::ImageCompressSettings::default(),
         prompt,
         preserve_system_prompt: false,
         key_scope: None,

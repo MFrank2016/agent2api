@@ -1,4 +1,5 @@
 import { createRoot } from 'react-dom/client'
+import { mountOnPage } from '../island-lazy'
 import * as React from 'react'
 import { Badge, Button, Progress, SegmentedControl, Spinner } from '@ui'
 import { PROVIDER_ICONS } from './add-provider-pick'
@@ -1051,17 +1052,18 @@ declare global {
   interface Window {
     /** 签到中心页（app.js 切页时调 load；数据自持，不随主状态轮询） */
     wbCheckinPanel?: { load(): Promise<void> }
+    /** 上游切页钩子 / ZCode 领套餐后刷新用的是这个名字 */
+    wbCheckin?: { load(): Promise<void>; refresh(): void }
   }
 }
 
 // 对外契约：app.js 切到本页时调 load（保证「切入这次刷新一定落地」）
 const load = (): Promise<void> => loadCheckinCenter()
+window.wbCheckin = { load, refresh: () => { void load() } }
 window.wbCheckinPanel = { load }
 
-// 脚本排在页面骨架之后（islands/ui.js 在各 section 之后），正常直接挂；
-// 万一将来被挪到前面，退化成等 DOM 解析完再挂。
-if (document.querySelector(PAGE_SELECTOR)) mount()
-else document.addEventListener('DOMContentLoaded', mount, { once: true })
+// 页面首次被切到时才挂（island-lazy 已含 DOM 就绪 / 模块晚到 / 节点等待的兼容路径）
+mountOnPage('checkin', PAGE_SELECTOR, mount)
 
 // 首屏自持加载：app.js 的 showPage 在本脚本加载前就执行过（那时 wbCheckinPanel
 // 还不存在，切页那次调用落空），用户上次若停在本页，这里补一次 —— 与 tasks-panel 同款

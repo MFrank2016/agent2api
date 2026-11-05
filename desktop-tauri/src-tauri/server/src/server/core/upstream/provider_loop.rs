@@ -2998,6 +2998,7 @@ async fn send_or_cancel(
             safe_to_retry: false,
             status_code: 502,
             retryable: false,
+            network_failure: false,
         }),
     }
 }

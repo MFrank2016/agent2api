@@ -354,7 +354,19 @@ pub fn is_reserved(key: &str) -> bool {
 ///   · 幂等补建 `assistant_sessions.title_generated`（先查 `pragma_table_info`，
 ///     上游 v21 已建过则跳过）；
 ///   · 清掉模型目录刷新在旧成败判据下累积的假失败冷却（`reset_model_refresh_cooldown`）。
-pub const SCHEMA_VERSION: i64 = 22;
+pub const SCHEMA_VERSION: i64 = 23;
+
+/// ── 版本 22：清掉模型目录刷新的假失败冷却（[`reset_model_refresh_cooldown`]）
+/// 这是一次**纯数据修复**（无 DDL）：旧成败判据把「任一家失败」当成整轮失败，
+/// 于是一家的长期 401 就能把整条任务按到 24 小时冷却上，界面上显示成「冷却中」。
+/// 判据已改成 `round_succeeded`，但存量库里的 `failures` / `retryAt` 得在这里
+/// 清一次，否则升级后仍要干等旧冷却到期 —— 修复等于没生效。
+///
+/// ── 版本 23：requests 补「积分消耗」一列（[`V23_SCHEMA`]）─────────
+/// 有些提供商（已实测 WorkBuddy 的 `usage.credit`）会按请求上报积分消耗，
+/// 请求日志新增「积分」列读它。与 token 四列刻意不同：这一列**可空 REAL** ——
+/// `NULL` = 这一家没上报（旧行 / 不提供该读数），0 = 确实零消耗；用 0 兜底会
+/// 把「没读到」画成「花了 0 积分」，比缺一列更难排查。
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -771,8 +783,8 @@ ALTER TABLE requests ADD COLUMN route TEXT;
 ///   - `ts`：记账时刻（毫秒，`logging::now_ms` 同口径；排序与翻页游标）；
 ///   - `date`：北京时间 `YYYY-MM-DD`（上游自然日，`core::beijing` 的日期键 ——
 ///     「哪天的签到」按它算，跟机器时区无关，与调度判定同一份口径）；
-///   - `source`：触发来源 `schedule / startup / manual / single / activity`
-///     （见 `core::checkin_records` 的模块头），界面显示为「来源」列；
+///   - `source`：触发来源 `schedule / makeup / startup / manual / single /
+///     activity`（见 `core::checkin_records` 的模块头），界面显示为「来源」列；
 ///   - `reason`：给日志看的那句（「到点触发（08:00）」「手动签到」…），原样存；
 ///   - `account_id` / `account_name` / `provider`：账号三件套（结果行里就有，
 ///     原样复制；账号删除后历史行仍然可读）；
@@ -940,6 +952,19 @@ UPDATE requests SET api_key_id = key_id, api_key_source = 'key'
 WHERE api_key_id = '' AND key_id != '';
 UPDATE requests SET api_key_name = key_name
 WHERE api_key_name = '' AND key_name != '';
+";
+
+/// 版本 23：requests 补「积分消耗」一列（schema v23）。
+///
+/// 与 v5 / v7 / v10 / v12 同一形态（既有表加列，单条 ALTER，幂等靠版本号）。
+/// 为什么是 **REAL 且可空**，而不是像 token 四列那样 `INTEGER NOT NULL DEFAULT 0`：
+///   · 上游的 `credit` 是小数（WorkBuddy 实测 0.03～0.31），整数列会把读数截断；
+///   · `NULL` 表达「这一家没上报 / 旧行没有」，0 表达「上报了 0」。展示层对前者
+///     显示「—」、对后者显示「0」—— 把两者并成 0 会让「没读到」看起来像
+///     「这条请求免费」，正是余额/用量一列最怕的那种假读数。
+const V23_SCHEMA: &str = "
+-- ── requests 补积分消耗列（schema v23）──────────────────────
+ALTER TABLE requests ADD COLUMN credit REAL;
 ";
 
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
@@ -1119,6 +1144,8 @@ fn apply_version(
         // v22：上游 beta.6 的 assistant_sessions.title_generated（幂等补列）
         // + 模型目录刷新假失败冷却修复（见 SCHEMA_VERSION 的 v22 段）。
         22 => migrate_v22(conn),
+        // v23：requests 补「积分消耗」一列（请求日志的积分列，见 V23_SCHEMA）
+        23 => conn.execute_batch(V23_SCHEMA),
         _ => Ok(()),
     }
 }
@@ -1188,7 +1215,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("user_version 应当可读");
-        assert_eq!(version, 22);
+        assert_eq!(version, 23);
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))
@@ -1218,7 +1245,10 @@ mod tests {
         assert_eq!(rows.len(), 3);
         for (key_id, api_key_id, key_name, api_key_name, api_key_source) in rows {
             assert_eq!(api_key_id, key_id, "api_key_id 必须由 key_id 映射而来");
-            assert_eq!(api_key_name, key_name, "api_key_name 必须由 key_name 映射而来");
+            assert_eq!(
+                api_key_name, key_name,
+                "api_key_name 必须由 key_name 映射而来"
+            );
             assert_eq!(api_key_source, "key", "回填行的来源必须是 key");
         }
     }
@@ -1286,7 +1316,11 @@ fn reset_model_refresh_cooldown(conn: &Connection) -> rusqlite::Result<()> {
     use serde_json::{json, Map, Value};
 
     let text: Option<String> = conn
-        .query_row("SELECT value FROM kv WHERE key = 'backgroundTaskState'", [], |row| row.get(0))
+        .query_row(
+            "SELECT value FROM kv WHERE key = 'backgroundTaskState'",
+            [],
+            |row| row.get(0),
+        )
         .optional()?;
     let Some(text) = text else { return Ok(()) };
     let Ok(mut states) = serde_json::from_str::<Map<String, Value>>(&text) else {
@@ -1295,7 +1329,10 @@ fn reset_model_refresh_cooldown(conn: &Connection) -> rusqlite::Result<()> {
     // 任务级键就是任务 id 本身（`scheduled_tasks::state_key`：模型刷新不是更新
     // 检查那种带仓库前缀的特例）。逐家的 `modelRefresh:<provider>` 键不动 ——
     // 它们的冷却记的是各家自己的失败，与这条误判无关。
-    let Some(state) = states.get_mut("modelRefresh").and_then(Value::as_object_mut) else {
+    let Some(state) = states
+        .get_mut("modelRefresh")
+        .and_then(Value::as_object_mut)
+    else {
         return Ok(());
     };
     let had_cooldown = state.get("retryAt").and_then(Value::as_i64).unwrap_or(0) > 0

@@ -60,6 +60,7 @@ fn connect_timeout_seconds() -> u64 {
 }
 
 /// 一次上游请求的全部素材（协议无关形态；provider 差异在构造阶段已消解）
+#[derive(Clone)]
 pub struct TransportRequest {
     /// 上游完整 URL（由适配器给出）
     pub url: String,
@@ -297,6 +298,7 @@ pub async fn send_chat_request(
                 safe_to_retry,
                 status_code: 502,
                 retryable: true,
+                network_failure: true,
             })
         }
         Err(_elapsed) => {
@@ -307,6 +309,7 @@ pub async fn send_chat_request(
                 safe_to_retry: false,
                 status_code: 502,
                 retryable: true,
+                network_failure: true,
             })
         }
     }
@@ -327,6 +330,9 @@ pub struct UpstreamRequestError {
     /// 是否允许按设置退避重发。脱敏门禁失败**不可重试**：重发只会得到同
     /// 一份错误，且没有任何字节到过上游。
     pub retryable: bool,
+    /// 是否是「链路层」失败（证书类错误除外）：备用入口 / 候选地址只对这类生效。
+    /// 出站脱敏门禁失败不算链路故障。
+    pub network_failure: bool,
 }
 
 impl UpstreamRequestError {
@@ -341,12 +347,58 @@ impl UpstreamRequestError {
             safe_to_retry: false,
             status_code: 503,
             retryable: false,
+            network_failure: false,
         }
     }
 
     pub fn to_gateway_error(&self) -> GatewayError {
         GatewayError::with_status(self.status_code, self.message.clone())
     }
+}
+
+/// 用「已解析的候选地址」客户端发一次（备用入口 / 候选 IP 路径专用）。
+///
+/// `plan.payload` 在构造阶段已脱敏（并挂了 `mask_session`），这里不再二次
+/// 脱敏 —— 调用方（`network_fallback::Fallback`）只在 `send_chat_request`
+/// 之外补发同一份已备好的请求。multipart 信封由调用方按需构造。
+pub(super) async fn send_chat_with_client(
+    plan: &TransportRequest,
+    client: &wreq::Client,
+    form: Option<wreq::multipart::Form>,
+) -> Result<wreq::Response, UpstreamRequestError> {
+    let url = plan.url.clone();
+    let headers = plan.headers.clone();
+    let payload = plan.payload.clone();
+    let mut builder = client.post(&url);
+    if let Some(form) = form {
+        builder = builder.multipart(form);
+    } else {
+        builder = builder.body(payload);
+    }
+    for (key, value) in &headers {
+        // multipart 由 wreq 自己写 Content-Type（含 boundary），跳过原始头
+        if form_present(&plan.headers) && key.eq_ignore_ascii_case("content-type") {
+            continue;
+        }
+        builder = builder.header(key, value);
+    }
+    if let Some(timeout) = NO_TOTAL_TIMEOUT {
+        builder = builder.timeout(Duration::from_millis(timeout));
+    }
+    builder.send().await.map_err(|error| UpstreamRequestError {
+        message: format!("上游请求失败（备用入口）: {}", egress::describe_error_detail(&error)),
+        reason: "上游连接失败".to_string(),
+        safe_to_retry: error.is_connect() || error.is_builder(),
+        status_code: 502,
+        retryable: true,
+        network_failure: !error.is_builder() && (error.is_connect() || error.is_timeout()),
+    })
+}
+
+fn form_present(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case("content-type") && value.eq_ignore_ascii_case("multipart/form-data")
+    })
 }
 
 /// 生成一轮对话的追踪 id（对应 Node 的 `randomUUID()`）。
