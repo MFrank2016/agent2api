@@ -327,13 +327,16 @@ async fn a_real_413_response_is_sent_once_and_handed_back() {
     // （`transport::RetryBudget` + `fallback_retry_advice`），因此随便挑一个
     // 内置家即可。原先这里用 ZCode 的实例，它随实现搬到插件了 —— 换成本家
     // 走得通的 WorkBuddy，断言的仍是同一处语义。
+    let telemetry = Arc::new(RequestTelemetry::new());
     let result = send_with_retry(
         adapter_for(ProviderKind::WorkBuddy),
         &transport,
         &mut budget,
         Some(&capture),
-        &RequestTelemetry::new(),
+        &telemetry,
         false,
+        None,
+        None,
     )
     .await;
     task.abort();
