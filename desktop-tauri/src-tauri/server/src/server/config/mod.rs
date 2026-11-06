@@ -67,8 +67,8 @@ use crate::server::db::Db;
 
 mod account_sort;
 mod assistant_config;
-pub(crate) mod compact_routes;
 pub(crate) mod client_identification;
+pub(crate) mod compact_routes;
 mod github_access;
 mod mutations;
 pub(crate) use mutations::try_update_raw_field;
@@ -90,6 +90,7 @@ pub use github_access::{
     github_access, set_github_access, GithubAccessMode, GithubAccessPatch, GithubAccessSettings,
     DEFAULT_GITHUB_MIRROR,
 };
+pub use routing_groups::{RoutingGroup, RoutingMember};
 pub use routing_profiles::{
     normalize_model as normalize_routing_model, routing_profiles, routing_snapshot,
     save_routing_profile, settings_for_model as routing_settings_for_model,
@@ -100,7 +101,6 @@ pub use sanitize_config::{
     set_sanitize_settings, SanitizePatch, SanitizeSettings, KEY_SANITIZE_PROVIDERS,
     KEY_SANITIZE_RULES, MAX_SANITIZE_PROVIDERS,
 };
-pub use routing_groups::{RoutingGroup, RoutingMember};
 pub use types::*;
 pub use update_policy::{
     set_update_channels, update_beta, update_channels, UpdateChannels, UpdateChannelsPatch,
@@ -1824,17 +1824,23 @@ pub(crate) fn write_routing_strategy_canonical(
     config: &mut RuntimeConfig,
     settings: &RoutingStrategySettings,
 ) {
-    use crate::server::core::routing::RoutingStrategy;
     config.raw.insert(
         KEY_ROUTING_STRATEGY.to_string(),
         routing_strategy_value(settings),
     );
     config.routing_strategy = settings.clone();
-    config.routing.strategy = match settings.default {
-        RoutingStrategy::GlobalRoundRobin => RouteStrategy::Rotate,
-        RoutingStrategy::RoundRobin => RouteStrategy::Provider,
-        _ => RouteStrategy::Order,
-    };
+    config.routing.strategy = route_strategy_display(settings.default);
+}
+
+/// 本地权威策略 → 上游**展示档位字符串**（`order` / `rotate` / `provider`）。
+///
+/// 供 `/api/routing/workspace` 的 profile 契约使用：`RoutingProfile::validate_shape`
+/// 只认这三档，直接把本地 7 档 id 塞进去会让全局保存一律 400。与
+/// `parse::route_strategy_display` 共用同一份映射（唯一权威仍是本地对象形态）。
+pub fn routing_strategy_display_id(
+    strategy: crate::server::core::routing::RoutingStrategy,
+) -> &'static str {
+    route_strategy_display(strategy).as_str()
 }
 
 /// 前者让下一个请求立刻用新策略，后者保证写盘时不吃掉 config.json 里的其它字段。

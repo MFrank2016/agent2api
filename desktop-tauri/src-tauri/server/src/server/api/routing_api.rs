@@ -42,7 +42,12 @@ pub async fn get_routing(State(_state): State<ServerState>) -> Response {
 }
 
 /// PUT /api/routing —— 统一 patch，另接受旧形态的 `routingStrategy` 字符串。
-pub async fn put_routing(State(_state): State<ServerState>, body: Bytes) -> Response {
+///
+/// 粘性模式变化（`auto` / `session` / `turn` / `off` 之间切换）时清空全部会话
+/// 绑定：旧的绑定是按**上一套**粘性语义建立的（例如 `session` 下按会话、`turn`
+/// 下按单轮），沿用会让新模式下选到「本该轮换却还钉在原账号」的结果。只在真正
+/// 变化时清，避免每次保存都打断正在进行的会话。
+pub async fn put_routing(State(state): State<ServerState>, body: Bytes) -> Response {
     let payload = match parse_body(&body) {
         Ok(value) => value,
         Err(error) => return errors::management_error(400, error.message),
@@ -70,8 +75,12 @@ pub async fn put_routing(State(_state): State<ServerState>, body: Bytes) -> Resp
             );
         }
     }
+    let previous_sticky = config::routing_settings().sticky;
     if let Err(message) = super::routing_strategy::apply_object(&object) {
         return errors::management_error(400, message);
+    }
+    if previous_sticky != config::routing_settings().sticky {
+        state.upstream().clear_route_sticky(None, None);
     }
     ok_json(with_legacy_strategy(super::routing_strategy::routing_json()))
 }
@@ -113,12 +122,16 @@ fn with_legacy_strategy(mut value: Value) -> Value {
 
 /// 路由附加维度的 JSON（`/api/routing/workspace` 的 `settings` 字段）。
 ///
-/// 本地 `RoutingSettings` 不含策略维度（策略是逐家的
-/// `RoutingStrategySettings`），所以策略从 `routing_strategy_settings().default`
-/// 取 —— 与统一端点 `/api/routing-strategy` 的默认档位保持一致。
+/// **这个面是上游 profile 契约**：`RoutingProfile::validate_shape` 只接受
+/// `order` / `rotate` / `provider`，所以这里必须给映射后的展示档位，不能直接
+/// 给本地 7 档 id（否则 `PUT /api/routing/profile` 一律 400）。权威策略仍由
+/// `/api/routing-strategy`（对象形态）与 `/api/routing`（`with_legacy_strategy`）
+/// 承载，二者互不影响。
 pub(crate) fn routing_json(settings: config::RoutingSettings) -> Value {
     json!({
-        config::KEY_ROUTING_STRATEGY: config::routing_strategy_settings().default.as_str(),
+        config::KEY_ROUTING_STRATEGY: config::routing_strategy_display_id(
+            config::routing_strategy_settings().default,
+        ),
         config::KEY_ROUTING_STICKY: settings.sticky.as_str(),
         config::KEY_ROUTING_FAILOVER_BACKOFF: settings.failover_backoff,
         config::KEY_ROUTING_SINK: settings.sink,

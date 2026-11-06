@@ -368,8 +368,6 @@ pub const SCHEMA_VERSION: i64 = 24;
 /// `NULL` = 这一家没上报（旧行 / 不提供该读数），0 = 确实零消耗；用 0 兜底会
 /// 把「没读到」画成「花了 0 积分」，比缺一列更难排查。
 
-
-
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
 /// 为什么把六张表写成一个 batch 而不是每张一个常量再拼：它们共同构成「版本 1
@@ -923,6 +921,13 @@ FROM requests WHERE account_id != '' AND status != 0 AND attempts > 0;
 ///
 /// 见 [`SCHEMA_VERSION`] 的 v21 段。可重复执行：建表 / 建索引用
 /// `IF NOT EXISTS`，回填用 `WHERE ... = ''`，旧索引用 `DROP INDEX IF EXISTS`。
+///
+/// **不在这里重放 `account_limiter_events` 的历史回填**：那段
+/// `INSERT OR IGNORE ... SELECT 'legacy:' || row_id` 与上游 `V17_SCHEMA` 逐字相同，
+/// 而 v17 之后 `limiter::counter::note` 已经用 `request_id` 作为 `id` 写过新行；
+/// 再插一遍 `legacy:<row_id>` 会与同一批请求形成两份事件，把 token / 请求计数
+/// 翻倍、限额提前熔断。v17 已保证建表与回填，这里只补「停在 fork v17 的库」
+/// 缺失的表/索引（CREATE IF NOT EXISTS）与旧索引清理。
 const V21_SCHEMA: &str = "
 -- ── 补建上游 v17 的限额事件表（停在 fork v17 的库跳过了该分支）──
 CREATE TABLE IF NOT EXISTS account_limiter_events (
@@ -936,11 +941,6 @@ CREATE TABLE IF NOT EXISTS account_limiter_events (
   requests INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_limiter_events_account_time ON account_limiter_events(account_id, ts, channel);
-INSERT OR IGNORE INTO account_limiter_events (id, account_id, model, ts, tokens, requests)
-SELECT 'legacy:' || row_id, account_id,
-       CASE WHEN upstream_model != '' THEN upstream_model ELSE model END,
-       ts, MAX(total_tokens, 0), 1
-FROM requests WHERE account_id != '' AND status != 0 AND attempts > 0;
 -- ── fork 线旧索引已被 v18 的 idx_requests_api_key_ts 取代 ──
 DROP INDEX IF EXISTS idx_requests_key_ts;
 ";
@@ -1255,7 +1255,105 @@ mod tests {
             assert_eq!(api_key_source, "key", "回填行的来源必须是 key");
         }
     }
+
+    /// B（fix round 3）：v17 已经回填过 `account_limiter_events`，v21 不得再插
+    /// 一遍 `legacy:<row_id>` —— 否则同一批请求被计两次，限额提前熔断。
+    ///
+    /// **判别性夹具**：3 条 requests 在 v17 之前插入（v17 回填成 legacy:1..3），
+    /// 之后**再插入一条全新的 r4** 并让 `limiter::counter::note` 用 `id='r4'`
+    /// 写一条事件。此时若 V21_SCHEMA 仍带那条重复 INSERT，回放会为 r4 生成
+    /// 一个全新的 `legacy:4`（不与任何已有 id 冲突，INSERT OR IGNORE 拦不住），
+    /// 事件数 4 → 5；删掉重复 INSERT 后必须保持 4。
+    #[test]
+    fn v21_does_not_double_limiter_events_after_v17() {
+        let conn = Connection::open_in_memory().expect("内存库应当能建起来");
+        conn.execute_batch(
+            "CREATE TABLE requests (
+                row_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                id             TEXT NOT NULL,
+                ts             INTEGER NOT NULL DEFAULT 0,
+                model          TEXT NOT NULL DEFAULT '',
+                upstream_model TEXT NOT NULL DEFAULT '',
+                account_id     TEXT NOT NULL DEFAULT '',
+                status         INTEGER NOT NULL DEFAULT 0,
+                attempts       INTEGER NOT NULL DEFAULT 1,
+                total_tokens   INTEGER NOT NULL DEFAULT 0,
+                key_id         TEXT NOT NULL DEFAULT '',
+                key_name       TEXT NOT NULL DEFAULT '',
+                api_key_id     TEXT NOT NULL DEFAULT '',
+                api_key_name   TEXT NOT NULL DEFAULT '',
+                api_key_source TEXT NOT NULL DEFAULT ''
+            );
+            INSERT INTO requests (id, account_id, status, attempts, total_tokens) VALUES
+                ('r1', 'acc-1', 200, 1, 100),
+                ('r2', 'acc-1', 200, 1, 200),
+                ('r3', 'acc-2', 500, 1, 50);
+            PRAGMA user_version = 16;",
+        )
+        .expect("v16 fixture 应当能建起来");
+
+        // 模拟上游 v17：建表 + 历史回填（3 条 legacy:1..3）。
+        conn.execute_batch(V17_SCHEMA)
+            .expect("v17 应当能建表并回填");
+
+        // v17 **之后**才发生的新请求：它不在 v17 的回填快照里。
+        conn.execute_batch(
+            "INSERT INTO requests (id, account_id, status, attempts, total_tokens)
+             VALUES ('r4', 'acc-1', 200, 1, 999);
+             INSERT INTO account_limiter_events (id, account_id, ts, tokens, requests)
+             VALUES ('r4', 'acc-1', 2000, 999, 1);",
+        )
+        .expect("v17 之后的新请求与 note 事件应当能插入");
+
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM account_limiter_events", [], |row| {
+                row.get(0)
+            })
+            .expect("事件数应当可读");
+        assert_eq!(before, 4, "v17 的 3 条 legacy + 1 条 note = 4");
+        let legacy_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_limiter_events WHERE id LIKE 'legacy:%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy 事件数应当可读");
+        assert_eq!(legacy_before, 3, "v17 只回填了 3 条 legacy");
+
+        // 走到 v21（只跑 v21 动作，避免 migrate() 连带 v18~v23 需要更多表）。
+        migrate_v21(&conn).expect("v21 应当成功");
+
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM account_limiter_events", [], |row| {
+                row.get(0)
+            })
+            .expect("事件数应当可读");
+        assert_eq!(
+            after, before,
+            "v21 重放历史回填会为 r4 生成新的 legacy:4，把事件数 4 顶到 5"
+        );
+
+        let legacy_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_limiter_events WHERE id LIKE 'legacy:%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy 事件数应当可读");
+        assert_eq!(legacy_after, 3, "v21 不得新增任何 legacy:% 行");
+
+        // 条件 Key 回填仍然生效（fork 线的 key_id 不能丢）；本夹具 key_id 为空，不应误回填。
+        let mapped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM requests WHERE api_key_source = 'key'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("回填结果应当可读");
+        assert_eq!(mapped, 0, "本夹具 key_id 为空，不应误回填");
+    }
 }
+
 /// v22 的实际动作：幂等补建上游 beta.6 的 `assistant_sessions.title_generated`
 /// 列（上游 v21），再清掉模型目录刷新的假失败冷却（上游 v22）。
 ///

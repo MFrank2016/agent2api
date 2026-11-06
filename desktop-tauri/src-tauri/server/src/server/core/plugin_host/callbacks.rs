@@ -215,7 +215,12 @@ impl Host {
             return;
         }
         let outcome: Result<serde_json::Value, proto::WireError> = match method.as_str() {
-            "transport.capabilities" => Ok(serde_json::json!({ "multipart": true })),
+            // 插件 multipart 信封的解析层（`core/upstream/multipart.rs` 的
+            // `request_form`）当前**没有任何调用方**，转发链路的
+            // `send_chat_with_client` 一律传 `None` —— 即网关实际只发 JSON。
+            // 此处如实申报 false，避免插件 SDK 按 multipart 组装请求体
+            // 而网关丢掉文件字段（raccoon 参考图编辑等）。
+            "transport.capabilities" => Ok(serde_json::json!({ "multipart": false })),
             proto::methods::plugin::STORE_GET => {
                 self.callbacks.store_get(text("provider"), text("account")).await
             }

@@ -55,7 +55,11 @@ pub async fn get_routing_strategy(State(_state): State<ServerState>) -> Response
 ///
 /// 校验通过后：写配置库 → 返回**生效后**的值（前端直接用响应刷新界面，不必再
 /// GET 一次）。非法值 → 400 且什么都不改（先整单校验再落盘，与 `/api/retry` 同一顺序）。
-pub async fn put_routing_strategy(State(_state): State<ServerState>, body: Bytes) -> Response {
+///
+/// 粘性模式变化（`auto` / `session` / `turn` / `off` 之间切换）时清空全部会话
+/// 绑定：旧绑定是按上一套粘性语义建立的，沿用会让新模式下选到「本该轮换却还钉
+/// 在原账号」的结果。与 `/api/routing` 别名同一口径。
+pub async fn put_routing_strategy(State(state): State<ServerState>, body: Bytes) -> Response {
     let payload = match parse_body(&body) {
         Ok(value) => value,
         Err(error) => return errors::management_error(400, error.message),
@@ -63,8 +67,12 @@ pub async fn put_routing_strategy(State(_state): State<ServerState>, body: Bytes
     let Some(object) = payload.as_object() else {
         return errors::management_error(400, "请求体必须是 JSON 对象");
     };
+    let previous_sticky = config::routing_settings().sticky;
     if let Err(message) = apply_object(object) {
         return errors::management_error(400, message);
+    }
+    if previous_sticky != config::routing_settings().sticky {
+        state.upstream().clear_route_sticky(None, None);
     }
     let strategies = config::routing_strategy_settings();
     logging::log(
@@ -444,5 +452,37 @@ mod tests {
         assert_eq!(RoutingStrategy::parse("round-robin"), Some(RoutingStrategy::RoundRobin));
         assert_eq!(RoutingStrategy::parse("global-round-robin"), Some(RoutingStrategy::GlobalRoundRobin));
         assert_eq!(RoutingStrategy::parse("rotate"), Some(RoutingStrategy::GlobalRoundRobin));
+    }
+
+    /// 粘性模式变化必须**能被检测到**：两个 PUT 处理器（`/api/routing` 与
+    /// `/api/routing-strategy`）都在 `apply_object` 前后比对 `routing_settings().sticky`
+    /// 来决定是否清空会话绑定。若 `set_routing` 不写内存快照（或读侧读别的键），
+    /// 比对永远相等 → 换了粘性模式却还钉在旧账号上，且没有任何报错。
+    ///
+    /// 只测「前后可检测」这一段，不构造 `ServerState`（清空动作本身是
+    /// `UpstreamService::clear_route_sticky` 的一行调用，由 handler 覆盖）。
+    #[test]
+    fn sticky_mode_change_is_detectable_around_apply_object() {
+        let _guard = crate::server::core::provider_options::CONFIG_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = config::routing_settings().sticky;
+        let target = if previous == StickyMode::Session {
+            StickyMode::Off
+        } else {
+            StickyMode::Session
+        };
+
+        let before = config::routing_settings().sticky;
+        apply_object(&object(json!({ "routingSticky": target.as_str() })))
+            .expect("合法粘性值不应被拒绝");
+        let after = config::routing_settings().sticky;
+        assert_ne!(before, after, "粘性模式变化必须体现在快照里，否则不会清绑定");
+        assert_eq!(after, target);
+
+        // 复原（进程级配置，别污染后跑的用例）。
+        apply_object(&object(json!({ "routingSticky": previous.as_str() })))
+            .expect("复原值不应被拒绝");
+        assert_eq!(config::routing_settings().sticky, previous);
     }
 }

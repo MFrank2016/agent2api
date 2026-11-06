@@ -217,7 +217,7 @@ docker run -d --name agent2api --restart unless-stopped --memory=1g \
   aimodcc/agent2api:latest
 ```
 
-For compose, add `mem_limit: 1g` to the service (a commented example is in `docker-compose.yml`); on swarm or `docker compose --compatibility`, use `deploy.resources.limits.memory`. Treat 1g as a starting point and tune it to your concurrency.
+The bundled `docker-compose.yml` already sets `mem_limit: 1g` (a live, effective value — not a commented example); when writing your own compose, tune that value to your concurrency, and on swarm or `docker compose --compatibility` use `deploy.resources.limits.memory`.
 
 Both in-memory image caches can be shrunk with environment variables (128 MiB each by default): `AGENT2API_IMAGE_CACHE_MB` (download cache for generated images) and `AGENT2API_IMAGE_COMPRESS_CACHE_MB` (cache of compressed session images). Invalid or out-of-range values fall back to the default and never prevent startup.
 
