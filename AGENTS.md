@@ -6,10 +6,11 @@
 > 覆盖范围：切分支 / 给 PR 选 base / 合并 PR / 回复 Issue、PR / 改版本号 / 写更新日志 /
 > 打 tag / 挂 GitHub Release / 发 beta 预发布版 / 发版验收 / 排查发版失败。
 
-## 两条红线（先问人，不得自行推进）
+## 三条红线（先问人，不得自行推进）
 
 1. **发版**：改版本号、推 `main` / `beta`、打 tag、挂 Release 之前，先把版本号与「这次要发什么」讲清楚，等用户确认；**未经确认不得推任何分支或 tag** —— tag 一旦推出去就会触发构建、产出公开的安装包与镜像，收不回来。
 2. **更新日志**：写好的日志（= 发布提交信息 = Release 正文）必须先给用户逐条过目；按反馈改完**再确认一次**才能提交。
+3. **不提 PR**：任何情况下都不要创建 Pull Request（不用 `gh pr create`、不调 GitHub API、不在网页开 PR）。需要交付时只提交到本地分支 / 推送到 fork，并告知用户改动与分支名，由用户自行决定是否开 PR。
 
 其余细则（分支落脚点、署名与 AI 落款、六处版本号、正式版 / beta 完整流程、验收清单、已知坑与排查）见上述 Skill。
 
@@ -17,19 +18,24 @@
 
 网关 tag 只发起构建，实际发布分散在网关 / 构建 / 插件 / 索引四类仓库；细则见 Skill 第 0.5 节。
 
-| 仓库 | 作用 |
-|---|---|
-| 本仓库（网关） | 源码、tag、更新日志；`build.yml` 只派发 |
-| `Agent2Builder/agent2api-releases`（`BUILD_REPO`） | 编译安装包 / 镜像；网关 Release 在这里 |
-| `ProvidersPlugin/Agent2Providers`（`PLUGIN_REPO`） | 插件独立 tag，产出 5 平台 pack |
-| `Agent2Builder/agent2api-providers-releases`（`PLUGIN_RELEASE_REPO`） | 插件 Release（5 平台 zip + signature） |
-| `Agent2plugin/Agent2plugin`（`INDEX_REPO`） | `app.json` / `plugins/<id>.json` / `index.json` |
+| 仓库                                                                  | 作用                                            |
+| --------------------------------------------------------------------- | ----------------------------------------------- |
+| 本仓库（网关）                                                        | 源码、tag、更新日志；`build.yml` 只派发         |
+| `Agent2Builder/agent2api-releases`（`BUILD_REPO`）                    | 编译安装包 / 镜像；网关 Release 在这里          |
+| `ProvidersPlugin/Agent2Providers`（`PLUGIN_REPO`）                    | 插件独立 tag，产出 5 平台 pack                  |
+| `Agent2Builder/agent2api-providers-releases`（`PLUGIN_RELEASE_REPO`） | 插件 Release（5 平台 zip + signature）          |
+| `Agent2plugin/Agent2plugin`（`INDEX_REPO`）                           | `app.json` / `plugins/<id>.json` / `index.json` |
 
 - 网关 tag 只触发构建仓库；插件与索引不随网关 tag 自动更新，各自走发布流程。
 - 网关版本号同步六处：根 `package.json`、`desktop-tauri/package.json`、`desktop-tauri/src-tauri/Cargo.toml`、`desktop-tauri/src-tauri/tauri.conf.json`、`desktop-tauri/src-tauri/server/Cargo.toml`、`desktop-tauri/mobile/package.json`；插件版本在插件仓库独立维护。
 - 正式版 tag 落 `main`；beta tag 落 `beta` 且带 `-beta.N`，Release 标 **Prerelease**。
 - 发布前先 dry-run：`bash scripts/release.sh --dry-run vX.Y.Z`（不调用 gh、不推送、不打 tag）。
 - **红线**：未经用户确认，不得推任何分支 / tag / Release；dry-run 也不得推送。
+
+## 反代提供商问题排查
+
+收到反代提供商相关的问题反馈时，**优先使用网络搜索查找已有解决方案**，重点参考同类项目的 Issue、PR、修复记录和适配实现，了解其他项目是否遇到过相同问题、如何解决。**不要默认从零自行排查**：先核对已有方案与本项目的适用性，优先借鉴可靠的解决思路；未找到可靠方案、现有方案不适用或仍有未解决的问题时，再开展针对性的本地排查。
+
 
 ## 文档落点
 

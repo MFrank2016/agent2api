@@ -661,7 +661,10 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // 见 `providers::officeace::oauth` 的模块头），所以这里没有 CodeArts 那种
         // loopback 回调要放行；但「不设限」仍是必须显式写出的选择（落进默认分支
         // 会拿到 WorkBuddy 的白名单 → 窗口白屏）。
-//
+        // Nous（Nous Research Portal）同样不设限：OAuth 设备码流程把用户带到官方
+        // 的 verification_uri，主机由上游给、不可穷举（与 Qoder / ZCode / Cline 同一
+        // 情形）；落进默认分支会拿到 WorkBuddy 的白名单 → 授权窗口白屏。
+        //
         // OrcaTerm（腾讯云遨驰终端）同样不设限：登录窗口开在官方 OAuth 授权页
         // （`orcaterm.com/oauth/authorize`），它会 302 到 `open.weixin.qq.com`
         // 的微信二维码（`qrconnect`），沿途还会拉 `res.wx.qq.com` 的样式与
@@ -689,9 +692,6 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         "catpaw" | "qoder" | "qoder-intl" | "qwenwork" | "qwenwork-intl" | "cline-free"
         | "cline-pass" | "autoclaw"
         | "autoclaw-intl" | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae"
-        // Nous（Nous Research Portal）同样不设限：OAuth 设备码流程把用户带到官方
-        // 的 verification_uri，主机由上游给、不可穷举（与 Qoder / ZCode / Cline 同一
-        // 情形）；落进默认分支会拿到 WorkBuddy 的白名单 → 授权窗口白屏。
         | "kuku" | "antigravity" | "officeace" | "orcaterm" | "atomcode" | "lobsterai" | "nous" => None,
         // WorkBuddy 的两个地区共用这一张表（表里 `workbuddy.ai` 那一行就是国际站
         // 的登录域）。**显式列出**而不是靠下面的默认分支：上面那条警告要求
@@ -717,6 +717,9 @@ fn host_allowed(url: &url::Url, provider: &str, social_restore: bool) -> bool {
     }
     if provider == "doubaowork" {
         return url.as_str() == "about:blank" || crate::doubaowork_login::allowed(url);
+    }
+    if let Some(region) = crate::server::core::providers::monkeycode::Region::from_provider_id(provider) {
+        return url.as_str() == "about:blank" || crate::monkeycode_login::allowed(url, region);
     }
     match url.scheme() {
         "about" | "data" => true,
@@ -789,6 +792,9 @@ fn is_login_callback(url: &url::Url, provider: &str) -> bool {
 /// 与 Qoder 的设备授权同形；手工填凭证与导入桌面端登录态都不经过这里
 /// （那两条走 `POST /api/accounts`）。
 fn normalize_provider(provider: &str) -> Result<&'static str, String> {
+    if let Some(region) = crate::server::core::providers::monkeycode::Region::from_provider_id(provider.trim()) {
+        return Ok(region.provider_id());
+    }
     match provider.trim() {
         "" | "workbuddy" => Ok("workbuddy"),
         // WorkBuddy 国际版（2026-10 拆家后是独立 provider）：面板那块
@@ -867,6 +873,10 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // 与轮询 —— 与 ZCode / CodeArts 同一条路。它的授权码由网关**轮询云端**
         // 取回（云端回调页不往本机跳），所以窗口最后停在云端页上也不影响登录判定。
         "officeace" => Ok("officeace"),
+        // Nous（Nous Research Portal）：OAuth 设备码 —— 授权地址（verification_uri）
+        // 由**后端适配器**问上游拿，壳侧只负责开窗口与轮询，与 Qoder / ZCode / Cline
+        // 的设备授权同一条路（授权结果由服务端记录，不依赖窗口捕获回调）。
+        "nous" => Ok("nous"),
         // OrcaTerm（腾讯云遨驰终端）：地址由**后端适配器**返回（官方 OAuth 授权页，
         // 它会 302 到微信二维码），壳侧负责开窗口并把回调
         // `orcaterm://oauth_callback?session_id=…` 交回网关换令牌
@@ -883,10 +893,6 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // 「网页登录」按钮画出来了，缺了它点下去就是
         // 「登录失败：不支持网页登录的提供商：atomcode」。
         "atomcode" => Ok("atomcode"),
-        // Nous（Nous Research Portal）：OAuth 设备码 —— 授权地址（verification_uri）
-        // 由**后端适配器**问上游拿，壳侧只负责开窗口与轮询，与 Qoder / ZCode / Cline
-        // 的设备授权同一条路（授权结果由服务端记录，不依赖窗口捕获回调）。
-        "nous" => Ok("nous"),
         other => Err(format!("不支持网页登录的提供商：{other}")),
     }
 }
@@ -1446,6 +1452,9 @@ pub async fn start(
     if provider == "doubaowork" {
         return crate::doubaowork_login::start(app, &mode).await;
     }
+    if let Some(region) = crate::server::core::providers::monkeycode::Region::from_provider_id(provider) {
+        return crate::monkeycode_login::start(app, region, &mode).await;
+    }
 
     // 小浣熊：授权地址由**后端适配器**生成（静态地址 + 本地生成的 state），
     // 所以请求体里只带 provider，不带 edition（那是 workbuddy 的端点维度）。
@@ -1595,7 +1604,7 @@ pub async fn start(
         provider,
         "cline-free" | "cline-pass" | "zcode" | "zcode-intl" | "codearts" | "trae" | "qoder"
         | "qoder-intl" | "qwenwork" | "qwenwork-intl" | "antigravity" | "officeace" | "lobsterai"
-        | "atomcode" | "nous"
+        | "atomcode" | "nous
     ) {
         format!("登录 {provider_label} 账号")
     } else {
@@ -2073,7 +2082,10 @@ async fn run_embedded_with_proxy(
     // 密集重试只会延长风控窗口。
     let mut kuku_retry_block_until: Option<tokio::time::Instant> = None;
     let mut doubaowork_submitted = false;
+    let monkeycode_region = crate::server::core::providers::monkeycode::Region::from_provider_id(provider);
+    let mut monkeycode_submitted = false;
     let mut deepseek_submitted = false;
+    let mut deepseek_capture = crate::deepseek_login::CredentialCapture::default();
 
     // 导航拦截与弹窗拦截**共用同一个标志**：两种入口收到的可能是同一个回调
     // （页面先改 location、再被 WebView2 派生出一条弹窗请求），分开各一个标志
@@ -2174,6 +2186,13 @@ async fn run_embedded_with_proxy(
         // 同属一个 WebView2 数据目录、共享 Cookie 存储，弹窗里登录成功后
         // 等待循环照样能从 Cookie 读到 BDUSS）。
         .on_new_window(move |url, _features| {
+            if let Some(region) = monkeycode_region {
+                return if crate::monkeycode_login::allowed(&url, region) {
+                    tauri::webview::NewWindowResponse::Allow
+                } else {
+                    tauri::webview::NewWindowResponse::Deny
+                };
+            }
             if provider == "deepseek-web" && crate::deepseek_login::allowed(&url) {
                 return tauri::webview::NewWindowResponse::Allow;
             }
@@ -2308,7 +2327,7 @@ async fn run_embedded_with_proxy(
         // 初版那套「读窗口 cookie 找 ot_session」已删除：那条 Cookie 在
         // SPA 内扫码登录时根本不会被写出（见模块头的实测对照）。
         if provider == "deepseek-web" && !deepseek_submitted {
-            match crate::deepseek_login::credentials(&window).await {
+            match crate::deepseek_login::credentials(&window, &mut deepseek_capture).await {
                 Ok(Some(credentials)) if login_is_current(app, login_state) => {
                     deepseek_submitted = true;
                     submit_callback(login_state, &credentials).await;
@@ -2317,6 +2336,16 @@ async fn run_embedded_with_proxy(
                 Err(error) => {
                     eprintln!("[login] {error}");
                 }
+            }
+        }
+        if let Some(region) = monkeycode_region.filter(|_| !monkeycode_submitted) {
+            match crate::monkeycode_login::credentials(&window, region).await {
+                Ok(Some(credentials)) if login_is_current(app, login_state) => {
+                    monkeycode_submitted = true;
+                    submit_callback(login_state, &credentials).await;
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("[login] {error}"),
             }
         }
         if provider == "doubaowork" && !doubaowork_submitted {

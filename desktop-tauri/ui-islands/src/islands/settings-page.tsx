@@ -156,6 +156,11 @@ import { CloudSyncPanel } from './settings-cloud-sync'
 import { DbRestoreDialog } from './settings-db-restore'
 import { DatabaseBackupDialogs, DatabaseBackupPanel } from './settings-database-backup'
 import { SanitizePanel } from './settings-sanitize'
+import { MaskingPanel } from './settings-masking'
+
+import { ClientIdentificationPanel } from '../../../ui-shared/client-identification-panel'
+import { clientIdentificationApi } from './settings-client-identification'
+
 // 侧边栏菜单面板（设置 → 显示）：显隐 / 顺序 / 分组。布局模型在
 // ui/sidebar-layout.js（经典脚本，主侧边栏渲染与这里共用同一份），见该文件的模块头
 import { SidebarPane } from './sidebar-pane'
@@ -1851,6 +1856,10 @@ function SecurityPane({ snap }: { snap: SettingsSnapshot }) {
         </CardContent>
       </Card>
 
+      {/* 可逆出站脱敏：与上面的跨域、下面的指纹脱敏同属「安全」，但语义独立 ——
+          它只改发给上游的副本、回复里还原，且失败时拒绝发送（fail-closed）。 */}
+      <MaskingPanel snap={snap} />
+
       {/* 机器人校验搬到「账户」分类（与管理员账号、登录开关同层）。
           这里保留「退出登录」—— 它属于「当前这一端的会话」，与安全分类的
           其它项（跨域、脱敏）不是一类。 */}
@@ -2582,6 +2591,7 @@ function SettingsPage() {
           <DisplayPane />
         </div>
         <div className={paneClass('gateway')} data-cat='gateway'>
+          <ClientIdentificationPanel api={clientIdentificationApi} t={t} active={snap.category === 'gateway'} />
           <GatewayPane snap={snap} panels={adminPanels} />
         </div>
         <div className={paneClass('retry')} data-cat='retry'>

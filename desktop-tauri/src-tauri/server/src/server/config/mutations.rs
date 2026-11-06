@@ -21,7 +21,18 @@ pub(crate) fn try_update_raw_field<T, E>(
     let fingerprint = synced_fingerprint(&next.raw);
     next.raw.insert(key.to_string(), value);
     if key == crate::server::core::model_rules::KEY_MODEL_RULES {
-        next.model_rules = std::sync::Arc::new(crate::server::core::model_rules::ModelRules::from_raw(&next.raw));
+        next.model_rules = std::sync::Arc::new(
+            crate::server::core::model_rules::ModelRules::from_raw(&next.raw),
+        );
+    }
+    if key == super::KEY_ROUTING_PROFILES {
+        next.routing_profiles = super::routing_profiles::from_raw(&next.raw);
+    }
+    if key == super::compact_routes::KEY_COMPACT_ROUTES {
+        next.compact_routes = super::compact_routes::from_raw(&next.raw);
+    }
+    if key == super::client_identification::KEY_CLIENT_IDENTIFICATION {
+        next.client_identification = super::client_identification::from_raw(&next.raw);
     }
     if !save_raw(&next.raw) {
         return Err(storage_error());
@@ -31,10 +42,14 @@ pub(crate) fn try_update_raw_field<T, E>(
     let mut config = CONFIG
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if catalog_changed { crate::server::core::providers::catalog::invalidate(); }
+    if catalog_changed {
+        crate::server::core::providers::catalog::invalidate();
+    }
     *config = Some(next);
     drop(config);
-    if catalog_changed { crate::server::core::providers::catalog::invalidate(); }
+    if catalog_changed {
+        crate::server::core::providers::catalog::invalidate();
+    }
     if changed {
         crate::server::core::cloud_sync::auto_sync::notify_change();
     }

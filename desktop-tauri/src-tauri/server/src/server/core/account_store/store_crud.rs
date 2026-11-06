@@ -61,6 +61,49 @@ use crate::server::logging;
 /// （ui-islands 的 `CONC_MAX`）；两处要对得上，否则会「界面让填、接口回 400」。
 pub(crate) const MAX_CONCURRENT_LIMIT: u64 = 999;
 
+/// 滚动 60 秒请求上限（`maxRpm`）的封顶值（0 = 不限）。选路读侧
+/// （`routing::max_rpm_of`）用的是**同一个**常量：写入侧挡住的脏数据，
+/// 手改记录仍能塞进来，读侧必须按同一份上限兜底。
+pub(crate) const MAX_RPM_LIMIT: u64 = 10_000;
+
+/// 同 provider 同时使用的账号数上限（`maxAccounts`）的封顶值（0 = 不限）。
+pub(crate) const MAX_ACCOUNTS_LIMIT: u64 = 999;
+
+/// 账号在途已满时的排队上限（`queueLimit`）的封顶值（0 = 不排队）。
+pub(crate) const MAX_QUEUE_LIMIT: u64 = 1_000;
+
+/// `maxRpm` / `maxAccounts` / `queueLimit` 共用的归一化：必须是**非负整数**
+/// （`as_u64` 对浮点 / 负数 / 字符串一律返回 None）、封顶 `cap`。
+///
+/// 三个字段的语义不同（不限 / 不限 / 不排队），但校验规则完全相同；文案由
+/// 调用方给出，免得把「排队上限必须是不大于 999」这种复制错留在某一份里。
+fn normalize_limit(value: &Value, cap: u64, label: &str) -> Result<u64, AccountStoreError> {
+    match value.as_u64() {
+        Some(number) if number <= cap => Ok(number),
+        Some(_) => Err(AccountStoreError::bad_request(format!(
+            "{label}必须是不大于 {cap} 的非负整数"
+        ))),
+        None => Err(AccountStoreError::bad_request(format!(
+            "{label}必须是非负整数"
+        ))),
+    }
+}
+
+/// 归一 `maxRpm` 补丁值（0 = 不限，封顶 [`MAX_RPM_LIMIT`]）。
+pub(crate) fn normalize_max_rpm(value: &Value) -> Result<u64, AccountStoreError> {
+    normalize_limit(value, MAX_RPM_LIMIT, "RPM 上限")
+}
+
+/// 归一 `maxAccounts` 补丁值（0 = 不限，封顶 [`MAX_ACCOUNTS_LIMIT`]）。
+pub(crate) fn normalize_max_accounts(value: &Value) -> Result<u64, AccountStoreError> {
+    normalize_limit(value, MAX_ACCOUNTS_LIMIT, "账号上限")
+}
+
+/// 归一 `queueLimit` 补丁值（0 = 不排队，封顶 [`MAX_QUEUE_LIMIT`]）。
+pub(crate) fn normalize_queue_limit(value: &Value) -> Result<u64, AccountStoreError> {
+    normalize_limit(value, MAX_QUEUE_LIMIT, "排队上限")
+}
+
 /// 归一 `maxConcurrent` 补丁值：必须是**非负整数**（`as_u64` 对浮点 / 负数 /
 /// 字符串一律返回 None）、封顶 [`MAX_CONCURRENT_LIMIT`]。
 ///
@@ -870,6 +913,55 @@ impl AccountStore {
             }
         }
 
+        // Phase 2 的三个账号上限字段（滚动 RPM / 同 provider 账号数 / 排队）。
+        // 与 `maxConcurrent` 同一口径：0 = 不限（`queueLimit` 的 0 = 不排队），
+        // 写入侧归一化并封顶，读侧缺键按 0（`routing::max_rpm_of` /
+        // `max_accounts_of` / `queue_limit_of`）。
+        if let Some(value) = patch.get("maxRpm") {
+            let next = normalize_max_rpm(value)?;
+            let current = record.get("maxRpm").and_then(Value::as_u64).unwrap_or(0);
+            if next != current {
+                record.set("maxRpm", Value::from(next));
+                changes.push(if next == 0 {
+                    "RPM 上限 → 不限".to_string()
+                } else {
+                    format!("RPM 上限 → {next}")
+                });
+            }
+        }
+
+        if let Some(value) = patch.get("maxAccounts") {
+            let next = normalize_max_accounts(value)?;
+            let current = record
+                .get("maxAccounts")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if next != current {
+                record.set("maxAccounts", Value::from(next));
+                changes.push(if next == 0 {
+                    "账号上限 → 不限".to_string()
+                } else {
+                    format!("账号上限 → {next}")
+                });
+            }
+        }
+
+        if let Some(value) = patch.get("queueLimit") {
+            let next = normalize_queue_limit(value)?;
+            let current = record
+                .get("queueLimit")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if next != current {
+                record.set("queueLimit", Value::from(next));
+                changes.push(if next == 0 {
+                    "排队上限 → 不排队".to_string()
+                } else {
+                    format!("排队上限 → {next}")
+                });
+            }
+        }
+
         if let Some(value) = patch.get("usageQuery") {
             // 每账号自动余额查询（enabled + interval 秒）：界面的设置段每次保存
             // 都整块发回，与 name / proxy 同一形态。归一化后恒存显式对象
@@ -1201,5 +1293,76 @@ mod tests {
         let patch = json!({ "priority": 5 }).as_object().unwrap().clone();
         AccountStore::apply_patch(&mut record, &patch, no_holder).unwrap();
         assert_eq!(record.get("nameCustom"), None);
+    }
+
+    fn empty_record() -> StoredAccount {
+        StoredAccount::from_map(
+            json!({ "id": "a1", "provider": "workbuddy" })
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+    }
+
+    /// 新增三个上限字段的写入侧：归一化后恒存显式数字，变更日志按字段给出；
+    /// 同值提交（设置弹窗每次保存都整块回传）不产生日志。
+    #[test]
+    fn new_limit_fields_are_normalized_on_write() {
+        let mut record = empty_record();
+        let patch = json!({ "maxRpm": 20, "maxAccounts": 2, "queueLimit": 8 })
+            .as_object()
+            .unwrap()
+            .clone();
+        let changes = AccountStore::apply_patch(&mut record, &patch, |_| Ok(None)).unwrap();
+        assert_eq!(record.get("maxRpm").and_then(Value::as_u64), Some(20));
+        assert_eq!(record.get("maxAccounts").and_then(Value::as_u64), Some(2));
+        assert_eq!(record.get("queueLimit").and_then(Value::as_u64), Some(8));
+        assert_eq!(
+            changes,
+            vec!["RPM 上限 → 20", "账号上限 → 2", "排队上限 → 8"]
+        );
+
+        // 同值再提交：不写记录、不记日志
+        let same = json!({ "maxRpm": 20, "maxAccounts": 2, "queueLimit": 8 })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(AccountStore::apply_patch(&mut record, &same, |_| Ok(None))
+            .unwrap()
+            .is_empty());
+
+        // 归零 = 恢复不限 / 不排队，键仍然显式落库（读侧不必判缺键）
+        let zero = json!({ "maxRpm": 0, "maxAccounts": 0, "queueLimit": 0 })
+            .as_object()
+            .unwrap()
+            .clone();
+        let changes = AccountStore::apply_patch(&mut record, &zero, |_| Ok(None)).unwrap();
+        assert_eq!(
+            changes,
+            vec!["RPM 上限 → 不限", "账号上限 → 不限", "排队上限 → 不排队"]
+        );
+        assert_eq!(record.get("maxRpm").and_then(Value::as_u64), Some(0));
+        assert_eq!(record.get("maxAccounts").and_then(Value::as_u64), Some(0));
+        assert_eq!(record.get("queueLimit").and_then(Value::as_u64), Some(0));
+    }
+
+    /// 写入侧封顶：超过上限 / 非整数一律 400，且记录不变。
+    #[test]
+    fn new_limit_fields_reject_out_of_range_values() {
+        for (key, value) in [
+            ("maxRpm", json!(10_001)),
+            ("maxAccounts", json!(1_000)),
+            ("queueLimit", json!(1_001)),
+            ("maxRpm", json!(-1)),
+            ("maxAccounts", json!(1.5)),
+            ("queueLimit", json!("8")),
+        ] {
+            let mut record = empty_record();
+            let mut patch = Map::new();
+            patch.insert(key.to_string(), value);
+            let error = AccountStore::apply_patch(&mut record, &patch, |_| Ok(None)).unwrap_err();
+            assert_eq!(error.status_code, 400, "{key} 应当被拒绝");
+            assert_eq!(record.get(key), None, "{key} 被拒后不应落库");
+        }
     }
 }

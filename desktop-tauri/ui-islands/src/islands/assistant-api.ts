@@ -51,8 +51,8 @@ type DesktopBridge = {
   platform?: string
   getBackendStatus?: () => Promise<BackendStatus | null | undefined>
   waitForBackend?: () => Promise<BackendStatus | null | undefined>
-  /** 直连网关的管理凭证（桌面为本机会话；模型 Key 单独选择） */
-  directCredentials?: () => Promise<unknown>
+  /** 当前管理凭证；网页端 refresh=true 时先静默续期，桌面端由壳自行换证。 */
+  directCredentials?: (refresh?: boolean) => Promise<unknown>
 }
 
 function bridge(): DesktopBridge | undefined {
@@ -63,7 +63,15 @@ function bridge(): DesktopBridge | undefined {
 export async function gatewayBase(force = false): Promise<string> {
   if (cachedBase && !force) return cachedBase
   const api = bridge()
-  if (api?.platform === 'web') {
+  // 登录页会在 web bridge 初始化前就调用 gatewayBase（更新检查）：这时 api 还是
+  // undefined，不能只认 api.platform === 'web'，否则会错误回退到 127.0.0.1，
+  // 浏览器按 PNA/CORS 拦截公网页面到 loopback 的请求。
+  const isWebPage =
+    typeof window !== 'undefined' &&
+    /^https?:$/.test(window.location.protocol) &&
+    window.location.hostname !== 'tauri.localhost' &&
+    !(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__
+  if (api?.platform === 'web' || (isWebPage && api?.platform !== 'desktop')) {
     const origin = typeof window === 'undefined' ? '' : window.location?.origin
     if (origin && origin !== 'null') {
       cachedBase = origin
@@ -86,9 +94,8 @@ export async function gatewayBase(force = false): Promise<string> {
   return `http://127.0.0.1:${FALLBACK_PORT}`
 }
 
-/** 桥返回的管理凭证缓存；明确的管理会话失效时重新获取一次。 */
+/** 同源请求照常带 cookie；跨源桌面请求由当前会话头表达凭证。 */
 const CREDENTIALS: RequestCredentials = 'same-origin'
-let cachedAuthHeaders: Record<string, string> | null = null
 
 /** 桥返回的凭证表 → 只保留值为非空字符串的项（形状校验，防老壳/异常值） */
 function asHeaderTable(value: unknown): Record<string, string> {
@@ -100,12 +107,9 @@ function asHeaderTable(value: unknown): Record<string, string> {
   return table
 }
 
-async function directAuthHeaders(force = false): Promise<Record<string, string>> {
-  if (cachedAuthHeaders && !force) return cachedAuthHeaders
-  const api = bridge()
-  const table = asHeaderTable(await api?.directCredentials?.())
-  cachedAuthHeaders = table
-  return table
+/** 不跨请求缓存：桌面壳会提前换证，网页端也可能已在另一标签页完成续期。 */
+async function directAuthHeaders(refresh = false): Promise<Record<string, string>> {
+  return asHeaderTable(await bridge()?.directCredentials?.(refresh))
 }
 
 /**
@@ -162,7 +166,7 @@ function wrapFetchError(error: unknown, base: string): Error {
  * 不带体 —— 与原先每个调用点自己拼 headers/body 相比，凭证合并、Content-Type
  * 与重试策略都只有这一处实现。
  *
- * 桌面端只在明确的管理会话失效时清掉缓存重试一次，模型 Key 错误不重试。
+ * 明确的管理会话失效时重新获取凭证，网页端同时续期；最多重试一次，模型 Key 错误不重试。
  */
 export async function requestDirect(
   path: string,
@@ -172,7 +176,7 @@ export async function requestDirect(
   const api = bridge()
   if (api?.platform !== 'web' && api?.waitForBackend) await api.waitForBackend()
   const base = await gatewayBase()
-  const headers: Record<string, string> = { ...(await directAuthHeaders()) }
+  const headers: Record<string, string> = { ...(await directAuthHeaders(retried)) }
   if (options.apiKey !== undefined) {
     headers['x-api-key'] = options.apiKey
     headers.Authorization = `Bearer ${options.apiKey}`
@@ -200,11 +204,10 @@ export async function requestDirect(
     const kind = rejected?.error?.type || rejected?.error?.code
     const desktopRecovery = api?.platform !== 'web' && (kind === 'panel_login_required'
       || kind === 'invalid_api_key' && options.apiKey === undefined)
-    const webRetry = api?.platform === 'web' && options.apiKey === undefined
+    const webRetry = api?.platform === 'web' && kind === 'panel_login_required' && options.apiKey === undefined
       && (options.method === 'GET' || !path.startsWith('/api/assistant/images/'))
     if (desktopRecovery || webRetry) {
       await response.text().catch(() => '')
-      cachedAuthHeaders = null
       return requestDirect(path, options, true)
     }
   }

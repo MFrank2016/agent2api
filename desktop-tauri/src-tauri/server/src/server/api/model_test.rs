@@ -765,7 +765,7 @@ async fn run_forward(
             use futures::StreamExt;
             match tokio::time::timeout(
                 TEST_TIMEOUT,
-                aggregate_frame_stream(source.boxed(), telemetry.clone(), FramePolicy::default()),
+                aggregate_frame_stream(source.boxed(), telemetry.clone(), FramePolicy::default(), None),
             )
             .await
             {

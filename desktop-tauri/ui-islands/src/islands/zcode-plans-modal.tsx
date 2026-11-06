@@ -204,7 +204,7 @@ function PlansModal({ options, onClose }: { options: OpenOptions; onClose: () =>
       const result = await bridge.preview(id) as PreviewResult
       if (mounted.current && request === previewRequest.current) {
         setPreview({ status: 'ready', result: result || {} })
-        void window.wbCheckinPanel?.load?.()
+        void window.wbCheckin?.load?.()
       }
     } catch (error) {
       if (mounted.current && request === previewRequest.current) setPreview({ status: 'error', message: errorMessage(error) })
@@ -247,7 +247,7 @@ function PlansModal({ options, onClose }: { options: OpenOptions; onClose: () =>
         // 余额静默刷新（不 await：toast 是单例，领取结果那条不能被顶掉）
         void refreshUsageAfterCheckin(id)
         void shared().wbApp?.refresh?.()
-        void window.wbCheckinPanel?.load?.()
+        void window.wbCheckin?.load?.()
         void loadPreview()
       }
     } finally {

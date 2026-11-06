@@ -399,8 +399,10 @@ pub(crate) fn apply_save(input: SaveInput) -> Result<CloudSyncSettings, String> 
     settings.webdav.user_agent = input.webdav_user_agent;
     // 空串 = 沿用旧值；非空 = 换新（加密后落库）
     if !input.webdav_password.is_empty() {
-        settings.webdav.password =
-            crypto::seal(input.webdav_password.as_bytes(), SecretScope::CloudSync)?;
+        settings.webdav.password = crypto::seal(
+            input.webdav_password.as_bytes(),
+            SecretScope::CloudSync,
+        )?;
     }
     settings.s3.region = input.s3_region;
     settings.s3.bucket = input.s3_bucket;

@@ -215,10 +215,7 @@ impl Host {
             return;
         }
         let outcome: Result<serde_json::Value, proto::WireError> = match method.as_str() {
-            // 3.4.1 同步时按混合架构省略了 reqwest 侧的 multipart 传输模块
-            // （见 core/upstream/mod.rs），此处如实申报 false，避免插件 SDK
-            // 按 multipart 组装请求体而网关只支持 JSON（raccoon 参考图编辑等）。
-            "transport.capabilities" => Ok(serde_json::json!({ "multipart": false })),
+            "transport.capabilities" => Ok(serde_json::json!({ "multipart": true })),
             proto::methods::plugin::STORE_GET => {
                 self.callbacks.store_get(text("provider"), text("account")).await
             }

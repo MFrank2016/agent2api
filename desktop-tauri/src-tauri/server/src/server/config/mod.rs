@@ -67,10 +67,13 @@ use crate::server::db::Db;
 
 mod account_sort;
 mod assistant_config;
+pub(crate) mod compact_routes;
+pub(crate) mod client_identification;
 mod github_access;
 mod mutations;
 pub(crate) use mutations::try_update_raw_field;
 pub(crate) mod parse;
+pub(crate) mod routing_groups;
 mod routing_profiles;
 pub(crate) mod routing_workspace;
 mod sanitize_config;
@@ -79,24 +82,25 @@ mod types;
 mod update_policy;
 
 pub use account_sort::{
-    account_sort_settings, save_account_sort, validate_account_sort, AccountSortRule, AccountSortSettings,
-    AddedSortDirection, CreditSortDirection,
+    account_sort_settings, save_account_sort, validate_account_sort, AccountSortRule,
+    AccountSortSettings, AddedSortDirection, CreditSortDirection,
 };
 pub use assistant_config::*;
 pub use github_access::{
-    github_access, set_github_access, GithubAccessMode, GithubAccessPatch,
-    GithubAccessSettings, DEFAULT_GITHUB_MIRROR,
+    github_access, set_github_access, GithubAccessMode, GithubAccessPatch, GithubAccessSettings,
+    DEFAULT_GITHUB_MIRROR,
+};
+pub use routing_profiles::{
+    normalize_model as normalize_routing_model, routing_profiles, routing_snapshot,
+    save_routing_profile, settings_for_model as routing_settings_for_model,
+    validate_shape as validate_routing_profile, RoutingProfile, RoutingProfiles,
+    RoutingProviderScope, KEY_ROUTING_PROFILES,
 };
 pub use sanitize_config::{
     set_sanitize_settings, SanitizePatch, SanitizeSettings, KEY_SANITIZE_PROVIDERS,
     KEY_SANITIZE_RULES, MAX_SANITIZE_PROVIDERS,
 };
-pub use routing_profiles::{
-    normalize_model as normalize_routing_model, routing_profiles, routing_snapshot, save_routing_profile,
-    settings_for_model as routing_settings_for_model,
-    validate_shape as validate_routing_profile, RoutingProfile, RoutingProfiles, RoutingProviderScope,
-    KEY_ROUTING_PROFILES,
-};
+pub use routing_groups::{RoutingGroup, RoutingMember};
 pub use types::*;
 pub use update_policy::{
     set_update_channels, update_beta, update_channels, UpdateChannels, UpdateChannelsPatch,
@@ -146,13 +150,6 @@ pub struct RuntimeConfig {
     /// 与 timeouts 同一理由：走排队制的适配器**每次遇到排队**都要取它
     /// （改完设置下一个请求就用新值，不重启进程），解析一次存下来最省事。
     queue: QueueSettings,
-    /// 账号选路策略（本地独有：逐家 6 档；设置页「网关 → 选路策略」）。
-    ///
-    /// **唯一权威**：`routingStrategy` 配置键恒为本对象形态（default + 逐家覆盖），
-    /// 由 `routing_strategy_from` 解析（含旧字符串单向迁移）。上游
-    /// `RouteStrategy` / `RoutingSettings.strategy` 只是展示档位，由
-    /// `routing_from` 从本对象映射而来，不参与选路、也不写回该键。
-    routing_strategy: RoutingStrategySettings,
     /// ZCode 验证码令牌池的补货节奏（设置页「网关 → 验证码令牌池」区域）。
     ///
     /// 与 queue 同一理由：stats 端点**每次被铸造器轮询**都要取它（改完设置
@@ -169,7 +166,15 @@ pub struct RuntimeConfig {
     /// 与 timeouts 同一理由：转发层**每次选路**都要取它（改完设置下一个
     /// 请求就生效，不重启进程），解析一次存下来最省事。
     routing: RoutingSettings,
+    /// 出站脱敏开关与词表（设置页「隐私」区域）。
+    ///
+    /// 与 `sanitize` 同一理由：转发层**每次构造请求体**都要判一次（改完设置
+    /// 下一个请求就生效），解析一次存下来最省事。关闭时出站路径连 JSON 都
+    /// 不解析，字节与改造前逐字节一致（见 `core::masking` 的模块头）。
+    mask: MaskSettings,
     routing_profiles: std::sync::Arc<RoutingProfiles>,
+    compact_routes: std::sync::Arc<compact_routes::CompactRoutesSnapshot>,
+    client_identification: std::sync::Arc<client_identification::ClientIdentificationSnapshot>,
     account_sort: std::sync::Arc<AccountSortSettings>,
     model_rules: std::sync::Arc<crate::server::core::model_rules::ModelRules>,
     /// 事件日志的保存目录（原始配置值；None = 未设置，用配置目录）。
@@ -263,6 +268,12 @@ pub struct RuntimeConfig {
     /// 于是转发热路径上一次磁盘 IO 都没有；文件读不到时这里已经是「内置默认 +
     /// 一条原因」的形态，转发层不必再处理失败路径。
     prompt: PromptSettings,
+    /// 账号选路策略（设置页「网关 → 选路策略」）。
+    ///
+    /// 与 `prompt` 同一理由：转发层**每次选路**都要取一次（改完设置下一个
+    /// 请求就生效，不重启进程），从 `Value` 里翻一次要处理类型判定与逐家表
+    /// 解析，解析一次存下来最省事。表小（≤6 家），克隆代价可忽略。
+    routing_strategy: RoutingStrategySettings,
     /// 「软件更新」的出网线路（`updateProxy`：None = 直连，默认）。
     ///
     /// 存的是归一后的配置对象（与账号代理同一形状），解析交给
@@ -315,6 +326,11 @@ impl RuntimeConfig {
     /// 出站指纹脱敏是否开启（转发层每次发送前判一次，见字段说明）
     pub fn sanitize_fingerprints(&self) -> bool {
         self.sanitize.enabled
+    }
+
+    /// 出站脱敏设置（密钥 / 个人信息 / 自定义词，转发层每次构造请求体时取一次）
+    pub fn mask_settings(&self) -> &MaskSettings {
+        &self.mask
     }
 
     /// 开发者角色兼容是否开启（转发层每次发送前判一次，见字段说明）
@@ -374,6 +390,11 @@ impl RuntimeConfig {
     /// 系统提示词设置（界面 / 日志用；转发层要的是下面的借用视图）
     pub fn prompt_settings(&self) -> &PromptSettings {
         &self.prompt
+    }
+
+    /// 账号选路策略设置（界面 / 日志用；转发层用下面的轻量读取）
+    pub fn routing_strategy_settings(&self) -> &RoutingStrategySettings {
+        &self.routing_strategy
     }
 
     /// 转发层要的**提示词决定**：全局默认 + 各家覆盖的借用视图。
@@ -564,8 +585,10 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
     let queue = queue_from(&raw);
     let captcha_pool = captcha_pool_from(&raw);
     let routing_strategy = routing_strategy_from(&raw);
+
     let image_compress = image_compress_from(&raw);
     let routing = routing_from(&raw);
+    let mask = mask_from(&raw);
     RuntimeConfig {
         // 文件里有就用文件的，否则环境变量兜底（对应 `if (config.apiKey && !opts.apiKey)`）。
         // 这里存的是**磁盘原值**：`apiKey` 从本轮改造起可能是 `enc1:` 信封（顶层旧
@@ -575,7 +598,8 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         locale: env_text("WORKBUDDY_LOCALE")
             .or_else(|| string_field(&raw, "locale"))
             .unwrap_or_else(|| DEFAULT_LOCALE.to_string()),
-        default_model: env_text("WORKBUDDY_DEFAULT_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+        default_model: env_text("WORKBUDDY_DEFAULT_MODEL")
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
         last_request_model: string_field(&raw, "lastRequestModel"),
         retention,
         scheduled,
@@ -583,18 +607,27 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         timeouts,
         queue,
         captcha_pool,
+        routing_strategy,
+
         image_compress,
         routing,
-        routing_strategy,
+        mask,
         routing_profiles: routing_profiles::from_raw(&raw),
+        compact_routes: compact_routes::from_raw(&raw),
+        client_identification: client_identification::from_raw(&raw),
         account_sort: account_sort::from_raw(&raw),
-        model_rules: std::sync::Arc::new(crate::server::core::model_rules::ModelRules::from_raw(&raw)),
+        model_rules: std::sync::Arc::new(crate::server::core::model_rules::ModelRules::from_raw(
+            &raw,
+        )),
         log_dir: string_field(&raw, KEY_LOG_DIR),
         request_stats_dir: string_field(&raw, KEY_REQUEST_STATS_DIR),
         debug_dir: string_field(&raw, KEY_DEBUG_DIR),
         // 只有字面 `true` 算开启（手改文件写 "1" / "yes" 一律当关）：与
         // 「写坏回落」同一取向 —— 这个开关控制是否把凭据落盘，宁可少采
-        debug_mode: raw.get(KEY_DEBUG_MODE).and_then(Value::as_bool).unwrap_or(false),
+        debug_mode: raw
+            .get(KEY_DEBUG_MODE)
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         sanitize: sanitize_config::from_raw(&raw),
         // 只有字面 `false` 算关闭：**默认开**（缺失 → true）。改写语义无损
         // （developer 与 system 在 OpenAI 语义上等价），而默认关会让发 developer
@@ -645,11 +678,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         // 取值链（分端键 → 旧单开关 → 环境变量 → 默认开）：升级前用户只改过
         // `captchaEnabled`，那个值必须同时成为两端的新默认值 —— 否则老用户
         // 关掉的开关会在升级后自己打开。`env_captcha_enabled` 仍只作最终兜底。
-        captcha_desktop: captcha_switch_from(
-            &raw,
-            KEY_CAPTCHA_DESKTOP,
-            env_captcha_enabled(),
-        ),
+        captcha_desktop: captcha_switch_from(&raw, KEY_CAPTCHA_DESKTOP, env_captcha_enabled()),
         captcha_web: captcha_switch_from(&raw, KEY_CAPTCHA_WEB, env_captcha_enabled()),
         // 只有字面 `false` 算关闭：**默认开**（理由见 KEY_MODELS_DEV_ENABLED）。
         // 没有环境变量兜底：它不是「部署时才知道要不要开」的东西（Docker 与
@@ -668,8 +697,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
             .cloned(),
         update_channels: UpdateChannels::from_raw(&raw),
         // GitHub 令牌信封：空串按未设置处理（手改库写出的空值不该被当成密文）
-        github_token: string_field(&raw, KEY_GITHUB_TOKEN)
-            .filter(|envelope| !envelope.is_empty()),
+        github_token: string_field(&raw, KEY_GITHUB_TOKEN).filter(|envelope| !envelope.is_empty()),
         raw,
     }
 }
@@ -680,7 +708,10 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
 /// （头值只会是文本，手改库写出的数字/布尔没有意义），整体不是对象 = 没配。
 fn cline_headers_from(raw: &Map<String, Value>) -> std::collections::BTreeMap<String, String> {
     let mut table = std::collections::BTreeMap::new();
-    let Some(object) = raw.get(KEY_CLINE_UPSTREAM_HEADERS).and_then(Value::as_object) else {
+    let Some(object) = raw
+        .get(KEY_CLINE_UPSTREAM_HEADERS)
+        .and_then(Value::as_object)
+    else {
         return table;
     };
     for (key, value) in object {
@@ -742,7 +773,9 @@ fn gateway_text_from(
         if id.is_empty() {
             continue;
         }
-        let Some(entry) = value.as_object() else { continue };
+        let Some(entry) = value.as_object() else {
+            continue;
+        };
         let mut blocks = crate::server::core::prompt::GatewayBlocks::default();
         for field in crate::server::core::prompt::GatewayBlocks::FIELDS {
             if let Some(text) = entry.get(field).and_then(Value::as_str) {
@@ -801,7 +834,9 @@ fn providers_from(raw: &Map<String, Value>) -> std::collections::BTreeMap<String
         if id.is_empty() {
             continue;
         }
-        let Some(entry) = value.as_object() else { continue };
+        let Some(entry) = value.as_object() else {
+            continue;
+        };
         let mode = entry
             .get(KEY_PROMPT_MODE)
             .and_then(Value::as_str)
@@ -880,7 +915,11 @@ fn resolve_choice(
         source: PromptSource::BuiltIn,
         file_error: None,
     };
-    let Some(path) = file.as_deref().map(str::trim).filter(|text| !text.is_empty()) else {
+    let Some(path) = file
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    else {
         return built_in();
     };
     match read_prompt_file(path) {
@@ -892,7 +931,10 @@ fn resolve_choice(
             source: PromptSource::File,
             file_error: None,
         },
-        Err(error) => ResolvedChoice { file_error: Some(error), ..built_in() },
+        Err(error) => ResolvedChoice {
+            file_error: Some(error),
+            ..built_in()
+        },
     }
 }
 
@@ -917,9 +959,9 @@ pub fn read_prompt_file(path: &str) -> Result<String, String> {
         return Err("提示词文件路径为空".to_string());
     }
     match std::fs::read_to_string(trimmed) {
-        Ok(text) if text.trim().is_empty() => {
-            Err(format!("提示词文件是空的：{trimmed}（已回落内置默认提示词）"))
-        }
+        Ok(text) if text.trim().is_empty() => Err(format!(
+            "提示词文件是空的：{trimmed}（已回落内置默认提示词）"
+        )),
         Ok(text) => Ok(text),
         Err(error) => Err(format!("读不到提示词文件 {trimmed}: {error}")),
     }
@@ -1002,8 +1044,13 @@ pub fn current() -> RuntimeConfig {
     build(Map::new())
 }
 
-pub(crate) fn model_rules_snapshot() -> std::sync::Arc<crate::server::core::model_rules::ModelRules> {
-    if let Some(rules) = CONFIG.read().ok().and_then(|config| config.as_ref().map(|config| config.model_rules.clone())) {
+pub(crate) fn model_rules_snapshot() -> std::sync::Arc<crate::server::core::model_rules::ModelRules>
+{
+    if let Some(rules) = CONFIG
+        .read()
+        .ok()
+        .and_then(|config| config.as_ref().map(|config| config.model_rules.clone()))
+    {
         return rules;
     }
     std::sync::Arc::new(crate::server::core::model_rules::ModelRules::default())
@@ -1137,6 +1184,25 @@ pub fn strip_newline_keepalive() -> bool {
     env_strip_newline_keepalive()
 }
 
+/// 只取「剥离响应开头的思考标签」开关的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 [`strip_newline_keepalive`] 同一取舍：它在**每次装配下发策略**时读
+/// （`upstream::provider_loop::frame_policy_of`），而 `current()` 每调一次就
+/// 克隆整个 `raw` Map —— 热路径上没必要。
+///
+/// 本函数只提供**全局默认值**：`providerOptions` 里的同名键可逐家覆盖
+/// （见 `core::provider_options::is_enabled`，调用点把本值当 `default` 传进去）。
+/// 未初始化（启动极早期 / 单元测试里没装配过配置）时给 `false`，与
+/// `cors_enabled` 同一口径；默认关意味着没有明确开启就不改写上游原样字节。
+pub fn strip_leading_think() -> bool {
+    with_raw(|raw| {
+        raw.get(KEY_STRIP_LEADING_THINK)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    })
+    .unwrap_or(false)
+}
+
 /// 只取「长度截断自动续写」开关的轻量读取（**不克隆整份 raw**）。
 ///
 /// 与 [`strip_newline_keepalive`] 同一取舍：转发层**每个请求**都要问一次
@@ -1245,24 +1311,37 @@ where
     F: FnOnce(&mut RuntimeConfig),
 {
     // 读改写必须串行，否则两个模型的独立配置会互相覆盖。
-    let _update_guard = CONFIG_UPDATE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _update_guard = CONFIG_UPDATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut next = current();
     let previous = next.clone();
     let before = synced_fingerprint(&next.raw);
     mutate(&mut next);
-    if previous.raw().get(crate::server::core::model_rules::KEY_MODEL_RULES)
-        != next.raw().get(crate::server::core::model_rules::KEY_MODEL_RULES) {
-        next.model_rules = std::sync::Arc::new(crate::server::core::model_rules::ModelRules::from_raw(&next.raw));
+    if previous
+        .raw()
+        .get(crate::server::core::model_rules::KEY_MODEL_RULES)
+        != next
+            .raw()
+            .get(crate::server::core::model_rules::KEY_MODEL_RULES)
+    {
+        next.model_rules = std::sync::Arc::new(
+            crate::server::core::model_rules::ModelRules::from_raw(&next.raw),
+        );
     }
     let saved = save_raw(&next.raw);
     // 先算改动后的指纹再交出所有权：`next` 要移进内存快照
     let changed = before != synced_fingerprint(&next.raw);
     let catalog_changed = crate::server::core::providers::catalog::config_changed(&previous, &next);
-    if catalog_changed { crate::server::core::providers::catalog::invalidate(); }
+    if catalog_changed {
+        crate::server::core::providers::catalog::invalidate();
+    }
     if let Ok(mut guard) = CONFIG.write() {
         *guard = Some(next);
     }
-    if catalog_changed { crate::server::core::providers::catalog::invalidate(); }
+    if catalog_changed {
+        crate::server::core::providers::catalog::invalidate();
+    }
     // 云同步的自动上传：只有**同步范围内的键**真的变了才发信号。
     //
     // ── 为什么在这里而不是在 `save_raw` 里 ─────────────────────
@@ -1374,7 +1453,9 @@ pub fn set_api_key(api_key: Option<String>) -> Result<bool, String> {
         // 见 `set_update_proxy` / `set_prompt` 的「与 set_api_key(None) 同一语义」）。
         // 这条路不经过加密，因此 `Err` 不可能出现
         return Ok(update(|config| {
-            config.raw.remove(crate::server::core::api_keys::KEY_API_KEY);
+            config
+                .raw
+                .remove(crate::server::core::api_keys::KEY_API_KEY);
             config.api_key = None;
         }));
     };
@@ -1400,10 +1481,13 @@ pub fn set_api_key(api_key: Option<String>) -> Result<bool, String> {
 /// 环境变量注入的 Key 不在文件里，`active_api_keys` 仍会把它算进去）。
 pub fn replace_api_keys(list: Value) -> bool {
     update(move |config| {
+        config.raw.insert(
+            crate::server::core::api_keys::KEY_API_KEYS.to_string(),
+            list.clone(),
+        );
         config
             .raw
-            .insert(crate::server::core::api_keys::KEY_API_KEYS.to_string(), list.clone());
-        config.raw.remove(crate::server::core::api_keys::KEY_API_KEY);
+            .remove(crate::server::core::api_keys::KEY_API_KEY);
         config.api_key = None;
     })
 }
@@ -1412,7 +1496,9 @@ pub fn replace_api_keys(list: Value) -> bool {
 pub fn set_locale(locale: &str) -> bool {
     let locale = locale.to_string();
     update(|config| {
-        config.raw.insert("locale".to_string(), Value::String(locale.clone()));
+        config
+            .raw
+            .insert("locale".to_string(), Value::String(locale.clone()));
         config.locale = locale.clone();
     })
 }
@@ -1458,6 +1544,12 @@ pub(crate) fn update_raw_field_with(key: &str, mutate: impl FnOnce(&mut Value)) 
         if key == routing_profiles::KEY_ROUTING_PROFILES {
             config.routing_profiles = routing_profiles::from_raw(&config.raw);
         }
+        if key == compact_routes::KEY_COMPACT_ROUTES {
+            config.compact_routes = compact_routes::from_raw(&config.raw);
+        }
+        if key == client_identification::KEY_CLIENT_IDENTIFICATION {
+            config.client_identification = client_identification::from_raw(&config.raw);
+        }
         if key == account_sort::KEY_ACCOUNT_SORT {
             config.account_sort = account_sort::from_raw(&config.raw);
         }
@@ -1483,7 +1575,11 @@ pub fn set_retention(patch: RetentionPatch) -> bool {
             }
         };
         apply(KEY_LOG_RETENTION_DAYS, patch.log_days, &mut next.log_days);
-        apply(KEY_LOG_RETENTION_COUNT, patch.log_count, &mut next.log_count);
+        apply(
+            KEY_LOG_RETENTION_COUNT,
+            patch.log_count,
+            &mut next.log_count,
+        );
         apply(
             KEY_REQUEST_RETENTION_DAYS,
             patch.request_days,
@@ -1494,7 +1590,11 @@ pub fn set_retention(patch: RetentionPatch) -> bool {
             patch.request_count,
             &mut next.request_count,
         );
-        apply(KEY_DAILY_RETENTION_DAYS, patch.daily_days, &mut next.daily_days);
+        apply(
+            KEY_DAILY_RETENTION_DAYS,
+            patch.daily_days,
+            &mut next.daily_days,
+        );
         config.retention = next;
     })
 }
@@ -1512,12 +1612,7 @@ pub fn set_retention(patch: RetentionPatch) -> bool {
 /// 与 `set_retention` 同一模式：内存快照与 raw 底稿一起改 —— 前者让正在跑的
 /// 循环下一轮就用新间隔（不必重启进程），后者保证写盘时不吃掉兄弟字段
 /// （只改一条任务时，`scheduledTasks` 下其余各条必须原样保留）。
-pub fn set_scheduled_task(
-    key: &str,
-    patch: IntervalTaskPatch,
-    min: i64,
-    max: i64,
-) -> bool {
+pub fn set_scheduled_task(key: &str, patch: IntervalTaskPatch, min: i64, max: i64) -> bool {
     let key = key.to_string();
     update(move |config| {
         // 先在 raw 里把这条任务的子对象取出来（不存在就建一个），再逐项写入。
@@ -1575,13 +1670,16 @@ pub fn set_retry(patch: RetryPatch) -> bool {
     update(|config| {
         let mut next = config.retry.clone();
         if let Some(count) = patch.count {
-            config.raw.insert(KEY_RETRY_COUNT.to_string(), Value::from(count));
+            config
+                .raw
+                .insert(KEY_RETRY_COUNT.to_string(), Value::from(count));
             next.count = count;
         }
         if let Some(count) = patch.account_switch_count {
-            config
-                .raw
-                .insert(KEY_RETRY_ACCOUNT_SWITCH_COUNT.to_string(), Value::from(count));
+            config.raw.insert(
+                KEY_RETRY_ACCOUNT_SWITCH_COUNT.to_string(),
+                Value::from(count),
+            );
             next.account_switch_count = count;
         }
         if let Some(seconds) = patch.interval_seconds {
@@ -1632,10 +1730,18 @@ pub fn set_timeouts(patch: TimeoutPatch) -> bool {
             *slot = value;
         };
         if let Some(seconds) = patch.connect_seconds {
-            write(KEY_TIMEOUT_CONNECT_SECONDS, seconds, &mut next.connect_seconds);
+            write(
+                KEY_TIMEOUT_CONNECT_SECONDS,
+                seconds,
+                &mut next.connect_seconds,
+            );
         }
         if let Some(seconds) = patch.headers_seconds {
-            write(KEY_TIMEOUT_HEADERS_SECONDS, seconds, &mut next.headers_seconds);
+            write(
+                KEY_TIMEOUT_HEADERS_SECONDS,
+                seconds,
+                &mut next.headers_seconds,
+            );
         }
         if let Some(seconds) = patch.stream_idle_seconds {
             write(
@@ -1690,6 +1796,65 @@ pub fn set_queue(patch: QueuePatch) -> bool {
     })
 }
 
+// ─── 账号选路策略（routingStrategy）──────────────────────────
+
+/// 只取选路策略设置的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 `retry_settings()` 同一取舍：转发层**每次选路**都要取一次（改完设置
+/// 下一个请求就生效，不重启进程），而 `current()` 每次都会克隆整个 `raw` Map。
+/// 返回一份克隆：表很小（≤6 家），克隆只付一次 BTreeMap 的代价。未初始化时
+/// 给默认值（全 `priority`）。
+pub fn routing_strategy_settings() -> RoutingStrategySettings {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.routing_strategy.clone();
+        }
+    }
+    RoutingStrategySettings::default()
+}
+
+/// 更新选路策略（`None` = 该项不动；`providers` 出现即整体替换）。
+///
+/// 调用方（`api::routing_strategy::put_routing_strategy`）**必须先校验**：本函数
+/// 按「已合法」处理。与 `set_retry` 同一模式：内存快照与 raw 底稿一起改 ——
+/// 本地 7 档策略的**唯一写入口**：raw 底稿恒为对象形态，两份内存快照
+/// （`routing_strategy` 与上游展示用 `routing.strategy`）一起更新。
+/// 供 `routing_workspace::save_workspace` 在「展示 id 不覆盖权威档位」时使用。
+pub(crate) fn write_routing_strategy_canonical(
+    config: &mut RuntimeConfig,
+    settings: &RoutingStrategySettings,
+) {
+    use crate::server::core::routing::RoutingStrategy;
+    config.raw.insert(
+        KEY_ROUTING_STRATEGY.to_string(),
+        routing_strategy_value(settings),
+    );
+    config.routing_strategy = settings.clone();
+    config.routing.strategy = match settings.default {
+        RoutingStrategy::GlobalRoundRobin => RouteStrategy::Rotate,
+        RoutingStrategy::RoundRobin => RouteStrategy::Provider,
+        _ => RouteStrategy::Order,
+    };
+}
+
+/// 前者让下一个请求立刻用新策略，后者保证写盘时不吃掉 config.json 里的其它字段。
+pub fn set_routing_strategy(patch: RoutingStrategyPatch) -> bool {
+    update(|config| {
+        let mut next = config.routing_strategy.clone();
+        if let Some(default) = patch.default {
+            next.default = default;
+        }
+        if let Some(providers) = &patch.providers {
+            next.providers = providers.clone();
+        }
+        config.raw.insert(
+            KEY_ROUTING_STRATEGY.to_string(),
+            routing_strategy_value(&next),
+        );
+        config.routing_strategy = next;
+    })
+}
+
 // ─── ZCode 验证码令牌池（zcodeCaptchaPoolTarget / PollMs / MaxPerRound）──
 
 /// 只取令牌池的三项（**不克隆整份 raw**）。
@@ -1735,6 +1900,8 @@ pub fn set_captcha_pool(patch: CaptchaPoolPatch) -> bool {
         config.captcha_pool = next;
     })
 }
+
+// ─── 账号路由（routingSticky / 退避 / 垫底 / 熔断）──
 
 // ─── 会话图片压缩（imageCompressEnabled / MaxEdge / Quality / ThresholdKb）──
 
@@ -1791,7 +1958,8 @@ pub fn set_image_compress(patch: ImageCompressPatch) -> bool {
 /// 只取路由设置的轻量读取（**不克隆整份 raw**）。
 ///
 /// 与 `timeout_settings()` 同一取舍：转发层每次选路都要取一次，读锁取一份
-/// `Copy` 快照即可。未初始化时给默认值。
+/// `Copy` 快照即可。未初始化时给默认值。策略维度不在这里（逐家，见
+/// `routing_strategy_settings`）。
 pub fn routing_settings() -> RoutingSettings {
     if let Ok(guard) = CONFIG.read() {
         if let Some(config) = guard.as_ref() {
@@ -1810,12 +1978,22 @@ pub fn set_routing(patch: RoutingPatch) -> bool {
     update(|config| {
         let mut next = config.routing;
         if let Some(strategy) = patch.strategy {
-            // 规范写法：把上游三档展示值翻译成本地六档，写回唯一的
-            // 权威对象形态（保留逐家覆盖），并同步两份内存快照。
-            let mut canonical = config.routing_strategy.clone();
-            canonical.default = crate::server::core::routing::RoutingStrategy::from_config(strategy.as_str());
-            write_routing_strategy_canonical(config, &canonical);
-            next.strategy = config.routing.strategy;
+            // 逐模型三档覆盖映射到本仓逐家 7 档的 `default`，并写回对象形态：
+            // 直接把 `strategy.as_str()` 塞进 KEY_ROUTING_STRATEGY 会把
+            // `{default, providers}` 覆盖成裸字符串、丢掉逐家表。
+            use crate::server::core::routing::RoutingStrategy;
+            let mut next_strategy = config.routing_strategy.clone();
+            next_strategy.default = match strategy {
+                RouteStrategy::Order => RoutingStrategy::Priority,
+                RouteStrategy::Rotate => RoutingStrategy::GlobalRoundRobin,
+                RouteStrategy::Provider => RoutingStrategy::RoundRobin,
+            };
+            config.raw.insert(
+                KEY_ROUTING_STRATEGY.to_string(),
+                routing_strategy_value(&next_strategy),
+            );
+            config.routing_strategy = next_strategy;
+            next.strategy = strategy;
         }
         if let Some(sticky) = patch.sticky {
             config
@@ -1828,24 +2006,34 @@ pub fn set_routing(patch: RoutingPatch) -> bool {
             *slot = value;
         };
         if let Some(enabled) = patch.failover_backoff {
-            write_bool(KEY_ROUTING_FAILOVER_BACKOFF, enabled, &mut next.failover_backoff);
+            write_bool(
+                KEY_ROUTING_FAILOVER_BACKOFF,
+                enabled,
+                &mut next.failover_backoff,
+            );
         }
         if let Some(enabled) = patch.sink {
             write_bool(KEY_ROUTING_SINK, enabled, &mut next.sink);
         }
         if let Some(enabled) = patch.breaker_enabled {
-            write_bool(KEY_ROUTING_BREAKER_ENABLED, enabled, &mut next.breaker_enabled);
+            write_bool(
+                KEY_ROUTING_BREAKER_ENABLED,
+                enabled,
+                &mut next.breaker_enabled,
+            );
         }
         if let Some(count) = patch.breaker_threshold {
-            config
-                .raw
-                .insert(KEY_ROUTING_BREAKER_THRESHOLD.to_string(), Value::from(count));
+            config.raw.insert(
+                KEY_ROUTING_BREAKER_THRESHOLD.to_string(),
+                Value::from(count),
+            );
             next.breaker_threshold = count;
         }
         if let Some(seconds) = patch.breaker_timeout_seconds {
-            config
-                .raw
-                .insert(KEY_ROUTING_BREAKER_TIMEOUT.to_string(), Value::from(seconds));
+            config.raw.insert(
+                KEY_ROUTING_BREAKER_TIMEOUT.to_string(),
+                Value::from(seconds),
+            );
             next.breaker_timeout_seconds = seconds;
         }
         if let Some(count) = patch.breaker_success_threshold {
@@ -1854,8 +2042,90 @@ pub fn set_routing(patch: RoutingPatch) -> bool {
                 .insert(KEY_ROUTING_BREAKER_SUCCESS.to_string(), Value::from(count));
             next.breaker_success_threshold = count;
         }
+        if let Some(enabled) = patch.shadow_quota_kind {
+            config.raw.insert(
+                KEY_ROUTING_SHADOW_QUOTA_KIND.to_string(),
+                Value::Bool(enabled),
+            );
+            next.shadow_quota_kind = enabled;
+        }
         config.routing = next;
     })
+}
+
+// ─── 出站脱敏（maskSecrets / maskPii / maskWords）──────────────
+
+/// 只取出站脱敏设置的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 `routing_settings()` 同一取舍：转发层每次构造请求体都要取一次，
+/// 读锁取一份快照即可。配置尚未初始化时给默认值（全关）—— 与
+/// [`mask_settings_checked`] 的区别只在「读不到时给不给 `None`」。
+pub fn mask_settings() -> MaskSettings {
+    mask_settings_checked().unwrap_or_default()
+}
+
+/// 读不到配置时返回 `None`（fail-closed 接缝，见 `core::masking::config`）。
+///
+/// 「读不到」只有两种情况：全局快照还没初始化（启动早期）、或读锁中毒。
+/// 生产路径上脱敏开关本身也是从同一份快照读的，所以这里返回 `None` 时
+/// 通常连 `active().enabled` 都不会成立；保留这个返回值是为了让
+/// `core::masking::config::masker()` 能在「配置要求脱敏却读不到规则」时
+/// 明确地 fail-closed，而不是拿一份空规则悄悄放行。
+pub fn mask_settings_checked() -> Option<MaskSettings> {
+    CONFIG
+        .read()
+        .ok()?
+        .as_ref()
+        .map(|config| config.mask.clone())
+}
+
+/// 更新出站脱敏设置（`None` = 该项不动），返回是否写盘成功。
+///
+/// 与 `set_routing` 同一模式：内存快照与 raw 底稿一起改 —— 前者让下一个请求
+/// 立刻用新值，后者保证写盘时不吃掉配置里的其它字段。
+pub fn set_mask_settings(patch: MaskPatch) -> bool {
+    update(|config| {
+        let mut next = config.mask.clone();
+        let mut write_bool = |key: &str, value: bool, slot: &mut bool| {
+            config.raw.insert(key.to_string(), Value::Bool(value));
+            *slot = value;
+        };
+        if let Some(enabled) = patch.secrets {
+            write_bool(KEY_MASK_SECRETS, enabled, &mut next.secrets);
+        }
+        if let Some(enabled) = patch.pii {
+            write_bool(KEY_MASK_PII, enabled, &mut next.pii);
+        }
+        if let Some(words) = patch.words {
+            config
+                .raw
+                .insert(KEY_MASK_WORDS.to_string(), Value::from(words.clone()));
+            next.words = words;
+        }
+        config.mask = next;
+    })
+}
+
+/// 把选路策略设置编成 raw 底稿里的形态：`{ "default": "...", "providers": {...} }`。
+/// 逐家表为空时不写 `providers` 键（配置里不留没意义的空对象，与
+/// `set_prompt_provider` 对空表的处理同一取向）。
+pub(crate) fn routing_strategy_value(settings: &RoutingStrategySettings) -> Value {
+    let mut object = Map::new();
+    object.insert(
+        KEY_ROUTING_STRATEGY_DEFAULT.to_string(),
+        Value::String(settings.default.as_str().to_string()),
+    );
+    if !settings.providers.is_empty() {
+        let mut providers = Map::new();
+        for (id, strategy) in &settings.providers {
+            providers.insert(id.clone(), Value::String(strategy.as_str().to_string()));
+        }
+        object.insert(
+            KEY_ROUTING_STRATEGY_PROVIDERS.to_string(),
+            Value::Object(providers),
+        );
+    }
+    Value::Object(object)
 }
 
 // ─── 调试模式（debugMode）────────────────────────────────────
@@ -1950,9 +2220,7 @@ pub fn set_cors_enabled(enabled: bool) -> bool {
 pub fn set_assistant_config(config: AssistantConfig) -> bool {
     let value = config.to_value();
     update(|current| {
-        current
-            .raw
-            .insert(KEY_ASSISTANT_CONFIG.to_string(), value);
+        current.raw.insert(KEY_ASSISTANT_CONFIG.to_string(), value);
         current.assistant = config;
     })
 }
@@ -1967,10 +2235,34 @@ pub fn set_assistant_config(config: AssistantConfig) -> bool {
 /// 这件事必须在日志里查得到。
 pub fn set_strip_newline_keepalive(enabled: bool) -> bool {
     update(|config| {
+        config.raw.insert(
+            KEY_STRIP_NEWLINE_KEEPALIVE.to_string(),
+            Value::Bool(enabled),
+        );
+        config.strip_newline_keepalive = enabled;
+    })
+}
+
+// ─── 剥离响应开头的思考标签（stripLeadingThink）────────────
+
+/// 写入「剥离响应开头的 `<think>` 块」的**全局默认值**（`stripLeadingThink`）。
+///
+/// 与 [`set_strip_newline_keepalive`] 同一形状：写入走 `update()` 闭包，内存
+/// 快照随之刷新（下一请求立即生效，不重启）。
+///
+/// ── 为什么只写 `raw`、不同步解析字段 ───────────────────────
+/// [`strip_leading_think`] 直接从 `raw` 取这个键（它没有 `RuntimeConfig` 上的
+/// 解析字段，见那里的说明）—— 所以这里插进底稿就是全部工作，多写一个字段
+/// 反而会出现「两个真相来源」。
+///
+/// 返回 `false` 只表示**落库失败**（本次运行内仍生效），与其它 setter 同一口径。
+/// 本键只提供全局默认值：`providerOptions` 里的同名键可逐家覆盖
+/// （见 `core::provider_options::is_enabled`）。
+pub fn set_strip_leading_think(enabled: bool) -> bool {
+    update(|config| {
         config
             .raw
-            .insert(KEY_STRIP_NEWLINE_KEEPALIVE.to_string(), Value::Bool(enabled));
-        config.strip_newline_keepalive = enabled;
+            .insert(KEY_STRIP_LEADING_THINK.to_string(), Value::Bool(enabled));
     })
 }
 
@@ -2000,9 +2292,10 @@ pub fn set_auto_continue_patch(patch: AutoContinuePatch) -> bool {
             config.auto_continue = enabled;
         }
         if let Some(rounds) = patch.max_rounds {
-            config
-                .raw
-                .insert(KEY_AUTO_CONTINUE_MAX_ROUNDS.to_string(), Value::from(rounds));
+            config.raw.insert(
+                KEY_AUTO_CONTINUE_MAX_ROUNDS.to_string(),
+                Value::from(rounds),
+            );
             config.auto_continue_max_rounds = rounds;
         }
     })
@@ -2037,11 +2330,7 @@ pub fn set_auto_continue_max_rounds(rounds: i64) -> bool {
 /// 旧单开关只当「默认值」用，不参与写入 —— 分端键一旦写过，它就不再影响
 /// 这一端。这样升级前后的行为连续（老用户关着就还是关着），而用户在新界面
 /// 里改某一端时也不会顺手把另一端改掉。
-fn captcha_switch_from(
-    raw: &serde_json::Map<String, Value>,
-    key: &str,
-    fallback: bool,
-) -> bool {
+fn captcha_switch_from(raw: &serde_json::Map<String, Value>, key: &str, fallback: bool) -> bool {
     raw.get(key)
         .and_then(Value::as_bool)
         .or_else(|| raw.get(KEY_CAPTCHA_ENABLED).and_then(Value::as_bool))
@@ -2150,16 +2439,16 @@ pub fn github_token_envelope() -> Option<String> {
 /// 与校验。与 `set_update_proxy` 同一模式：内存立即生效（下一次检查更新就用
 /// 新令牌），写盘时不吃掉其它字段。
 pub fn set_github_token_envelope(envelope: Option<String>) -> bool {
-    update(move |config| {
-        match envelope.clone() {
-            Some(value) => {
-                config.raw.insert(KEY_GITHUB_TOKEN.to_string(), Value::String(value));
-                config.github_token = envelope.clone();
-            }
-            None => {
-                config.raw.remove(KEY_GITHUB_TOKEN);
-                config.github_token = None;
-            }
+    update(move |config| match envelope.clone() {
+        Some(value) => {
+            config
+                .raw
+                .insert(KEY_GITHUB_TOKEN.to_string(), Value::String(value));
+            config.github_token = envelope.clone();
+        }
+        None => {
+            config.raw.remove(KEY_GITHUB_TOKEN);
+            config.github_token = None;
         }
     })
 }
@@ -2184,9 +2473,10 @@ pub fn set_prompt(
     inline: Option<String>,
 ) -> bool {
     update(|config| {
-        config
-            .raw
-            .insert(KEY_PROMPT_MODE.to_string(), Value::String(mode.as_str().to_string()));
+        config.raw.insert(
+            KEY_PROMPT_MODE.to_string(),
+            Value::String(mode.as_str().to_string()),
+        );
         match file.filter(|text| !text.trim().is_empty()) {
             Some(path) => {
                 config
@@ -2516,7 +2806,7 @@ mod auto_continue_tests {
     //!
     //! ── 为什么用例不操纵进程环境 ────────────────────────────
     //! `std::env::set_var` 在同一进程里全局可见、并行用例互踩（同类取舍见
-    //! `core::providers::trae::forward::forward_at` 的注释）。所以这里每条断言
+    //! trae provider 迁出前 `forward_at` 的注释）。所以这里每条断言
     //! 都写成**与环境变量取值无关**的形式：要么给底稿显式的值（那一级本来就盖过
     //! 环境变量），要么用「与同一条兜底表达式同值」这种差分形式。
     //! 「文件值盖过环境变量」那一半在 `parse.rs` 的 `resolve_auto_continue` /
@@ -2528,10 +2818,12 @@ mod auto_continue_tests {
     /// 全局快照是进程级状态，而 `update()` 是「读整份 → 改 → 写整份」的**非原子**
     /// 读改写：两条用例并行时，一条的写可能被另一条「读走的旧底稿」整体盖掉。
     /// 本模块动全局的用例因此串行跑（与 `api::panel` 那把探针槽位锁同一手法）。
-    static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn hold_config() -> std::sync::MutexGuard<'static, ()> {
-        CONFIG_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    pub(super) fn hold_config() -> std::sync::MutexGuard<'static, ()> {
+        CONFIG_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// 一份只含给定几项的原始底稿。
@@ -2551,7 +2843,11 @@ mod auto_continue_tests {
     fn an_empty_backup_means_off_and_three_rounds_without_seeding_defaults() {
         let fresh = build(Map::new());
         // 差分形式：空底稿 ≡ 「文件没给」，那一级只能由环境变量说话
-        assert_eq!(fresh.auto_continue(), env_auto_continue(), "空底稿的开关落点必须只由环境变量决定");
+        assert_eq!(
+            fresh.auto_continue(),
+            env_auto_continue(),
+            "空底稿的开关落点必须只由环境变量决定"
+        );
         assert_eq!(
             fresh.auto_continue_max_rounds(),
             auto_continue_rounds_from(&Map::new()),
@@ -2567,7 +2863,10 @@ mod auto_continue_tests {
                 "文件与环境变量都没配 → 必须是默认 3 轮"
             );
         }
-        assert!(fresh.raw().is_empty(), "默认值只进解析字段，不许写进写盘底稿");
+        assert!(
+            fresh.raw().is_empty(),
+            "默认值只进解析字段，不许写进写盘底稿"
+        );
     }
 
     /// 底稿给了值就以它为准 —— 包括「写 `false` 关掉」与「写 1 / 8 这两个边界」。
@@ -2589,15 +2888,26 @@ mod auto_continue_tests {
         );
 
         let off = build(raw_of(&[(KEY_AUTO_CONTINUE, json!(false))]));
-        assert!(!off.auto_continue(), "文件写了 false 就必须是关（关掉要能被表达）");
+        assert!(
+            !off.auto_continue(),
+            "文件写了 false 就必须是关（关掉要能被表达）"
+        );
 
         for bound in [AUTO_CONTINUE_MIN_ROUNDS, AUTO_CONTINUE_MAX_ROUNDS] {
             let at_edge = build(raw_of(&[(KEY_AUTO_CONTINUE_MAX_ROUNDS, json!(bound))]));
-            assert_eq!(at_edge.auto_continue_max_rounds(), bound, "边界值 {bound} 必须是可用值");
+            assert_eq!(
+                at_edge.auto_continue_max_rounds(),
+                bound,
+                "边界值 {bound} 必须是可用值"
+            );
         }
 
         let too_many = build(raw_of(&[(KEY_AUTO_CONTINUE_MAX_ROUNDS, json!(99))]));
-        assert_ne!(too_many.auto_continue_max_rounds(), 99, "越界的值不许原样生效");
+        assert_ne!(
+            too_many.auto_continue_max_rounds(),
+            99,
+            "越界的值不许原样生效"
+        );
         assert_ne!(
             too_many.auto_continue_max_rounds(),
             AUTO_CONTINUE_MAX_ROUNDS,
@@ -2615,7 +2925,10 @@ mod auto_continue_tests {
             (KEY_AUTO_CONTINUE_MAX_ROUNDS, json!("8")),
         ]));
         assert_eq!(junk.auto_continue(), build(Map::new()).auto_continue());
-        assert_eq!(junk.auto_continue_max_rounds(), build(Map::new()).auto_continue_max_rounds());
+        assert_eq!(
+            junk.auto_continue_max_rounds(),
+            build(Map::new()).auto_continue_max_rounds()
+        );
     }
 
     /// `set_auto_continue` / `set_auto_continue_max_rounds` 必须同时落到底稿与
@@ -2639,10 +2952,24 @@ mod auto_continue_tests {
         });
 
         let saved = set_auto_continue(true);
-        assert_eq!(saved, db().is_some(), "返回值只该由「落库成不成功」决定（测试进程里没有库）");
-        assert!(auto_continue(), "开关必须能被在线打开（轻量读取走的是解析字段）");
-        assert_eq!(current().raw()[KEY_AUTO_CONTINUE], json!(true), "底稿里必须带上这一项，否则写盘写不出它");
-        assert!(current().auto_continue(), "快照 getter 与轻量读取必须是同一个值");
+        assert_eq!(
+            saved,
+            db().is_some(),
+            "返回值只该由「落库成不成功」决定（测试进程里没有库）"
+        );
+        assert!(
+            auto_continue(),
+            "开关必须能被在线打开（轻量读取走的是解析字段）"
+        );
+        assert_eq!(
+            current().raw()[KEY_AUTO_CONTINUE],
+            json!(true),
+            "底稿里必须带上这一项，否则写盘写不出它"
+        );
+        assert!(
+            current().auto_continue(),
+            "快照 getter 与轻量读取必须是同一个值"
+        );
         assert_eq!(
             auto_continue_rounds_from(current().raw()),
             DEFAULT_AUTO_CONTINUE_MAX_ROUNDS,
@@ -2650,9 +2977,20 @@ mod auto_continue_tests {
         );
 
         set_auto_continue_max_rounds(AUTO_CONTINUE_MAX_ROUNDS);
-        assert_eq!(auto_continue_max_rounds(), AUTO_CONTINUE_MAX_ROUNDS, "上限必须能被在线收到边界值");
-        assert_eq!(current().raw()[KEY_AUTO_CONTINUE_MAX_ROUNDS], json!(8), "底稿里要落成一个 JSON 数字");
-        assert!(auto_continue(), "改上限时开关必须保持原样（部分更新不是整份替换）");
+        assert_eq!(
+            auto_continue_max_rounds(),
+            AUTO_CONTINUE_MAX_ROUNDS,
+            "上限必须能被在线收到边界值"
+        );
+        assert_eq!(
+            current().raw()[KEY_AUTO_CONTINUE_MAX_ROUNDS],
+            json!(8),
+            "底稿里要落成一个 JSON 数字"
+        );
+        assert!(
+            auto_continue(),
+            "改上限时开关必须保持原样（部分更新不是整份替换）"
+        );
 
         // 两项一起写（PUT 的形状）：一次 update 就该把两项都对齐
         set_auto_continue_patch(AutoContinuePatch {
@@ -2670,121 +3008,77 @@ mod auto_continue_tests {
     }
 }
 
-// ─── 本地独有（beta）：逐家选路策略（唯一权威写入口）/ think-strip 读写 ──
-pub fn strip_leading_think() -> bool {
-    with_raw(|raw| {
-        raw.get(KEY_STRIP_LEADING_THINK)
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    })
-    .unwrap_or(false)
-}
+#[cfg(test)]
+mod mask_settings_tests {
+    //! 出站脱敏设置在**读写入口**这一层的形状：默认全关、setter 同时写底稿与
+    //! 解析字段、部分更新不牵连兄弟项。
+    //!
+    //! 全局快照的读改写与 `auto_continue_tests` 共用同一把测试锁：两个模块都会
+    //! 动进程级配置，各用一把锁等于没锁。
 
+    use super::auto_continue_tests::hold_config;
+    use super::*;
+    use serde_json::json;
 
-// ─── 账号选路策略（routingStrategy）──────────────────────────
+    #[test]
+    fn mask_settings_roundtrip_through_patch_and_snapshot() {
+        let _guard = hold_config();
+        // 起点固定：先回到出厂态，免得别的用例留下的状态改变判据
+        let _ = set_mask_settings(MaskPatch {
+            secrets: Some(false),
+            pii: Some(false),
+            words: Some(Vec::new()),
+        });
+        assert!(!mask_settings().enabled(), "复位后必须全关");
+        assert!(current().raw()[KEY_MASK_SECRETS] == json!(false));
 
-/// 只取选路策略设置的轻量读取（**不克隆整份 raw**）。
-///
-/// 与 `retry_settings()` 同一取舍：转发层**每次选路**都要取一次（改完设置
-/// 下一个请求就生效，不重启进程），而 `current()` 每次都会克隆整个 `raw` Map。
-/// 返回一份克隆：表很小（≤6 家），克隆只付一次 BTreeMap 的代价。未初始化时
-/// 给默认值（全 `priority`）。
-pub fn routing_strategy_settings() -> RoutingStrategySettings {
-    if let Ok(guard) = CONFIG.read() {
-        if let Some(config) = guard.as_ref() {
-            return config.routing_strategy.clone();
-        }
-    }
-    RoutingStrategySettings::default()
-}
-
-/// 更新选路策略（`None` = 该项不动；`providers` 出现即整体替换）。
-///
-/// 调用方（`api::routing_strategy::put_routing_strategy`）**必须先校验**：本函数
-/// 按「已合法」处理。与 `set_retry` 同一模式：内存快照与 raw 底稿一起改 ——
-/// 前者让下一个请求立刻用新策略，后者保证写盘时不吃掉 config.json 里的其它字段。
-pub fn set_routing_strategy(patch: RoutingStrategyPatch) -> bool {
-    update(|config| {
-        let mut next = config.routing_strategy.clone();
-        if let Some(default) = patch.default {
-            next.default = default;
-        }
-        if let Some(providers) = &patch.providers {
-            next.providers = providers.clone();
-        }
-        write_routing_strategy_canonical(config, &next);
-    })
-}
-
-
-/// `routingStrategy` 的**唯一写入口**（本地混合架构）：raw 底稿恒为本地六档
-/// 对象形态，两份内存快照（本地 `routing_strategy` 与上游展示用 `routing`）
-/// 一起更新，任何 setter 都不得绕过它单独写字符串。
-pub(crate) fn write_routing_strategy_canonical(
-    config: &mut RuntimeConfig,
-    settings: &RoutingStrategySettings,
-) {
-    config.raw.insert(
-        KEY_ROUTING_STRATEGY.to_string(),
-        routing_strategy_value(settings),
-    );
-    config.routing_strategy = settings.clone();
-    config.routing.strategy = route_strategy_display(settings.default);
-}
-
-/// 本地权威策略 → 上游**展示档位字符串**（`order` / `rotate` / `provider`）。
-///
-/// 供 `/api/routing/workspace` 的 profile 契约使用：`RoutingProfile::validate_shape`
-/// 只认这三档，直接把本地 7 档 id 塞进去会让全局保存一律 400。与
-/// `parse::route_strategy_display` 共用同一份映射（唯一权威仍是本地对象形态）。
-pub fn routing_strategy_display_id(
-    strategy: crate::server::core::routing::RoutingStrategy,
-) -> &'static str {
-    route_strategy_display(strategy).as_str()
-}
-
-/// 把选路策略设置编成 raw 底稿里的形态：`{ "default": "...", "providers": {...} }`。
-/// 逐家表为空时不写 `providers` 键（配置里不留没意义的空对象，与
-/// `set_prompt_provider` 对空表的处理同一取向）。
-fn routing_strategy_value(settings: &RoutingStrategySettings) -> Value {
-    let mut object = Map::new();
-    object.insert(
-        KEY_ROUTING_STRATEGY_DEFAULT.to_string(),
-        Value::String(settings.default.as_str().to_string()),
-    );
-    if !settings.providers.is_empty() {
-        let mut providers = Map::new();
-        for (id, strategy) in &settings.providers {
-            providers.insert(id.clone(), Value::String(strategy.as_str().to_string()));
-        }
-        object.insert(
-            KEY_ROUTING_STRATEGY_PROVIDERS.to_string(),
-            Value::Object(providers),
+        let saved = set_mask_settings(MaskPatch {
+            secrets: Some(true),
+            pii: Some(true),
+            words: Some(vec!["Project Falcon".to_string()]),
+        });
+        assert_eq!(
+            saved,
+            db().is_some(),
+            "返回值只该由「落库成不成功」决定（测试进程里没有库）"
         );
+        let settings = mask_settings();
+        assert!(settings.secrets);
+        assert!(settings.pii);
+        assert_eq!(settings.words, vec!["Project Falcon"]);
+        assert!(settings.enabled());
+        assert_eq!(current().raw()[KEY_MASK_SECRETS], json!(true));
+        assert_eq!(current().raw()[KEY_MASK_PII], json!(true));
+        assert_eq!(current().raw()[KEY_MASK_WORDS], json!(["Project Falcon"]));
+        assert_eq!(
+            current().mask_settings(),
+            &settings,
+            "轻量读取与快照 getter 必须是同一个值"
+        );
+
+        // 部分更新：只动 pii，另外两项原样保留
+        set_mask_settings(MaskPatch {
+            pii: Some(false),
+            ..Default::default()
+        });
+        let settings = mask_settings();
+        assert!(settings.secrets, "部分更新不许把兄弟项按默认值补齐");
+        assert!(!settings.pii);
+        assert_eq!(settings.words, vec!["Project Falcon"]);
+
+        // 清空词表：secrets 仍开着，整体仍是开启
+        set_mask_settings(MaskPatch {
+            words: Some(Vec::new()),
+            ..Default::default()
+        });
+        assert!(mask_settings().words.is_empty());
+        assert!(mask_settings().enabled());
+
+        // 复位出厂态
+        let _ = set_mask_settings(MaskPatch {
+            secrets: Some(false),
+            pii: Some(false),
+            words: Some(Vec::new()),
+        });
     }
-    Value::Object(object)
-}
-
-
-// ─── 剥离响应开头的思考标签（stripLeadingThink）────────────
-
-/// 写入「剥离响应开头的 `<think>` 块」的**全局默认值**（`stripLeadingThink`）。
-///
-/// 与 [`set_strip_newline_keepalive`] 同一形状：写入走 `update()` 闭包，内存
-/// 快照随之刷新（下一请求立即生效，不重启）。
-///
-/// ── 为什么只写 `raw`、不同步解析字段 ───────────────────────
-/// [`strip_leading_think`] 直接从 `raw` 取这个键（它没有 `RuntimeConfig` 上的
-/// 解析字段，见那里的说明）—— 所以这里插进底稿就是全部工作，多写一个字段
-/// 反而会出现「两个真相来源」。
-///
-/// 返回 `false` 只表示**落库失败**（本次运行内仍生效），与其它 setter 同一口径。
-/// 本键只提供全局默认值：`providerOptions` 里的同名键可逐家覆盖
-/// （见 `core::provider_options::is_enabled`）。
-pub fn set_strip_leading_think(enabled: bool) -> bool {
-    update(|config| {
-        config
-            .raw
-            .insert(KEY_STRIP_LEADING_THINK.to_string(), Value::Bool(enabled));
-    })
 }

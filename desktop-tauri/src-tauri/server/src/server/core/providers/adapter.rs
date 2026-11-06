@@ -326,6 +326,46 @@ pub enum UpstreamErrorClass {
     },
 }
 
+impl UpstreamErrorClass {
+    /// 这次配额类失败属于哪种冷却口径；非配额类返回 None。
+    ///
+    /// ── 为什么是「事后问」而不是枚举里的字段 ──────────────────
+    /// 分类只依赖 [`QuotaLimited`](Self::QuotaLimited) 已有的三个字段
+    /// （`status` / `upstream_code` / `message`）外加**调用方才知道的
+    /// 厂商身份**（`vendor`）。把 `kind` 塞进枚举会让每一处构造点都要先
+    /// 拿到 vendor —— 插件协议（`proto::ErrorClass`）与
+    /// `plugin_host/rpc.rs` / `plugin_host/strict_errors.rs` 都只传错误
+    /// 本身，拿不到厂商身份，于是被迫全链路改签名。
+    /// 做成访问器后：枚举形状不变、构造点一行不动，需要冷却口径的上层
+    /// （限额处置）在自己拿到 vendor 的地方问一次即可。
+    ///
+    /// `vendor` 口径见 [`classify_quota_kind`]：内置 provider id，或自定义
+    /// 提供商的余额方案 / preset key。
+    ///
+    /// [`classify_quota_kind`]: crate::server::core::providers::error_kind::classify_quota_kind
+    pub fn quota_kind(
+        &self,
+        vendor: &str,
+    ) -> Option<crate::server::core::providers::error_kind::QuotaKind> {
+        match self {
+            Self::QuotaLimited {
+                status,
+                upstream_code,
+                message,
+                ..
+            } => Some(
+                crate::server::core::providers::error_kind::classify_quota_kind(
+                    *status,
+                    *upstream_code,
+                    message,
+                    vendor,
+                ),
+            ),
+            _ => None,
+        }
+    }
+}
+
 /// 一次「可退避重试」的建议（见模块头扩展 1）。
 ///
 /// 适配器把「要不要退避重试」连同**原因**一起给出，编排层负责睡这一觉、
@@ -2511,3 +2551,40 @@ pub async fn refresh_implemented_forced(
 // 两家先后接上真身（W5-T-d4 / W4b-T-c2）后，占位实现不再有任何生产调用点，
 // W6 收尾时连文件一起删除 —— 现在加 provider 的过渡方案是：先在
 // `adapter_for` 里给一个最小实现，而不是重新引入一层占位结构。
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::core::providers::error_kind::QuotaKind;
+
+    fn quota_limited(message: &str, upstream_code: Option<i64>, status: u16) -> UpstreamErrorClass {
+        UpstreamErrorClass::QuotaLimited {
+            reset_at: None,
+            message: message.to_string(),
+            upstream_code,
+            status,
+        }
+    }
+
+    #[test]
+    fn quota_kind_reads_credit_from_message() {
+        let class = quota_limited("上游返回 429: 余额不足或无可用资源包", None, 429);
+        assert_eq!(class.quota_kind("zhipu"), Some(QuotaKind::Credit));
+    }
+
+    #[test]
+    fn quota_kind_reads_rate_from_message() {
+        let class = quota_limited("上游返回 429: 20 requests per minute", None, 429);
+        assert_eq!(class.quota_kind("openrouter"), Some(QuotaKind::Rate));
+    }
+
+    #[test]
+    fn quota_kind_is_none_for_fatal() {
+        let class = UpstreamErrorClass::Fatal {
+            status: 500,
+            message: "上游返回 500: internal error".to_string(),
+            upstream_code: None,
+        };
+        assert_eq!(class.quota_kind("openai"), None);
+    }
+}

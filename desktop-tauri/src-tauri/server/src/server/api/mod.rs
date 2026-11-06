@@ -12,6 +12,7 @@
 //!   stats_api.rs  GET /api/stats/summary、/api/stats/requests、DELETE /api/stats/requests、
 //!                 GET/PUT /api/retention
 //!   retry_api.rs  GET/PUT /api/retry（请求重试设置，转发层退避的次数 / 间隔）
+//!   routing_strategy.rs GET/POST /api/routing-strategy（账号选路策略：全局默认 + 逐家覆盖）
 //!   queue_api.rs  GET/PUT /api/queue（排队等待：次数与单次时长）
 //!   accounts.rs   /api/accounts*（对照 workbuddy-account-routes.mjs）
 //!   proxies.rs    /api/proxies*（Clash 读取 + 出口测试）
@@ -20,6 +21,7 @@
 //!   models.rs     POST /api/models/refresh（手动刷新模型清单；管理 API，
 //!                 与上一条的对外只读探针是两个分组，见该文件模块头）
 //!   sanitize.rs   GET/PUT /api/sanitize（出站指纹脱敏开关）
+//!   masking.rs    GET/PUT /api/masking（可逆脱敏：密钥 / 个人信息 / 自定义词）
 //!   prompt.rs     GET/PUT /api/prompt（系统提示词模式 + 内容拦截降级状态）
 //!   auto_checkin.rs /api/auto-checkin*（定时签到设置 / 手动执行）
 //!   scheduled_tasks.rs /api/scheduled-tasks*（间隔型定时任务的开关 / 间隔 / 立即执行）
@@ -80,6 +82,8 @@ pub mod checkin_records;
 pub mod checkin_schedules;
 pub mod cline_headers;
 pub mod codearts_welfare;
+pub mod compact_routes;
+pub mod client_identification;
 pub mod config_api;
 // WorkBuddy 成长任务（查询 / 执行 / 开学季 / 猫猫旅行）：从参考项目
 // workbuddy2api 的 task_runner.py 移植，见该文件模块头
@@ -105,10 +109,12 @@ pub mod import_sources;
 pub mod images;
 mod image_assets;
 mod image_output;
-pub mod keys_api;
-/// 保活换行丢弃开关（`/api/keepalive-strip`）：与 `/api/sanitize`、`/api/debug`
-/// 同形的单开关端点，独立成文件而不是塞进 config_api —— 理由见该模块头。
+// 流式请求「首字节等待」的 SSE 保活（转发超过宽限期仍没就绪时先回保活流，
+// 见该文件模块头）—— 与 disconnect_guard 同属 handler 生命周期上的兜底件；
+// 同一文件还承载「保活换行丢弃开关」（`/api/keepalive-strip`，与 `/api/sanitize`、
+// `/api/debug` 同形的单开关端点，理由见该模块头）。
 pub mod keepalive;
+pub mod keys_api;
 pub mod logs_api;
 pub mod model_manage;
 pub(crate) mod model_access;
@@ -136,8 +142,9 @@ pub mod plugin_ui;
 pub mod plugin_theme;
 pub mod prompt;
 pub mod protocol;
-// 逐家开关覆盖（GET/PUT /api/provider-options）：存储与读取在
-// `core::provider_options`，见该文件模块头
+// 每 provider 的行为开关（`providerOptions`）的读写入口：
+// `GET/PUT /api/provider-options`。存储与读取在 `core::provider_options`，
+// 本模块只补上写侧 `set()` 一直缺失的生产调用方，见该文件模块头
 pub mod provider_options;
 pub mod proxies;
 pub mod qoder_umid;
@@ -153,13 +160,17 @@ pub(crate) mod request_prepare;
 // 见该文件模块头
 pub mod role_compat;
 pub mod routing_api;
-pub mod routing_flow;
 // 统一的路由设置端点（选路策略 + 粘性 / 退避 / 垫底 / 熔断）；
 // `routing_api` 是它的兼容别名 + 队列可见化端点
 pub mod routing_strategy;
+pub mod routing_flow;
+pub mod routing_groups;
 pub mod routing_trace;
 pub mod routing_workspace;
 pub mod sanitize;
+// 可逆脱敏设置（密钥 / 个人信息 / 自定义词）：`GET/PUT /api/masking`。
+// 与 `/api/sanitize` 分开的理由见该模块头（指纹脱敏不可逆，这里可逆）。
+pub mod masking;
 pub mod scheduled_tasks;
 pub mod session;
 // 侧边栏布局（GET/PUT /api/sidebar-layout）：桌面壳与网页端两个 origin
@@ -167,10 +178,10 @@ pub mod session;
 pub mod sidebar_layout;
 pub mod stats_api;
 pub mod storage_api;
-// 剥离响应开头思考标签的开关（GET/PUT /api/think-strip）：判据与执行链在
-// `core::middleware::think_tags`，见该文件模块头
-pub mod think_strip;
 pub mod timeouts_api;
+// 剥离响应开头思考标签的开关（GET/PUT /api/think-strip）：与 /api/keepalive-strip
+// 同形的单开关端点，判据与执行链在 `core::middleware::think_tags`，见该文件模块头
+pub mod think_strip;
 // 派猫猫旅行（CN WorkBuddy 运营活动）：per-account 只读状态 + 手动跑一次，
 // 见该文件模块头
 pub mod travel;
@@ -181,6 +192,7 @@ pub mod zcode_captcha;
 // 令牌池的**补货节奏**设置（目标 / 轮询间隔 / 单轮上限），见该文件模块头
 pub mod zcode_captcha_pool;
 pub mod zcode_claim;
+pub mod zcode_claim_verification;
 // ZCode 客户端版本号（设置页可改）：上游按它决定活动套餐下不下发，
 // 落后时的症状是**静默空列表**，见该文件模块头
 pub mod zcode_version;

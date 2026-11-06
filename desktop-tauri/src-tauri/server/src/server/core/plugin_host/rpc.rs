@@ -844,7 +844,7 @@ impl ProviderAdapter for RpcAdapter {
                 .network(proto::methods::gateway::MODELS_REFRESH, Value::Object(params))
                 .await
             {
-                Ok(value) => match serde_json::from_value::<proto::RefreshOutcome>(value.clone()) {
+                Ok(value) => match serde_json::from_value::<proto::RefreshOutcome>(value) {
                     Ok(outcome) => {
                         if !outcome.refreshed {
                             return ModelRefreshOutcome {
@@ -855,25 +855,34 @@ impl ProviderAdapter for RpcAdapter {
                                 } else { outcome.message },
                             };
                         }
-                        let list = if crate::server::core::providers::is_scoped_runtime_provider(self.id) {
-                            match serde_json::from_value::<proto::ModelList>(value) {
-                                Ok(list) if list.meta.remote && outcome.count == list.models.len() => list,
-                                _ => return ModelRefreshOutcome::failed("插件刷新缺少同次真实远程模型快照，已保留旧清单"),
-                            }
-                        } else { match self.control(
+                        // ── 为什么两条路都要再要一次 MODELS_LIST ──────────────
+                        // `MODELS_REFRESH` 的返回形状恒是 `RefreshOutcome`
+                        // （`{refreshed, count, message}`），**不是** `ModelList`。
+                        // 以前 scoped 分支直接把它当 `ModelList` 反序列化，于是
+                        // 每一次「刷新模型清单」都必然失败（字段全缺 → Err）。
+                        // 正确口径：先用 `RefreshOutcome` 判成功，再补一次
+                        // `MODELS_LIST` 拿**同一次**的真实远程快照；scoped 家额外
+                        // 要求 `meta.remote`（否则拿回来的是兜底清单，等于没刷新）。
+                        let scoped = crate::server::core::providers::is_scoped_runtime_provider(self.id);
+                        let list = match self.control(
                             proto::methods::gateway::MODELS_LIST,
                             self.with_account(account_id),
                         ).await {
                             Ok(value) => match serde_json::from_value::<proto::ModelList>(value) {
+                                Ok(list) if scoped && !list.meta.remote => {
+                                    return ModelRefreshOutcome::failed(
+                                        "插件刷新缺少同次真实远程模型快照，已保留旧清单",
+                                    )
+                                }
                                 Ok(list) => list,
                                 Err(error) => return ModelRefreshOutcome::failed(
                                     format!("插件刷新后返回的模型清单无法解析: {error}"),
                                 ),
                             },
                             Err(error) => return ModelRefreshOutcome::failed(error.message),
-                        } };
+                        };
                         let count = super::rpc_cache::set_remote(self.id, list);
-                        if count == 0 && !crate::server::core::providers::is_scoped_runtime_provider(self.id) {
+                        if count == 0 && !scoped {
                             return ModelRefreshOutcome::failed("插件刷新后没有可用模型，已保留旧清单");
                         }
                         crate::server::core::providers::adapter::seed_hidden_visibility_defaults();
@@ -1647,20 +1656,24 @@ impl RpcAdapter {
             lease,
         );
 
-        // ── 非流式：网关把帧聚合掉（插件恒按 stream:true 推）───────────
-        // 客户端要不要流式是**网关**的事：非流式时网关自己聚合（与内置家
-        // 同一份 `aggregate_frame_stream`）。插件作者因此只写一条路径，
-        // 不必再实现一份「聚合成本」—— 两份规则迟早分叉，而症状是
-        // 「流式与非流式的正文不一样」，极难排查。
-        // 本地独有：剥离开头 think 块按逐家开关取值（插件协议暂无
-        // capabilities.think_strip，统一按「未申报」处理）。非流式走聚合器里的
-        // FramePolicy，流式走 LeadingThinkStream —— 两条路径共用同一个判据。
+        // 非流式与流式共用同一个开关：`providerOptions.stripLeadingThink` 逐家
+        // 覆盖全局键。插件协议目前没有 `capabilities.think_strip`，所以所有
+        // 插件都按「未申报」处理，由网关统一剥离（见下面的迁移说明）。
         let strip_leading_think = crate::server::core::provider_options::is_enabled(
             self.id,
             crate::server::config::KEY_STRIP_LEADING_THINK,
             crate::server::config::strip_leading_think(),
         );
+
+        // ── 非流式：网关把帧聚合掉（插件恒按 stream:true 推）───────────
+        // 客户端要不要流式是**网关**的事：非流式时网关自己聚合（与内置家
+        // 同一份 `aggregate_frame_stream`）。插件作者因此只写一条路径，
+        // 不必再实现一份「聚合成本」—— 两份规则迟早分叉，而症状是
+        // 「流式与非流式的正文不一样」，极难排查。
         if !stream {
+            // 用 `assembled_for_plugin` 而不是 `assembled`：`think_strip` 目前
+            // 恒为 false（协议无此能力位），但装配入口已经预留了「插件已剥过
+            // 就不再剥」的 R21 语义。取切换后执行体的能力位。
             let policy = crate::server::core::upstream::sse::FramePolicy::assembled_for_plugin(
                 self.metadata().capabilities
                     .sse_model_rewrite
@@ -1676,6 +1689,9 @@ impl RpcAdapter {
                 Box::pin(source),
                 telemetry.clone(),
                 policy,
+                // 插件路径的出站请求由插件自己发（不经 `TransportRequest`），
+                // 没有脱敏会话可还原 —— 与接入前逐字节一致。
+                None,
             )
             .await;
             // 输入流在聚合器丢弃 HTTP/业务元数据前保存错误；不重造聚合规则。
@@ -1714,10 +1730,15 @@ impl RpcAdapter {
             };
         }
 
-        // ── 流式：R41 回归修复（本地独有）────────────────────────────
-        // 插件流式路径原先直接把 `RpcStream` 交给客户端，绕过核心的
+        // ── 流式：R41 回归修复 ─────────────────────────────────────
+        // 插件流式路径原先直接把 `RpcStream` 交给客户端，绕过了核心的
         // `LeadingThinkFilter`（非流式走聚合器所以不受影响）。开关打开时
         // 在这里套上跨帧剥离；关着时原样下发，字节与接入前一致。
+        //
+        // 迁移说明：协议目前没有 `capabilities.think_strip`，所有插件都按
+        // 「未申报」处理。等插件协议加上该能力位后，这里要改成
+        // `strip_leading_think && !capabilities.think_strip`，否则插件已剥过
+        // 的正文会被二次剥离（与 `assembled_for_plugin` 的 R21 语义对齐）。
         let stream: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin> =
             if strip_leading_think {
                 Box::new(super::LeadingThinkStream::new(source))

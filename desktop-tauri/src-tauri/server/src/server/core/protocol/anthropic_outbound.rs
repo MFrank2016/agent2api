@@ -999,7 +999,7 @@ mod tests {
         let mut stream = ChatFromAnthropicStream::new("glm-5.3");
         let frames = futures::stream::iter(stream.finish().into_iter().map(Ok));
         let result =
-            aggregate_frame_stream(Box::pin(frames), Arc::new(RequestTelemetry::new()), FramePolicy::default()).await;
+            aggregate_frame_stream(Box::pin(frames), Arc::new(RequestTelemetry::new()), FramePolicy::default(), None).await;
         match result {
             Err(error) => {
                 assert_eq!(error.status_code, 502);

@@ -63,7 +63,7 @@ impl Fallback {
         &self.current
     }
 
-    pub async fn send(&mut self) -> Result<reqwest::Response, UpstreamRequestError> {
+    pub async fn send(&mut self) -> Result<wreq::Response, UpstreamRequestError> {
         self.attempts += 1;
         if self.policy.is_none() {
             return request::send_chat_request(&self.current).await;
@@ -77,8 +77,13 @@ impl Fallback {
             .into_iter()
             .map(|ip| SocketAddr::new(ip, 443))
             .collect();
+        // 没有 pin 到候选 IP 时，不要绕过 egress::dispatch 的轮询出口：
+        // 直接走常规发送路径（含脱敏门禁），由它决定直连 / 单一代理 / 轮询组。
+        if addresses.is_empty() {
+            return request::send_chat_request(&self.current).await;
+        }
         let client = egress::resolved_client(
-            self.current.proxy.as_ref(),
+            self.current.egress.primary(),
             self.current.system_proxy_when_unset,
             &host,
             &addresses,
@@ -87,9 +92,11 @@ impl Fallback {
             message,
             reason: "无法创建备用连接".into(),
             safe_to_retry: true,
+            status_code: 502,
+            retryable: true,
             network_failure: false,
         })?;
-        request::send_chat_with_client(&self.current, &client).await
+        request::send_chat_with_client(&self.current, &client, None).await
     }
 
     pub fn success(&self) {
@@ -168,7 +175,10 @@ impl Fallback {
             return false;
         };
         // 指定 HTTP/SOCKS 代理的 DNS 由代理负责，不能绕过它去直连解析或连接。
-        if !self.available() || self.current.proxy.is_some() || self.current.system_proxy_when_unset
+        // 指定了代理的 DNS 由代理负责，不能绕过它去直连解析或连接。
+        if !self.available()
+            || !matches!(self.current.egress, crate::server::core::proxies::AccountEgress::Direct)
+            || self.current.system_proxy_when_unset
         {
             return false;
         }
@@ -254,7 +264,7 @@ fn breaker_key(origin: &str, transport: &TransportRequest) -> String {
     use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
     digest.update(origin.as_bytes());
-    if let Some(proxy) = &transport.proxy {
+    if let Some(proxy) = transport.egress.primary() {
         digest.update(format!("{proxy:?}").as_bytes());
     }
     digest.update([u8::from(transport.system_proxy_when_unset)]);

@@ -52,6 +52,7 @@ export function newSessionId(): string {
   return `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 }
 
+
 /** 工具权限模式：
  *  · `confirm` 变更前确认 —— 改动类工具先渲染确认卡；
  *  · `full` 完全访问 —— 改动类工具直接执行，不再询问。 */

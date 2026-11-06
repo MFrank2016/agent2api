@@ -49,6 +49,10 @@ export type LimitRow = {
   reset: string
   /** 第二行右半：上游给的原因（可能为空） */
   reason: string
+  /** 原因标签：额度不足 / 额度 / 限流 / 套餐 / 验证（旧记录回落「限流」） */
+  reasonLabel: string
+  /** 作用域标签：账号级 / 模型级（旧记录回落「模型级」） */
+  scopeLabel: string
   /** 悬停全文（相对 + 绝对 + 原因 + 这条标记怎么解除） */
   title: string
   /** 冷却进度（0–100）；读不到触发时刻时 null = 不画线 */
@@ -75,6 +79,33 @@ function waitText(remainingMs: number): string {
 }
 
 /**
+ * 后端 `rateLimits[model].reason` → 界面标签。
+ *
+ * 缺失 / 未知一律回落「限流」：旧版本落盘的记录只有 status / message，升级后不该
+ * 因为多了个字段就换一套说法；而 `rate` 本身也正是历史上这条记录的默认含义。
+ */
+function reasonLabelOf(reason: string | undefined): string {
+  switch (reason) {
+    case 'credit': return t('额度不足')
+    case 'quota': return t('额度')
+    case 'rate': return t('限流')
+    case 'plan': return t('套餐')
+    case 'verification': return t('验证')
+    default: return t('限流')
+  }
+}
+
+/**
+ * 后端 `rateLimits[model].scope` → 界面标签。
+ *
+ * 只有显式 `account` 才是账号级；缺失（旧记录）与未知值都按历史行为当作模型级 ——
+ * 那时一条冷却只停一个模型，不能反过来把整号说成停用。
+ */
+function scopeLabelOf(scope: string | undefined): string {
+  return scope === 'account' ? t('账号级') : t('模型级')
+}
+
+/**
  * 账号**当前生效**的限流记录 → 明细行。
  *
  * 顺序照 `activeLimits` 给的（按恢复时间升序，最早恢复的排最前）：先回来的排最前，
@@ -88,6 +119,8 @@ export function limitRowsOf(account: AccountRecord | null | undefined): LimitRow
     const reset = formatResetText(entry.resetAt)
     const unknown = reset === RESET_UNKNOWN
     const reason = entry.message || (entry.status ? t('上游返回 {status}', { status: entry.status }) : '')
+    const reasonLabel = reasonLabelOf(entry.reason)
+    const scopeLabel = scopeLabelOf(entry.scope)
     const span = resetAt - started
     const progress = started > 0 && Number.isFinite(span) && span > 0
       ? Math.max(0, Math.min(100, ((now - started) / span) * 100))
@@ -100,8 +133,11 @@ export function limitRowsOf(account: AccountRecord | null | undefined): LimitRow
       tone: unknown ? 'muted' : 'warn',
       reset: resetLine,
       reason,
+      reasonLabel,
+      scopeLabel,
       title: [
         entry.model,
+        `${reasonLabel} · ${scopeLabel}`,
         wait,
         resetLine,
         reason,
@@ -181,6 +217,10 @@ export function LimitDetailButton({ accountName, rows, count, cooldown, soonest,
                   <span className={`usage-pop-view ${row.tone}`}>{row.wait}</span>
                 </div>
                 <div className='lp-pop-subline'>
+                  <span className='lp-pop-tags'>
+                    <span className='lp-pop-tag'>{row.reasonLabel}</span>
+                    <span className='lp-pop-tag'>{row.scopeLabel}</span>
+                  </span>
                   <span className='lp-pop-reason'>
                     {row.reset ? `${row.reset} · ` : ''}{row.reason}
                   </span>

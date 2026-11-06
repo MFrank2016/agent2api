@@ -22,7 +22,12 @@ use serde_json::{json, Map, Value};
 
 use crate::server::core::account_store::state::{AccountState, StoredAccount};
 use crate::server::core::account_store::store::{forwards_requests, AccountStore};
-use crate::server::core::account_store::store_util::{js_truthy, max_concurrent_public_for, value_or, value_or_nullish};
+use crate::server::core::account_store::store_crud::{
+    MAX_ACCOUNTS_LIMIT, MAX_QUEUE_LIMIT, MAX_RPM_LIMIT,
+};
+use crate::server::core::account_store::store_util::{
+    js_truthy, limit_public, max_concurrent_public_for, value_or, value_or_nullish,
+};
 use crate::server::core::custom_providers;
 use crate::server::core::endpoints::{resolve_edition, EditionInfo};
 use crate::server::core::proxies::describe_account_proxy;
@@ -595,6 +600,21 @@ impl AccountStore {
                         record.get("maxConcurrent"),
                     )),
                 );
+                // Phase 2 的三个账号上限字段：与 maxConcurrent 同一处注入，
+                // 理由相同 —— 选路读公开形态，各家公开形态漏写一次就静默失效。
+                // 恒为数字键（0 = 不限 / 不排队），读侧不必判「键缺失」。
+                fields.insert(
+                    "maxRpm".to_string(),
+                    Value::from(limit_public(record.get("maxRpm"), MAX_RPM_LIMIT)),
+                );
+                fields.insert(
+                    "maxAccounts".to_string(),
+                    Value::from(limit_public(record.get("maxAccounts"), MAX_ACCOUNTS_LIMIT)),
+                );
+                fields.insert(
+                    "queueLimit".to_string(),
+                    Value::from(limit_public(record.get("queueLimit"), MAX_QUEUE_LIMIT)),
+                );
                 fields.insert(
                     "allowRouteSkip".to_string(),
                     Value::Bool(record.get("allowRouteSkip").and_then(Value::as_bool).unwrap_or(true)),
@@ -987,5 +1007,44 @@ mod tests {
         assert_eq!(display_name_of(&value, "id-1"), "u-77");
         let empty = fields(json!({ "provider": "raccoon" }));
         assert_eq!(display_name_of(&empty, "id-9"), "id-9");
+    }
+
+    /// 三个新上限字段在公开形态里恒为数字键（0 = 不限 / 不排队）：选路读的
+    /// 正是公开形态，缺键会被当成 0，但显式键让前端不必判「字段存在」；
+    /// 存量记录（没有这些键）与脏数据（超过读侧上限）都要有确定读数。
+    #[test]
+    fn public_account_reports_new_limits() {
+        let (db, _guard) = crate::server::db::test_temp::TempDb::open("store-view-limits");
+        let store = crate::server::core::account_store::AccountStore::with_db(Some(db));
+        let record = |value: serde_json::Value| {
+            crate::server::core::account_store::state::StoredAccount::from_map(
+                value.as_object().cloned().unwrap_or_default(),
+            )
+        };
+
+        let configured = store.public_account(&record(json!({
+            "id": "a1", "provider": "workbuddy",
+            "maxRpm": 20, "maxAccounts": 2, "queueLimit": 8,
+        })));
+        assert_eq!(configured.get("maxRpm"), Some(&json!(20)));
+        assert_eq!(configured.get("maxAccounts"), Some(&json!(2)));
+        assert_eq!(configured.get("queueLimit"), Some(&json!(8)));
+
+        // 存量记录没有这三个键：公开形态仍报 0（向后兼容）
+        let legacy = store.public_account(&record(json!({
+            "id": "a2", "provider": "workbuddy",
+        })));
+        assert_eq!(legacy.get("maxRpm"), Some(&json!(0)));
+        assert_eq!(legacy.get("maxAccounts"), Some(&json!(0)));
+        assert_eq!(legacy.get("queueLimit"), Some(&json!(0)));
+
+        // 脏数据（手改记录）按读侧上限报，选路采用的也是这个数
+        let dirty = store.public_account(&record(json!({
+            "id": "a3", "provider": "workbuddy",
+            "maxRpm": 99_999, "maxAccounts": 5_000, "queueLimit": 9_999,
+        })));
+        assert_eq!(dirty.get("maxRpm"), Some(&json!(10_000)));
+        assert_eq!(dirty.get("maxAccounts"), Some(&json!(999)));
+        assert_eq!(dirty.get("queueLimit"), Some(&json!(1_000)));
     }
 }

@@ -433,6 +433,24 @@ pub struct TelemetrySnapshot {
     /// 见 `payload::send_body` 的说明：跨家降级时每个在范围内的家各处理一次，
     /// 合并计数才是「这次请求命中了什么」的正确读数。
     pub sensitive_hits: Vec<SensitiveHit>,
+    /// **本次请求的出站脱敏命中**（规则类型 → 命中值个数；空表 = 没命中）。
+    ///
+    /// ── 与 `sensitive_hits` 的分工 ──────────────────────────────
+    /// `sensitive_hits` 是 `core::sanitize` 的**出站指纹脱敏**（改写后不还原）；
+    /// 本字段是 `core::masking` 的**可逆脱敏**（请求侧换占位符、回复侧还原）。
+    /// 两者都只记「命中了什么类型 / 几次」，**永远不记原文** —— 原文进日志
+    /// 等于把要保护的东西换个地方又存了一份。
+    ///
+    /// ── 计数口径 ────────────────────────────────────────────────
+    /// 单位是**占位符**（= 不同的值）：同一个邮箱在请求里出现三次，只有一个
+    /// 占位符，这里记 1 次。与 `MaskReport::counts` 同一口径。
+    ///
+    /// ── 数据从哪来 / 到哪去 ─────────────────────────────────────
+    /// `TransportRequest::mask_payload` 成功时把 `MaskReport` 交回调用点，
+    /// 由 [`Self::note_mask_hits`] 并进本字段；记账点（`api::pipeline`）再把
+    /// 它按 `sensitive_hits` 的既有形状（`{word, count}`）透给请求日志，
+    /// 前端不需要为它新增一套渲染。
+    pub mask_hits: Vec<(String, usize)>,
     /// **每一次上游尝试的明细**（按发生顺序，与账号轮换链一一对应）。
     ///
     /// ── 为什么需要它（Agent2API 请求日志改造）───────────────────
@@ -547,6 +565,9 @@ struct LiveStamp {
     last_finished_at: Option<i64>,
     route_revision: u64,
     sensitive: usize,
+    /// 脱敏命中的**类型数**（与 `sensitive` 同一「只看条数」的口径：命中表
+    /// 是并集累加，类型数变了就值得回写一次进行中行）
+    mask: usize,
 }
 
 impl LiveStamp {
@@ -570,6 +591,7 @@ impl LiveStamp {
             last_finished_at: last.and_then(|item| item.finished_at),
             route_revision: snapshot.route_revision,
             sensitive: snapshot.sensitive_hits.len(),
+            mask: snapshot.mask_hits.len(),
         }
     }
 }
@@ -1111,6 +1133,31 @@ impl RequestTelemetry {
         self.flush_live(&guard);
     }
 
+    /// 记一批**可逆脱敏**的命中（规则类型 → 值个数，见
+    /// [`TelemetrySnapshot::mask_hits`]）。
+    ///
+    /// 入参来自 `MaskReport::counts()`：已经按占位符去重、按类型首次出现排序。
+    /// 同一类型再次上报（跨家降级时每一家各脱敏一次）时**合并计数**，理由与
+    /// [`Self::note_sensitive_hits`] 相同。空表直接返回（关闭脱敏时的常态，
+    /// 不该触发一次在途回写）。
+    pub fn note_mask_hits(&self, kind_counts: &[(String, usize)]) {
+        if kind_counts.is_empty() {
+            return;
+        }
+        let mut guard = self.lock();
+        for (kind, count) in kind_counts {
+            if *count == 0 {
+                continue;
+            }
+            match guard.mask_hits.iter_mut().find(|(seen, _)| seen == kind) {
+                Some((_, total)) => *total += *count,
+                None => guard.mask_hits.push((kind.clone(), *count)),
+            }
+        }
+        // 在途回写：命中表参与「敏」标签，与 sensitive_hits 同一时机
+        self.flush_live(&guard);
+    }
+
     /// 取当前快照（记账点收尾时调一次）
     pub fn snapshot(&self) -> TelemetrySnapshot {
         self.lock().clone()
@@ -1291,5 +1338,44 @@ mod body_bytes_observation {
         // 负数只可能来自手改的库：夹成 0，展示层不为一位数写分支
         telemetry.note_attempt_body_bytes(-5);
         assert_eq!(Some(0), telemetry.snapshot().attempts_detail[1].body_bytes);
+    }
+}
+
+#[cfg(test)]
+mod mask_hit_metadata {
+    //! 可逆脱敏的命中元数据（只记类型 / 数量，不记原文）。
+
+    use super::*;
+
+    #[test]
+    fn mask_hits_merge_by_kind_and_never_carry_originals() {
+        let telemetry = RequestTelemetry::new();
+        assert!(
+            telemetry.snapshot().mask_hits.is_empty(),
+            "新槽位默认没有命中"
+        );
+
+        telemetry.note_mask_hits(&[("api_key".to_string(), 2), ("email".to_string(), 1)]);
+        telemetry.note_mask_hits(&[("api_key".to_string(), 3)]);
+
+        let hits = telemetry.snapshot().mask_hits;
+        assert_eq!(
+            hits,
+            vec![("api_key".to_string(), 5), ("email".to_string(), 1)],
+            "同一类型合并计数，顺序按首次出现"
+        );
+        let debug = format!("{hits:?}");
+        assert!(!debug.contains("sk-"), "{debug}");
+        assert!(!debug.contains('@'), "命中表里不能出现原文片段: {debug}");
+    }
+
+    #[test]
+    fn an_empty_mask_report_is_a_no_op() {
+        let telemetry = RequestTelemetry::new();
+        telemetry.note_mask_hits(&[]);
+        assert!(telemetry.snapshot().mask_hits.is_empty());
+        // 0 次的项也不该凭空造出来
+        telemetry.note_mask_hits(&[("word".to_string(), 0)]);
+        assert!(telemetry.snapshot().mask_hits.is_empty());
     }
 }

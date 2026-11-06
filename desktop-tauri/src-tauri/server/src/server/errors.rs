@@ -111,6 +111,24 @@ impl GatewayError {
         self.status_code == 429 || self.upstream_code == Some(QUOTA_LIMIT_CODE)
     }
 
+    /// 网关侧限流（滚动 RPM 打满）的 429：带 `Retry-After`（秒，向上取整）。
+    ///
+    /// 与上游 429 的区别：这不是上游给的拒绝，而是我们自己的滑动窗口满了。
+    /// 因此不挂 `upstream_code`、也不该走 `mark_account_limited` 记账 ——
+    /// 账号本身没问题，只是这一分钟的名额用完了。
+    ///
+    /// `wait_ms` 来自 [`crate::server::core::upstream::rpm::RpmWindow::wait_ms`]
+    /// （>0 才有意义）。秒数向上取整且至少 1 秒：`Retry-After: 0` 会被响应侧
+    /// 丢掉（见 `response`），等于让客户端立刻再撞一次。
+    pub fn rate_limited_with_retry_after(wait_ms: i64) -> Self {
+        let seconds = (wait_ms.max(0) as u64).div_ceil(1000).max(1);
+        Self::with_status(
+            429,
+            format!("账号已达每分钟请求上限（RPM），请 {seconds} 秒后重试"),
+        )
+        .with_retry_after_seconds(seconds)
+    }
+
     /// 挂上 `Retry-After`（秒）。
     ///
     /// 用在**已知恢复时刻**的限额类错误上（上游给了窗口重置文案、我们算得出

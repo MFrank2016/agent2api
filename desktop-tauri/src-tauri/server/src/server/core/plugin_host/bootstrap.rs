@@ -22,6 +22,7 @@ use std::time::Duration;
 use agent2api_provider_protocol as proto;
 
 use crate::server::core::account_store::AccountStore;
+use crate::server::core::providers::error_kind::QuotaKind;
 use crate::server::core::providers::ProviderKind;
 use crate::server::logging;
 
@@ -230,8 +231,19 @@ impl GatewayCallbacks for StoreCallbacks {
                 if store.account_provider_of(&account).as_deref() != Some(provider.as_str()) {
                     return Err("账号归属已变化".to_string());
                 }
-                store.mark_rate_limited(&account, &model, 429, None,
-                    reset_at.map(|value| value as f64), "插件上报限额");
+                // 插件只上报「这个模型限额了」，不带归类：按最保守的 Quota 记
+                // （模型级、停到 resetAt），既不误判成分钟级限流而反复重试，也不会
+                // 因为缺 kind 就把整个账号摘掉。Retry-After 协议里也没有。
+                store.mark_rate_limited(
+                    &account,
+                    &model,
+                    429,
+                    None,
+                    reset_at.map(|value| value as f64),
+                    "插件上报限额",
+                    QuotaKind::Quota,
+                    None,
+                );
                 Ok(())
             }).await.map_err(|error| proto::WireError::with_code(error.message, proto::WireError::INTERNAL))?
                 .map_err(|message| proto::WireError::with_code(message, super::CALLBACK_FORBIDDEN))

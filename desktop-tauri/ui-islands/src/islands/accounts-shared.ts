@@ -71,6 +71,18 @@ export type RateLimitInfo = {
    */
   at?: number
   message?: string
+  /**
+   * **触发原因**（后端 `QuotaKind` 的归类结果）：`credit` / `quota` / `rate` /
+   * `plan` / `verification`。旧版本落盘的记录没有这个键，读取侧按「限流」显示。
+   */
+  reason?: string
+  /**
+   * **冷却作用域**：`account`（整号停）/ `model`（只停这个模型）。旧版本没有这个键，
+   * 按历史行为当作 `model`。
+   */
+  scope?: string
+  /** 上游 `Retry-After` 折算的毫秒数；拿不到时后端写 `null`（旧记录无此键）。 */
+  retryAfterMs?: number | null
 }
 
 /**
@@ -133,6 +145,15 @@ export type AccountUpdateResult = {
 
 /** 与后端 MAX_CONCURRENT_LIMIT 一致。 */
 export const ACCOUNT_CONCURRENCY_MAX = 999
+
+/** 与后端 MAX_RPM_LIMIT 一致（滚动 60 秒请求上限，0 = 不限）。 */
+export const ACCOUNT_RPM_MAX = 10_000
+
+/** 与后端 MAX_ACCOUNTS_LIMIT 一致（同家同时使用的账号数，0 = 不限）。 */
+export const ACCOUNT_MAX_ACCOUNTS = 999
+
+/** 与后端 MAX_QUEUE_LIMIT 一致（在途已满时的排队上限，0 = 不排队）。 */
+export const ACCOUNT_QUEUE_MAX = 1_000
 
 /**
  * 一个 Token 规则窗口在**当前窗口**的消耗读数（用量快照 `tokenUsage` 的行，
@@ -227,6 +248,21 @@ export type AccountRecord = {
    */
   balanceQuery?: BalanceQueryPublic
   maxConcurrent?: number
+  /**
+   * 滚动 60 秒请求上限（后端 `MAX_RPM_LIMIT` 封顶）：**0 = 不限**。公开形态恒有
+   * 这个键（旧记录由后端归一成 0，见 `store_view::limit_public`）。
+   */
+  maxRpm?: number
+  /**
+   * 同一提供商**同时使用**的账号数上限（后端 `MAX_ACCOUNTS_LIMIT` 封顶）：
+   * **0 = 不限**。同家多条账号各填一个时，选路取其中最小的非零值。
+   */
+  maxAccounts?: number
+  /**
+   * 账号在途已满时的排队上限（后端 `MAX_QUEUE_LIMIT` 封顶）：**0 = 不排队**
+   * （直接换号 / 429）。
+   */
+  queueLimit?: number
   allowRouteSkip?: boolean
   checkinAt?: number
   /**

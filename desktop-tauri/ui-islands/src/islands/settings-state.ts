@@ -30,7 +30,7 @@
  *   全部经 window.workbuddyDesktop，本文件不自己拼 URL。
  */
 
-import * as React from 'react'
+import * as React from "react";
 import {
   CATEGORIES,
   CAPTCHA_POOL_FIELDS,
@@ -59,53 +59,62 @@ import {
   type CaptchaSetting,
   type ClineHeadersData,
   type GatewayBlocks,
+  type MaskingPatch,
   type ModelsDevState,
   type NumberField,
   type PromptPatch,
-} from './settings-model'
+} from "./settings-model";
 import {
-  INITIAL_SANITIZE, sanitizeStateFrom, type SanitizePatch, type SanitizeState,
-} from './settings-sanitize-model'
-import { t } from '../i18n'
-import { retentionSavedMessage, retentionShrinkHead, type RetentionField } from './settings-retention-model'
+  INITIAL_SANITIZE,
+  sanitizeStateFrom,
+  type SanitizePatch,
+  type SanitizeState,
+} from "./settings-sanitize-model";
+import { t } from "../i18n";
+import {
+  retentionSavedMessage,
+  retentionShrinkHead,
+  type RetentionField,
+} from "./settings-retention-model";
 
 /* ─── 快照类型 ─────────────────────────────── */
 
 /** 三态：首屏「检测中…」、读到、读不到（三者对应的界面与旧实现逐一对齐） */
-export type LoadStatus = 'loading' | 'ready' | 'unavailable'
+export type LoadStatus = "loading" | "ready" | "unavailable";
 
 /**
  * 忙碌归属：决定这一次操作期间哪些控件禁用（旧实现是各面板自己置 disabled，
  * 这里收成一处状态）。null = 空闲。
  */
 export type BusyScope =
-  | 'app'
-  | 'lan'
-  | 'retention'
-  | 'retry'
-  | 'codes'
-  | 'timeouts'
-  | 'queue'
-  | 'imageCompress'
-  | 'captchaPool'
-  | 'routing'
-  | 'debug'
-  | 'sanitize'
-  | 'thinkStrip'
-  | 'providerOptions'
-  | 'developerRoleCompat'
-  | 'clineHeaders'
-  | 'zcodeVersion'
-  | 'cors'
-  | 'prompt'
-  | 'captcha'
-  | 'modelsDev'
-  | 'modelsDevRefresh'
-  | 'export'
-  | 'import'
-  | 'dbExport'
-  | 'dbImport'
-  | null
+  | "app"
+  | "lan"
+  | "retention"
+  | "retry"
+  | "codes"
+  | "timeouts"
+  | "queue"
+  | "imageCompress"
+  | "captchaPool"
+  | "routing"
+  | "debug"
+  | "sanitize"
+  | "masking"
+  | "thinkStrip"
+  | "providerOptions"
+  | "developerRoleCompat"
+  | "clineHeaders"
+  | "zcodeVersion"
+  | "cors"
+  | "prompt"
+  | "captcha"
+  | "modelsDev"
+  | "modelsDevRefresh"
+  | "export"
+  | "import"
+  | "dbExport"
+  | "dbImport"
+  | null;
 
 /**
  * 启动与托盘。unavailable 时开关**仍可拨**（照旧实现：拨了直接发全量 patch，
@@ -116,66 +125,72 @@ export type BusyScope =
  * 「锦上添花」的读数，查询失败不该拖垮设置本身）。
  */
 export type AppState = {
-  status: LoadStatus
-  closeToTray: boolean
-  autostart: boolean
+  status: LoadStatus;
+  closeToTray: boolean;
+  autostart: boolean;
   /** 局域网访问：监听 0.0.0.0（改动随「应用重启」生效） */
-  lanAccess: boolean
+  lanAccess: boolean;
   /** 局域网访问开启时是否同时托管网页管理面板 */
-  lanPanel: boolean
+  lanPanel: boolean;
   /** 轻量模式：关窗销毁界面进程（释放 WebView2 内存），托盘按需重建 */
-  lightweightMode: boolean
+  lightweightMode: boolean;
   /** 本机在局域网里的 IP（查不到为 null，地址展示退化为占位符） */
-  lanIp: string | null
+  lanIp: string | null;
   /** 网关端口（0 = 还没查到），拼局域网地址用 */
-  port: number
+  port: number;
   /** 面板管理员是否已注册（null = 还没查过；流程里会再查一次拿最新值） */
-  adminRegistered: boolean | null
-}
+  adminRegistered: boolean | null;
+};
 
 /** 数值面板：values 为 null 时（loading / unavailable）各输入框保持禁用 */
-export type NumericState = { status: LoadStatus; values: Record<string, number> | null }
+export type NumericState = {
+  status: LoadStatus;
+  values: Record<string, number> | null;
+};
 
 /**
  * 账号路由（策略 + 会话粘性）：两档都是受控枚举，读不到时档位回落后端默认
  * （order / auto，由视图侧按合法值表兜底）。
  */
 export type RoutingState = {
-  status: LoadStatus
-  strategy: string
-  sticky: string
+  status: LoadStatus;
+  strategy: string;
+  sticky: string;
   /** 失败退避：转发失败的账号休息一会儿再回来（后端默认开） */
-  failoverBackoff: boolean
+  failoverBackoff: boolean;
   /** 限流垫底：还有额度时被 429 的账号排到队尾（后端默认开） */
-  sink: boolean
+  sink: boolean;
   /** 熔断开关：连续失败到阈值后打开（后端默认关） */
-  breakerEnabled: boolean
-}
+  breakerEnabled: boolean;
+};
 
 export type DebugState = {
-  status: LoadStatus
-  on: boolean
+  status: LoadStatus;
+  on: boolean;
   /** 已保存条数 / 上限；后端没给可用的数时为 null（文案里那一句整个不出现） */
-  count: number | null
-  limit: number | null
-}
+  count: number | null;
+  limit: number | null;
+};
 
 /** 开发者角色兼容开关 */
-export type DeveloperRoleCompatState = { status: LoadStatus; on: boolean }
-
-/**
- * 会话图片压缩：一个开关 + 三项参数。`values` 为 null（loading / unavailable）
- * 时三个输入框保持禁用；`enabled` 在读到之前按关显示（与 developerRoleCompat
- * 同款降级口径）。
- */
-export type ImageCompressState = {
-  status: LoadStatus
-  enabled: boolean
-  values: Record<string, number> | null
-}
+export type DeveloperRoleCompatState = { status: LoadStatus; on: boolean };
 
 /** 剥离响应开头思考标签的全局开关；与 SanitizeState 同形 */
-export type ThinkStripState = { status: LoadStatus; on: boolean }
+export type ThinkStripState = { status: LoadStatus; on: boolean };
+
+/**
+ * 可逆出站脱敏（`/api/masking`）：三项互相独立，任一开启即会改写出站副本。
+ *
+ * `saved = false` 表示这次 PUT 没写进库（只在本次运行内生效），界面要常驻提示；
+ * 读侧不可用时 status 为 unavailable，面板整体禁用但**不影响设置页其它块**。
+ */
+export type MaskingState = {
+  status: LoadStatus;
+  secrets: boolean;
+  pii: boolean;
+  words: string[];
+  saved: boolean;
+};
 
 /**
  * 逐家开关覆盖（`providerOptions`）：只含**显式设过**的家与键。
@@ -184,20 +199,31 @@ export type ThinkStripState = { status: LoadStatus; on: boolean }
  * 存在布尔值 = 显式开 / 关。缺失与 `false` 不是一回事，界面因此必须是三档。
  */
 export type ProviderOptionsState = {
-  status: LoadStatus
-  overrides: Record<string, Record<string, boolean>>
-}
+  status: LoadStatus;
+  overrides: Record<string, Record<string, boolean>>;
+};
+
+/**
+ * 会话图片压缩：一个开关 + 三项参数。`values` 为 null（loading / unavailable）
+ * 时三个输入框保持禁用；`enabled` 在读到之前按关显示（与 developerRoleCompat
+ * 同款降级口径）。
+ */
+export type ImageCompressState = {
+  status: LoadStatus;
+  enabled: boolean;
+  values: Record<string, number> | null;
+};
 
 /** Cline 伪装头：三份表（默认 / 覆盖 / 生效）都来自后端，界面据此渲染与判断改动 */
 export type ClineHeadersState = {
-  status: LoadStatus
-  defaults: Record<string, string>
-  overrides: Record<string, string>
-  effective: Record<string, string>
-}
+  status: LoadStatus;
+  defaults: Record<string, string>;
+  overrides: Record<string, string>;
+  effective: Record<string, string>;
+};
 
 /** 网关面（/v1/*）跨域访问开关 */
-export type CorsState = { status: LoadStatus; on: boolean }
+export type CorsState = { status: LoadStatus; on: boolean };
 
 /**
  * ZCode 客户端版本号（`/api/zcode/version`）。
@@ -208,10 +234,10 @@ export type CorsState = { status: LoadStatus; on: boolean }
  * 输入框反复重试。
  */
 export type ZcodeVersionState = {
-  status: LoadStatus
-  version: string
-  envOverride: string
-}
+  status: LoadStatus;
+  version: string;
+  envOverride: string;
+};
 
 /**
  * models.dev 模型元数据：开关 + 「这份数据是什么时候的、有多少条」。
@@ -220,50 +246,50 @@ export type ZcodeVersionState = {
  * 视图层；未知值原样回显（后端将来加了档位，界面不会显示成空白）。
  */
 export type ModelsDevPanelState = {
-  status: LoadStatus
-  enabled: boolean
-  source: string
-  updatedAt: number
-  count: number
-}
+  status: LoadStatus;
+  enabled: boolean;
+  source: string;
+  updatedAt: number;
+  count: number;
+};
 
 export type PromptState = {
-  status: LoadStatus
-  mode: string
-  file: string
+  status: LoadStatus;
+  mode: string;
+  file: string;
   /** **生效正文**（`passthrough` 下是空串）：界面直接编辑这一段 */
-  text: string
+  text: string;
   /** 后端给的来源：'file' | 'builtin' | 'inline' | ''（文案在视图层映射） */
-  source: string
-  lines: number
-  fileError: string
-  degradeActive: boolean
-  degradeUntilText: string
+  source: string;
+  lines: number;
+  fileError: string;
+  degradeActive: boolean;
+  degradeUntilText: string;
   /** **按提供商**的覆盖（只含已单独配置的家，后端已按 id 排好序） */
-  providers: ProviderPromptState[]
+  providers: ProviderPromptState[];
   /** **网关自带提示词**的逐家开关：只含被明确拨过的家（键缺失 = 默认装） */
-  gateway: Record<string, boolean>
+  gateway: Record<string, boolean>;
   /** **网关自带提示词的正文覆盖**：只含改过的家与段（缺的段 = 官方原文） */
-  gatewayText: Record<string, GatewayBlocks>
+  gatewayText: Record<string, GatewayBlocks>;
   /** 可配置的家（下拉用）：注册表全量，含网关自带提示词的说明、规模与正文模板 */
-  options: ProviderPromptOption[]
-}
+  options: ProviderPromptOption[];
+};
 
 /** 单一提供商的提示词覆盖（字段与全局那份同构，同一套渲染逻辑） */
 export type ProviderPromptState = {
-  id: string
-  mode: string
-  file: string
+  id: string;
+  mode: string;
+  file: string;
   /** **生效正文**（同上；`passthrough` 下是空串） */
-  text: string
-  source: string
-  lines: number
-  fileError: string
+  text: string;
+  source: string;
+  lines: number;
+  fileError: string;
   /** 这一家的**网关自带提示词**是否装上（缺省 true；只有带 `gatewayNote` 的家有意义） */
-  gateway: boolean
+  gateway: boolean;
   /** 是否配过模式 / 文件 / 正文；只有网关开关覆盖时，客户端提示词仍跟随全局。 */
-  configured: boolean
-}
+  configured: boolean;
+};
 
 /**
  * 可配置的家。
@@ -275,62 +301,68 @@ export type ProviderPromptState = {
  * 此时界面不提供编辑入口（免得用户拿一份空文本把官方原文清掉）。
  */
 export type ProviderPromptOption = {
-  id: string
-  label: string
-  gatewayNote: string
-  gatewayChars: number
-  gatewayBlocks: GatewayBlocks | null
-}
+  id: string;
+  label: string;
+  gatewayNote: string;
+  gatewayChars: number;
+  gatewayBlocks: GatewayBlocks | null;
+};
 
 export type StorageState = {
-  status: LoadStatus
+  status: LoadStatus;
   /** 库能不能打开（false = 「数据库不可用」徽章）；与 status 的「读不到」不同 */
-  available: boolean
-  file: string
-  bytes: number
+  available: boolean;
+  file: string;
+  bytes: number;
   /** null 表示后端未提供可用读数。 */
-  accounts: number | null
-  logs: number | null
-  requests: number | null
-  dailyDays: number | null
-  downstreamRaw: number | null
-  upstreamRaw: number | null
-}
+  accounts: number | null;
+  logs: number | null;
+  requests: number | null;
+  dailyDays: number | null;
+  downstreamRaw: number | null;
+  upstreamRaw: number | null;
+};
 
 /** 导入失败明细（只列前 3 条，more 表示还有更多） */
-export type IoFailure = { failed: number; detail: string; more: boolean } | null
+export type IoFailure = {
+  failed: number;
+  detail: string;
+  more: boolean;
+} | null;
 
 export type SettingsSnapshot = {
   /** 当前分类（左侧导航与右侧面板的显隐都由它派生） */
-  category: string
+  category: string;
   /** 每次 showCategory 递增：视图据此把内容栏滚回顶部（旧实现是命令式写 scrollTop） */
-  scrollReset: number
-  busy: BusyScope
-  app: AppState
-  unitsChinese: boolean
-  retention: NumericState
-  retry: NumericState
+  scrollReset: number;
+  busy: BusyScope;
+  app: AppState;
+  unitsChinese: boolean;
+  retention: NumericState;
+  retry: NumericState;
   /** 「指定错误码直接换号」名单；retry.status 为 unavailable 时是 null */
-  retryCodes: number[] | null
-  timeouts: NumericState
-  queue: NumericState
+  retryCodes: number[] | null;
+  timeouts: NumericState;
+  queue: NumericState;
   /** 会话图片压缩：开关 + 三项参数（长边 / 质量 / 阈值） */
-  imageCompress: ImageCompressState
-  captchaPool: NumericState
+  imageCompress: ImageCompressState;
+  captchaPool: NumericState;
   /** 账号路由：策略 + 会话粘性（「路由」分类） */
-  routing: RoutingState
-  debug: DebugState
-  sanitize: SanitizeState
+  routing: RoutingState;
+  debug: DebugState;
+  sanitize: SanitizeState;
+  /** 可逆出站脱敏（密钥 / 个人信息 / 自定义词） */
+  masking: MaskingState;
   /** 剥离响应开头思考标签（全局开关） */
-  thinkStrip: ThinkStripState
+  thinkStrip: ThinkStripState;
   /** 逐家开关覆盖 */
-  providerOptions: ProviderOptionsState
-  developerRoleCompat: DeveloperRoleCompatState
-  clineHeaders: ClineHeadersState
-  zcodeVersion: ZcodeVersionState
-  cors: CorsState
-  prompt: PromptState
-  storage: StorageState
+  providerOptions: ProviderOptionsState;
+  developerRoleCompat: DeveloperRoleCompatState;
+  clineHeaders: ClineHeadersState;
+  zcodeVersion: ZcodeVersionState;
+  cors: CorsState;
+  prompt: PromptState;
+  storage: StorageState;
   /**
    * 机器人校验（ALTCHA）：两端各一个开关，`localPanel` 标出本进程是哪一端
    * （桌面壳 true / 网页端 false），界面据此把「正在用的这一端」标出来。
@@ -338,7 +370,12 @@ export type SettingsSnapshot = {
    * `available = false` 表示读不到后端状态（端点不可用），两张开关都置灰 ——
    * 与 retention / cors 的降级口径一致。
    */
-  captcha: { available: boolean; desktop: boolean; web: boolean; localPanel: boolean }
+  captcha: {
+    available: boolean;
+    desktop: boolean;
+    web: boolean;
+    localPanel: boolean;
+  };
   /**
    * 面板账户（设置页「账户」分类）。
    *
@@ -346,12 +383,12 @@ export type SettingsSnapshot = {
    * 界面照常可用，只是没有「改密码」可改。`username` 只用于展示。
    */
   account: {
-    status: 'loading' | 'ready' | 'unavailable'
-    registered: boolean
-    username: string
+    status: "loading" | "ready" | "unavailable";
+    registered: boolean;
+    username: string;
     /** 改密码弹窗（非空 = 开着；busy 时按钮转圈，error 非空显示红字） */
-    password: { busy: boolean; error: string } | null
-  }
+    password: { busy: boolean; error: string } | null;
+  };
   /**
    * models.dev 模型元数据（能力位与逐模型思考档位）。
    *
@@ -359,17 +396,17 @@ export type SettingsSnapshot = {
    * 这个开关的价值全在「那份元数据是什么时候的、有多少条」，只给一个布尔值
    * 等于把功能做成一个不知道有没有生效的按钮。
    */
-  modelsDev: ModelsDevPanelState
-  ioFailure: IoFailure
+  modelsDev: ModelsDevPanelState;
+  ioFailure: IoFailure;
   /** 保留期改小的确认框正文（非空即开着）；确认 / 取消都收口到 resolveRetentionConfirm */
-  retentionConfirm: { head: string } | null
+  retentionConfirm: { head: string } | null;
   /**
    * 整库备份 / 恢复（「数据」分类）：`dbIncludeLogs` 是导出复选框的当前值；
    * `dbBackupConfirm` 非空 = 恢复确认弹窗开着（记录的是确认时要执行的参数集）。
    */
-  dbIncludeLogs: boolean
-  dbExportConfirm: boolean
-  dbBackupConfirm: { includeLogs: boolean } | null
+  dbIncludeLogs: boolean;
+  dbExportConfirm: boolean;
+  dbBackupConfirm: { includeLogs: boolean } | null;
   /**
    * 整库恢复返回的密钥警告原文（`DatabaseImportResult.warning`；null = 没有警告）。
    *
@@ -378,7 +415,7 @@ export type SettingsSnapshot = {
    * 错过就再没有第二次提示。生命周期与 ioFailure 同约定：只反映最近一次恢复，
    * 下一次恢复开始时清掉。
    */
-  dbWarning: string | null
+  dbWarning: string | null;
   /**
    * 整库恢复的进度 / 结果（非空 = 那个**不可关闭**的弹窗开着）。
    *
@@ -386,53 +423,56 @@ export type SettingsSnapshot = {
    * 完成 / 失败后只给一个「知道了」。进度由后端给（见 `db::backup` 的
    * `RestoreProgress`），前端每 500ms 拉一次。
    */
-  dbRestore: DbRestoreProgress | null
+  dbRestore: DbRestoreProgress | null;
   /** 局域网访问的确认框（非空即开着）；确认 / 取消都收口到 resolveLanConfirm */
-  lanConfirm: LanConfirm
+  lanConfirm: LanConfirm;
   /** 局域网开启流程的注册步（非空 = 弹窗切到注册表单） */
-  lanRegister: LanRegister
+  lanRegister: LanRegister;
   /** 面板登录整块：仅网页端渲染 */
-  panelLogin: boolean
-}
+  panelLogin: boolean;
+};
 
 /**
  * 局域网访问确认框的内容。`mode` 决定确认后的动作（enable 还要看注册状态，
  * 可能接注册步）；`panel` 是「网页面板」子开关的目标值（mode 为 panel 时）。
  */
-export type LanConfirm = { mode: 'enable' | 'disable' | 'panel'; panel: boolean } | null
+export type LanConfirm = {
+  mode: "enable" | "disable" | "panel";
+  panel: boolean;
+} | null;
 
 /** 整库恢复的进度与结果（弹窗读它） */
 export type DbRestoreProgress = {
   /** 正在跑（此时弹窗不给关） */
-  active: boolean
+  active: boolean;
   /** 成功收口 */
-  done: boolean
+  done: boolean;
   /** 失败收口 */
-  failed: boolean
+  failed: boolean;
   /** 当前阶段的可读文案（后端给，前端只显示） */
-  phase: string
+  phase: string;
   /** 大致百分比（只增不减） */
-  percent: number
+  percent: number;
   /** 失败原因（`failed` 时才有） */
-  error: string
+  error: string;
   /** 恢复了多少张表（`done` 时才有） */
-  tables: number
+  tables: number;
   /** 替换前自动备份的文件名（`done` 时才有） */
-  safetyBackup: string
+  safetyBackup: string;
   /** 密钥指纹不匹配的警告原文（`done` 时可能有） */
-  warning: string
-  reencryptedSecrets: number
-  localKeysPreserved: boolean
-  startedAt: number
-  finishedAt: number
-}
+  warning: string;
+  reencryptedSecrets: number;
+  localKeysPreserved: boolean;
+  startedAt: number;
+  finishedAt: number;
+};
 
 /** 注册步的状态：busy 时按钮转圈，error 非空时红字显示在表单里 */
-export type LanRegister = { busy: boolean; error: string } | null
+export type LanRegister = { busy: boolean; error: string } | null;
 
 /** 是否网页端（桌面壳的面板跟着应用走，没有「登录面板」的概念） */
 export function readPanelLogin(): boolean {
-  return shared().workbuddyDesktop?.platform === 'web'
+  return shared().workbuddyDesktop?.platform === "web";
 }
 
 /** 首屏值：各面板都是「检测中…」，与静态骨架逐字一致 */
@@ -442,7 +482,7 @@ const INITIAL: SettingsSnapshot = {
   scrollReset: 0,
   busy: null,
   app: {
-    status: 'loading',
+    status: "loading",
     closeToTray: false,
     autostart: false,
     lanAccess: false,
@@ -453,41 +493,60 @@ const INITIAL: SettingsSnapshot = {
     adminRegistered: null,
   },
   unitsChinese: true,
-  retention: { status: 'loading', values: null },
-  retry: { status: 'loading', values: null },
+  retention: { status: "loading", values: null },
+  retry: { status: "loading", values: null },
   retryCodes: null,
-  timeouts: { status: 'loading', values: null },
-  queue: { status: 'loading', values: null },
-  imageCompress: { status: 'loading', enabled: true, values: null },
-  captchaPool: { status: 'loading', values: null },
-  routing: { status: 'loading', strategy: 'order', sticky: 'auto', failoverBackoff: true, sink: true, breakerEnabled: false },
-  debug: { status: 'loading', on: false, count: null, limit: null },
+  timeouts: { status: "loading", values: null },
+  queue: { status: "loading", values: null },
+  imageCompress: { status: "loading", enabled: true, values: null },
+  captchaPool: { status: "loading", values: null },
+  routing: {
+    status: "loading",
+    strategy: "order",
+    sticky: "auto",
+    failoverBackoff: true,
+    sink: true,
+    breakerEnabled: false,
+  },
+  debug: { status: "loading", on: false, count: null, limit: null },
   sanitize: INITIAL_SANITIZE,
-  thinkStrip: { status: 'loading', on: false },
-  providerOptions: { status: 'loading', overrides: {} },
-  developerRoleCompat: { status: 'loading', on: false },
-  clineHeaders: { status: 'loading', defaults: {}, overrides: {}, effective: {} },
-  zcodeVersion: { status: 'loading', version: '', envOverride: '' },
-  cors: { status: 'loading', on: false },
+  masking: {
+    status: "loading",
+    secrets: false,
+    pii: false,
+    words: [],
+    saved: true,
+  },
+  thinkStrip: { status: "loading", on: false },
+  providerOptions: { status: "loading", overrides: {} },
+  developerRoleCompat: { status: "loading", on: false },
+  clineHeaders: {
+    status: "loading",
+    defaults: {},
+    overrides: {},
+    effective: {},
+  },
+  zcodeVersion: { status: "loading", version: "", envOverride: "" },
+  cors: { status: "loading", on: false },
   prompt: {
-    status: 'loading',
-    mode: 'passthrough',
-    file: '',
-    text: '',
-    source: '',
+    status: "loading",
+    mode: "passthrough",
+    file: "",
+    text: "",
+    source: "",
     lines: 0,
-    fileError: '',
+    fileError: "",
     degradeActive: false,
-    degradeUntilText: '',
+    degradeUntilText: "",
     providers: [],
     gateway: {},
     gatewayText: {},
     options: [],
   },
   storage: {
-    status: 'loading',
+    status: "loading",
     available: true,
-    file: '',
+    file: "",
     bytes: 0,
     accounts: null,
     logs: null,
@@ -497,8 +556,19 @@ const INITIAL: SettingsSnapshot = {
     upstreamRaw: null,
   },
   captcha: { available: true, desktop: false, web: false, localPanel: false },
-  account: { status: 'loading', registered: false, username: '', password: null },
-  modelsDev: { status: 'loading', enabled: true, source: '', updatedAt: 0, count: 0 },
+  account: {
+    status: "loading",
+    registered: false,
+    username: "",
+    password: null,
+  },
+  modelsDev: {
+    status: "loading",
+    enabled: true,
+    source: "",
+    updatedAt: 0,
+    count: 0,
+  },
   ioFailure: null,
   retentionConfirm: null,
   // 整库备份：默认包含日志与调试报文（完整备份）；恢复确认弹窗默认关闭
@@ -510,31 +580,33 @@ const INITIAL: SettingsSnapshot = {
   lanConfirm: null,
   lanRegister: null,
   panelLogin: false,
-}
+};
 
 /* ─── 快照 store ───────────────────────────── */
 
-let snapshot: SettingsSnapshot = { ...INITIAL, panelLogin: readPanelLogin() }
+let snapshot: SettingsSnapshot = { ...INITIAL, panelLogin: readPanelLogin() };
 
-const subscribers = new Set<() => void>()
+const subscribers = new Set<() => void>();
 
 export function subscribe(listener: () => void): () => void {
-  subscribers.add(listener)
-  return () => { subscribers.delete(listener) }
+  subscribers.add(listener);
+  return () => {
+    subscribers.delete(listener);
+  };
 }
 
 export function getSnapshot(): SettingsSnapshot {
-  return snapshot
+  return snapshot;
 }
 
 /** 视图层订阅入口（useSyncExternalStore 靠引用比较判变化，publish 必须换新对象） */
 export function useSettings(): SettingsSnapshot {
-  return React.useSyncExternalStore(subscribe, getSnapshot)
+  return React.useSyncExternalStore(subscribe, getSnapshot);
 }
 
 function publish(patch: Partial<SettingsSnapshot>): void {
-  snapshot = { ...snapshot, ...patch }
-  for (const listener of subscribers) listener()
+  snapshot = { ...snapshot, ...patch };
+  for (const listener of subscribers) listener();
 }
 
 /**
@@ -552,7 +624,7 @@ function publish(patch: Partial<SettingsSnapshot>): void {
  * **发布那一刻**，谁先谁后都不会丢字段。
  */
 function publishApp(patch: Partial<AppState>): void {
-  publish({ app: { ...snapshot.app, ...patch } })
+  publish({ app: { ...snapshot.app, ...patch } });
 }
 
 /**
@@ -562,7 +634,7 @@ function publishApp(patch: Partial<AppState>): void {
  * DOM 的 checked 翻回去，React 这边只要让订阅者重跑一次渲染即可。
  */
 function repaint(): void {
-  publish({})
+  publish({});
 }
 
 /**
@@ -571,16 +643,16 @@ function repaint(): void {
  * 刻意放模块级而不是快照里：流程里要**同步**读到它（同一刻的第二下、disabled 触发的
  * blur 补发 change 都靠它早退）。快照里的 busy 只服务界面禁用，两者不混。
  */
-let busyScope: BusyScope = null
+let busyScope: BusyScope = null;
 
 function beginBusy(scope: Exclude<BusyScope, null>): void {
-  busyScope = scope
-  publish({ busy: scope })
+  busyScope = scope;
+  publish({ busy: scope });
 }
 
 function endBusy(): void {
-  busyScope = null
-  publish({ busy: null })
+  busyScope = null;
+  publish({ busy: null });
 }
 
 /* ─── 界面偏好：当前分类 / 计量单位 ─────────── */
@@ -594,23 +666,31 @@ function endBusy(): void {
  * 那不该改用户手点的默认分类（写偏好的是 selectCategory）。
  */
 export function showCategory(category?: string | null): void {
-  const target = CATEGORIES.some(item => item.id === category)
+  const target = CATEGORIES.some((item) => item.id === category)
     ? String(category)
-    : CATEGORIES[0].id
-  publish({ category: target, scrollReset: snapshot.scrollReset + 1 })
+    : CATEGORIES[0].id;
+  publish({ category: target, scrollReset: snapshot.scrollReset + 1 });
 }
 
 /** 导航项点击：切换并记住偏好 */
 export function selectCategory(category: string): void {
-  showCategory(category)
-  try { localStorage.setItem(SETTINGS_CAT_KEY, category) } catch { /* 存储不可用只影响下次启动 */ }
+  showCategory(category);
+  try {
+    localStorage.setItem(SETTINGS_CAT_KEY, category);
+  } catch {
+    /* 存储不可用只影响下次启动 */
+  }
 }
 
 /** 按 localStorage 恢复上次所在的分类（非法值由 showCategory 兜底） */
 export function restoreCategory(): void {
-  let saved: string | null = null
-  try { saved = localStorage.getItem(SETTINGS_CAT_KEY) } catch { saved = null }
-  showCategory(saved)
+  let saved: string | null = null;
+  try {
+    saved = localStorage.getItem(SETTINGS_CAT_KEY);
+  } catch {
+    saved = null;
+  }
+  showCategory(saved);
 }
 
 /**
@@ -619,13 +699,15 @@ export function restoreCategory(): void {
  * `wb-units-changed`，收到后用手里那份数据原地重绘。
  */
 export function renderUnits(): void {
-  publish({ unitsChinese: shared().wbUnits?.isChinese?.() !== false })
+  publish({ unitsChinese: shared().wbUnits?.isChinese?.() !== false });
 }
 
 export function applyUnits(on: boolean): void {
-  shared().wbUnits?.setChinese?.(on)
-  renderUnits()
-  toast(on ? t('✅ 已改用本地量级词（万 / 亿式）') : t('✅ 已改用 k / M / B 缩写'))
+  shared().wbUnits?.setChinese?.(on);
+  renderUnits();
+  toast(
+    on ? t("✅ 已改用本地量级词（万 / 亿式）") : t("✅ 已改用 k / M / B 缩写"),
+  );
 }
 
 /* ─── 启动与托盘 ───────────────────────────── */
@@ -636,30 +718,30 @@ export function applyUnits(on: boolean): void {
  * checked，刷新失败不该把用户刚拨的开关吞掉。
  */
 export function renderSettings(data?: unknown): void {
-  if (data === undefined) return
-  if (!data || typeof data !== 'object') {
-    publishApp({ status: 'unavailable' })
-    return
+  if (data === undefined) return;
+  if (!data || typeof data !== "object") {
+    publishApp({ status: "unavailable" });
+    return;
   }
-  const record = data as Record<string, unknown>
+  const record = data as Record<string, unknown>;
   // 主进程返回的字段一律按「严格 true」判定，缺字段时按关闭处理（与后端默认值一致）。
   // lanIp / port / adminRegistered 是旁路读数，不在启动设置的响应里 —— 保留当前值。
   publishApp({
-    status: 'ready',
+    status: "ready",
     closeToTray: record.closeToTray === true,
     autostart: record.autostart === true,
     lanAccess: record.lanAccess === true,
     lanPanel: record.lanPanel === true,
     lightweightMode: record.lightweightMode === true,
-  })
+  });
 }
 
 async function loadSettings(): Promise<void> {
   try {
-    renderSettings(await shared().workbuddyDesktop?.getAppSettings())
+    renderSettings(await shared().workbuddyDesktop?.getAppSettings());
   } catch (error) {
-    console.warn('读取应用设置失败:', errorMessage(error))
-    renderSettings(null)
+    console.warn("读取应用设置失败:", errorMessage(error));
+    renderSettings(null);
   }
 }
 
@@ -671,19 +753,25 @@ async function loadSettings(): Promise<void> {
  * 网页面板不渲染这一块。
  */
 async function loadLanExtras(): Promise<void> {
-  const api = shared().workbuddyDesktop
-  if (!api?.localIp) return
+  const api = shared().workbuddyDesktop;
+  if (!api?.localIp) return;
   try {
-    publishApp({ lanIp: (await api.localIp()) || null })
-  } catch { /* 查不到就不显示，地址展示退化成占位符 */ }
+    publishApp({ lanIp: (await api.localIp()) || null });
+  } catch {
+    /* 查不到就不显示，地址展示退化成占位符 */
+  }
   try {
-    const port = Number((await api.getBackendStatus?.())?.port) || 0
-    if (port) publishApp({ port })
-  } catch { /* 端口保持 0，地址展示退化 */ }
+    const port = Number((await api.getBackendStatus?.())?.port) || 0;
+    if (port) publishApp({ port });
+  } catch {
+    /* 端口保持 0，地址展示退化 */
+  }
   try {
-    const registered = (await api.panelAdminStatus?.())?.registered === true
-    publishApp({ adminRegistered: registered })
-  } catch { /* 状态保持「未查」；开启流程会再查一次拿最新值 */ }
+    const registered = (await api.panelAdminStatus?.())?.registered === true;
+    publishApp({ adminRegistered: registered });
+  } catch {
+    /* 状态保持「未查」；开启流程会再查一次拿最新值 */
+  }
 }
 
 /**
@@ -691,38 +779,45 @@ async function loadLanExtras(): Promise<void> {
  * 当前值 —— 旧实现读的是 DOM 里那个 checkbox 的 checked，等价。
  * 忙碌中早退时什么都不写：受控开关的 checked 来自快照，界面自动「还原这一下拨动」。
  */
-export async function saveToggle(kind: 'tray' | 'autostart' | 'lightweight', next: boolean): Promise<void> {
-  if (busyScope) { repaint(); return }
-  const previous = snapshot.app
+export async function saveToggle(
+  kind: "tray" | "autostart" | "lightweight",
+  next: boolean,
+): Promise<void> {
+  if (busyScope) {
+    repaint();
+    return;
+  }
+  const previous = snapshot.app;
   const patch: AppSettings = {
-    closeToTray: kind === 'tray' ? next : previous.closeToTray,
-    autostart: kind === 'autostart' ? next : previous.autostart,
+    closeToTray: kind === "tray" ? next : previous.closeToTray,
+    autostart: kind === "autostart" ? next : previous.autostart,
     // 局域网访问归「局域网访问」面板管（它有自己的确认与重启流程），
     // 全量覆盖的 patch 里原样带上磁盘现值，避免把它悄悄抹掉
     lanAccess: previous.lanAccess,
     lanPanel: previous.lanPanel,
-    lightweightMode: kind === 'lightweight' ? next : previous.lightweightMode,
-  }
-  beginBusy('app')
-  publishApp(patch)
-  const label = kind === 'autostart'
-    ? t('开机自动启动')
-    : kind === 'lightweight'
-      ? t('轻量模式')
-      : t('关闭窗口时最小化到托盘')
+    lightweightMode: kind === "lightweight" ? next : previous.lightweightMode,
+  };
+  beginBusy("app");
+  publishApp(patch);
+  const label =
+    kind === "autostart"
+      ? t("开机自动启动")
+      : kind === "lightweight"
+        ? t("轻量模式")
+        : t("关闭窗口时最小化到托盘");
   try {
-    const api = shared().workbuddyDesktop
-    if (!api) throw new Error(t('主进程桥不可用'))
-    const saved = await api.saveAppSettings(patch)
+    const api = shared().workbuddyDesktop;
+    if (!api) throw new Error(t("主进程桥不可用"));
+    const saved = await api.saveAppSettings(patch);
     // 以主进程返回的设置为准渲染，避免界面与真实状态不一致（旁路读数保留当前值）
-    publishApp({ status: 'ready', ...normalizeApp(saved, patch) })
-    toast(t('✅ 已更新「{label}」', { label }))
+    publishApp({ status: "ready", ...normalizeApp(saved, patch) });
+    toast(t("✅ 已更新「{label}」", { label }));
   } catch (error) {
     // 回滚到拨动前的状态（旧实现：已知状态按状态回滚，未知状态只把刚切的这项切回去）
-    publishApp(previous)
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
+    publishApp(previous);
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
@@ -735,24 +830,41 @@ export async function saveToggle(kind: 'tray' | 'autostart' | 'lightweight', nex
  * 确认前开关不落快照（受控组件自动弹回），保存成功后随重启以新值重来。
  */
 export function toggleLan(next: boolean): void {
-  if (busyScope) { repaint(); return }
-  publish({ lanConfirm: { mode: next ? 'enable' : 'disable', panel: snapshot.app.lanPanel } })
+  if (busyScope) {
+    repaint();
+    return;
+  }
+  publish({
+    lanConfirm: {
+      mode: next ? "enable" : "disable",
+      panel: snapshot.app.lanPanel,
+    },
+  });
 }
 
 /** 拨动「同时开放网页管理面板」（仅在局域网访问开启时可拨；同样要重启应用） */
 export function toggleLanPanel(next: boolean): void {
-  if (busyScope) { repaint(); return }
-  publish({ lanConfirm: { mode: 'panel', panel: next } })
+  if (busyScope) {
+    repaint();
+    return;
+  }
+  publish({ lanConfirm: { mode: "panel", panel: next } });
 }
 
 /** 确认框的出口（与 resolveRetentionConfirm 同形）：确认 true / 取消与关窗 false */
 export function resolveLanConfirm(accepted: boolean): void {
-  const current = snapshot.lanConfirm
-  publish({ lanConfirm: null })
-  if (!current || !accepted) return
-  if (current.mode === 'disable') { void applyLan(false, false); return }
-  if (current.mode === 'panel') { void applyLan(true, current.panel); return }
-  void proceedEnable()
+  const current = snapshot.lanConfirm;
+  publish({ lanConfirm: null });
+  if (!current || !accepted) return;
+  if (current.mode === "disable") {
+    void applyLan(false, false);
+    return;
+  }
+  if (current.mode === "panel") {
+    void applyLan(true, current.panel);
+    return;
+  }
+  void proceedEnable();
 }
 
 /**
@@ -761,24 +873,30 @@ export function resolveLanConfirm(accepted: boolean): void {
  * 注册成功后无缝继续（就是用户在确认框里读到的那句「将跳转注册」）。
  */
 async function proceedEnable(): Promise<void> {
-  const api = shared().workbuddyDesktop
-  if (!api?.panelAdminStatus) { toast(t('当前环境不支持局域网访问设置'), 'err'); return }
-  beginBusy('lan')
-  let registered: boolean
+  const api = shared().workbuddyDesktop;
+  if (!api?.panelAdminStatus) {
+    toast(t("当前环境不支持局域网访问设置"), "err");
+    return;
+  }
+  beginBusy("lan");
+  let registered: boolean;
   try {
-    registered = (await api.panelAdminStatus())?.registered === true
+    registered = (await api.panelAdminStatus())?.registered === true;
   } catch (error) {
-    endBusy()
-    toast(t('查询管理员状态失败：{message}', { message: errorMessage(error) }), 'err')
-    return
+    endBusy();
+    toast(
+      t("查询管理员状态失败：{message}", { message: errorMessage(error) }),
+      "err",
+    );
+    return;
   }
-  endBusy()
-  publishApp({ adminRegistered: registered })
+  endBusy();
+  publishApp({ adminRegistered: registered });
   if (registered) {
-    await applyLan(true, snapshot.app.lanPanel)
-    return
+    await applyLan(true, snapshot.app.lanPanel);
+    return;
   }
-  publish({ lanRegister: { busy: false, error: '' } })
+  publish({ lanRegister: { busy: false, error: "" } });
 }
 
 /**
@@ -786,36 +904,41 @@ async function proceedEnable(): Promise<void> {
  * （账号 64 字符以内、密码至少 8 位）；「管理员已存在」由壳命令折叠成
  * `existed: true`，这里当作成功继续 —— 流程只关心「现在有没有管理员」。
  */
-export async function submitLanRegister(username: string, password: string): Promise<void> {
-  if (busyScope) return
-  const api = shared().workbuddyDesktop
-  if (!api?.panelRegister) return
-  const name = username.trim()
+export async function submitLanRegister(
+  username: string,
+  password: string,
+): Promise<void> {
+  if (busyScope) return;
+  const api = shared().workbuddyDesktop;
+  if (!api?.panelRegister) return;
+  const name = username.trim();
   if (!name || name.length > 64) {
-    publish({ lanRegister: { busy: false, error: t('请填写管理员账号（64 字符以内）') } })
-    return
+    publish({
+      lanRegister: { busy: false, error: t("请填写管理员账号（64 字符以内）") },
+    });
+    return;
   }
   if (password.length < 8) {
-    publish({ lanRegister: { busy: false, error: t('密码至少 8 位') } })
-    return
+    publish({ lanRegister: { busy: false, error: t("密码至少 8 位") } });
+    return;
   }
-  publish({ lanRegister: { busy: true, error: '' } })
+  publish({ lanRegister: { busy: true, error: "" } });
   try {
-    await api.panelRegister(name, password)
+    await api.panelRegister(name, password);
     // 用户在注册期间关掉了弹窗：中止开启流程（管理员已注册的事实保留，无害，
     // 下次开启会直接跳过注册步），不能替一个已经取消的用户把应用重启了
-    if (snapshot.lanRegister === null) return
-    publish({ lanRegister: null })
-    publishApp({ adminRegistered: true })
-    await applyLan(true, snapshot.app.lanPanel)
+    if (snapshot.lanRegister === null) return;
+    publish({ lanRegister: null });
+    publishApp({ adminRegistered: true });
+    await applyLan(true, snapshot.app.lanPanel);
   } catch (error) {
-    publish({ lanRegister: { busy: false, error: errorMessage(error) } })
+    publish({ lanRegister: { busy: false, error: errorMessage(error) } });
   }
 }
 
 /** 注册步的取消：整个开启流程中止，开关保持原状（管理员若已注册就留着，无害） */
 export function cancelLanRegister(): void {
-  publish({ lanRegister: null })
+  publish({ lanRegister: null });
 }
 
 /**
@@ -824,20 +947,25 @@ export function cancelLanRegister(): void {
  * （写盘失败、管理员校验被拒）必须如实地把开关弹回去，靠 loadSettings 回滚。
  */
 async function applyLan(enabled: boolean, panel: boolean): Promise<void> {
-  if (busyScope) return
-  const api = shared().workbuddyDesktop
-  if (!api?.changeLanAccess) { toast(t('当前环境不支持局域网访问设置'), 'err'); return }
-  beginBusy('lan')
-  publishApp({ lanAccess: enabled, lanPanel: panel })
+  if (busyScope) return;
+  const api = shared().workbuddyDesktop;
+  if (!api?.changeLanAccess) {
+    toast(t("当前环境不支持局域网访问设置"), "err");
+    return;
+  }
+  beginBusy("lan");
+  publishApp({ lanAccess: enabled, lanPanel: panel });
   try {
-    const result = await api.changeLanAccess(enabled, panel) as { createdKey?: unknown } | null | undefined
-    if (result?.createdKey) toast(t('✅ 已自动创建网关 Key「默认」（可在「网关 Key」页查看）'))
-    toast(t('✅ 设置已保存，应用正在重启…'))
+    const result = (await api.changeLanAccess(enabled, panel)) as
+      { createdKey?: unknown } | null | undefined;
+    if (result?.createdKey)
+      toast(t("✅ 已自动创建网关 Key「默认」（可在「网关 Key」页查看）"));
+    toast(t("✅ 设置已保存，应用正在重启…"));
   } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadSettings() // 回滚到磁盘上的真实值
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
+    await loadSettings(); // 回滚到磁盘上的真实值
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
@@ -848,80 +976,108 @@ async function applyLan(enabled: boolean, panel: boolean): Promise<void> {
  * busy === 'export' 派生），另一个按钮保持可点但会被守卫挡下（旧实现也是这样）。
  */
 export async function exportAccounts(): Promise<void> {
-  if (busyScope) return
-  publish({ ioFailure: null })
-  beginBusy('export')
+  if (busyScope) return;
+  publish({ ioFailure: null });
+  beginBusy("export");
   try {
-    const result = await shared().workbuddyDesktop?.exportAccounts()
-    if (result?.canceled) { toast(t('已取消导出')); return }
-    const count = Number(result?.count) || 0
-    const providers = Number(result?.customProviders) || 0
-    if (!count && !providers) { toast(t('没有可导出的账号'), 'err'); return }
+    const result = await shared().workbuddyDesktop?.exportAccounts();
+    if (result?.canceled) {
+      toast(t("已取消导出"));
+      return;
+    }
+    const count = Number(result?.count) || 0;
+    const providers = Number(result?.customProviders) || 0;
+    if (!count && !providers) {
+      toast(t("没有可导出的账号"), "err");
+      return;
+    }
     // v2 导出文件附带自定义提供商定义：账号为 0 但有定义时同样值得导
-    const providerNote = providers ? t('、{n} 个自定义提供商', { n: providers }) : ''
-    const fileNote = result?.file ? t(' 到 {file}', { file: result.file }) : ''
-    toast(t('✅ 已导出 {count} 个账号{note}{file}', { count, note: providerNote, file: fileNote }))
+    const providerNote = providers
+      ? t("、{n} 个自定义提供商", { n: providers })
+      : "";
+    const fileNote = result?.file ? t(" 到 {file}", { file: result.file }) : "";
+    toast(
+      t("✅ 已导出 {count} 个账号{note}{file}", {
+        count,
+        note: providerNote,
+        file: fileNote,
+      }),
+    );
   } catch (error) {
-    toast(t('操作失败：{message}', { message: errorMessage(error) }), 'err')
+    toast(t("操作失败：{message}", { message: errorMessage(error) }), "err");
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
 /** 导入：合并策略在后端，这里只负责把结果摊成人话（失败明细收进快照，由视图渲染） */
 export async function importAccounts(): Promise<void> {
-  if (busyScope) return
-  publish({ ioFailure: null })
-  beginBusy('import')
+  if (busyScope) return;
+  publish({ ioFailure: null });
+  beginBusy("import");
   try {
-    const result = await shared().workbuddyDesktop?.importAccounts()
-    if (result?.canceled) { toast(t('已取消导入')); return }
+    const result = await shared().workbuddyDesktop?.importAccounts();
+    if (result?.canceled) {
+      toast(t("已取消导入"));
+      return;
+    }
 
-    const added = Number(result?.added) || 0
-    const updated = Number(result?.updated) || 0
-    const skipped = Number(result?.skipped) || 0
-    const failed = Number(result?.failed) || 0
-    const errors = Array.isArray(result?.errors) ? result.errors : []
-    const custom = result?.customProviders ?? {}
-    const customAdded = Number(custom.added) || 0
-    const customUpdated = Number(custom.updated) || 0
+    const added = Number(result?.added) || 0;
+    const updated = Number(result?.updated) || 0;
+    const skipped = Number(result?.skipped) || 0;
+    const failed = Number(result?.failed) || 0;
+    const errors = Array.isArray(result?.errors) ? result.errors : [];
+    const custom = result?.customProviders ?? {};
+    const customAdded = Number(custom.added) || 0;
+    const customUpdated = Number(custom.updated) || 0;
 
-    const extras: string[] = []
-    if (skipped) extras.push(t('跳过 {n} 个', { n: skipped }))
-    if (failed) extras.push(t('失败 {n} 个', { n: failed }))
-    const suffix = extras.length ? t('，{items}', { items: extras.join(t('、')) }) : ''
-    const providerNote = (customAdded || customUpdated)
-      ? t('，自定义提供商新增 {added} 个、更新 {updated} 个', { added: customAdded, updated: customUpdated })
-      : ''
-    const summary = t('新增 {added} 个、更新 {updated} 个{suffix}{note}', {
-      added, updated, suffix, note: providerNote,
-    })
+    const extras: string[] = [];
+    if (skipped) extras.push(t("跳过 {n} 个", { n: skipped }));
+    if (failed) extras.push(t("失败 {n} 个", { n: failed }));
+    const suffix = extras.length
+      ? t("，{items}", { items: extras.join(t("、")) })
+      : "";
+    const providerNote =
+      customAdded || customUpdated
+        ? t("，自定义提供商新增 {added} 个、更新 {updated} 个", {
+            added: customAdded,
+            updated: customUpdated,
+          })
+        : "";
+    const summary = t("新增 {added} 个、更新 {updated} 个{suffix}{note}", {
+      added,
+      updated,
+      suffix,
+      note: providerNote,
+    });
 
     if (failed) {
-      toast(t('导入完成：{summary}', { summary }), 'err')
+      toast(t("导入完成：{summary}", { summary }), "err");
       // 失败明细只列前 3 条，与账号页批量操作的展示密度保持一致；
       // 定义警告（customProvider 标记）没有账号语义，展示时注明归属
-      const detail = errors.slice(0, 3)
-        .map(item => {
+      const detail = errors
+        .slice(0, 3)
+        .map((item) => {
           const label = item?.customProvider
-            ? t('自定义提供商 {id}', { id: item?.id || t('(无 id)') })
-            : (item?.id ?? t('未知账号'))
-          const message = item?.message ?? t('未知原因')
-          return t('{label}（{message}）', { label, message })
+            ? t("自定义提供商 {id}", { id: item?.id || t("(无 id)") })
+            : (item?.id ?? t("未知账号"));
+          const message = item?.message ?? t("未知原因");
+          return t("{label}（{message}）", { label, message });
         })
-        .join(t('；'))
-      publish({ ioFailure: { failed, detail, more: errors.length > 3 } })
+        .join(t("；"));
+      publish({ ioFailure: { failed, detail, more: errors.length > 3 } });
     } else {
-      toast(t('✅ 导入完成：{summary}', { summary }))
+      toast(t("✅ 导入完成：{summary}", { summary }));
     }
 
     // 账号被改动（新增/更新）后让主界面立刻反映：账号列表、导航计数等；
     // 自定义提供商定义有变化时同样要刷（分组名、模型清单都会变）
-    if (added || updated || customAdded || customUpdated) await shared().wbApp?.refresh?.()
+    if (added || updated || customAdded || customUpdated)
+      await shared().wbApp?.refresh?.();
   } catch (error) {
-    toast(t('操作失败：{message}', { message: errorMessage(error) }), 'err')
+    toast(t("操作失败：{message}", { message: errorMessage(error) }), "err");
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
@@ -929,7 +1085,7 @@ export async function importAccounts(): Promise<void> {
 
 /** 拨动「包含日志与调试报文」复选框（默认勾上；取消后只备业务数据） */
 export function toggleDbIncludeLogs(on: boolean): void {
-  publish({ dbIncludeLogs: on })
+  publish({ dbIncludeLogs: on });
 }
 
 /**
@@ -937,50 +1093,55 @@ export function toggleDbIncludeLogs(on: boolean): void {
  * 下载附件（见 web_shim.rs），两侧返回值同形。导出没有「空库不导」分支。
  */
 export function confirmDbExport(): void {
-  if (busyScope || snapshot.dbRestore?.active) return
-  publish({ dbExportConfirm: true })
+  if (busyScope || snapshot.dbRestore?.active) return;
+  publish({ dbExportConfirm: true });
 }
 
 export function cancelDbExport(): void {
-  publish({ dbExportConfirm: false })
+  publish({ dbExportConfirm: false });
 }
 
 export async function exportDatabase(password: string): Promise<void> {
-  if (busyScope || snapshot.dbRestore?.active) return
-  publish({ dbExportConfirm: false })
-  beginBusy('dbExport')
+  if (busyScope || snapshot.dbRestore?.active) return;
+  publish({ dbExportConfirm: false });
+  beginBusy("dbExport");
   try {
-    const api = shared().workbuddyDesktop
+    const api = shared().workbuddyDesktop;
     if (!api?.exportDatabase) {
-      toast(t('当前环境不支持整库备份'), 'err')
-      return
+      toast(t("当前环境不支持整库备份"), "err");
+      return;
     }
-    const result = await api.exportDatabase(snapshot.dbIncludeLogs, password)
-    if (result?.canceled) { toast(t('已取消导出')); return }
-    const size = Number(result?.bytes) || 0
-    const tables = Array.isArray(result?.tables) ? result.tables.length : 0
-    toast(t('✅ 已加密备份 {n} 张表（{size}），包含恢复密钥：{file}', {
-      n: tables,
-      size: formatBytes(size),
-      file: result?.file || '',
-    }))
+    const result = await api.exportDatabase(snapshot.dbIncludeLogs, password);
+    if (result?.canceled) {
+      toast(t("已取消导出"));
+      return;
+    }
+    const size = Number(result?.bytes) || 0;
+    const tables = Array.isArray(result?.tables) ? result.tables.length : 0;
+    toast(
+      t("✅ 已加密备份 {n} 张表（{size}），包含恢复密钥：{file}", {
+        n: tables,
+        size: formatBytes(size),
+        file: result?.file || "",
+      }),
+    );
   } catch (error) {
-    toast(t('操作失败：{message}', { message: errorMessage(error) }), 'err')
+    toast(t("操作失败：{message}", { message: errorMessage(error) }), "err");
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
 /** 点「恢复」：先弹确认框（整库恢复是替换语义，二次确认后才开始） */
 export function confirmDbRestore(): void {
-  if (busyScope || snapshot.dbRestore?.active) return
-  publish({ dbBackupConfirm: { includeLogs: snapshot.dbIncludeLogs } })
+  if (busyScope || snapshot.dbRestore?.active) return;
+  publish({ dbBackupConfirm: { includeLogs: snapshot.dbIncludeLogs } });
 }
 
 /** 确认框出口（与 resolveRetentionConfirm 同形）：确认后才执行恢复 */
-export function resolveDbBackupConfirm(accepted: boolean, password = ''): void {
-  publish({ dbBackupConfirm: null })
-  if (accepted) void proceedDbRestore(password)
+export function resolveDbBackupConfirm(accepted: boolean, password = ""): void {
+  publish({ dbBackupConfirm: null });
+  if (accepted) void proceedDbRestore(password);
 }
 
 /**
@@ -999,13 +1160,13 @@ export function resolveDbBackupConfirm(accepted: boolean, password = ''): void {
  * 同时写进 `dbWarning`（面板里常驻），因为用户关掉弹窗之后仍需要看到它。
  */
 async function proceedDbRestore(password: string): Promise<void> {
-  if (busyScope) return
-  const api = shared().workbuddyDesktop
+  if (busyScope) return;
+  const api = shared().workbuddyDesktop;
   if (!api?.importDatabase) {
-    toast(t('当前环境不支持整库恢复'), 'err')
-    return
+    toast(t("当前环境不支持整库恢复"), "err");
+    return;
   }
-  beginBusy('dbImport')
+  beginBusy("dbImport");
   // 结果区只反映最近一次操作：上一次恢复留下的密钥警告先清掉（与 ioFailure 同一约定）
   //
   // ── 为什么这里不先把弹窗挂上 ──────────────────────────────
@@ -1013,47 +1174,49 @@ async function proceedDbRestore(password: string): Promise<void> {
   // 中间那段可能停很久（用户在文件框里翻目录）。如果这时就把弹窗挂出来，
   // 用户会看到一个「正在读取备份文件…」的进度条 —— 而他连文件都还没选。
   // 所以弹窗由**后端进度**驱动：轮询第一次看到 `active: true` 才显示。
-  publish({ dbWarning: null })
+  publish({ dbWarning: null });
   // 本次尝试的起点：后端 `startedAt` 一定晚于它。用来把「上一次恢复留下的
   // 已完成快照」和「这一次的结果」区分开（文件对话框可能要开很久，这期间
   // 后端读到的仍是上一次的 Done）。
-  const attemptStartedAt = Date.now()
-  const stop = watchRestoreProgress(attemptStartedAt)
+  const attemptStartedAt = Date.now();
+  const stop = watchRestoreProgress(attemptStartedAt);
   try {
-    const result = await api.importDatabase(password)
+    const result = await api.importDatabase(password);
     // 取消（桌面壳的文件框 / 网页端的文件选择器都回 {canceled:true}）：
     // 不是失败也不是「恢复了 0 张表」，静默收场即可
     if (result?.canceled) {
-      stop()
-      publish({ dbRestore: null })
-      toast(t('已取消恢复'))
-      return
+      stop();
+      publish({ dbRestore: null });
+      toast(t("已取消恢复"));
+      return;
     }
-    const tables = Array.isArray(result?.tables) ? result.tables.length : 0
+    const tables = Array.isArray(result?.tables) ? result.tables.length : 0;
     // 密钥指纹不匹配的警告（账号将无法解密）：后端把文案给全了，这里只负责让它
     // 在面板里**常驻**显示 —— 光靠弹窗里那一段，用户关掉之后只会对着空账号列表
     // 发懵，不知道「为什么账号都没了」
-    const warning = typeof result?.warning === 'string' ? result.warning.trim() : ''
-    if (warning) publish({ dbWarning: warning })
-    stop()
+    const warning =
+      typeof result?.warning === "string" ? result.warning.trim() : "";
+    if (warning) publish({ dbWarning: warning });
+    stop();
     // 弹窗留在「完成」态，等用户点「知道了」—— 结果要让人看完再走
     publish({
       dbRestore: {
         active: false,
         done: true,
         failed: false,
-        phase: t('恢复完成'),
+        phase: t("恢复完成"),
         percent: 100,
-        error: '',
+        error: "",
         tables,
-        safetyBackup: typeof result?.safetyBackup === 'string' ? result.safetyBackup : '',
+        safetyBackup:
+          typeof result?.safetyBackup === "string" ? result.safetyBackup : "",
         warning,
         reencryptedSecrets: Number(result?.reencryptedSecrets) || 0,
         localKeysPreserved: result?.localKeysPreserved === true,
         startedAt: snapshot.dbRestore?.startedAt ?? Date.now(),
         finishedAt: Date.now(),
       },
-    })
+    });
     // 重拉整页（含启动/托盘设置、保留期、提示词、存储概况等全部面板）。
     //
     // ── 这里的失败**不能**当成恢复失败 ────────────────────────
@@ -1062,16 +1225,16 @@ async function proceedDbRestore(password: string): Promise<void> {
     // 没成功」。早先这段在 try 里，令牌一清就把一次成功的恢复报成红色失败。
     // 现在两件事分开：恢复结果以上面的 publish 为准，刷新的失败只静默。
     try {
-      await load()
-      await shared().wbApp?.refresh?.()
+      await load();
+      await shared().wbApp?.refresh?.();
     } catch {
       /* 刷新失败不影响恢复结果；用户下一次操作会自然重拉 */
     }
   } catch (error) {
-    const message = errorMessage(error)
+    const message = errorMessage(error);
     if (snapshot.dbRestore?.done) {
-      stop()
-      return
+      stop();
+      return;
     }
     // ── 先别急着报失败 ────────────────────────────────────────
     // 恢复是一次长调用：壳侧的 HTTP 预算、浏览器的 fetch 都可能先于后端收尾
@@ -1087,43 +1250,45 @@ async function proceedDbRestore(password: string): Promise<void> {
           active: true,
           done: false,
           failed: false,
-          phase: t('恢复仍在进行中…'),
+          phase: t("恢复仍在进行中…"),
           startedAt: snapshot.dbRestore?.startedAt || Date.now(),
         },
-      })
-      toast(t('请求已断开，但恢复仍在后台进行 —— 请等待进度弹窗给出结果'))
-      return
+      });
+      toast(t("请求已断开，但恢复仍在后台进行 —— 请等待进度弹窗给出结果"));
+      return;
     }
-    stop()
+    stop();
     publish({
       dbRestore: {
         active: false,
         done: false,
         failed: true,
-        phase: t('恢复失败'),
+        phase: t("恢复失败"),
         percent: 100,
         error: message,
         tables: 0,
-        safetyBackup: '',
-        warning: '',
+        safetyBackup: "",
+        warning: "",
         reencryptedSecrets: 0,
         localKeysPreserved: false,
         startedAt: snapshot.dbRestore?.startedAt ?? Date.now(),
         finishedAt: Date.now(),
       },
-    })
+    });
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
 /** 后端此刻是否仍在恢复（查不到进度就按「没有」处理，让失败照常上报） */
-async function restoreStillRunning(api: ReturnType<typeof shared>['workbuddyDesktop']): Promise<boolean> {
+async function restoreStillRunning(
+  api: ReturnType<typeof shared>["workbuddyDesktop"],
+): Promise<boolean> {
   try {
-    const data = await api?.getBackupProgress?.()
-    return data?.active === true
+    const data = await api?.getBackupProgress?.();
+    return data?.active === true;
   } catch {
-    return false
+    return false;
   }
 }
 
@@ -1132,20 +1297,20 @@ const EMPTY_RESTORE: DbRestoreProgress = {
   active: false,
   done: false,
   failed: false,
-  phase: '',
+  phase: "",
   percent: 0,
-  error: '',
+  error: "",
   tables: 0,
-  safetyBackup: '',
-  warning: '',
+  safetyBackup: "",
+  warning: "",
   reencryptedSecrets: 0,
   localKeysPreserved: false,
   startedAt: 0,
   finishedAt: 0,
-}
+};
 
 /** 进度轮询间隔：500ms。恢复各阶段的耗时以秒计，再快只是白打接口 */
-const RESTORE_POLL_MS = 500
+const RESTORE_POLL_MS = 500;
 
 /**
  * 轮询的总时长上限：40 分钟。
@@ -1153,7 +1318,7 @@ const RESTORE_POLL_MS = 500
  * 比壳侧的请求预算（`commands.rs` 的 `BACKUP_TRANSFER_TIMEOUT_MS`，30 分钟）
  * 多留 10 分钟 —— 壳先断开时后端往往还在跑，轮询要继续等到它写结局。
  */
-const RESTORE_POLL_MAX_MS = 40 * 60 * 1000
+const RESTORE_POLL_MAX_MS = 40 * 60 * 1000;
 
 /**
  * 开始轮询恢复进度，返回「停止」函数。
@@ -1164,45 +1329,52 @@ const RESTORE_POLL_MAX_MS = 40 * 60 * 1000
  * 跟上」，所以轮询里**静默忽略**错误，以 `importDatabase` 的返回值为准。
  */
 function watchRestoreProgress(attemptStartedAt: number): () => void {
-  let stopped = false
-  let querying = false
+  let stopped = false;
+  let querying = false;
   // 上限：壳侧预算已放宽到 30 分钟，这里再多给一段余量。到点还等不到收口
   // 就不再轮询（重建时页面本来也会重来）—— 免得一个没有终点的 interval
   // 一直挂在后台打接口。
-  const deadline = Date.now() + RESTORE_POLL_MAX_MS
-  let timer = 0
+  const deadline = Date.now() + RESTORE_POLL_MAX_MS;
+  let timer = 0;
   const tick = async () => {
-    if (stopped) return
+    if (stopped) return;
     if (Date.now() > deadline) {
-      stopped = true
-      window.clearInterval(timer)
-      return
+      stopped = true;
+      window.clearInterval(timer);
+      return;
     }
-    if (querying) return
-    querying = true
+    if (querying) return;
+    querying = true;
     try {
-      const data = await shared().workbuddyDesktop?.getBackupProgress?.()
-      if (stopped || !data) return
-      const startedAt = Number(data.startedAt) || 0
+      const data = await shared().workbuddyDesktop?.getBackupProgress?.();
+      if (stopped || !data) return;
+      const startedAt = Number(data.startedAt) || 0;
       // 上一次恢复留下的快照（`startedAt` 早于本次尝试）：不是这次的结果，
       // 一律无视 —— 否则用户还在文件框里挑文件，弹窗就已经显示「恢复完成」了。
-      if (startedAt && startedAt < attemptStartedAt) return
-      if (!startedAt) return
-      const current = snapshot.dbRestore
+      if (startedAt && startedAt < attemptStartedAt) return;
+      if (!startedAt) return;
+      const current = snapshot.dbRestore;
       // ── 后端已收口：由轮询直接写结果 ──────────────────────────
       // 正常情况下 `importDatabase()` 的返回值也会写同一份结果，两条路径谁先到
       // 都一样（字段一致）。但**请求断线**时只有这里能收口 —— 壳侧超时之后
       // 后端仍在跑，靠这一次轮询才能等到真正的结局，否则弹窗会永远停在
       // 「恢复仍在进行中…」。
       if (data.active !== true) {
-        const body = (data.result ?? {}) as { tables?: unknown; warning?: unknown; safetyBackup?: unknown; reencryptedSecrets?: unknown; localKeysPreserved?: unknown }
-        const tables = Array.isArray(body.tables) ? body.tables.length : 0
-        const warning = typeof body.warning === 'string' ? body.warning.trim() : ''
-        const failed = data.failed === true
-        if (!failed && data.done !== true) return
-        if (failed && !(typeof data.error === 'string' && data.error.trim())) {
+        const body = (data.result ?? {}) as {
+          tables?: unknown;
+          warning?: unknown;
+          safetyBackup?: unknown;
+          reencryptedSecrets?: unknown;
+          localKeysPreserved?: unknown;
+        };
+        const tables = Array.isArray(body.tables) ? body.tables.length : 0;
+        const warning =
+          typeof body.warning === "string" ? body.warning.trim() : "";
+        const failed = data.failed === true;
+        if (!failed && data.done !== true) return;
+        if (failed && !(typeof data.error === "string" && data.error.trim())) {
           // 既没收口理由、也不在跑：多半是刚开始就被打断，等下一次轮询
-          return
+          return;
         }
         publish({
           dbRestore: {
@@ -1211,36 +1383,37 @@ function watchRestoreProgress(attemptStartedAt: number): () => void {
             active: false,
             done: !failed,
             failed,
-            phase: failed ? t('恢复失败') : t('恢复完成'),
+            phase: failed ? t("恢复失败") : t("恢复完成"),
             percent: 100,
-            error: failed ? String(data.error ?? '') : '',
+            error: failed ? String(data.error ?? "") : "",
             tables,
-            safetyBackup: typeof body.safetyBackup === 'string' ? body.safetyBackup : '',
+            safetyBackup:
+              typeof body.safetyBackup === "string" ? body.safetyBackup : "",
             warning,
             reencryptedSecrets: Number(body.reencryptedSecrets) || 0,
             localKeysPreserved: body.localKeysPreserved === true,
             startedAt: startedAt || current?.startedAt || attemptStartedAt,
             finishedAt: Number(data.finishedAt) || Date.now(),
           },
-        })
-        if (warning) publish({ dbWarning: warning })
+        });
+        if (warning) publish({ dbWarning: warning });
         // 已收口：停表。随后成功的那次还要重拉整页 —— 数据库被整体换掉了，
         // 配置、账号、保留期等每一块旧快照都失效。
         //
         // 只在「外层已经不再等这条请求」时刷（`busyScope` 已清）：正常成功路径
         // 上外层紧接着自己会 `load()`，这里再刷一遍是同一件事做两次。断线的
         // 场景则相反 —— 外层早已收场，只有这里能补上这次刷新。
-        stopped = true
-        window.clearInterval(timer)
+        stopped = true;
+        window.clearInterval(timer);
         if (!failed && !busyScope) {
           try {
-            await load()
-            await shared().wbApp?.refresh?.()
+            await load();
+            await shared().wbApp?.refresh?.();
           } catch {
             /* 刷新失败不影响恢复结果（理由见 `proceedDbRestore` 的成功分支） */
           }
         }
-        return
+        return;
       }
       // 第一次看到后端在跑 = 用户选完文件、恢复真的开始了 → 这时才挂弹窗
       publish({
@@ -1250,31 +1423,35 @@ function watchRestoreProgress(attemptStartedAt: number): () => void {
           active: true,
           done: false,
           failed: false,
-          phase: typeof data.phase === 'string' && data.phase ? data.phase : (current?.phase ?? t('正在恢复…')),
+          phase:
+            typeof data.phase === "string" && data.phase
+              ? data.phase
+              : (current?.phase ?? t("正在恢复…")),
           // 进度只增不减：后端给的百分比是阶段起点，这里再兜一层，避免抖动
           percent: Math.max(current?.percent ?? 0, Number(data.percent) || 0),
           startedAt: startedAt || current?.startedAt || Date.now(),
         },
-      })
+      });
     } catch {
       /* 静默：见函数头的说明 */
     } finally {
-      querying = false
+      querying = false;
     }
-  }
-  void tick()
-  timer = window.setInterval(() => void tick(), RESTORE_POLL_MS)
+  };
+  void tick();
+  timer = window.setInterval(() => void tick(), RESTORE_POLL_MS);
   return () => {
-    stopped = true
-    window.clearInterval(timer)
-  }
+    stopped = true;
+    window.clearInterval(timer);
+  };
 }
 
 async function reconnectDbRestore(): Promise<void> {
-  if (busyScope || snapshot.dbRestore) return
+  if (busyScope || snapshot.dbRestore) return;
   try {
-    const progress = await shared().workbuddyDesktop?.getBackupProgress?.()
-    if (progress?.active) watchRestoreProgress(Number(progress.startedAt) || Date.now())
+    const progress = await shared().workbuddyDesktop?.getBackupProgress?.();
+    if (progress?.active)
+      watchRestoreProgress(Number(progress.startedAt) || Date.now());
   } catch {
     /* 恢复进度不可用不影响其他设置加载。 */
   }
@@ -1282,103 +1459,149 @@ async function reconnectDbRestore(): Promise<void> {
 
 /** 关掉恢复结果弹窗（只在 `done` / `failed` 之后可调） */
 export function dismissDbRestore(): void {
-  if (snapshot.dbRestore?.active) return
-  publish({ dbRestore: null })
+  if (snapshot.dbRestore?.active) return;
+  publish({ dbRestore: null });
 }
 
 /* ─── 数据保留 ──────────────────────────── */
 
 export function renderRetention(data?: unknown): void {
-  if (data === undefined) return
-  const values = normalizeNumbers(RETENTION_FIELDS, data, snapshot.retention.values)
-  publish({ retention: { status: values === null ? 'unavailable' : 'ready', values } })
+  if (data === undefined) return;
+  const values = normalizeNumbers(
+    RETENTION_FIELDS,
+    data,
+    snapshot.retention.values,
+  );
+  publish({
+    retention: { status: values === null ? "unavailable" : "ready", values },
+  });
 }
 
 async function loadRetention(): Promise<void> {
   try {
-    renderRetention(await shared().workbuddyDesktop?.getRetention())
+    renderRetention(await shared().workbuddyDesktop?.getRetention());
   } catch (error) {
-    console.warn('读取数据保留设置失败:', errorMessage(error))
-    renderRetention(null)
+    console.warn("读取数据保留设置失败:", errorMessage(error));
+    renderRetention(null);
   }
 }
 
 /** 确认弹窗的 Promise resolver；非空即表示弹窗开着 */
-let retentionConfirmResolver: ((accepted: boolean) => void) | null = null
+let retentionConfirmResolver: ((accepted: boolean) => void) | null = null;
 
 /** 关窗并把结果交给等待者（重复调用无副作用：resolver 取走即置空） */
 export function resolveRetentionConfirm(accepted: boolean): void {
-  const resolve = retentionConfirmResolver
-  retentionConfirmResolver = null
-  publish({ retentionConfirm: null })
-  resolve?.(accepted)
+  const resolve = retentionConfirmResolver;
+  retentionConfirmResolver = null;
+  publish({ retentionConfirm: null });
+  resolve?.(accepted);
 }
 
 /** 弹确认框，返回 Promise<boolean>：确认继续为 true，取消 / 关窗 / Esc 为 false */
 function askRetentionShrink(head: string): Promise<boolean> {
-  return new Promise(resolve => {
+  return new Promise((resolve) => {
     // 理论上同时只有一个问题（saveRetentionField 已挡掉重入），这里仍兜一层：
     // 万一有第二个问题挤进来，先把旧的按「取消」收尾，而不是让它的 Promise 永远挂着
-    if (retentionConfirmResolver) resolveRetentionConfirm(false)
-    retentionConfirmResolver = resolve
-    publish({ retentionConfirm: { head } })
-  })
+    if (retentionConfirmResolver) resolveRetentionConfirm(false);
+    retentionConfirmResolver = resolve;
+    publish({ retentionConfirm: { head } });
+  });
 }
 
 /**
  * 单个输入框的提交流程：校验 → （改小时）确认 → 提交。任一步失败都不写快照，
  * 视图层把草稿收掉，显示回到生效值（旧实现是显式 revert）。
  */
-export async function saveRetentionField(field: RetentionField, raw: string): Promise<void> {
-  if (busyScope) return
+export async function saveRetentionField(
+  field: RetentionField,
+  raw: string,
+): Promise<void> {
+  if (busyScope) return;
   // 确认框开着时不再受理新的编辑：一次只问一个问题，否则第二个问题会把第一个顶掉
   // （resolver 只能存一个），那个输入框就会在没人点过「取消」的情况下被回滚。
   // 遮罩已经挡住了页面，走到这里只剩键盘 Tab 之类的少数路径，挡一下成本极低。
-  if (snapshot.retentionConfirm) return
+  if (snapshot.retentionConfirm) return;
 
-  const parsed = parseInteger(raw, field.min, field.max, field.kind === 'count' ? t('条数') : t('天数'))
-  if (!parsed.ok) { toast(parsed.message, 'err'); return }
+  const parsed = parseInteger(
+    raw,
+    field.min,
+    field.max,
+    field.kind === "count" ? t("条数") : t("天数"),
+  );
+  if (!parsed.ok) {
+    toast(parsed.message, "err");
+    return;
+  }
 
-  const known = snapshot.retention.values?.[field.key]
-  const previous = typeof known === 'number' && Number.isInteger(known) ? known : null
+  const known = snapshot.retention.values?.[field.key];
+  const previous =
+    typeof known === "number" && Number.isInteger(known) ? known : null;
   // 值与后端一致就不发请求：数字框里换个写法（如 007）也会触发 change
-  if (previous !== null && parsed.value === previous) return
+  if (previous !== null && parsed.value === previous) return;
 
   // 读不到旧值时无从判断是否改小 —— 只有改小才会删数据，所以这里宁可多问一次：
   // 白弹一次确认的代价，远小于静默删掉用户的历史数据
-  const shrinking = previous === null || parsed.value < previous
-  if (shrinking && !await askRetentionShrink(retentionShrinkHead(field, previous, parsed.value))) return
+  const shrinking = previous === null || parsed.value < previous;
+  if (
+    shrinking &&
+    !(await askRetentionShrink(
+      retentionShrinkHead(field, previous, parsed.value),
+    ))
+  )
+    return;
 
-  await commitRetention(field, parsed.value, shrinking)
+  await commitRetention(field, parsed.value, shrinking);
 }
 
 /** 只提交变化的字段，避免覆盖其他保留设置。 */
-async function commitRetention(field: RetentionField, value: number, shrinking: boolean): Promise<void> {
-  if (busyScope) return
-  beginBusy('retention')
+async function commitRetention(
+  field: RetentionField,
+  value: number,
+  shrinking: boolean,
+): Promise<void> {
+  if (busyScope) return;
+  beginBusy("retention");
   // 乐观写入待保存的值，再禁用输入框（视图按 busy === 'retention' 禁用）。理由：Chromium 里
   // 「让正在聚焦的输入框 disabled」会触发一次 blur，而 blur 可能补发 change —— 那个重入的
   // 提交会走忙碌分支早退；不先记新值，用户就会看到「刚改的数字闪回旧值、过一下又变回来」。
   // 真失败了下面的 catch 会重读后端覆盖，所以这个乐观值不会被留在界面上。
-  const optimistic = snapshot.retention.values
-  if (optimistic) publish({ retention: { status: 'ready', values: { ...optimistic, [field.key]: value } } })
+  const optimistic = snapshot.retention.values;
+  if (optimistic)
+    publish({
+      retention: {
+        status: "ready",
+        values: { ...optimistic, [field.key]: value },
+      },
+    });
   try {
-    const saved = await shared().workbuddyDesktop?.saveRetention({ [field.key]: value })
-    renderRetention(saved)
-    const values = snapshot.retention.values
-    if (RETENTION_FIELDS.every(item => Number.isInteger(values?.[item.key]))) {
-      toast(retentionSavedMessage(field, values?.[field.key] ?? value, shrinking))
-      return
+    const saved = await shared().workbuddyDesktop?.saveRetention({
+      [field.key]: value,
+    });
+    renderRetention(saved);
+    const values = snapshot.retention.values;
+    if (
+      RETENTION_FIELDS.every((item) => Number.isInteger(values?.[item.key]))
+    ) {
+      toast(
+        retentionSavedMessage(field, values?.[field.key] ?? value, shrinking),
+      );
+      return;
     }
     // 响应不完整时重新读取，避免把未确认的值当成已生效设置。
-    await loadRetention()
-    toast(retentionSavedMessage(field, snapshot.retention.values?.[field.key] ?? value, shrinking))
+    await loadRetention();
+    toast(
+      retentionSavedMessage(
+        field,
+        snapshot.retention.values?.[field.key] ?? value,
+        shrinking,
+      ),
+    );
   } catch (error) {
     // 400 的 message（点名哪个字段、超出多少）比自造一句更指向具体问题
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadRetention() // 回滚到后端的真实值
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
+    await loadRetention(); // 回滚到后端的真实值
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
@@ -1394,96 +1617,115 @@ async function commitRetention(field: RetentionField, value: number, shrinking: 
  * 直接换号」名单）由各自的代码实现，在数据到达 / 不可用时被回调一次。
  */
 type NumericPanel = {
-  scope: 'retry' | 'timeouts' | 'queue' | 'imageCompress' | 'captchaPool'
-  fields: NumberField[]
-  consoleLabel: string
+  scope: "retry" | "timeouts" | "queue" | "imageCompress" | "captchaPool";
+  fields: NumberField[];
+  consoleLabel: string;
   /** 取数 / 写回：桥不在时给 undefined（各调用点按「读不到」处理） */
-  get: () => Promise<unknown> | undefined
-  save: (patch: Record<string, number>) => Promise<unknown> | undefined
+  get: () => Promise<unknown> | undefined;
+  save: (patch: Record<string, number>) => Promise<unknown> | undefined;
   /** 读 / 写快照里的生效值（null = 不可用） */
-  read: () => NumericState
-  write: (state: NumericState) => void
-  syncExtras?: (data: unknown) => void
-}
+  read: () => NumericState;
+  write: (state: NumericState) => void;
+  syncExtras?: (data: unknown) => void;
+};
 
 /** 按响应重铺面板：只采纳范围内的整数，缺字段沿用上一轮；一项都没有则整块不可用 */
 function renderNumericPanel(panel: NumericPanel, data: unknown): void {
-  if (data === undefined) return
-  const values = normalizeNumbers(panel.fields, data, panel.read().values)
-  panel.write({ status: values === null ? 'unavailable' : 'ready', values })
-  panel.syncExtras?.(values === null ? null : data)
+  if (data === undefined) return;
+  const values = normalizeNumbers(panel.fields, data, panel.read().values);
+  panel.write({ status: values === null ? "unavailable" : "ready", values });
+  panel.syncExtras?.(values === null ? null : data);
 }
 
 async function loadNumericPanel(panel: NumericPanel): Promise<void> {
   try {
-    renderNumericPanel(panel, await panel.get())
+    renderNumericPanel(panel, await panel.get());
   } catch (error) {
-    console.warn(`${panel.consoleLabel}失败:`, errorMessage(error))
-    renderNumericPanel(panel, null)
+    console.warn(`${panel.consoleLabel}失败:`, errorMessage(error));
+    renderNumericPanel(panel, null);
   }
 }
 
 /** 单个输入框的提交流程：校验 → 提交，失败回滚（与保留期同款，少一道确认） */
-async function saveNumericField(panel: NumericPanel, field: NumberField, raw: string): Promise<void> {
-  if (busyScope) return
+async function saveNumericField(
+  panel: NumericPanel,
+  field: NumberField,
+  raw: string,
+): Promise<void> {
+  if (busyScope) return;
 
-  const parsed = parseInteger(raw, field.min, field.max, field.label)
-  if (!parsed.ok) { toast(parsed.message, 'err'); return }
+  const parsed = parseInteger(raw, field.min, field.max, field.label);
+  if (!parsed.ok) {
+    toast(parsed.message, "err");
+    return;
+  }
 
-  const known = panel.read().values?.[field.key]
+  const known = panel.read().values?.[field.key];
   // 值与后端一致就不发请求：数字框里换个写法（如 05）也会触发 change
-  if (Number.isInteger(known) && parsed.value === known) return
+  if (Number.isInteger(known) && parsed.value === known) return;
 
-  beginBusy(panel.scope)
+  beginBusy(panel.scope);
   // 乐观写入待保存的值（理由同 commitRetention）
-  const current = panel.read().values
-  if (current) panel.write({ status: 'ready', values: { ...current, [field.key]: parsed.value } })
+  const current = panel.read().values;
+  if (current)
+    panel.write({
+      status: "ready",
+      values: { ...current, [field.key]: parsed.value },
+    });
   try {
-    const saved = await panel.save({ [field.key]: parsed.value })
+    const saved = await panel.save({ [field.key]: parsed.value });
     // PUT 契约返回生效后的全量值，正常情况下用响应刷新即可，不必再跑一趟 GET
-    renderNumericPanel(panel, saved)
-    const applied = panel.read().values?.[field.key]
-    const shown = Number.isInteger(applied) ? applied : parsed.value
-    toast(t('✅ 已保存：{label} {value}', { label: field.label, value: String(shown) }))
+    renderNumericPanel(panel, saved);
+    const applied = panel.read().values?.[field.key];
+    const shown = Number.isInteger(applied) ? applied : parsed.value;
+    toast(
+      t("✅ 已保存：{label} {value}", {
+        label: field.label,
+        value: String(shown),
+      }),
+    );
   } catch (error) {
     // 400 的 message（点名哪个字段、超出多少）比自造一句更指向具体问题
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadNumericPanel(panel) // 回滚到后端的真实值
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
+    await loadNumericPanel(panel); // 回滚到后端的真实值
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
 /* ─── 排队等待 ─────────────────────────────── */
 
 const queuePanel: NumericPanel = {
-  scope: 'queue',
+  scope: "queue",
   fields: QUEUE_FIELDS,
-  consoleLabel: '读取排队等待设置',
+  consoleLabel: "读取排队等待设置",
   get: () => shared().workbuddyDesktop?.getQueue(),
-  save: patch => shared().workbuddyDesktop?.saveQueue(patch),
+  save: (patch) => shared().workbuddyDesktop?.saveQueue(patch),
   read: () => snapshot.queue,
-  write: state => publish({ queue: state }),
-}
+  write: (state) => publish({ queue: state }),
+};
 
 export function renderQueue(data?: unknown): void {
-  renderNumericPanel(queuePanel, data)
+  renderNumericPanel(queuePanel, data);
 }
 
 export async function loadQueue(): Promise<void> {
-  await loadNumericPanel(queuePanel)
+  await loadNumericPanel(queuePanel);
 }
 
-export async function saveQueueField(field: NumberField, raw: string): Promise<void> {
-  await saveNumericField(queuePanel, field, raw)
+export async function saveQueueField(
+  field: NumberField,
+  raw: string,
+): Promise<void> {
+  await saveNumericField(queuePanel, field, raw);
 }
 
 /* ─── 会话图片压缩（开关 + 三项参数）────────────── */
 
 /** 从响应里读开关（非对象 / 字段不是字面 true 都算关，与后端「只认字面 true」一致） */
 function imageCompressEnabledFlag(data: unknown): boolean {
-  if (!data || typeof data !== 'object') return false
-  return (data as Record<string, unknown>)[IMAGE_COMPRESS_ENABLED_KEY] === true
+  if (!data || typeof data !== "object") return false;
+  return (data as Record<string, unknown>)[IMAGE_COMPRESS_ENABLED_KEY] === true;
 }
 
 /**
@@ -1492,124 +1734,156 @@ function imageCompressEnabledFlag(data: unknown): boolean {
  * `/api/image-compress` 端点，响应里同时带开关与三项参数。
  */
 const imageCompressPanel: NumericPanel = {
-  scope: 'imageCompress',
+  scope: "imageCompress",
   fields: IMAGE_COMPRESS_FIELDS,
-  consoleLabel: '读取会话图片压缩设置',
+  consoleLabel: "读取会话图片压缩设置",
   get: () => shared().workbuddyDesktop?.getImageCompress(),
-  save: patch => shared().workbuddyDesktop?.saveImageCompress(patch),
-  read: () => ({ status: snapshot.imageCompress.status, values: snapshot.imageCompress.values }),
-  write: state => publish({
-    imageCompress: { ...snapshot.imageCompress, status: state.status, values: state.values },
+  save: (patch) => shared().workbuddyDesktop?.saveImageCompress(patch),
+  read: () => ({
+    status: snapshot.imageCompress.status,
+    values: snapshot.imageCompress.values,
   }),
+  write: (state) =>
+    publish({
+      imageCompress: {
+        ...snapshot.imageCompress,
+        status: state.status,
+        values: state.values,
+      },
+    }),
   // 同一份响应里还带开关；数字面板不认布尔值，这里顺手回写
-  syncExtras: data => {
-    publish({ imageCompress: { ...snapshot.imageCompress, enabled: imageCompressEnabledFlag(data) } })
+  syncExtras: (data) => {
+    publish({
+      imageCompress: {
+        ...snapshot.imageCompress,
+        enabled: imageCompressEnabledFlag(data),
+      },
+    });
   },
-}
+};
 
 export function renderImageCompress(data?: unknown): void {
-  renderNumericPanel(imageCompressPanel, data)
+  renderNumericPanel(imageCompressPanel, data);
 }
 
 export async function loadImageCompress(): Promise<void> {
-  await loadNumericPanel(imageCompressPanel)
+  await loadNumericPanel(imageCompressPanel);
 }
 
-export async function saveImageCompressField(field: NumberField, raw: string): Promise<void> {
-  await saveNumericField(imageCompressPanel, field, raw)
+export async function saveImageCompressField(
+  field: NumberField,
+  raw: string,
+): Promise<void> {
+  await saveNumericField(imageCompressPanel, field, raw);
 }
 
 /** 开关的保存路径（只改一个布尔值；失败回滚到后端真实值） */
 export async function saveImageCompressEnabled(next: boolean): Promise<void> {
-  if (busyScope) { repaint(); return }
-  beginBusy('imageCompress')
-  publish({ imageCompress: { ...snapshot.imageCompress, enabled: next } })
+  if (busyScope) {
+    repaint();
+    return;
+  }
+  beginBusy("imageCompress");
+  publish({ imageCompress: { ...snapshot.imageCompress, enabled: next } });
   try {
-    const saved = await shared().workbuddyDesktop?.saveImageCompress({ [IMAGE_COMPRESS_ENABLED_KEY]: next })
-    renderImageCompress(saved)
-    toast(next ? t('✅ 会话图片压缩已开启') : t('已关闭会话图片压缩'))
+    const saved = await shared().workbuddyDesktop?.saveImageCompress({
+      [IMAGE_COMPRESS_ENABLED_KEY]: next,
+    });
+    renderImageCompress(saved);
+    toast(next ? t("✅ 会话图片压缩已开启") : t("已关闭会话图片压缩"));
   } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadImageCompress() // 回滚到后端的真实值
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
+    await loadImageCompress(); // 回滚到后端的真实值
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
 /* ─── 验证码令牌池 ─────────────────────────── */
 
 const captchaPoolPanel: NumericPanel = {
-  scope: 'captchaPool',
+  scope: "captchaPool",
   fields: CAPTCHA_POOL_FIELDS,
-  consoleLabel: '读取验证码令牌池设置',
+  consoleLabel: "读取验证码令牌池设置",
   get: () => shared().workbuddyDesktop?.getCaptchaPool(),
-  save: patch => shared().workbuddyDesktop?.saveCaptchaPool(patch),
+  save: (patch) => shared().workbuddyDesktop?.saveCaptchaPool(patch),
   read: () => snapshot.captchaPool,
-  write: state => publish({ captchaPool: state }),
-}
+  write: (state) => publish({ captchaPool: state }),
+};
 
 export function renderCaptchaPool(data?: unknown): void {
-  renderNumericPanel(captchaPoolPanel, data)
+  renderNumericPanel(captchaPoolPanel, data);
 }
 
 export async function loadCaptchaPool(): Promise<void> {
-  await loadNumericPanel(captchaPoolPanel)
+  await loadNumericPanel(captchaPoolPanel);
 }
 
-export async function saveCaptchaPoolField(field: NumberField, raw: string): Promise<void> {
-  await saveNumericField(captchaPoolPanel, field, raw)
+export async function saveCaptchaPoolField(
+  field: NumberField,
+  raw: string,
+): Promise<void> {
+  await saveNumericField(captchaPoolPanel, field, raw);
 }
 
 /* ─── 账号路由（策略 + 会话粘性）───────────── */
 
 /** 后端给的路由配置里我们关心的两个键（与 /api/routing 的长键名逐字对应） */
-const ROUTING_STRATEGY_KEY = 'routingStrategy'
-const ROUTING_STICKY_KEY = 'routingSticky'
-const ROUTING_FAILOVER_BACKOFF_KEY = 'routingFailoverBackoff'
-const ROUTING_SINK_KEY = 'routingSink'
-const ROUTING_BREAKER_ENABLED_KEY = 'routingBreakerEnabled'
+const ROUTING_STRATEGY_KEY = "routingStrategy";
+const ROUTING_STICKY_KEY = "routingSticky";
+const ROUTING_FAILOVER_BACKOFF_KEY = "routingFailoverBackoff";
+const ROUTING_SINK_KEY = "routingSink";
+const ROUTING_BREAKER_ENABLED_KEY = "routingBreakerEnabled";
 
 /** 路由配置的合法取值表（逐字来自 settings-model 的档位表，校验与兜底共用） */
 const ROUTING_VALID: Record<string, ReadonlySet<string>> = {
-  [ROUTING_STRATEGY_KEY]: new Set(ROUTE_STRATEGIES.map(item => item.value)),
-  [ROUTING_STICKY_KEY]: new Set(ROUTE_STICKY_OPTIONS.map(item => item.value)),
-}
+  [ROUTING_STRATEGY_KEY]: new Set(ROUTE_STRATEGIES.map((item) => item.value)),
+  [ROUTING_STICKY_KEY]: new Set(ROUTE_STICKY_OPTIONS.map((item) => item.value)),
+};
 
 /** 路由响应 → 快照值：只认合法档位，读不到 / 非法时按该键的默认档兜底 */
 function routingValuesFrom(data: unknown): {
-  strategy: string
-  sticky: string
-  failoverBackoff: boolean
-  sink: boolean
-  breakerEnabled: boolean
+  strategy: string;
+  sticky: string;
+  failoverBackoff: boolean;
+  sink: boolean;
+  breakerEnabled: boolean;
 } {
-  const record = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>
+  const record = (data && typeof data === "object" ? data : {}) as Record<
+    string,
+    unknown
+  >;
   const pick = (key: string, fallback: string): string => {
-    const raw = record[key]
-    return typeof raw === 'string' && ROUTING_VALID[key].has(raw) ? raw : fallback
-  }
+    const raw = record[key];
+    return typeof raw === "string" && ROUTING_VALID[key].has(raw)
+      ? raw
+      : fallback;
+  };
   // 三个布尔开关：只认字面 true / false（后端返回的一定是布尔），缺字段时回落后端默认值
   const pickBool = (key: string, fallback: boolean): boolean => {
-    const raw = record[key]
-    return typeof raw === 'boolean' ? raw : fallback
-  }
+    const raw = record[key];
+    return typeof raw === "boolean" ? raw : fallback;
+  };
   return {
-    strategy: pick(ROUTING_STRATEGY_KEY, 'order'),
-    sticky: pick(ROUTING_STICKY_KEY, 'auto'),
+    strategy: pick(ROUTING_STRATEGY_KEY, "order"),
+    sticky: pick(ROUTING_STICKY_KEY, "auto"),
     failoverBackoff: pickBool(ROUTING_FAILOVER_BACKOFF_KEY, true),
     sink: pickBool(ROUTING_SINK_KEY, true),
     breakerEnabled: pickBool(ROUTING_BREAKER_ENABLED_KEY, false),
-  }
+  };
 }
 
 export async function loadRouting(): Promise<void> {
   try {
-    const data = await shared().workbuddyDesktop?.getRoutingConfig()
-    if (data === undefined) { publish({ routing: { ...snapshot.routing, status: 'unavailable' } }); return }
-    publish({ routing: { status: 'ready', ...routingValuesFrom(data) } })
+    const data = await shared().workbuddyDesktop?.getRoutingConfig();
+    if (data === undefined) {
+      publish({ routing: { ...snapshot.routing, status: "unavailable" } });
+      return;
+    }
+    publish({ routing: { status: "ready", ...routingValuesFrom(data) } });
   } catch (error) {
-    console.warn('读取路由设置失败:', errorMessage(error))
-    publish({ routing: { ...snapshot.routing, status: 'unavailable' } })
+    console.warn("读取路由设置失败:", errorMessage(error));
+    publish({ routing: { ...snapshot.routing, status: "unavailable" } });
   }
 }
 
@@ -1618,275 +1892,574 @@ export async function loadRouting(): Promise<void> {
  * 后端只认长键名；未知档位在界面上就发不出来（SegmentedControl 的取值来自档位表）。
  */
 export async function saveRoutingField(patch: {
-  routingStrategy?: string
-  routingSticky?: string
-  routingFailoverBackoff?: boolean
-  routingSink?: boolean
-  routingBreakerEnabled?: boolean
+  routingStrategy?: string;
+  routingSticky?: string;
+  routingFailoverBackoff?: boolean;
+  routingSink?: boolean;
+  routingBreakerEnabled?: boolean;
 }): Promise<void> {
-  if (busyScope) return
-  const bridge = shared().workbuddyDesktop
+  if (busyScope) return;
+  const bridge = shared().workbuddyDesktop;
   if (!bridge?.setRoutingConfig) {
-    toast(t('桌面运行时不可用，暂时无法保存'), 'err')
-    return
+    toast(t("桌面运行时不可用，暂时无法保存"), "err");
+    return;
   }
-  beginBusy('routing')
+  beginBusy("routing");
   try {
-    const saved = await bridge.setRoutingConfig(patch)
+    const saved = await bridge.setRoutingConfig(patch);
     if (saved !== undefined) {
-      publish({ routing: { status: 'ready', ...routingValuesFrom(saved) } })
+      publish({ routing: { status: "ready", ...routingValuesFrom(saved) } });
     } else {
       // 老壳不回响应体：回读一次拿真实生效值（loadRouting 会给出 ready / unavailable）
-      await loadRouting()
+      await loadRouting();
     }
-    toast(t('✅ 路由设置已保存'))
+    toast(t("✅ 路由设置已保存"));
   } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadRouting() // 回滚到后端的真实值
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
+    await loadRouting(); // 回滚到后端的真实值
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
 /* ─── 请求重试 ─────────────────────────────── */
 
 const retryPanel: NumericPanel = {
-  scope: 'retry',
+  scope: "retry",
   fields: RETRY_FIELDS,
-  consoleLabel: '读取请求重试设置',
+  consoleLabel: "读取请求重试设置",
   get: () => shared().workbuddyDesktop?.getRetry(),
-  save: patch => shared().workbuddyDesktop?.saveRetry(patch),
+  save: (patch) => shared().workbuddyDesktop?.saveRetry(patch),
   read: () => snapshot.retry,
-  write: state => publish({ retry: state }),
-  syncExtras: data => {
+  write: (state) => publish({ retry: state }),
+  syncExtras: (data) => {
     // 「指定错误码直接换号」的名单：只收 100–599 的整数项（后端已排序去重，这里不再排序
     // —— 顺序就是后端给的）。键缺失（旧后端）时沿用上一轮的值，不误判成「清空」；
     // data 为 null（整块不可用）时清掉并锁住输入框。
-    if (data === null) { publish({ retryCodes: null }); return }
-    const raw = (data as Record<string, unknown>)[NO_RETRY_CODES_KEY]
-    if (!Array.isArray(raw)) return
-    const list = raw as unknown[]
+    if (data === null) {
+      publish({ retryCodes: null });
+      return;
+    }
+    const raw = (data as Record<string, unknown>)[NO_RETRY_CODES_KEY];
+    if (!Array.isArray(raw)) return;
+    const list = raw as unknown[];
     publish({
-      retryCodes: list.filter((code): code is number =>
-        typeof code === 'number' && Number.isInteger(code)
-        && code >= RETRY_CODE_MIN && code <= RETRY_CODE_MAX),
-    })
+      retryCodes: list.filter(
+        (code): code is number =>
+          typeof code === "number" &&
+          Number.isInteger(code) &&
+          code >= RETRY_CODE_MIN &&
+          code <= RETRY_CODE_MAX,
+      ),
+    });
   },
-}
+};
 
 export function renderRetry(data?: unknown): void {
-  renderNumericPanel(retryPanel, data)
+  renderNumericPanel(retryPanel, data);
 }
 
 export async function loadRetry(): Promise<void> {
-  await loadNumericPanel(retryPanel)
+  await loadNumericPanel(retryPanel);
 }
 
-export async function saveRetryField(field: NumberField, raw: string): Promise<void> {
-  await saveNumericField(retryPanel, field, raw)
+export async function saveRetryField(
+  field: NumberField,
+  raw: string,
+): Promise<void> {
+  await saveNumericField(retryPanel, field, raw);
 }
 
 /** 增删后的统一提交：乐观更新本地值 → PUT → 用响应里的生效值重画 */
 async function saveRetryCodes(codes: number[]): Promise<void> {
-  if (busyScope) return
-  publish({ retryCodes: codes })
-  beginBusy('codes')
+  if (busyScope) return;
+  publish({ retryCodes: codes });
+  beginBusy("codes");
   try {
-    const saved = await shared().workbuddyDesktop?.saveRetry({ [NO_RETRY_CODES_KEY]: codes })
+    const saved = await shared().workbuddyDesktop?.saveRetry({
+      [NO_RETRY_CODES_KEY]: codes,
+    });
     // PUT 契约返回生效后的全量值（含三个数字项），交给面板统一回填，
     // 顺带把徽章重画成后端确认的形态（排序去重后的结果）
-    renderNumericPanel(retryPanel, saved)
-    toast(t('✅ 已保存：指定错误码直接换号'))
+    renderNumericPanel(retryPanel, saved);
+    toast(t("✅ 已保存：指定错误码直接换号"));
   } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadNumericPanel(retryPanel) // 回滚到后端的真实值
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
+    await loadNumericPanel(retryPanel); // 回滚到后端的真实值
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
 /** 校验并添加一枚：整数、100–599、去重、限量（口径与后端 400 文案同源） */
 export async function addRetryCode(raw: string): Promise<void> {
-  const codes = snapshot.retryCodes
-  if (codes === null) return
-  const text = String(raw ?? '').trim()
-  if (!text) return
-  if (!/^\d+$/.test(text) || Number(text) < RETRY_CODE_MIN || Number(text) > RETRY_CODE_MAX) {
-    toast(t('状态码必须是 {min}–{max} 的整数（收到: {text}）', {
-      min: RETRY_CODE_MIN, max: RETRY_CODE_MAX, text,
-    }), 'err')
-    return
+  const codes = snapshot.retryCodes;
+  if (codes === null) return;
+  const text = String(raw ?? "").trim();
+  if (!text) return;
+  if (
+    !/^\d+$/.test(text) ||
+    Number(text) < RETRY_CODE_MIN ||
+    Number(text) > RETRY_CODE_MAX
+  ) {
+    toast(
+      t("状态码必须是 {min}–{max} 的整数（收到: {text}）", {
+        min: RETRY_CODE_MIN,
+        max: RETRY_CODE_MAX,
+        text,
+      }),
+      "err",
+    );
+    return;
   }
-  const code = Number(text)
-  if (codes.includes(code)) { toast(t('状态码 {code} 已在名单里', { code })); return }
+  const code = Number(text);
+  if (codes.includes(code)) {
+    toast(t("状态码 {code} 已在名单里", { code }));
+    return;
+  }
   if (codes.length >= RETRY_MAX_CODES) {
-    toast(t('名单最多 {max} 个状态码', { max: RETRY_MAX_CODES }), 'err')
-    return
+    toast(t("名单最多 {max} 个状态码", { max: RETRY_MAX_CODES }), "err");
+    return;
   }
-  await saveRetryCodes([...codes, code])
+  await saveRetryCodes([...codes, code]);
 }
 
 /** 删除一枚（点徽章上的 ✕） */
 export async function removeRetryCode(code: number): Promise<void> {
-  const codes = snapshot.retryCodes
-  if (!codes || !codes.includes(code)) return
-  await saveRetryCodes(codes.filter(item => item !== code))
+  const codes = snapshot.retryCodes;
+  if (!codes || !codes.includes(code)) return;
+  await saveRetryCodes(codes.filter((item) => item !== code));
 }
 
 /** 输入框为空时退格删最后一枚（与 GitHub Topics 一致） */
 export async function dropLastRetryCode(): Promise<void> {
-  const codes = snapshot.retryCodes
-  if (!codes?.length) return
-  await saveRetryCodes(codes.slice(0, -1))
+  const codes = snapshot.retryCodes;
+  if (!codes?.length) return;
+  await saveRetryCodes(codes.slice(0, -1));
 }
 
 /* ─── 请求超时 ─────────────────────────────── */
 
 const timeoutsPanel: NumericPanel = {
-  scope: 'timeouts',
+  scope: "timeouts",
   fields: TIMEOUT_FIELDS,
-  consoleLabel: '读取请求超时设置',
+  consoleLabel: "读取请求超时设置",
   get: () => shared().workbuddyDesktop?.getTimeouts(),
-  save: patch => shared().workbuddyDesktop?.saveTimeouts(patch),
+  save: (patch) => shared().workbuddyDesktop?.saveTimeouts(patch),
   read: () => snapshot.timeouts,
-  write: state => publish({ timeouts: state }),
-}
+  write: (state) => publish({ timeouts: state }),
+};
 
 export async function loadTimeouts(): Promise<void> {
-  await loadNumericPanel(timeoutsPanel)
+  await loadNumericPanel(timeoutsPanel);
 }
 
-export async function saveTimeoutField(field: NumberField, raw: string): Promise<void> {
-  await saveNumericField(timeoutsPanel, field, raw)
+export async function saveTimeoutField(
+  field: NumberField,
+  raw: string,
+): Promise<void> {
+  await saveNumericField(timeoutsPanel, field, raw);
 }
 
 /* ─── 调试模式 / 指纹脱敏 ── */
 
 export function renderDebug(data?: unknown): void {
-  if (data === undefined) return
-  if (!data || typeof data !== 'object') {
-    publish({ debug: { status: 'unavailable', on: false, count: null, limit: null } })
-    return
+  if (data === undefined) return;
+  if (!data || typeof data !== "object") {
+    publish({
+      debug: { status: "unavailable", on: false, count: null, limit: null },
+    });
+    return;
   }
-  const record = data as Record<string, unknown>
-  const count = Number(record.count)
-  const limit = Number(record.limit)
+  const record = data as Record<string, unknown>;
+  const count = Number(record.count);
+  const limit = Number(record.limit);
   publish({
     debug: {
-      status: 'ready',
+      status: "ready",
       on: record.debugMode === true,
       count: Number.isInteger(count) ? count : null,
       limit: Number.isInteger(limit) ? limit : null,
     },
-  })
+  });
 }
 
 async function loadDebug(): Promise<void> {
   try {
-    renderDebug(await shared().workbuddyDesktop?.getDebug())
+    renderDebug(await shared().workbuddyDesktop?.getDebug());
   } catch (error) {
-    console.warn('读取调试模式设置失败:', errorMessage(error))
-    renderDebug(null)
+    console.warn("读取调试模式设置失败:", errorMessage(error));
+    renderDebug(null);
   }
 }
 
 export async function saveDebug(next: boolean): Promise<void> {
   // 忙碌中早退：受控开关的 checked 来自快照，不写快照即等于「还原这一下拨动」
-  if (busyScope) { repaint(); return }
-  beginBusy('debug')
-  publish({ debug: { ...snapshot.debug, on: next } })
+  if (busyScope) {
+    repaint();
+    return;
+  }
+  beginBusy("debug");
+  publish({ debug: { ...snapshot.debug, on: next } });
   try {
-    const saved = await shared().workbuddyDesktop?.saveDebug(next)
-    renderDebug(saved)
-    toast(next ? t('✅ 调试模式已开启') : t('✅ 调试模式已关闭'))
+    const saved = await shared().workbuddyDesktop?.saveDebug(next);
+    renderDebug(saved);
+    toast(next ? t("✅ 调试模式已开启") : t("✅ 调试模式已关闭"));
   } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadDebug() // 回滚到后端的真实值
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
+    await loadDebug(); // 回滚到后端的真实值
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
 export function renderSanitize(data?: unknown): void {
-  if (data === undefined) return
-  publish({ sanitize: sanitizeStateFrom(data, snapshot.sanitize) })
+  if (data === undefined) return;
+  publish({ sanitize: sanitizeStateFrom(data, snapshot.sanitize) });
 }
 
 async function loadSanitize(): Promise<void> {
   try {
-    renderSanitize(await shared().workbuddyDesktop?.getSanitize())
+    renderSanitize(await shared().workbuddyDesktop?.getSanitize());
   } catch (error) {
-    console.warn('读取出站指纹脱敏设置失败:', errorMessage(error))
-    renderSanitize(null)
+    console.warn("读取出站指纹脱敏设置失败:", errorMessage(error));
+    renderSanitize(null);
   }
 }
 
 export async function saveSanitize(next: boolean): Promise<void> {
-  await saveSanitizeConfig({ sanitizeBlacklistFingerprints: next }, next
-    ? t('✅ 出站指纹脱敏已开启') : t('已关闭出站指纹脱敏'))
+  await saveSanitizeConfig(
+    { sanitizeBlacklistFingerprints: next },
+    next ? t("✅ 出站指纹脱敏已开启") : t("已关闭出站指纹脱敏"),
+  );
 }
 
-export async function saveSanitizeConfig(patch: SanitizePatch, message?: string): Promise<boolean> {
-  if (busyScope) { repaint(); return false }
-  beginBusy('sanitize')
+export async function saveSanitizeConfig(
+  patch: SanitizePatch,
+  message?: string,
+): Promise<boolean> {
+  if (busyScope) {
+    repaint();
+    return false;
+  }
+  beginBusy("sanitize");
   try {
-    const api = shared().workbuddyDesktop
-    if (!api?.saveSanitize) throw new Error(t('主进程桥不可用'))
-    const request = !snapshot.sanitize.editable && typeof patch.sanitizeBlacklistFingerprints === 'boolean'
-      ? patch.sanitizeBlacklistFingerprints : patch
-    const data = await api.saveSanitize(request)
-    const state = sanitizeStateFrom(data, snapshot.sanitize)
-    if (state.status !== 'ready') throw new Error(t('未能读取保存后的指纹脱敏设置'))
-    publish({ sanitize: state })
+    const api = shared().workbuddyDesktop;
+    if (!api?.saveSanitize) throw new Error(t("主进程桥不可用"));
+    const request =
+      !snapshot.sanitize.editable &&
+      typeof patch.sanitizeBlacklistFingerprints === "boolean"
+        ? patch.sanitizeBlacklistFingerprints
+        : patch;
+    const data = await api.saveSanitize(request);
+    const state = sanitizeStateFrom(data, snapshot.sanitize);
+    if (state.status !== "ready")
+      throw new Error(t("未能读取保存后的指纹脱敏设置"));
+    publish({ sanitize: state });
     toast(
       state.saved
-        ? message ?? t('✅ 指纹脱敏设置已保存')
-        : t('指纹脱敏设置仅本次运行生效，写入数据库失败，请检查配置目录'),
-      state.saved ? 'ok' : 'err',
-    )
-    return true
+        ? (message ?? t("✅ 指纹脱敏设置已保存"))
+        : t("指纹脱敏设置仅本次运行生效，写入数据库失败，请检查配置目录"),
+      state.saved ? "ok" : "err",
+    );
+    return true;
   } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    return false
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
+    return false;
   } finally {
-    endBusy()
+    endBusy();
+  }
+}
+
+/* ─── 剥离响应开头的思考标签（全局开关）── */
+
+export function renderThinkStrip(data?: unknown): void {
+  if (data === undefined) return;
+  if (!data || typeof data !== "object") {
+    publish({ thinkStrip: { status: "unavailable", on: false } });
+    return;
+  }
+  const record = data as Record<string, unknown>;
+  publish({
+    thinkStrip: { status: "ready", on: record.stripLeadingThink === true },
+  });
+}
+
+async function loadThinkStrip(): Promise<void> {
+  try {
+    renderThinkStrip(await shared().workbuddyDesktop?.getThinkStrip());
+  } catch (error) {
+    console.warn("读取思考标签剥离设置失败:", errorMessage(error));
+    renderThinkStrip(null);
+  }
+}
+
+export async function saveThinkStrip(next: boolean): Promise<void> {
+  if (busyScope) {
+    repaint();
+    return;
+  }
+  beginBusy("thinkStrip");
+  publish({ thinkStrip: { status: "ready", on: next } });
+  try {
+    const saved = await shared().workbuddyDesktop?.saveThinkStrip(next);
+    renderThinkStrip(saved);
+    toast(
+      next
+        ? t("✅ 已开启剥离响应开头的思考标签")
+        : t("已关闭剥离响应开头的思考标签"),
+    );
+  } catch (error) {
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
+    await loadThinkStrip(); // 回滚到后端的真实值
+  } finally {
+    endBusy();
+  }
+}
+
+/* ─── 可逆出站脱敏（密钥 / 个人信息 / 自定义词）── */
+
+/**
+ * 归一化 `maskWords`：只收字符串，去首尾空白、丢空项与重复项。
+ * 与后端 `parse_words` 同一口径 —— 界面上的草稿可以留空行，落库的永远是干净的词表。
+ */
+function maskWordsFrom(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const words: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== "string") continue;
+    const word = item.trim();
+    if (!word || words.includes(word)) continue;
+    words.push(word);
+  }
+  return words;
+}
+
+export function renderMasking(data?: unknown): void {
+  if (data === undefined) return;
+  if (!data || typeof data !== "object") {
+    publish({
+      masking: {
+        status: "unavailable",
+        secrets: false,
+        pii: false,
+        words: [],
+        saved: true,
+      },
+    });
+    return;
+  }
+  const record = data as Record<string, unknown>;
+  publish({
+    masking: {
+      status: "ready",
+      secrets: record.maskSecrets === true,
+      pii: record.maskPii === true,
+      words: maskWordsFrom(record.maskWords),
+      // PUT 响应才带 saved；GET 不带，按「已保存」处理
+      saved: record.saved !== false,
+    },
+  });
+}
+
+/**
+ * 读设置。桥方法缺失（旧壳 / 网页端漏注册）时按 unavailable 处理，
+ * 面板禁用但不拖垮设置页的其它块。
+ */
+async function loadMasking(): Promise<void> {
+  const bridge = shared().workbuddyDesktop;
+  if (!bridge?.getMasking) {
+    publish({ masking: { ...snapshot.masking, status: "unavailable" } });
+    return;
+  }
+  try {
+    renderMasking(await bridge.getMasking());
+  } catch (error) {
+    console.warn("读取出站脱敏设置失败:", errorMessage(error));
+    renderMasking(null);
+  }
+}
+
+/**
+ * 保存三项（全量）。响应体是生效后的全量值（PUT 另带 saved）；
+ * 失败时回读一次拿后端的真实值，与其它开关面板同一口径。
+ */
+export async function saveMasking(patch: MaskingPatch): Promise<void> {
+  if (busyScope) return;
+  const bridge = shared().workbuddyDesktop;
+  if (!bridge?.saveMasking) {
+    toast(t("当前环境不支持出站脱敏设置"), "err");
+    return;
+  }
+  beginBusy("masking");
+  try {
+    const saved = await bridge.saveMasking(patch);
+    if (saved === undefined) await loadMasking();
+    else renderMasking(saved);
+    // 与 saveSanitizeConfig 同一口径：写库失败（saved=false）时不能说「已保存」，
+    // 否则会和面板里的常驻红色告警自相矛盾。
+    const persisted = snapshot.masking.saved;
+    toast(
+      persisted
+        ? t("✅ 出站脱敏设置已保存")
+        : t("出站脱敏设置仅本次运行生效，写入数据库失败，请检查配置目录"),
+      persisted ? "ok" : "err",
+    );
+  } catch (error) {
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
+    await loadMasking();
+  } finally {
+    endBusy();
+  }
+}
+
+/* ─── 逐家开关覆盖（providerOptions）── */
+
+/**
+ * 归一化 `{providerOptions: {"<id>": {"<key>": true|false}}}`。
+ *
+ * 只收布尔值：后端 `set` 写进去的一定是布尔，别的东西（未来多出来的键）
+ * 界面认不得就不渲染 —— 宁可少一行，也不要拿它去猜一个开关的状态。
+ */
+export function renderProviderOptions(data?: unknown): void {
+  if (data === undefined) return;
+  if (!data || typeof data !== "object") {
+    publish({ providerOptions: { status: "unavailable", overrides: {} } });
+    return;
+  }
+  const record = data as Record<string, unknown>;
+  publish({
+    providerOptions: {
+      status: "ready",
+      overrides: providerOptionOverrides(record.providerOptions),
+    },
+  });
+}
+
+function providerOptionOverrides(
+  raw: unknown,
+): Record<string, Record<string, boolean>> {
+  if (!raw || typeof raw !== "object") return {};
+  const out: Record<string, Record<string, boolean>> = {};
+  for (const [providerId, value] of Object.entries(
+    raw as Record<string, unknown>,
+  )) {
+    if (!providerId || !value || typeof value !== "object") continue;
+    const entry: Record<string, boolean> = {};
+    for (const [key, flag] of Object.entries(
+      value as Record<string, unknown>,
+    )) {
+      if (typeof flag === "boolean") entry[key] = flag;
+    }
+    if (Object.keys(entry).length) out[providerId] = entry;
+  }
+  return out;
+}
+
+async function loadProviderOptions(): Promise<void> {
+  try {
+    renderProviderOptions(
+      await shared().workbuddyDesktop?.getProviderOptions(),
+    );
+  } catch (error) {
+    console.warn("读取逐家开关覆盖失败:", errorMessage(error));
+    renderProviderOptions(null);
+  }
+}
+
+/**
+ * 写一家的一项覆盖。`value` 为 `null` = 删掉这项覆盖、回到「跟随全局」。
+ */
+export async function saveProviderOption(
+  providerId: string,
+  key: string,
+  value: boolean | null,
+  providerLabel?: string,
+  keyLabel?: string,
+): Promise<void> {
+  if (busyScope) {
+    repaint();
+    return;
+  }
+  beginBusy("providerOptions");
+  const optimistic: Record<string, Record<string, boolean>> = {
+    ...snapshot.providerOptions.overrides,
+  };
+  const entry: Record<string, boolean> = { ...(optimistic[providerId] ?? {}) };
+  if (value === null) delete entry[key];
+  else entry[key] = value;
+  if (Object.keys(entry).length) optimistic[providerId] = entry;
+  else delete optimistic[providerId];
+  publish({ providerOptions: { status: "ready", overrides: optimistic } });
+  const provider = providerLabel || providerId;
+  const label = keyLabel || key;
+  try {
+    const saved = await shared().workbuddyDesktop?.saveProviderOption(
+      providerId,
+      key,
+      value,
+    );
+    renderProviderOptions(saved);
+    toast(
+      value === null
+        ? t("✅ {provider} 的「{key}」已回到跟随全局", { provider, key: label })
+        : value
+          ? t("✅ {provider} 的「{key}」已设为开", { provider, key: label })
+          : t("✅ {provider} 的「{key}」已设为关", { provider, key: label }),
+    );
+  } catch (error) {
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
+    await loadProviderOptions(); // 回滚到后端的真实值
+  } finally {
+    endBusy();
   }
 }
 
 /* ─── 开发者角色兼容（developer 角色消息归一为 system）── */
 
 export function renderDeveloperRoleCompat(data?: unknown): void {
-  if (data === undefined) return
-  if (!data || typeof data !== 'object') {
-    publish({ developerRoleCompat: { status: 'unavailable', on: false } })
-    return
+  if (data === undefined) return;
+  if (!data || typeof data !== "object") {
+    publish({ developerRoleCompat: { status: "unavailable", on: false } });
+    return;
   }
-  const record = data as Record<string, unknown>
-  publish({ developerRoleCompat: { status: 'ready', on: record.developerRoleCompat === true } })
+  const record = data as Record<string, unknown>;
+  publish({
+    developerRoleCompat: {
+      status: "ready",
+      on: record.developerRoleCompat === true,
+    },
+  });
 }
 
 async function loadDeveloperRoleCompat(): Promise<void> {
   try {
-    renderDeveloperRoleCompat(await shared().workbuddyDesktop?.getDeveloperRoleCompat())
+    renderDeveloperRoleCompat(
+      await shared().workbuddyDesktop?.getDeveloperRoleCompat(),
+    );
   } catch (error) {
-    console.warn('读取开发者角色兼容设置失败:', errorMessage(error))
-    renderDeveloperRoleCompat(null)
+    console.warn("读取开发者角色兼容设置失败:", errorMessage(error));
+    renderDeveloperRoleCompat(null);
   }
 }
 
 export async function saveDeveloperRoleCompat(next: boolean): Promise<void> {
-  if (busyScope) { repaint(); return }
-  beginBusy('developerRoleCompat')
-  publish({ developerRoleCompat: { status: 'ready', on: next } })
+  if (busyScope) {
+    repaint();
+    return;
+  }
+  beginBusy("developerRoleCompat");
+  publish({ developerRoleCompat: { status: "ready", on: next } });
   try {
-    const saved = await shared().workbuddyDesktop?.saveDeveloperRoleCompat(next)
-    renderDeveloperRoleCompat(saved)
-    toast(next ? t('✅ 开发者角色兼容已开启') : t('已关闭开发者角色兼容'))
+    const saved =
+      await shared().workbuddyDesktop?.saveDeveloperRoleCompat(next);
+    renderDeveloperRoleCompat(saved);
+    toast(next ? t("✅ 开发者角色兼容已开启") : t("已关闭开发者角色兼容"));
   } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadDeveloperRoleCompat() // 回滚到后端的真实值
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
+    await loadDeveloperRoleCompat(); // 回滚到后端的真实值
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
@@ -1894,43 +2467,50 @@ export async function saveDeveloperRoleCompat(next: boolean): Promise<void> {
 
 /** 非字符串值一律丢弃（后端只会给字符串，这里是给「形状不对的响应」兜底） */
 function asStringTable(value: unknown): Record<string, string> {
-  if (!value || typeof value !== 'object') return {}
-  const out: Record<string, string> = {}
+  if (!value || typeof value !== "object") return {};
+  const out: Record<string, string> = {};
   for (const [key, text] of Object.entries(value as Record<string, unknown>)) {
-    if (typeof text === 'string') out[key] = text
+    if (typeof text === "string") out[key] = text;
   }
-  return out
+  return out;
 }
 
 export function renderClineHeaders(data?: unknown): void {
-  if (data === undefined) return
-  if (!data || typeof data !== 'object') {
-    publish({ clineHeaders: { status: 'unavailable', defaults: {}, overrides: {}, effective: {} } })
-    return
+  if (data === undefined) return;
+  if (!data || typeof data !== "object") {
+    publish({
+      clineHeaders: {
+        status: "unavailable",
+        defaults: {},
+        overrides: {},
+        effective: {},
+      },
+    });
+    return;
   }
-  const record = data as ClineHeadersData
+  const record = data as ClineHeadersData;
   publish({
     clineHeaders: {
-      status: 'ready',
+      status: "ready",
       defaults: asStringTable(record.defaults),
       overrides: asStringTable(record.overrides),
       effective: asStringTable(record.effective),
     },
-  })
+  });
 }
 
 async function loadClineHeaders(): Promise<void> {
   try {
-    renderClineHeaders(await shared().workbuddyDesktop?.getClineHeaders())
+    renderClineHeaders(await shared().workbuddyDesktop?.getClineHeaders());
   } catch (error) {
-    console.warn('读取 Cline 伪装头失败:', errorMessage(error))
-    renderClineHeaders(null)
+    console.warn("读取 Cline 伪装头失败:", errorMessage(error));
+    renderClineHeaders(null);
   }
 }
 
 export async function refreshClineHeaders(): Promise<void> {
-  await loadClineHeaders()
-  toast(t('Cline 伪装头已刷新'))
+  await loadClineHeaders();
+  toast(t("Cline 伪装头已刷新"));
 }
 
 /**
@@ -1938,52 +2518,60 @@ export async function refreshClineHeaders(): Promise<void> {
  * 默认行「值改回了默认」就不进表、值留空 = 该头不发、删掉的行 = 回落默认。
  * 空表 = 全部回落默认（「恢复默认」按钮就是存一份空表）。
  */
-export async function saveClineHeaders(overrides: Record<string, string>): Promise<void> {
-  if (busyScope) { repaint(); return }
-  beginBusy('clineHeaders')
+export async function saveClineHeaders(
+  overrides: Record<string, string>,
+): Promise<void> {
+  if (busyScope) {
+    repaint();
+    return;
+  }
+  beginBusy("clineHeaders");
   try {
-    const saved = await shared().workbuddyDesktop?.saveClineHeaders(overrides)
-    renderClineHeaders(saved)
-    toast(t('✅ Cline 伪装头已保存'))
+    const saved = await shared().workbuddyDesktop?.saveClineHeaders(overrides);
+    renderClineHeaders(saved);
+    toast(t("✅ Cline 伪装头已保存"));
   } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadClineHeaders() // 回滚到后端的真实值
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
+    await loadClineHeaders(); // 回滚到后端的真实值
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
 /* ─── ZCode 客户端版本号（上游按它决定活动套餐下不下发）── */
 
 export function renderZcodeVersion(data?: unknown): void {
-  if (data === undefined) return
-  if (!data || typeof data !== 'object') {
-    publish({ zcodeVersion: { status: 'unavailable', version: '', envOverride: '' } })
-    return
+  if (data === undefined) return;
+  if (!data || typeof data !== "object") {
+    publish({
+      zcodeVersion: { status: "unavailable", version: "", envOverride: "" },
+    });
+    return;
   }
-  const source = data as { version?: unknown; envOverride?: unknown }
+  const source = data as { version?: unknown; envOverride?: unknown };
   publish({
     zcodeVersion: {
-      status: 'ready',
-      version: typeof source.version === 'string' ? source.version : '',
+      status: "ready",
+      version: typeof source.version === "string" ? source.version : "",
       // null / 缺失统一成空串：视图层只需判「非空 = 环境变量压着」
-      envOverride: typeof source.envOverride === 'string' ? source.envOverride : '',
+      envOverride:
+        typeof source.envOverride === "string" ? source.envOverride : "",
     },
-  })
+  });
 }
 
 async function loadZcodeVersion(): Promise<void> {
   try {
-    renderZcodeVersion(await shared().workbuddyDesktop?.getZcodeVersion())
+    renderZcodeVersion(await shared().workbuddyDesktop?.getZcodeVersion());
   } catch (error) {
-    console.warn('读取 ZCode 客户端版本号失败:', errorMessage(error))
-    renderZcodeVersion(null)
+    console.warn("读取 ZCode 客户端版本号失败:", errorMessage(error));
+    renderZcodeVersion(null);
   }
 }
 
 export async function refreshZcodeVersion(): Promise<void> {
-  await loadZcodeVersion()
-  toast(t('ZCode 版本号已刷新'))
+  await loadZcodeVersion();
+  toast(t("ZCode 版本号已刷新"));
 }
 
 /**
@@ -1994,101 +2582,123 @@ export async function refreshZcodeVersion(): Promise<void> {
  * 让用户看到落库的到底是什么。
  */
 export async function saveZcodeVersion(version: string): Promise<void> {
-  if (busyScope) { repaint(); return }
-  beginBusy('zcodeVersion')
+  if (busyScope) {
+    repaint();
+    return;
+  }
+  beginBusy("zcodeVersion");
   try {
-    const saved = await shared().workbuddyDesktop?.saveZcodeVersion(version)
-    renderZcodeVersion(saved)
-    toast(version.trim() ? t('✅ ZCode 版本号已保存') : t('已清空，回落插件内置默认值'))
+    const saved = await shared().workbuddyDesktop?.saveZcodeVersion(version);
+    renderZcodeVersion(saved);
+    toast(
+      version.trim()
+        ? t("✅ ZCode 版本号已保存")
+        : t("已清空，回落插件内置默认值"),
+    );
   } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadZcodeVersion() // 回滚到后端的真实值
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
+    await loadZcodeVersion(); // 回滚到后端的真实值
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
 /* ─── 网关面跨域访问（/v1/* 的 CORS，默认关）── */
 
 export function renderCors(data?: unknown): void {
-  if (data === undefined) return
-  if (!data || typeof data !== 'object') {
-    publish({ cors: { status: 'unavailable', on: false } })
-    return
+  if (data === undefined) return;
+  if (!data || typeof data !== "object") {
+    publish({ cors: { status: "unavailable", on: false } });
+    return;
   }
-  const record = data as Record<string, unknown>
-  publish({ cors: { status: 'ready', on: record.corsEnabled === true } })
+  const record = data as Record<string, unknown>;
+  publish({ cors: { status: "ready", on: record.corsEnabled === true } });
 }
 
 async function loadCors(): Promise<void> {
   try {
-    renderCors(await shared().workbuddyDesktop?.getCors())
+    renderCors(await shared().workbuddyDesktop?.getCors());
   } catch (error) {
-    console.warn('读取网关跨域访问设置失败:', errorMessage(error))
-    renderCors(null)
+    console.warn("读取网关跨域访问设置失败:", errorMessage(error));
+    renderCors(null);
   }
 }
 
 export async function saveCors(next: boolean): Promise<void> {
-  if (busyScope) { repaint(); return }
-  beginBusy('cors')
-  publish({ cors: { status: 'ready', on: next } })
+  if (busyScope) {
+    repaint();
+    return;
+  }
+  beginBusy("cors");
+  publish({ cors: { status: "ready", on: next } });
   try {
-    const saved = await shared().workbuddyDesktop?.saveCors(next)
-    renderCors(saved)
-    toast(next ? t('网关跨域访问已开启') : t('已关闭网关跨域访问'))
+    const saved = await shared().workbuddyDesktop?.saveCors(next);
+    renderCors(saved);
+    toast(next ? t("网关跨域访问已开启") : t("已关闭网关跨域访问"));
   } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadCors() // 回滚到后端的真实值
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
+    await loadCors(); // 回滚到后端的真实值
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
 /* ─── 机器人校验（面板登录 / 注册的 ALTCHA 开关，分两端）── */
 
 /** 把 `/api/captcha` 的响应折成快照（读与写后的回读共用一份解析） */
-function captchaState(state: CaptchaSetting | null | undefined): SettingsSnapshot['captcha'] {
-  if (!state || typeof state !== 'object') {
-    return { available: false, desktop: false, web: false, localPanel: false }
+function captchaState(
+  state: CaptchaSetting | null | undefined,
+): SettingsSnapshot["captcha"] {
+  if (!state || typeof state !== "object") {
+    return { available: false, desktop: false, web: false, localPanel: false };
   }
   return {
     available: true,
     desktop: state.captchaDesktop === true,
     web: state.captchaWeb === true,
     localPanel: state.localPanel === true,
-  }
+  };
 }
 
 async function loadCaptcha(): Promise<void> {
   try {
-    const state = await shared().workbuddyDesktop?.getCaptchaSetting()
-    publish({ captcha: captchaState(state) })
+    const state = await shared().workbuddyDesktop?.getCaptchaSetting();
+    publish({ captcha: captchaState(state) });
   } catch (error) {
     // 读失败降级禁用开关（照 retention 的模式）
-    publish({ captcha: captchaState(null) })
-    console.warn('读取机器人校验设置失败:', errorMessage(error))
+    publish({ captcha: captchaState(null) });
+    console.warn("读取机器人校验设置失败:", errorMessage(error));
   }
 }
 
 /** 拨动某一端的开关（`side` 决定写哪个字段，另一端原样不动） */
-export async function saveCaptcha(side: 'desktop' | 'web', next: boolean): Promise<void> {
-  if (busyScope) { repaint(); return }
-  beginBusy('captcha')
+export async function saveCaptcha(
+  side: "desktop" | "web",
+  next: boolean,
+): Promise<void> {
+  if (busyScope) {
+    repaint();
+    return;
+  }
+  beginBusy("captcha");
   // 乐观更新：只改拨动的那一端
-  publish({ captcha: { ...snapshot.captcha, [side]: next } })
-  const label = side === 'desktop' ? t('桌面端') : t('网页端')
+  publish({ captcha: { ...snapshot.captcha, [side]: next } });
+  const label = side === "desktop" ? t("桌面端") : t("网页端");
   try {
     const state = await shared().workbuddyDesktop?.saveCaptchaSetting(
-      side === 'desktop' ? { captchaDesktop: next } : { captchaWeb: next },
-    )
-    publish({ captcha: captchaState(state) })
-    toast(next ? t('✅ 已开启「{label}」的机器人校验', { label }) : t('⚠️ 已关闭「{label}」的机器人校验', { label }))
+      side === "desktop" ? { captchaDesktop: next } : { captchaWeb: next },
+    );
+    publish({ captcha: captchaState(state) });
+    toast(
+      next
+        ? t("✅ 已开启「{label}」的机器人校验", { label })
+        : t("⚠️ 已关闭「{label}」的机器人校验", { label }),
+    );
   } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadCaptcha()
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
+    await loadCaptcha();
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
@@ -2096,109 +2706,149 @@ export async function saveCaptcha(side: 'desktop' | 'web', next: boolean): Promi
 
 async function loadAccount(): Promise<void> {
   try {
-    const state = await shared().workbuddyDesktop?.getPanelAccount()
+    const state = await shared().workbuddyDesktop?.getPanelAccount();
     publish({
       account: {
-        status: 'ready',
+        status: "ready",
         registered: state?.registered === true,
-        username: typeof state?.username === 'string' ? state.username : '',
+        username: typeof state?.username === "string" ? state.username : "",
         password: snapshot.account.password,
       },
-    })
+    });
   } catch (error) {
-    publish({ account: { ...snapshot.account, status: 'unavailable' } })
-    console.warn('读取面板账户失败:', errorMessage(error))
+    publish({ account: { ...snapshot.account, status: "unavailable" } });
+    console.warn("读取面板账户失败:", errorMessage(error));
   }
 }
 
 /** 打开改密码弹窗（表单值由弹窗自己持有，这里只管开关与忙碌态） */
 export function openPasswordDialog(): void {
-  if (!snapshot.account.registered) return
-  publish({ account: { ...snapshot.account, password: { busy: false, error: '' } } })
+  if (!snapshot.account.registered) return;
+  publish({
+    account: { ...snapshot.account, password: { busy: false, error: "" } },
+  });
 }
 
 /** 关闭改密码弹窗（忙碌中不允许关 —— 请求还在路上，关掉就看不到结果） */
 export function closePasswordDialog(): void {
-  if (snapshot.account.password?.busy) return
-  publish({ account: { ...snapshot.account, password: null } })
+  if (snapshot.account.password?.busy) return;
+  publish({ account: { ...snapshot.account, password: null } });
 }
 
 /**
  * 提交改密码。校验口径与后端一致（新密码至少 8 位、不能与旧密码相同），
  * 前端先挡一道只是为了少一次往返；真正的判据在 `panel_change_password`。
  */
-export async function submitPasswordChange(oldPassword: string, newPassword: string): Promise<void> {
-  const current = snapshot.account.password
-  if (!current || current.busy) return
+export async function submitPasswordChange(
+  oldPassword: string,
+  newPassword: string,
+): Promise<void> {
+  const current = snapshot.account.password;
+  if (!current || current.busy) return;
   if (!oldPassword) {
-    publish({ account: { ...snapshot.account, password: { busy: false, error: t('请输入当前密码') } } })
-    return
+    publish({
+      account: {
+        ...snapshot.account,
+        password: { busy: false, error: t("请输入当前密码") },
+      },
+    });
+    return;
   }
   if (newPassword.length < 8) {
-    publish({ account: { ...snapshot.account, password: { busy: false, error: t('新密码至少 8 位') } } })
-    return
+    publish({
+      account: {
+        ...snapshot.account,
+        password: { busy: false, error: t("新密码至少 8 位") },
+      },
+    });
+    return;
   }
   if (newPassword === oldPassword) {
-    publish({ account: { ...snapshot.account, password: { busy: false, error: t('新密码不能与当前密码相同') } } })
-    return
+    publish({
+      account: {
+        ...snapshot.account,
+        password: { busy: false, error: t("新密码不能与当前密码相同") },
+      },
+    });
+    return;
   }
-  publish({ account: { ...snapshot.account, password: { busy: true, error: '' } } })
+  publish({
+    account: { ...snapshot.account, password: { busy: true, error: "" } },
+  });
   try {
-    await shared().workbuddyDesktop?.changePanelPassword(oldPassword, newPassword)
+    await shared().workbuddyDesktop?.changePanelPassword(
+      oldPassword,
+      newPassword,
+    );
     // 其他会话已被后端撤销，本机这条仍然有效 —— 关掉弹窗、提示即可
-    publish({ account: { ...snapshot.account, password: null } })
-    toast(t('✅ 密码已修改，其他设备的登录已失效'))
+    publish({ account: { ...snapshot.account, password: null } });
+    toast(t("✅ 密码已修改，其他设备的登录已失效"));
   } catch (error) {
     publish({
       account: {
         ...snapshot.account,
         password: { busy: false, error: errorMessage(error) },
       },
-    })
+    });
   }
 }
 
 /* ─── models.dev 模型元数据（能力位与逐模型思考档位）── */
 
 /** 把后端的响应折成面板状态（两处调用共用：读设置与刷新后的回读） */
-function modelsDevState(state: ModelsDevState | null | undefined): ModelsDevPanelState {
-  if (!state || typeof state !== 'object') {
-    return { status: 'unavailable', enabled: true, source: '', updatedAt: 0, count: 0 }
+function modelsDevState(
+  state: ModelsDevState | null | undefined,
+): ModelsDevPanelState {
+  if (!state || typeof state !== "object") {
+    return {
+      status: "unavailable",
+      enabled: true,
+      source: "",
+      updatedAt: 0,
+      count: 0,
+    };
   }
   return {
-    status: 'ready',
+    status: "ready",
     // 缺字段时按「开」处理：这个开关默认开（后端同理），显示成关会让用户以为
     // 自己没开过，而去拨一个本来已经生效的开关
     enabled: state.modelsDevEnabled !== false,
-    source: typeof state.source === 'string' ? state.source : '',
+    source: typeof state.source === "string" ? state.source : "",
     updatedAt: Number(state.updatedAt) || 0,
     count: Number(state.count) || 0,
-  }
+  };
 }
 
 async function loadModelsDev(): Promise<void> {
   try {
-    const state = await shared().workbuddyDesktop?.getModelsDev?.()
-    publish({ modelsDev: modelsDevState(state) })
+    const state = await shared().workbuddyDesktop?.getModelsDev?.();
+    publish({ modelsDev: modelsDevState(state) });
   } catch (error) {
-    publish({ modelsDev: { ...snapshot.modelsDev, status: 'unavailable' } })
-    console.warn('读取 models.dev 元数据设置失败:', errorMessage(error))
+    publish({ modelsDev: { ...snapshot.modelsDev, status: "unavailable" } });
+    console.warn("读取 models.dev 元数据设置失败:", errorMessage(error));
   }
 }
 
 export async function saveModelsDev(next: boolean): Promise<void> {
-  if (busyScope) { repaint(); return }
-  beginBusy('modelsDev')
-  publish({ modelsDev: { ...snapshot.modelsDev, enabled: next } })
+  if (busyScope) {
+    repaint();
+    return;
+  }
+  beginBusy("modelsDev");
+  publish({ modelsDev: { ...snapshot.modelsDev, enabled: next } });
   try {
-    const state = await shared().workbuddyDesktop?.saveModelsDev?.(next)
-    publish({ modelsDev: modelsDevState(state) })
-    toast(next ? t('✅ models.dev 模型元数据已开启') : t('已关闭 models.dev 联网刷新'))
+    const state = await shared().workbuddyDesktop?.saveModelsDev?.(next);
+    publish({ modelsDev: modelsDevState(state) });
+    toast(
+      next
+        ? t("✅ models.dev 模型元数据已开启")
+        : t("已关闭 models.dev 联网刷新"),
+    );
   } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadModelsDev() // 回滚到后端的真实值
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
+    await loadModelsDev(); // 回滚到后端的真实值
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
@@ -2209,56 +2859,66 @@ export async function saveModelsDev(next: boolean): Promise<void> {
  * **公网**，结果行按各家目录刷新那套三档文案讲清楚（成功 / 本次没刷 / 失败）。
  */
 export async function refreshModelsDev(): Promise<void> {
-  if (busyScope) { repaint(); return }
-  beginBusy('modelsDevRefresh')
+  if (busyScope) {
+    repaint();
+    return;
+  }
+  beginBusy("modelsDevRefresh");
   try {
-    const payload = await shared().workbuddyDesktop?.refreshModelsDev?.()
-    publish({ modelsDev: modelsDevState(payload?.status) })
-    const result = payload?.result
-    const status = String(result?.status || '')
-    if (status === 'refreshed') {
-      toast(t('models.dev 元数据已更新（{count} 条）', { count: Number(result?.count) || 0 }))
-    } else if (status === 'failed') {
-      toast(t('刷新失败：{message}', { message: String(result?.message || '') }), 'err')
+    const payload = await shared().workbuddyDesktop?.refreshModelsDev?.();
+    publish({ modelsDev: modelsDevState(payload?.status) });
+    const result = payload?.result;
+    const status = String(result?.status || "");
+    if (status === "refreshed") {
+      toast(
+        t("models.dev 元数据已更新（{count} 条）", {
+          count: Number(result?.count) || 0,
+        }),
+      );
+    } else if (status === "failed") {
+      toast(
+        t("刷新失败：{message}", { message: String(result?.message || "") }),
+        "err",
+      );
     } else {
       // skipped：未到间隔 / 设置里关着 —— 原因由后端给，原样透出
-      toast(String(result?.message || t('本次无需刷新')))
+      toast(String(result?.message || t("本次无需刷新")));
     }
   } catch (error) {
-    toast(t('刷新失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadModelsDev()
+    toast(t("刷新失败：{message}", { message: errorMessage(error) }), "err");
+    await loadModelsDev();
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
 /* ─── 系统提示词（模式 + 文件 + 降级状态） ───── */
 
 export function renderPrompt(data?: unknown): void {
-  if (data === undefined) return
-  if (!data || typeof data !== 'object') {
-    publish({ prompt: { ...snapshot.prompt, status: 'unavailable' } })
-    return
+  if (data === undefined) return;
+  if (!data || typeof data !== "object") {
+    publish({ prompt: { ...snapshot.prompt, status: "unavailable" } });
+    return;
   }
-  const record = data as Record<string, unknown>
-  const gateway = gatewayPrompts(record.promptGateway)
+  const record = data as Record<string, unknown>;
+  const gateway = gatewayPrompts(record.promptGateway);
   publish({
     prompt: {
-      status: 'ready',
-      mode: String(record.promptMode || 'passthrough'),
-      file: String(record.promptFile || ''),
-      text: String(record.promptText || ''),
-      source: String(record.promptSource || ''),
+      status: "ready",
+      mode: String(record.promptMode || "passthrough"),
+      file: String(record.promptFile || ""),
+      text: String(record.promptText || ""),
+      source: String(record.promptSource || ""),
       lines: Number(record.promptLines) || 0,
-      fileError: String(record.promptFileError || ''),
+      fileError: String(record.promptFileError || ""),
       degradeActive: record.degradeActive === true,
-      degradeUntilText: String(record.degradeUntilText || ''),
+      degradeUntilText: String(record.degradeUntilText || ""),
       providers: providerPrompts(record.promptProviders, gateway),
       gateway,
       gatewayText: gatewayTexts(record.promptGatewayText),
       options: providerOptions(record.promptProviderOptions),
     },
-  })
+  });
 }
 
 /**
@@ -2272,43 +2932,53 @@ export function renderPrompt(data?: unknown): void {
  * 后端也是分开的（见 `KEY_PROMPT_GATEWAY`），这里保持同样的边界：
  * 「客户端 system 怎么处理」与「网关自己装什么」互不牵连。
  */
-function providerPrompts(raw: unknown, gateway: Record<string, boolean>): ProviderPromptState[] {
-  if (!raw || typeof raw !== 'object') return []
-  return Object.entries(raw as Record<string, unknown>)
-    .filter(([id, value]) => !!id && !!value && typeof value === 'object')
-    .map(([id, value]) => {
-      const entry = value as Record<string, unknown>
-      return {
-        id,
-        mode: String(entry.promptMode || 'passthrough'),
-        file: String(entry.promptFile || ''),
-        text: String(entry.promptText || ''),
-        source: String(entry.promptSource || ''),
-        lines: Number(entry.promptLines) || 0,
-        fileError: String(entry.promptFileError || ''),
-        gateway: gateway[id] ?? true,
-        configured: true,
-      }
-    })
-    // 后端已按 id 排序（BTreeMap），这里保持原序：前端再排一次只会多一套顺序规则
-    .sort((a, b) => a.id.localeCompare(b.id))
+function providerPrompts(
+  raw: unknown,
+  gateway: Record<string, boolean>,
+): ProviderPromptState[] {
+  if (!raw || typeof raw !== "object") return [];
+  return (
+    Object.entries(raw as Record<string, unknown>)
+      .filter(([id, value]) => !!id && !!value && typeof value === "object")
+      .map(([id, value]) => {
+        const entry = value as Record<string, unknown>;
+        return {
+          id,
+          mode: String(entry.promptMode || "passthrough"),
+          file: String(entry.promptFile || ""),
+          text: String(entry.promptText || ""),
+          source: String(entry.promptSource || ""),
+          lines: Number(entry.promptLines) || 0,
+          fileError: String(entry.promptFileError || ""),
+          gateway: gateway[id] ?? true,
+          configured: true,
+        };
+      })
+      // 后端已按 id 排序（BTreeMap），这里保持原序：前端再排一次只会多一套顺序规则
+      .sort((a, b) => a.id.localeCompare(b.id))
+  );
 }
 
 /** 可配置的家的清单（后端给什么就是什么，认不出的项直接丢掉 —— 宁缺勿错） */
 function providerOptions(raw: unknown): ProviderPromptOption[] {
-  if (!Array.isArray(raw)) return []
+  if (!Array.isArray(raw)) return [];
   return raw
-    .filter(item => !!item && typeof item === 'object' && String((item as Record<string, unknown>).id || ''))
-    .map(item => {
-      const entry = item as Record<string, unknown>
+    .filter(
+      (item) =>
+        !!item &&
+        typeof item === "object" &&
+        String((item as Record<string, unknown>).id || ""),
+    )
+    .map((item) => {
+      const entry = item as Record<string, unknown>;
       return {
         id: String(entry.id),
         label: String(entry.label || entry.id),
-        gatewayNote: String(entry.gatewayNote || ''),
+        gatewayNote: String(entry.gatewayNote || ""),
         gatewayChars: Number(entry.gatewayChars) || 0,
         gatewayBlocks: gatewayBlocks(entry.gatewayBlocks),
-      }
-    })
+      };
+    });
 }
 
 /**
@@ -2317,14 +2987,14 @@ function providerOptions(raw: unknown): ProviderPromptOption[] {
  * 键**缺失 = 默认装**：表里只出现被明确拨过的家，界面按 `[id] ?? true` 取。
  */
 function gatewayPrompts(raw: unknown): Record<string, boolean> {
-  if (!raw || typeof raw !== 'object') return {}
-  const flags: Record<string, boolean> = {}
+  if (!raw || typeof raw !== "object") return {};
+  const flags: Record<string, boolean> = {};
   for (const [id, value] of Object.entries(raw as Record<string, unknown>)) {
-    const key = String(id || '').trim()
-    if (!key || typeof value !== 'boolean') continue
-    flags[key] = value
+    const key = String(id || "").trim();
+    if (!key || typeof value !== "boolean") continue;
+    flags[key] = value;
   }
-  return flags
+  return flags;
 }
 
 /**
@@ -2335,43 +3005,48 @@ function gatewayPrompts(raw: unknown): Record<string, boolean> {
  * 与后端的 `GatewayBlocks::FIELDS` 逐字对齐。
  */
 function gatewayTexts(raw: unknown): Record<string, GatewayBlocks> {
-  if (!raw || typeof raw !== 'object') return {}
-  const table: Record<string, GatewayBlocks> = {}
+  if (!raw || typeof raw !== "object") return {};
+  const table: Record<string, GatewayBlocks> = {};
   for (const [id, value] of Object.entries(raw as Record<string, unknown>)) {
-    const key = String(id || '').trim()
-    if (!key || !value || typeof value !== 'object') continue
-    const entry = value as Record<string, unknown>
-    const blocks: GatewayBlocks = { identity: '', stable: '', dynamic: '' }
-    let any = false
-    for (const field of ['identity', 'stable', 'dynamic'] as const) {
-      const text = String(entry[field] || '')
-      blocks[field] = text
-      if (text.trim()) any = true
+    const key = String(id || "").trim();
+    if (!key || !value || typeof value !== "object") continue;
+    const entry = value as Record<string, unknown>;
+    const blocks: GatewayBlocks = { identity: "", stable: "", dynamic: "" };
+    let any = false;
+    for (const field of ["identity", "stable", "dynamic"] as const) {
+      const text = String(entry[field] || "");
+      blocks[field] = text;
+      if (text.trim()) any = true;
     }
-    if (any) table[key] = blocks
+    if (any) table[key] = blocks;
   }
-  return table
+  return table;
 }
 
 /** 三段正文（配置 / 模板）的归一化；三段都没给就给 null */
 function gatewayBlocks(raw: unknown): GatewayBlocks | null {
-  if (!raw || typeof raw !== 'object') return null
-  const entry = raw as Record<string, unknown>
+  if (!raw || typeof raw !== "object") return null;
+  const entry = raw as Record<string, unknown>;
   const blocks: GatewayBlocks = {
-    identity: String(entry.identity || ''),
-    stable: String(entry.stable || ''),
-    dynamic: String(entry.dynamic || ''),
-  }
-  if (!blocks.identity.trim() && !blocks.stable.trim() && !blocks.dynamic.trim()) return null
-  return blocks
+    identity: String(entry.identity || ""),
+    stable: String(entry.stable || ""),
+    dynamic: String(entry.dynamic || ""),
+  };
+  if (
+    !blocks.identity.trim() &&
+    !blocks.stable.trim() &&
+    !blocks.dynamic.trim()
+  )
+    return null;
+  return blocks;
 }
 
 async function loadPrompt(): Promise<void> {
   try {
-    renderPrompt(await shared().workbuddyDesktop?.getPrompt())
+    renderPrompt(await shared().workbuddyDesktop?.getPrompt());
   } catch (error) {
-    console.warn('读取系统提示词设置失败:', errorMessage(error))
-    renderPrompt(null)
+    console.warn("读取系统提示词设置失败:", errorMessage(error));
+    renderPrompt(null);
   }
 }
 
@@ -2384,36 +3059,42 @@ async function loadPrompt(): Promise<void> {
  * 返回值 = 这次写入是否成功：编辑器（提示词正文那个弹窗）据此决定关不关窗 ——
  * 保存失败时留在原地，用户不必重新把整段文本再敲一遍。
  */
-async function savePromptField(label: string, patch: PromptPatch): Promise<boolean> {
+async function savePromptField(
+  label: string,
+  patch: PromptPatch,
+): Promise<boolean> {
   if (busyScope) {
-    await loadPrompt() // 有别的操作在跑：把界面拉回后端真实值，别让用户以为改了
-    return false
+    await loadPrompt(); // 有别的操作在跑：把界面拉回后端真实值，别让用户以为改了
+    return false;
   }
-  beginBusy('prompt')
+  beginBusy("prompt");
   try {
-    const saved = await shared().workbuddyDesktop?.savePrompt(patch)
-    renderPrompt(saved)
-    toast(t('✅ 已保存：{label}', { label }))
-    return true
+    const saved = await shared().workbuddyDesktop?.savePrompt(patch);
+    renderPrompt(saved);
+    toast(t("✅ 已保存：{label}", { label }));
+    return true;
   } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadPrompt() // 回滚到后端的真实值
-    return false
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
+    await loadPrompt(); // 回滚到后端的真实值
+    return false;
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
 export async function savePromptMode(mode: string): Promise<void> {
-  const option = PROMPT_MODES.find(item => item.value === mode)
-  await savePromptField(t('模式改为「{mode}」', { mode: option?.toastLabel ?? mode }), { promptMode: mode })
+  const option = PROMPT_MODES.find((item) => item.value === mode);
+  await savePromptField(
+    t("模式改为「{mode}」", { mode: option?.toastLabel ?? mode }),
+    { promptMode: mode },
+  );
 }
 
 export async function savePromptFile(raw: string): Promise<void> {
   await savePromptField(
-    raw.trim() ? t('提示词文件已更新') : t('已改回内置默认提示词'),
+    raw.trim() ? t("提示词文件已更新") : t("已改回内置默认提示词"),
     { promptFile: raw },
-  )
+  );
 }
 
 /**
@@ -2423,18 +3104,20 @@ export async function savePromptFile(raw: string): Promise<void> {
  * 保存成功返回 true，供编辑器决定是否关窗。
  */
 export async function savePromptText(text: string): Promise<boolean> {
-  const empty = !text.trim()
+  const empty = !text.trim();
   return savePromptField(
-    empty ? t('已清掉界面编辑的提示词（回落文件 / 内置默认）') : t('提示词正文已更新'),
-    { promptText: empty ? '' : text },
-  )
+    empty
+      ? t("已清掉界面编辑的提示词（回落文件 / 内置默认）")
+      : t("提示词正文已更新"),
+    { promptText: empty ? "" : text },
+  );
 }
 
 /* ─── 系统提示词：按提供商 ─────────────────────── */
 
 /** 这一家在界面上的名字（清单里查不到就回显 id —— 与后端的兜底同一取向） */
 export function promptProviderLabel(prompt: PromptState, id: string): string {
-  return prompt.options.find(item => item.id === id)?.label || id
+  return prompt.options.find((item) => item.id === id)?.label || id;
 }
 
 /**
@@ -2448,18 +3131,22 @@ export function promptProviderLabel(prompt: PromptState, id: string): string {
  * 未登记的家**永远发不出去** —— 与后端 `is_known_provider_id` 同一口径。
  */
 function knownProviderId(id: unknown): string {
-  const text = id == null ? '' : String(id).trim()
-  if (!text) return ''
-  return snapshot.prompt.options.some(item => item.id === text) ? text : ''
+  const text = id == null ? "" : String(id).trim();
+  if (!text) return "";
+  return snapshot.prompt.options.some((item) => item.id === text) ? text : "";
 }
 
 /** 写一家（`patch` 里未给的字段由后端保持原值） */
 async function saveProviderPrompt(
   label: string,
   id: string,
-  patch: { promptMode?: string; promptFile?: string; promptText?: string } | null,
+  patch: {
+    promptMode?: string;
+    promptFile?: string;
+    promptText?: string;
+  } | null,
 ): Promise<boolean> {
-  return savePromptField(label, { promptProviders: { [id]: patch } })
+  return savePromptField(label, { promptProviders: { [id]: patch } });
 }
 
 /**
@@ -2476,22 +3163,29 @@ function providerPatch(
   prompt: PromptState,
   item: ProviderPromptState,
 ): { promptMode: string; promptFile: string; promptText: string } {
-  const followGlobal = !item.configured
+  const followGlobal = !item.configured;
   return {
     promptMode: item.mode,
     promptFile: item.file,
-    promptText: item.source === 'inline' || item.mode === 'passthrough' ? item.text
-      : followGlobal && (prompt.source === 'inline' || prompt.mode === 'passthrough') ? prompt.text : '',
-  }
+    promptText:
+      item.source === "inline" || item.mode === "passthrough"
+        ? item.text
+        : followGlobal &&
+            (prompt.source === "inline" || prompt.mode === "passthrough")
+          ? prompt.text
+          : "",
+  };
 }
 
 /** 给这一家加一条覆盖（初始值 = 全局那份：屏幕上显示的几项都照抄当前的全局值） */
 export async function addProviderPrompt(rawId: string): Promise<void> {
-  const id = knownProviderId(rawId)
-  if (!id) return
-  const prompt = snapshot.prompt
+  const id = knownProviderId(rawId);
+  if (!id) return;
+  const prompt = snapshot.prompt;
   await saveProviderPrompt(
-    t('已为「{label}」单独配置提示词', { label: promptProviderLabel(prompt, id) }),
+    t("已为「{label}」单独配置提示词", {
+      label: promptProviderLabel(prompt, id),
+    }),
     id,
     providerPatch(prompt, {
       id,
@@ -2504,34 +3198,44 @@ export async function addProviderPrompt(rawId: string): Promise<void> {
       gateway: prompt.gateway[id] ?? true,
       configured: false,
     }),
-  )
+  );
 }
 
-export async function saveProviderPromptMode(item: ProviderPromptState, mode: string): Promise<void> {
-  const id = knownProviderId(item.id)
-  if (!id || !PROMPT_MODES.some(option => option.value === mode)) return
-  const option = PROMPT_MODES.find(candidate => candidate.value === mode)
+export async function saveProviderPromptMode(
+  item: ProviderPromptState,
+  mode: string,
+): Promise<void> {
+  const id = knownProviderId(item.id);
+  if (!id || !PROMPT_MODES.some((option) => option.value === mode)) return;
+  const option = PROMPT_MODES.find((candidate) => candidate.value === mode);
   await saveProviderPrompt(
-    t('「{label}」的模式改为「{mode}」', {
+    t("「{label}」的模式改为「{mode}」", {
       label: promptProviderLabel(snapshot.prompt, id),
       mode: option?.toastLabel ?? mode,
     }),
     id,
     { ...providerPatch(snapshot.prompt, item), promptMode: mode },
-  )
+  );
 }
 
-export async function saveProviderPromptFile(item: ProviderPromptState, raw: string): Promise<void> {
-  const id = knownProviderId(item.id)
-  if (!id) return
+export async function saveProviderPromptFile(
+  item: ProviderPromptState,
+  raw: string,
+): Promise<void> {
+  const id = knownProviderId(item.id);
+  if (!id) return;
   await saveProviderPrompt(
     raw.trim()
-      ? t('「{label}」的提示词文件已更新', { label: promptProviderLabel(snapshot.prompt, id) })
-      : t('「{label}」改用内置默认提示词', { label: promptProviderLabel(snapshot.prompt, id) }),
+      ? t("「{label}」的提示词文件已更新", {
+          label: promptProviderLabel(snapshot.prompt, id),
+        })
+      : t("「{label}」改用内置默认提示词", {
+          label: promptProviderLabel(snapshot.prompt, id),
+        }),
     id,
     // 同上：与文件一起把当前显示的模式落定，避免「改文件把模式改回去」
     { ...providerPatch(snapshot.prompt, item), promptFile: raw },
-  )
+  );
 }
 
 /**
@@ -2545,26 +3249,30 @@ export async function saveProviderPromptText(
   item: ProviderPromptState,
   text: string,
 ): Promise<boolean> {
-  const id = knownProviderId(item.id)
-  if (!id) return false
-  const empty = !text.trim()
-  const label = promptProviderLabel(snapshot.prompt, id)
+  const id = knownProviderId(item.id);
+  if (!id) return false;
+  const empty = !text.trim();
+  const label = promptProviderLabel(snapshot.prompt, id);
   return saveProviderPrompt(
-    empty ? t('已清掉「{label}」界面编辑的正文', { label }) : t('「{label}」的提示词正文已更新', { label }),
+    empty
+      ? t("已清掉「{label}」界面编辑的正文", { label })
+      : t("「{label}」的提示词正文已更新", { label }),
     id,
-    { ...providerPatch(snapshot.prompt, item), promptText: empty ? '' : text },
-  )
+    { ...providerPatch(snapshot.prompt, item), promptText: empty ? "" : text },
+  );
 }
 
 /** 删掉这一家的覆盖（回落全局设置；传 null 是后端的「删除这一家」语义） */
 export async function removeProviderPrompt(rawId: string): Promise<void> {
-  const id = knownProviderId(rawId)
-  if (!id) return
+  const id = knownProviderId(rawId);
+  if (!id) return;
   await saveProviderPrompt(
-    t('已取消「{label}」的单独配置', { label: promptProviderLabel(snapshot.prompt, id) }),
+    t("已取消「{label}」的单独配置", {
+      label: promptProviderLabel(snapshot.prompt, id),
+    }),
     id,
     null,
-  )
+  );
 }
 
 /**
@@ -2576,29 +3284,37 @@ export async function removeProviderPrompt(rawId: string): Promise<void> {
  * 关掉是「用户主动放弃上游要求」的动作：只在明确关掉时提示后果，打开时
  * 提示语是普通的中性文案 —— 对着一件恢复正常的事喊警告只会让人脱敏。
  */
-export async function saveProviderGatewayPrompt(rawId: string, enabled: boolean): Promise<void> {
-  const id = knownProviderId(rawId)
-  if (!id) return
-  const label = promptProviderLabel(snapshot.prompt, id)
+export async function saveProviderGatewayPrompt(
+  rawId: string,
+  enabled: boolean,
+): Promise<void> {
+  const id = knownProviderId(rawId);
+  if (!id) return;
+  const label = promptProviderLabel(snapshot.prompt, id);
   if (busyScope) {
-    await loadPrompt()
-    return
+    await loadPrompt();
+    return;
   }
-  beginBusy('prompt')
+  beginBusy("prompt");
   try {
-    const saved = await shared().workbuddyDesktop?.savePrompt({ promptGateway: { [id]: enabled } })
-    renderPrompt(saved)
+    const saved = await shared().workbuddyDesktop?.savePrompt({
+      promptGateway: { [id]: enabled },
+    });
+    renderPrompt(saved);
     toast(
       enabled
-        ? t('✅ 已为「{label}」装上网关自带提示词', { label })
-        : t('已关闭「{label}」的网关自带提示词：能否通过上游校验取决于上游当前口径', { label }),
-      enabled ? 'ok' : 'err',
-    )
+        ? t("✅ 已为「{label}」装上网关自带提示词", { label })
+        : t(
+            "已关闭「{label}」的网关自带提示词：能否通过上游校验取决于上游当前口径",
+            { label },
+          ),
+      enabled ? "ok" : "err",
+    );
   } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadPrompt() // 回滚到后端的真实值
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
+    await loadPrompt(); // 回滚到后端的真实值
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
@@ -2617,34 +3333,37 @@ export async function saveProviderGatewayText(
   rawId: string,
   blocks: GatewayBlocks | null,
 ): Promise<boolean> {
-  const id = knownProviderId(rawId)
-  if (!id) return false
-  const label = promptProviderLabel(snapshot.prompt, id)
+  const id = knownProviderId(rawId);
+  if (!id) return false;
+  const label = promptProviderLabel(snapshot.prompt, id);
   // 三段全空白 = 没有覆盖（后端也是这个口径：空段不落盘、三段全空就把这家删掉）。
   // 归一成 `null` 只是为了提示语说得准：用户清空了三段，看到的是「已改回官方原文」。
-  const emptied = !blocks
-    || !(blocks.identity.trim() || blocks.stable.trim() || blocks.dynamic.trim())
+  const emptied =
+    !blocks ||
+    !(blocks.identity.trim() || blocks.stable.trim() || blocks.dynamic.trim());
   return savePromptField(
     emptied
-      ? t('「{label}」的网关自带提示词已改回官方原文', { label })
-      : t('「{label}」的网关自带提示词正文已更新', { label }),
+      ? t("「{label}」的网关自带提示词已改回官方原文", { label })
+      : t("「{label}」的网关自带提示词正文已更新", { label }),
     { promptGatewayText: { [id]: emptied ? null : blocks } },
-  )
+  );
 }
 
 /** 立即解除降级（后端把状态机清零；配置项一个都不动） */
 export async function clearDegrade(): Promise<void> {
-  if (busyScope) return
-  beginBusy('prompt')
+  if (busyScope) return;
+  beginBusy("prompt");
   try {
-    const saved = await shared().workbuddyDesktop?.savePrompt({ clearDegrade: true })
-    renderPrompt(saved)
-    toast(t('✅ 已解除内容拦截降级'))
+    const saved = await shared().workbuddyDesktop?.savePrompt({
+      clearDegrade: true,
+    });
+    renderPrompt(saved);
+    toast(t("✅ 已解除内容拦截降级"));
   } catch (error) {
-    toast(t('解除失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadPrompt()
+    toast(t("解除失败：{message}", { message: errorMessage(error) }), "err");
+    await loadPrompt();
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
@@ -2652,9 +3371,9 @@ export async function clearDegrade(): Promise<void> {
 
 /** 数值归一：非有限数一律 null（视图据此显示「—」） */
 function finiteOrNull(value: unknown): number | null {
-  if (value === null || value === undefined || value === '') return null
-  const num = Number(value)
-  return Number.isFinite(num) ? num : null
+  if (value === null || value === undefined || value === "") return null;
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
 }
 
 /**
@@ -2664,20 +3383,21 @@ function finiteOrNull(value: unknown): number | null {
  * 展示「不可用」而不是一排看着正常的 0。
  */
 export function renderStorage(data?: unknown): void {
-  if (data === undefined) return
-  const info = data && typeof data === 'object'
-    ? (data as Record<string, unknown>).database
-    : null
-  if (!info || typeof info !== 'object') {
-    publish({ storage: { ...snapshot.storage, status: 'unavailable' } })
-    return
+  if (data === undefined) return;
+  const info =
+    data && typeof data === "object"
+      ? (data as Record<string, unknown>).database
+      : null;
+  if (!info || typeof info !== "object") {
+    publish({ storage: { ...snapshot.storage, status: "unavailable" } });
+    return;
   }
-  const record = info as Record<string, unknown>
+  const record = info as Record<string, unknown>;
   publish({
     storage: {
-      status: 'ready',
+      status: "ready",
       available: record.available !== false,
-      file: String(record.file || ''),
+      file: String(record.file || ""),
       bytes: Number(record.bytes) || 0,
       accounts: finiteOrNull(record.accounts),
       logs: finiteOrNull(record.logs),
@@ -2686,15 +3406,15 @@ export function renderStorage(data?: unknown): void {
       downstreamRaw: finiteOrNull(record.downstreamRaw),
       upstreamRaw: finiteOrNull(record.upstreamRaw ?? record.debug),
     },
-  })
+  });
 }
 
 async function loadStorage(): Promise<void> {
   try {
-    renderStorage(await shared().workbuddyDesktop?.getStorage())
+    renderStorage(await shared().workbuddyDesktop?.getStorage());
   } catch (error) {
-    console.warn('读取数据存储概况失败:', errorMessage(error))
-    renderStorage(null)
+    console.warn("读取数据存储概况失败:", errorMessage(error));
+    renderStorage(null);
   }
 }
 
@@ -2706,19 +3426,19 @@ async function loadStorage(): Promise<void> {
  */
 export async function panelLogout(): Promise<boolean> {
   try {
-    await shared().workbuddyDesktop?.panelLogout()
+    await shared().workbuddyDesktop?.panelLogout();
     // 桌面壳里壳自己也存着一份令牌（panel_session），必须一并清掉 ——
     // 只撤销服务端会话而不清本地，下次启动壳仍会拿着死令牌去试，
     // 表现为「每次开机都要多绕一次登录页」。
-    await shared().workbuddyDesktop?.panelSessionClear?.()
+    await shared().workbuddyDesktop?.panelSessionClear?.();
     // 桌面窗口的页面来自 tauri://，站内路径 `/login` 不存在（那是 headless
     // 静态托管的路径）。两种形态各回各的登录页。
-    const desktop = shared().workbuddyDesktop?.platform !== 'web'
-    window.location.href = desktop ? 'login.html' : '/login'
-    return true
+    const desktop = shared().workbuddyDesktop?.platform !== "web";
+    window.location.href = desktop ? "login.html" : "/login";
+    return true;
   } catch (error) {
-    toast(t('退出失败：{message}', { message: errorMessage(error) }), 'err')
-    return false
+    toast(t("退出失败：{message}", { message: errorMessage(error) }), "err");
+    return false;
   }
 }
 
@@ -2729,10 +3449,10 @@ export async function panelLogout(): Promise<boolean> {
  * 九个取数并行，各自失败各自降级 —— 一个接口挂了不该把整页拖成空白。
  */
 export async function load(): Promise<void> {
-  restoreCategory()
-  renderUnits()
-  publish({ panelLogin: readPanelLogin() })
-  window.dispatchEvent(new Event('wb:settings-load'))
+  restoreCategory();
+  renderUnits();
+  publish({ panelLogin: readPanelLogin() });
+  window.dispatchEvent(new Event("wb:settings-load"));
   await Promise.all([
     loadSettings(),
     loadLanExtras(),
@@ -2744,6 +3464,9 @@ export async function load(): Promise<void> {
     loadCaptchaPool(),
     loadDebug(),
     loadSanitize(),
+    loadMasking(),
+    loadThinkStrip(),
+    loadProviderOptions(),
     loadDeveloperRoleCompat(),
     loadClineHeaders(),
     loadZcodeVersion(),
@@ -2759,198 +3482,87 @@ export async function load(): Promise<void> {
     // 「版本信息」也是独立岛（system-info-pane.tsx）：同样在切进设置页时重拉 ——
     // 版本 / 运行时长 / 在途请求这些读数会随时间变，缓存一份旧的没有意义
     shared().wbSystemInfoPane?.load?.(),
-  ])
+  ]);
 }
 
 /* ─── 刷新按钮（各自的 toast 文案照旧） ─────── */
 
 export async function refreshRetention(): Promise<void> {
-  await loadRetention()
-  toast(t('数据保留设置已刷新'))
+  await loadRetention();
+  toast(t("数据保留设置已刷新"));
 }
 
 export async function refreshRetry(): Promise<void> {
-  await loadRetry()
-  toast(t('重试设置已刷新'))
+  await loadRetry();
+  toast(t("重试设置已刷新"));
 }
 
 export async function refreshTimeouts(): Promise<void> {
-  await loadTimeouts()
-  toast(t('超时设置已刷新'))
+  await loadTimeouts();
+  toast(t("超时设置已刷新"));
 }
 
 export async function refreshQueue(): Promise<void> {
-  await loadQueue()
-  toast(t('排队等待设置已刷新'))
+  await loadQueue();
+  toast(t("排队等待设置已刷新"));
 }
 
 export async function refreshImageCompress(): Promise<void> {
-  await loadImageCompress()
-  toast(t('会话图片压缩设置已刷新'))
+  await loadImageCompress();
+  toast(t("会话图片压缩设置已刷新"));
 }
 
 export async function refreshCaptchaPool(): Promise<void> {
-  await loadCaptchaPool()
-  toast(t('验证码令牌池设置已刷新'))
+  await loadCaptchaPool();
+  toast(t("验证码令牌池设置已刷新"));
 }
 
 export async function refreshRouting(): Promise<void> {
-  await loadRouting()
-  toast(t('路由设置已刷新'))
+  await loadRouting();
+  toast(t("路由设置已刷新"));
 }
 
 export async function refreshDebug(): Promise<void> {
-  await loadDebug()
-  toast(t('调试模式设置已刷新'))
+  await loadDebug();
+  toast(t("调试模式设置已刷新"));
 }
 
 export async function refreshSanitize(): Promise<void> {
-  await loadSanitize()
-  toast(t('指纹脱敏设置已刷新'))
+  await loadSanitize();
+  toast(t("指纹脱敏设置已刷新"));
 }
 
-export async function refreshDeveloperRoleCompat(): Promise<void> {
-  await loadDeveloperRoleCompat()
-  toast(t('开发者角色兼容设置已刷新'))
-}
-
-export async function refreshCors(): Promise<void> {
-  await loadCors()
-  toast(t('网关跨域访问设置已刷新'))
-}
-
-export async function refreshPrompt(): Promise<void> {
-  await loadPrompt()
-  toast(t('系统提示词设置已刷新'))
-}
-
-export async function refreshStorage(): Promise<void> {
-  await loadStorage()
-  toast(t('存储概况已刷新'))
-}
-
-/* ─── 本地独有（beta）：think-strip / 逐家开关覆盖 ─────────────── */
-/* ─── 剥离响应开头的思考标签（全局开关）── */
-
-export function renderThinkStrip(data?: unknown): void {
-  if (data === undefined) return
-  if (!data || typeof data !== 'object') {
-    publish({ thinkStrip: { status: 'unavailable', on: false } })
-    return
-  }
-  const record = data as Record<string, unknown>
-  publish({ thinkStrip: { status: 'ready', on: record.stripLeadingThink === true } })
-}
-
-async function loadThinkStrip(): Promise<void> {
-  try {
-    renderThinkStrip(await shared().workbuddyDesktop?.getThinkStrip())
-  } catch (error) {
-    console.warn('读取思考标签剥离设置失败:', errorMessage(error))
-    renderThinkStrip(null)
-  }
-}
-
-export async function saveThinkStrip(next: boolean): Promise<void> {
-  if (busyScope) { repaint(); return }
-  beginBusy('thinkStrip')
-  publish({ thinkStrip: { status: 'ready', on: next } })
-  try {
-    const saved = await shared().workbuddyDesktop?.saveThinkStrip(next)
-    renderThinkStrip(saved)
-    toast(next ? t('✅ 已开启剥离响应开头的思考标签') : t('已关闭剥离响应开头的思考标签'))
-  } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadThinkStrip() // 回滚到后端的真实值
-  } finally {
-    endBusy()
-  }
-}
-
-/* ─── 逐家开关覆盖（providerOptions）── */
-
-/**
- * 归一化 `{providerOptions: {"<id>": {"<key>": true|false}}}`。
- *
- * 只收布尔值：后端 `set` 写进去的一定是布尔，别的东西（未来多出来的键）
- * 界面认不得就不渲染 —— 宁可少一行，也不要拿它去猜一个开关的状态。
- */
-export function renderProviderOptions(data?: unknown): void {
-  if (data === undefined) return
-  if (!data || typeof data !== 'object') {
-    publish({ providerOptions: { status: 'unavailable', overrides: {} } })
-    return
-  }
-  const record = data as Record<string, unknown>
-  publish({ providerOptions: { status: 'ready', overrides: providerOptionOverrides(record.providerOptions) } })
-}
-
-function providerOptionOverrides(raw: unknown): Record<string, Record<string, boolean>> {
-  if (!raw || typeof raw !== 'object') return {}
-  const out: Record<string, Record<string, boolean>> = {}
-  for (const [providerId, value] of Object.entries(raw as Record<string, unknown>)) {
-    if (!providerId || !value || typeof value !== 'object') continue
-    const entry: Record<string, boolean> = {}
-    for (const [key, flag] of Object.entries(value as Record<string, unknown>)) {
-      if (typeof flag === 'boolean') entry[key] = flag
-    }
-    if (Object.keys(entry).length) out[providerId] = entry
-  }
-  return out
-}
-
-async function loadProviderOptions(): Promise<void> {
-  try {
-    renderProviderOptions(await shared().workbuddyDesktop?.getProviderOptions())
-  } catch (error) {
-    console.warn('读取逐家开关覆盖失败:', errorMessage(error))
-    renderProviderOptions(null)
-  }
-}
-
-/**
- * 写一家的一项覆盖。`value` 为 `null` = 删掉这项覆盖、回到「跟随全局」。
- */
-export async function saveProviderOption(
-  providerId: string,
-  key: string,
-  value: boolean | null,
-  providerLabel?: string,
-  keyLabel?: string,
-): Promise<void> {
-  if (busyScope) { repaint(); return }
-  beginBusy('providerOptions')
-  const optimistic: Record<string, Record<string, boolean>> = { ...snapshot.providerOptions.overrides }
-  const entry: Record<string, boolean> = { ...(optimistic[providerId] ?? {}) }
-  if (value === null) delete entry[key]
-  else entry[key] = value
-  if (Object.keys(entry).length) optimistic[providerId] = entry
-  else delete optimistic[providerId]
-  publish({ providerOptions: { status: 'ready', overrides: optimistic } })
-  const provider = providerLabel || providerId
-  const label = keyLabel || key
-  try {
-    const saved = await shared().workbuddyDesktop?.saveProviderOption(providerId, key, value)
-    renderProviderOptions(saved)
-    toast(value === null
-      ? t('✅ {provider} 的「{key}」已回到跟随全局', { provider, key: label })
-      : value
-        ? t('✅ {provider} 的「{key}」已设为开', { provider, key: label })
-        : t('✅ {provider} 的「{key}」已设为关', { provider, key: label }))
-  } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadProviderOptions() // 回滚到后端的真实值
-  } finally {
-    endBusy()
-  }
+export async function refreshMasking(): Promise<void> {
+  await loadMasking();
+  toast(t("出站脱敏设置已刷新"));
 }
 
 export async function refreshThinkStrip(): Promise<void> {
-  await loadThinkStrip()
-  toast(t('思考标签剥离设置已刷新'))
+  await loadThinkStrip();
+  toast(t("思考标签剥离设置已刷新"));
 }
 
 export async function refreshProviderOptions(): Promise<void> {
-  await loadProviderOptions()
-  toast(t('逐家开关覆盖已刷新'))
+  await loadProviderOptions();
+  toast(t("逐家开关覆盖已刷新"));
+}
+
+export async function refreshDeveloperRoleCompat(): Promise<void> {
+  await loadDeveloperRoleCompat();
+  toast(t("开发者角色兼容设置已刷新"));
+}
+
+export async function refreshCors(): Promise<void> {
+  await loadCors();
+  toast(t("网关跨域访问设置已刷新"));
+}
+
+export async function refreshPrompt(): Promise<void> {
+  await loadPrompt();
+  toast(t("系统提示词设置已刷新"));
+}
+
+export async function refreshStorage(): Promise<void> {
+  await loadStorage();
+  toast(t("存储概况已刷新"));
 }

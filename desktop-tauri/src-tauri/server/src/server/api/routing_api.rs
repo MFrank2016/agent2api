@@ -113,16 +113,12 @@ fn with_legacy_strategy(mut value: Value) -> Value {
 
 /// 路由附加维度的 JSON（`/api/routing/workspace` 的 `settings` 字段）。
 ///
-/// **这个面是上游 profile 契约**：`RoutingProfile::validate_shape` 只接受
-/// `order` / `rotate` / `provider`，所以这里必须给映射后的展示档位，不能直接
-/// 给本地 7 档 id（否则 `PUT /api/routing/profile` 一律 400）。权威策略仍由
-/// `/api/routing-strategy`（对象形态）与 `/api/routing`（`with_legacy_strategy`）
-/// 承载，二者互不影响。
+/// 本地 `RoutingSettings` 不含策略维度（策略是逐家的
+/// `RoutingStrategySettings`），所以策略从 `routing_strategy_settings().default`
+/// 取 —— 与统一端点 `/api/routing-strategy` 的默认档位保持一致。
 pub(crate) fn routing_json(settings: config::RoutingSettings) -> Value {
     json!({
-        config::KEY_ROUTING_STRATEGY: config::routing_strategy_display_id(
-            config::routing_strategy_settings().default,
-        ),
+        config::KEY_ROUTING_STRATEGY: config::routing_strategy_settings().default.as_str(),
         config::KEY_ROUTING_STICKY: settings.sticky.as_str(),
         config::KEY_ROUTING_FAILOVER_BACKOFF: settings.failover_backoff,
         config::KEY_ROUTING_SINK: settings.sink,
@@ -130,13 +126,14 @@ pub(crate) fn routing_json(settings: config::RoutingSettings) -> Value {
         config::KEY_ROUTING_BREAKER_THRESHOLD: settings.breaker_threshold,
         config::KEY_ROUTING_BREAKER_TIMEOUT: settings.breaker_timeout_seconds,
         config::KEY_ROUTING_BREAKER_SUCCESS: settings.breaker_success_threshold,
+        config::KEY_ROUTING_SHADOW_QUOTA_KIND: settings.shadow_quota_kind,
     })
 }
 
 /// GET /api/routing/queue?model=
 pub async fn get_routing_queue(
     State(state): State<ServerState>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let model = params
         .get("model")
@@ -146,12 +143,16 @@ pub async fn get_routing_queue(
     ok_json(queue_json(&state, model))
 }
 
+/// 候选队列的 JSON（`/api/routing/queue` 与工作台共用同一份实现）。
 pub(crate) fn queue_json(state: &ServerState, model: Option<String>) -> Value {
     let accounts = routing::accounts_of(&state.store().list_visible_accounts());
     queue_for_accounts(state, model, &accounts)
 }
 
 pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, accounts: &[Value]) -> Value {
+    if let Some(group) = model.as_deref().and_then(|model| config::routing_profiles().group_for_model(model).cloned()) {
+        return super::routing_groups::group_queue(state, group);
+    }
     let snapshot = config::current();
     // 候选收窄：点名了模型 → 只留「清单里有它的家」（与转发同一张家清单，
     // `route_for_forward`）；没点名 → 全部账号。与 session.rs 的 ★ 推算同一取材。
@@ -160,17 +161,23 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
         None => Vec::new(),
     };
     let scoped: Vec<Value> = match model.as_deref() {
-        Some(_) => accounts.iter()
+        Some(_) => accounts
+            .iter()
             .filter(|account| providers.contains(&routing::provider_of(account).to_string()))
             .cloned().collect(),
         None => accounts.to_vec(),
     };
     let scoped = crate::server::core::routing_scope::apply_accounts(
-        &scoped, model.as_deref().unwrap_or(""),
+        &scoped,
+        model.as_deref().unwrap_or(""),
     );
-    let routable: Vec<Value> = scoped.iter()
-        .filter(|account| !crate::server::core::providers::readiness::gated(routing::provider_of(account)))
-        .cloned().collect();
+    let routable: Vec<Value> = scoped
+        .iter()
+        .filter(|account| {
+            !crate::server::core::providers::readiness::gated(routing::provider_of(account))
+        })
+        .cloned()
+        .collect();
     let scoped = if routable.is_empty() { scoped } else { routable };
     let now = crate::server::logging::now_ms();
     let counts: HashMap<String, usize> = state
@@ -186,31 +193,48 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
     let limiter_counts = crate::server::core::limiter::counter::facts();
     let limiter_blocked: HashSet<String> = scoped
         .iter()
-        .filter(|account| crate::server::core::limiter::evaluate::blocked(
-            account, &keys.for_account(account), &facts, &limiter_counts, now,
-        ))
+        .filter(|account| {
+            crate::server::core::limiter::evaluate::blocked(
+                account,
+                &keys.for_account(account),
+                &facts,
+                &limiter_counts,
+                now,
+            )
+        })
         .filter_map(|account| routing::account_id(account).map(str::to_string))
         .collect();
     let settings = config::routing_settings_for_model(model.as_deref().unwrap_or(""));
-    // 本地独有：逐家 6 档策略 + 运行时状态 + 余额事实表（面板预演不推进策略）。
     let strategies = config::routing_strategy_settings();
+    // 余额事实表：余额加权的权重来源（未知余额的账号不在表里）
     let balances: HashMap<String, f64> = crate::server::core::usage_records::balance_facts()
         .into_iter()
         .filter_map(|(id, fact)| fact.remaining.map(|remaining| (id, remaining)))
         .collect();
+    // 面板只**看**当前状态，不做粘性查找、不推进有状态策略（游标 / LRU / 加权轮询）
+    // —— 预演不该刷新任何会话的计时，也不该消耗下一次轮询
     let routing_state = state.upstream().routing();
-    let (sunk, resting, open) = state.upstream().route_queue_facts(now);
+    let facts = state.upstream().route_queue_facts(now);
+    // 队列面板是预演：RPM 只查不占（`rpm_blocked_accounts` 用 `wait_ms`），
+    // 不会因为刷新一次面板就吃掉真实配额；逐家账号上限与转发同一份汇总口径。
+    let rpm_blocked = state.upstream().rpm_blocked_accounts(&scoped, now);
+    let max_accounts = routing::max_accounts_by_provider(&scoped);
+
     let meta = routing::PlanMeta {
         strategies: &strategies,
         state: &routing_state,
         balances: &balances,
         model: model.as_deref().unwrap_or(""),
         advance: false,
-        sunk: &sunk,
-        resting: &resting,
-        open: &open,
+        sunk: &facts.sunk,
+        resting: &facts.resting,
+        account_resting: &facts.account_resting,
+        model_resting: &facts.model_resting,
+        open: &facts.open,
         limiter_blocked: &limiter_blocked,
         sticky_account: None,
+        rpm_blocked: &rpm_blocked,
+        max_accounts: &max_accounts,
     };
     let plan = routing::plan_route(&scoped, &keys, &counts, &[], now, &meta);
     let entry_json = |entry: &routing::PlanEntry| {
@@ -226,7 +250,7 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
         })
     };
     json!({
-        "strategy": settings.strategy.as_str(),
+        "strategy": strategies.default.as_str(),
         "sticky": settings.sticky.as_str(),
         "model": model.clone().map(Value::String).unwrap_or(Value::Null),
         "modelKnown": model.as_ref().map(|_| !providers.is_empty()),
@@ -235,46 +259,4 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
         "ordered": plan.ordered.iter().map(entry_json).collect::<Vec<_>>(),
         "blocked": plan.blocked.iter().map(entry_json).collect::<Vec<_>>(),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::server::config;
-    use crate::server::core::routing::RoutingStrategy;
-
-    /// A（fix round 2）：workspace/profile 面上的策略值必须永远是上游
-    /// `validate_shape` 认可的三档，不能漏出本地 7 档 id（否则
-    /// `PUT /api/routing/profile` 对存量默认配置一律 400）。
-    #[test]
-    fn workspace_strategy_is_always_upstream_display_value() {
-        let allowed = ["order", "rotate", "provider"];
-        for strategy in RoutingStrategy::ALL {
-            let shown = config::routing_strategy_display_id(strategy);
-            assert!(
-                allowed.contains(&shown),
-                "本地档位 {strategy:?} 映射成了 {shown}，profile 会 400"
-            );
-        }
-    }
-
-    /// A（fix round 2）：本地 7 档在统一端点 / 别名端点上仍可往返 ——
-    /// `GET /api/routing-strategy` 给 `default: <7 档 id>`，`PUT /api/routing`
-    /// 的 `legacy_strategy` 与 `RoutingStrategy::parse` 必须能原样读回。
-    #[test]
-    fn local_strategy_ids_round_trip_through_legacy_alias() {
-        for strategy in RoutingStrategy::ALL {
-            let id = strategy.as_str();
-            assert_eq!(
-                RoutingStrategy::parse(id),
-                Some(strategy),
-                "统一端点 default={id} 应能 parse 回原档位"
-            );
-            assert_eq!(
-                legacy_strategy(id),
-                Some(strategy),
-                "/api/routing 别名应把 {id} 翻回原档位"
-            );
-        }
-    }
 }

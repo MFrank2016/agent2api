@@ -69,6 +69,12 @@
 //! 保存，转发时报 400（见 `providers::custom::forward` 的分派骨架）。
 
 mod bindings;
+/// 预置提供商目录（新建自定义提供商表单的模板表）。
+///
+/// 纯编译期事实（表本身在 `preset_catalog::all()` 里），不读配置、不落库：
+/// 创建提供商时由 `presetId` 派生出 `protocol` / `baseUrl` / 特判与余额方案，
+/// 落库后就是一条普通自定义提供商（见模块头「条目形状」）。
+pub mod preset_catalog;
 mod presets;
 /// 自定义提供商**定义**的导入合并（账号导出文件里的 `customProviders` 段）。
 ///
@@ -654,7 +660,143 @@ pub fn protocol_of(id: &str) -> Option<String> {
     })
 }
 
-/// 新建一个自定义提供商：`{name, protocol, baseUrl}` → 落盘后的完整条目。
+/// 取请求体里的一个键；**JSON null 视同未给**。
+///
+/// 表单把「未填」的可选字段发成 `null` 很常见（而不是省略键）。派生预置时若
+/// 把 null 当成显式值，会出现「用户没动这一栏、预置值却被清空」的静默错误，
+/// 所以这里统一把 null 归入「未提供」。
+fn provided<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
+    object.get(key).filter(|value| !value.is_null())
+}
+
+/// 解析请求体里的 `presetId`（预置卡片标识）。
+///
+/// `None` / 空串 = 手动新建（走原来的路径）；**未收录的 id 一律报错**：静默
+/// 回落成手动新建会留下一条协议 / 基址全空的记录，而用户以为自己点的是那张卡。
+fn preset_of_record(
+    object: &Map<String, Value>,
+) -> Result<Option<&'static preset_catalog::PresetDef>, String> {
+    let id = match provided(object, "presetId") {
+        None => return Ok(None),
+        Some(Value::String(id)) => id.trim(),
+        Some(_) => return Err("presetId 必须是字符串".to_string()),
+    };
+    if id.is_empty() {
+        return Ok(None);
+    }
+    preset_catalog::find(id)
+        .map(Some)
+        .ok_or_else(|| format!("未知的预置: {id}"))
+}
+
+/// 请求体 → 待落盘的记录草稿（**不含** id / createdAt）。
+///
+/// 单独抽出来是为了让 `presetId` 的派生逻辑可被单元测试直接覆盖（`create`
+/// 还要落库，进程级配置单例不适合在并行用例里初始化）。
+///
+/// ── `presetId` 的派生规则 ──────────────────────────────────
+/// 预置只是**表单的预填模板**，请求体里显式给出的字段永远优先：
+///   * `name`：显式值优先，否则取 `preset.name`（卡片展示名）；
+///   * `protocol`：显式值优先，否则取 `preset.protocols[0].protocol`；
+///   * `baseUrl`：显式值优先，否则取预置的非空 `base_url`；两边都没有时
+///     报错 —— 自建面板（sub2api / newapi）的预置基址本来就是空串，落一条
+///     没有基址的记录等于存了个永远转不出去的空壳；
+///   * `urlSuffix` / `headers` / `anthropicToolType` / `clientEmulation`：
+///     先写预置特判（`apply_quirks_to_record`，平铺键），再用显式值覆盖；
+///   * `balanceScheme`：显式值优先，否则取 `preset.balance`；
+///   * `presetKey`：预置 id（它回答「这条记录最初是从哪张卡建的」）。
+///
+/// `noKey` **不派生**：它是 `/api/presets` 给账号表单的提示（默认勾选
+/// 「无需鉴权」），不是提供商记录里的字段；`noAuth` 属于账号，也不在这里。
+fn record_draft(object: &Map<String, Value>) -> Result<Value, String> {
+    let preset = preset_of_record(object)?;
+    // 展示名：显式值优先；没有就沿用预置卡的名字（表单预填的那一份）。
+    // 两边都没有才报错 —— 预置卡自带 name，所以 `{"presetId": "openai"}` 这种
+    // 只带 id 的请求也能建出一条名字正确的记录。
+    let name = match provided(object, "name") {
+        Some(value) => normalize_name(Some(value))?,
+        None => preset
+            .map(|preset| preset.name.to_string())
+            .ok_or_else(|| "缺少提供商名称".to_string())?,
+    };
+
+    // 协议：显式值优先；没有预置时保持原来的「必须显式给」行为。
+    let protocol = match provided(object, "protocol") {
+        Some(value) => normalize_protocol(Some(value))?,
+        None => match preset.and_then(|preset| preset.protocols.first()) {
+            Some(first) => first.protocol.to_string(),
+            None => normalize_protocol(None)?,
+        },
+    };
+
+    // baseUrl：显式值优先（空白视同未给），其次预置的非空基址。
+    let explicit_base_url = match provided(object, "baseUrl") {
+        None => None,
+        Some(Value::String(text)) => {
+            let text = text.trim();
+            (!text.is_empty()).then_some(text)
+        }
+        Some(_) => return Err("baseUrl 必须是字符串".to_string()),
+    };
+    let preset_base_url = preset
+        .and_then(|preset| preset.protocols.first())
+        .map(|first| first.base_url.trim())
+        .filter(|text| !text.is_empty());
+    let base_url = match explicit_base_url.or(preset_base_url) {
+        Some(raw) => normalize_base_url(raw)?,
+        None if preset.is_some() => {
+            return Err("这个预置需要填写 Base URL（自建面板没有固定站点）".to_string())
+        }
+        None => normalize_base_url("")?,
+    };
+
+    // 特判：先落预置的平铺键，再让显式值逐键覆盖（缺省键不动）。
+    let mut quirks = Map::new();
+    if let Some(preset) = preset {
+        preset.apply_quirks_to_record(&mut quirks);
+    }
+    for key in [
+        "urlSuffix",
+        "headers",
+        "anthropicToolType",
+        "clientEmulation",
+    ] {
+        if let Some(value) = provided(object, key) {
+            quirks.insert(key.to_string(), value.clone());
+        }
+    }
+
+    // 余额方案：显式值优先，否则用预置卡声明的方案。
+    let balance_value = provided(object, "balanceScheme").cloned().or_else(|| {
+        preset
+            .and_then(|preset| preset.balance)
+            .map(|scheme| json!(scheme))
+    });
+
+    let preset_key = match preset {
+        Some(preset) => preset.id.to_string(),
+        None => presets::validate(object.get("presetKey"))?,
+    };
+    let mut item = json!({
+        "name": name,
+        "protocol": protocol,
+        "baseUrl": base_url,
+        "enabled": true,
+        "models": [],
+        "mappings": [],
+        // per-provider 特判字段（预置目录带来的上游修正），见 validate_* 的说明
+        "urlSuffix": validate_url_suffix(quirks.get("urlSuffix"))?,
+        "headers": validate_headers(quirks.get("headers"))?,
+        "anthropicToolType": validate_tool_type(quirks.get("anthropicToolType"))?,
+        "clientEmulation": validate_client_emulation(quirks.get("clientEmulation"))?,
+        // 余额查询方案（预置卡片提交，见 BALANCE_SCHEMES 的说明）
+        "balanceScheme": validate_balance_scheme(balance_value.as_ref())?,
+    });
+    presets::write_key(&mut item, preset_key);
+    Ok(item)
+}
+
+/// 新建一个自定义提供商：`{name, protocol, baseUrl, presetId?}` → 落盘后的完整条目。
 ///
 /// `apiKey` **刻意不在本函数的处理范围**：它是账号的属性（见模块头），由
 /// 调用方（`api::custom_providers::create`）在拿到 provider id 之后写进
@@ -663,34 +805,13 @@ pub fn create(payload: &Value) -> Result<Value, String> {
     let object = payload
         .as_object()
         .ok_or_else(|| "请求体必须是 JSON 对象".to_string())?;
-    let name = normalize_name(object.get("name"))?;
-    let protocol = normalize_protocol(object.get("protocol"))?;
-    let base_url = normalize_base_url(
-        object
-            .get("baseUrl")
-            .and_then(Value::as_str)
-            .unwrap_or(""),
-    )?;
-    let preset_key = presets::validate(object.get("presetKey"))?;
+    let mut item = record_draft(object)?;
     let id = new_provider_id()?;
-    let mut item = json!({
-        "id": id,
-        "name": name,
-        "protocol": protocol,
-        "baseUrl": base_url,
-        "enabled": true,
-        "createdAt": logging::now_ms(),
-        "models": [],
-        "mappings": [],
-        // per-provider 特判字段（预置目录带来的上游修正），见 validate_* 的说明
-        "urlSuffix": validate_url_suffix(object.get("urlSuffix"))?,
-        "headers": validate_headers(object.get("headers"))?,
-        "anthropicToolType": validate_tool_type(object.get("anthropicToolType"))?,
-        "clientEmulation": validate_client_emulation(object.get("clientEmulation"))?,
-        // 余额查询方案（预置卡片提交，见 BALANCE_SCHEMES 的说明）
-        "balanceScheme": validate_balance_scheme(object.get("balanceScheme"))?,
-    });
-    presets::write_key(&mut item, preset_key);
+    let created_at = logging::now_ms();
+    if let Some(map) = item.as_object_mut() {
+        map.insert("id".to_string(), Value::String(id));
+        map.insert("createdAt".to_string(), json!(created_at));
+    }
     let mut items = read_items();
     items.push(item.clone());
     if !write_items(&items) {
@@ -866,6 +987,12 @@ pub fn set_models(id: &str, models: Value, mappings: Value) -> Result<Value, Gat
         let stored = items.iter_mut().find(|item| item.get("id").and_then(Value::as_str) == Some(id))
             .ok_or_else(|| GatewayError::with_status(404, format!("自定义提供商不存在: {id}")))?;
         let previous = stored.as_object().map(item_of).unwrap_or(Value::Null);
+        let groups = config::routing_profiles();
+        if models.iter().filter_map(|item| item.get("id").and_then(Value::as_str))
+            .chain(mappings.iter().filter_map(|item| item.get("alias").and_then(Value::as_str)))
+            .any(|model| groups.group_for_model(model).is_some()) {
+            return Err(GatewayError::with_status(409, "模型或映射的对外 ID 已被自定义路由组占用"));
+        }
         bindings::validate_change(&previous, &models, &mappings)?;
         let map = stored.as_object_mut().ok_or_else(|| GatewayError::bad_request("自定义提供商记录损坏"))?;
         map.insert("models".to_string(), Value::Array(models.clone()));
@@ -1465,4 +1592,192 @@ fn validate_balance_scheme(value: Option<&Value>) -> Result<String, String> {
         "balanceScheme 只支持 {}（留空表示不查询余额）",
         BALANCE_SCHEMES.join(" / ")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 从请求体派生出的**记录草稿**（不含 id / createdAt 这类落库时才生成的字段）。
+    ///
+    /// 为什么不直接测 `create`：`create` 走配置单例 + 落库（进程级状态 + 磁盘），
+    /// 单元测试里初始化它会波及同进程并行跑的其它用例。`presetId` 派生是本次
+    /// 改动的新逻辑，抽成纯函数后正好在这里逐项断言。
+    fn draft_of(payload: Value) -> Result<Value, String> {
+        let object = payload
+            .as_object()
+            .ok_or_else(|| "请求体必须是 JSON 对象".to_string())?;
+        record_draft(object)
+    }
+
+    /// `presetId=openai`：协议 / 基址 / 模板标识全部来自预置卡。
+    #[test]
+    fn create_from_preset_derives_openai_fields() {
+        let record = draft_of(json!({ "presetId": "openai", "name": "OpenAI" })).unwrap();
+        assert_eq!(record["protocol"], PROTOCOL_CHAT_COMPLETIONS);
+        assert_eq!(record["baseUrl"], "https://api.openai.com/v1");
+        assert_eq!(record["presetKey"], "openai");
+        assert_eq!(record["urlSuffix"], "");
+        assert!(record["headers"].as_object().unwrap().is_empty());
+    }
+
+    /// `presetId=clinepass`：客户端伪装头必须整包落进平铺的 `headers` 键
+    /// （`X-CLIENT-TYPE` 是上游硬门槛），该家没有后缀 / 工具 type 特判。
+    #[test]
+    fn create_from_preset_applies_clinepass_headers() {
+        let record = draft_of(json!({ "presetId": "clinepass", "name": "Cline Pass" })).unwrap();
+        let headers = record["headers"].as_object().unwrap();
+        assert_eq!(headers["X-CLIENT-TYPE"], "cline-sdk");
+        assert_eq!(headers["User-Agent"], "Cline/3.0.62");
+        // 记录契约是平铺键：空值写成空串，而不是缺键 / 嵌套 quirks。
+        assert_eq!(record["urlSuffix"], "");
+        assert_eq!(record["anthropicToolType"], "");
+        assert!(record.get("quirks").is_none());
+    }
+
+    /// `presetId=opencode-zen`：伪装开关是**顶层** `clientEmulation`，不是嵌套 quirks。
+    #[test]
+    fn create_from_preset_sets_opencode_zen_client_emulation() {
+        let record =
+            draft_of(json!({ "presetId": "opencode-zen", "name": "OpenCode Zen" })).unwrap();
+        assert_eq!(record["clientEmulation"], CLIENT_EMULATION_OPENCODE);
+        assert_eq!(record["baseUrl"], "https://opencode.ai/inference/v1");
+        assert!(record.get("quirks").is_none(), "记录里不应出现嵌套 quirks");
+        // noKey 只是账号表单的提示，不是提供商字段。
+        assert!(record.get("noKey").is_none());
+        assert!(record.get("account").is_none());
+    }
+
+    /// 自建面板（sub2api / newapi）的预置基址是空串：两处都没给基址时必须报错，
+    /// 不能落一条没有 baseUrl 的无效提供商。
+    #[test]
+    fn create_from_preset_requires_base_url_for_self_hosted() {
+        for preset in ["sub2api", "newapi"] {
+            let error = draft_of(json!({ "presetId": preset, "name": "自建面板" }))
+                .expect_err("自建预置缺 baseUrl 必须报错");
+            assert!(
+                error.contains("Base URL"),
+                "错误文案要指明缺 Base URL，实际: {error}"
+            );
+        }
+        // 补上基址就能建。
+        let record = draft_of(json!({
+            "presetId": "sub2api",
+            "name": "自建面板",
+            "baseUrl": "https://panel.example.com/v1",
+        }))
+        .unwrap();
+        assert_eq!(record["baseUrl"], "https://panel.example.com/v1");
+        assert_eq!(record["balanceScheme"], BALANCE_SCHEME_SUB2API);
+    }
+
+    /// 显式字段优先：预置只提供缺省值，用户在表单里改过的协议 / 基址必须落库。
+    #[test]
+    fn explicit_fields_override_preset() {
+        let record = draft_of(json!({
+            "presetId": "openai",
+            "name": "我的网关",
+            "protocol": PROTOCOL_ANTHROPIC,
+            "baseUrl": "https://my-gateway.example.com/anthropic/",
+        }))
+        .unwrap();
+        assert_eq!(record["protocol"], PROTOCOL_ANTHROPIC);
+        // baseUrl 仍按写侧规则归一（去掉末尾斜杠）。
+        assert_eq!(
+            record["baseUrl"],
+            "https://my-gateway.example.com/anthropic"
+        );
+        assert_eq!(record["presetKey"], "openai");
+    }
+
+    /// 只给 `presetId` 也能建：名称取预置卡的名字（表单预填的那一份）；
+    /// 显式 `name` 仍然优先。
+    #[test]
+    fn create_from_preset_derives_name_and_explicit_name_wins() {
+        let record = draft_of(json!({ "presetId": "openai" })).unwrap();
+        assert_eq!(record["name"], "OpenAI");
+
+        let record = draft_of(json!({ "presetId": "openai", "name": "My OpenAI" })).unwrap();
+        assert_eq!(record["name"], "My OpenAI");
+    }
+
+    /// 显式特判覆盖预置特判（含「显式清空」）—— 四个键逐项覆盖，且每个都先断言
+    /// 预置侧确实有值，避免「键被整段丢掉也照样通过」的空断言：
+    ///   * GLM 预置带 `urlSuffix` + `headers` → 空串 / 新对象整体替换；
+    ///   * Minimax 预置带 `anthropicToolType="custom"` → 空串清掉；
+    ///   * OpenCode Zen 预置带 `clientEmulation="opencode"` → 空串关掉伪装。
+    #[test]
+    fn explicit_quirks_override_preset() {
+        // urlSuffix / headers（GLM：?beta=true + Anthropic-Beta）
+        let glm_default = draft_of(json!({ "presetId": "glm" })).unwrap();
+        assert_eq!(glm_default["urlSuffix"], "?beta=true");
+        assert_eq!(
+            glm_default["headers"]["Anthropic-Beta"],
+            "claude-code-20250219,interleaved-thinking-2025-05-14"
+        );
+        let glm = draft_of(json!({
+            "presetId": "glm",
+            "urlSuffix": "",
+            "headers": { "X-A": "b" },
+        }))
+        .unwrap();
+        assert_eq!(glm["urlSuffix"], "", "显式空串要清掉预置的 ?beta=true");
+        assert_eq!(glm["headers"], json!({ "X-A": "b" }), "头族整体替换");
+        assert_eq!(glm["presetKey"], "glm");
+
+        // anthropicToolType（Minimax：预置写的是 custom）
+        let minimax_default = draft_of(json!({ "presetId": "minimax" })).unwrap();
+        assert_eq!(minimax_default["anthropicToolType"], TOOL_TYPE_CUSTOM);
+        let minimax = draft_of(json!({
+            "presetId": "minimax",
+            "anthropicToolType": "",
+        }))
+        .unwrap();
+        assert_eq!(minimax["anthropicToolType"], "", "显式空串要清掉 custom");
+
+        // clientEmulation（OpenCode Zen：预置写的是 opencode）
+        let zen_default = draft_of(json!({ "presetId": "opencode-zen" })).unwrap();
+        assert_eq!(zen_default["clientEmulation"], CLIENT_EMULATION_OPENCODE);
+        let zen = draft_of(json!({
+            "presetId": "opencode-zen",
+            "clientEmulation": "",
+        }))
+        .unwrap();
+        assert_eq!(zen["clientEmulation"], "", "显式空串要关掉伪装");
+    }
+
+    /// 未收录的 presetId 一律 400（不静默回落到手动新建 —— 拼错 id 时那会
+    /// 留下一条协议 / 基址全空、看起来却「建成了」的记录）。
+    #[test]
+    fn create_from_unknown_preset_is_rejected() {
+        let error = draft_of(json!({ "presetId": "no-such-preset", "name": "X" }))
+            .expect_err("未知预置必须报错");
+        assert!(error.contains("no-such-preset"), "实际: {error}");
+    }
+
+    /// 显式 `null` 视同「未填」：表单把未动的可选栏发成 null 时，预置值必须保留
+    /// （否则用户只是打开表单点了保存，特判 / 方案就被静默清空了）。
+    #[test]
+    fn explicit_null_keeps_preset_values() {
+        let record = draft_of(json!({
+            "presetId": "glm",
+            "name": "GLM Coding",
+            "protocol": null,
+            "baseUrl": null,
+            "urlSuffix": null,
+            "headers": null,
+            "anthropicToolType": null,
+            "clientEmulation": null,
+            "balanceScheme": null,
+        }))
+        .unwrap();
+        assert_eq!(record["protocol"], PROTOCOL_ANTHROPIC);
+        assert_eq!(record["baseUrl"], "https://api.z.ai/api/anthropic");
+        assert_eq!(record["urlSuffix"], "?beta=true");
+        assert_eq!(
+            record["headers"]["Anthropic-Beta"],
+            "claude-code-20250219,interleaved-thinking-2025-05-14"
+        );
+        assert_eq!(record["balanceScheme"], BALANCE_SCHEME_ZHIPU_ZAI);
+    }
 }

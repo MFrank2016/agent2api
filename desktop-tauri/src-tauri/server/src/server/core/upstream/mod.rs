@@ -52,14 +52,20 @@ pub mod continuation;
 mod image_tasks;
 mod images;
 pub mod image_compress;
+mod multipart;
+mod native_tools;
+mod http_dns;
+mod network_fallback;
 pub mod refusal;
 pub mod request;
 mod payload;
 mod provider_loop;
 mod rotate;
 mod route_state;
+mod route_context;
 mod conversation_ids;
 mod route_sticky;
+pub mod rpm;
 pub mod sse;
 pub mod stall;
 pub mod translate;
@@ -87,6 +93,8 @@ use self::sse::{FramePolicy, ReasoningCoalescer};
 
 #[cfg(test)]
 mod capture_tests;
+#[cfg(test)]
+mod restore_tests;
 
 /// 去重等待上限（对照 Node 的 INFLIGHT_WAIT_MS）
 const INFLIGHT_WAIT_MS: u64 = 45_000;
@@ -185,6 +193,15 @@ pub struct UpstreamService {
     /// 的只读快照 —— 状态只该被两条钩子路径改写。Arc 是给 `#[derive(Clone)]`
     /// 的：克隆服务句柄（入请求上下文）时状态必须仍是同一份。
     route: std::sync::Arc<route_state::RouteState>,
+    /// 滚动 60 秒的请求计数（`maxRpm`，见 `rpm.rs`）。
+    ///
+    /// 选路只 `wait_ms`（只查不占），真正的 `allow` 在发送前那一道闸门
+    /// （`provider_loop::rpm_gate`）—— 一次请求可能选路多次，在选路里占名额
+    /// 会让一条请求吃掉好几份配额。
+    ///
+    /// `Arc` 是给 `#[derive(Clone)]` 的：克隆服务句柄（入请求上下文）时窗口
+    /// 必须仍是同一份，否则每个克隆各记各的，限速就形同虚设。
+    rpm: Arc<rpm::RpmWindow>,
 }
 
 /// 一次转发的入参
@@ -294,6 +311,29 @@ pub(super) struct RouteTarget {
     pub decision: Option<Value>,
 }
 
+/// 队列端点要的只读事实：沉底 / 账号级软退避 / 账号级硬休息 / 模型级休息 / 熔断。
+///
+/// 用具名结构体而不是五元组：其中三张表的类型都是 `HashMap<String, i64>`，
+/// 元组里的位置一旦写错，编译期不会报错而语义会静默错位。
+pub struct RouteQueueFacts {
+    /// 沉底：账号 id → 沉底时刻（30 分钟内有效）
+    pub sunk: HashMap<String, i64>,
+    /// 账号级**软**退避（网络失败）：只垫底，不跳过
+    pub resting: HashMap<String, i64>,
+    /// 账号级**硬**休息（余额耗尽 / 需要验证）：对所有模型硬跳过
+    pub account_resting: HashMap<String, i64>,
+    /// 模型级 rest：(账号 id, 上游真名) → 恢复时刻，只跳过那一格
+    pub model_resting: HashMap<(String, String), i64>,
+    /// 熔断打开的账号
+    pub open: std::collections::HashSet<String>,
+}
+
+impl RouteTarget {
+    pub(super) fn attempt_key(&self) -> Option<String> {
+        self.account.as_ref().map(crate::server::core::routing_groups::attempt_key).or_else(|| self.account_id.clone())
+    }
+}
+
 impl UpstreamService {
     pub fn new(store: AccountStore, auth: AuthService) -> Self {
         Self {
@@ -303,23 +343,57 @@ impl UpstreamService {
             connections: Connections::new(),
             routing: crate::server::core::routing::RoutingState::new(),
             route: std::sync::Arc::new(route_state::RouteState::new()),
+            rpm: Arc::new(rpm::RpmWindow::new()),
         }
+    }
+
+    /// 选路用的「RPM 已打满」账号集合（只查不占，见 `rotate::rpm_blocked_accounts`）。
+    ///
+    /// 转发选路、429 顺延与队列面板必须用**同一份**判据，否则面板画的顺序与
+    /// 实际转发会分叉。`now` 由调用方传入（同一次选路共用一个时间点）。
+    pub fn rpm_blocked_accounts(
+        &self,
+        accounts: &[Value],
+        now: i64,
+    ) -> std::collections::HashSet<String> {
+        rotate::rpm_blocked_accounts(accounts, &self.rpm, now)
     }
 
     /// 路由运行期状态的**只读快照**（`api::routing` 的队列端点用）。
     ///
-    /// 返回纯 std 容器（沉底表 / 休息表 / 熔断集合），不把本模块的私有类型
-    /// 漏出去；面板只看不写，粘性查找不在此做（预演不该刷新会话计时）。
-    pub fn route_queue_facts(
-        &self,
-        now: i64,
-    ) -> (
-        HashMap<String, i64>,
-        HashMap<String, i64>,
-        std::collections::HashSet<String>,
-    ) {
+    /// 返回纯 std 容器（沉底表 / 账号级软退避 / 账号级硬休息 / 模型级休息表 /
+    /// 熔断集合），不把本模块的私有类型漏出去；面板只看不写，粘性查找不在此做
+    /// （预演不该刷新会话计时）。
+    pub fn route_queue_facts(&self, now: i64) -> RouteQueueFacts {
         let snapshot = self.route.snapshot("", now, 0);
-        (snapshot.sunk, snapshot.resting, snapshot.open)
+        RouteQueueFacts {
+            sunk: snapshot.sunk,
+            resting: snapshot.resting,
+            account_resting: snapshot.account_resting,
+            model_resting: snapshot.model_resting,
+            open: snapshot.open,
+        }
+    }
+
+    /// 手动解除账号级硬休息（账号页「清除限流」按钮）。
+    ///
+    /// 那个端点清的是**落库**的 `rateLimits`，而硬休息是进程内存里的另一张表：
+    /// 不一起清的话，用户点完「清除」界面上限流没了，转发却仍被 `plan_route`
+    /// 硬跳过（最长 24 小时）—— 按钮看起来「没生效」。
+    pub fn clear_account_rest(&self, account_id: &str) {
+        self.route.account_rest_clear(account_id);
+    }
+
+    /// 手动解除**模型级** rest（账号页「清除限流」按钮）。
+    ///
+    /// `model` 为 `None` = 清这个账号的全部模型（对应端点不点名模型的「全部
+    /// 清除」）。与 [`Self::clear_account_rest`] 一起调用：落库条目、账号级
+    /// 硬休息、模型级 rest 三张表都要清，否则「清除」只清掉界面看得到的那张。
+    pub fn clear_model_rest(&self, account_id: &str, model: Option<&str>) {
+        match model {
+            Some(model) => self.route.model_rest_clear(account_id, model),
+            None => self.route.model_rest_clear_all(account_id),
+        }
     }
 
     pub fn route_sticky_sessions(&self, model: Option<&str>, now: i64) -> Vec<Value> {
@@ -396,6 +470,14 @@ impl UpstreamService {
         if cancel.as_ref().is_some_and(|token| token.is_cancelled()) {
             return Err(cancellation::cancelled_error());
         }
+        let route_model = request.body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+        let route_store = self.store.clone();
+        let route_body = request.body.clone();
+        let route_scope = request.allowed_providers.clone();
+        let ignore_route = request.ignore_model_gate;
+        let routing = crate::server::core::blocking::run(move || {
+            route_context::RequestRouting::capture_request(&route_model, &route_store, &route_body, route_scope.as_ref(), ignore_route)
+        }).await??;
         let mut slot = self.begin_slot(&request.dedupe_key, cancel.as_ref()).await;
         // 账号级活跃连接计数：**本请求**的凭证，随选路改绑到实际使用的账号。
         // 建在这里（而不是选路处）是因为它必须活到响应体发完 —— 流式路径由
@@ -404,6 +486,11 @@ impl UpstreamService {
         let mut connections = ConnectionGuard::new(self.connections.clone());
         // 对话统一向上游请求流式；Images 保留独立的请求形态。
         let mut upstream_body = request.body.clone();
+        let compact_route = super::compact_routing::take_route(&mut upstream_body);
+        if let Some(object) = upstream_body.as_object_mut() {
+            object.remove("_wb_route_group_id");
+            object.remove("_wb_route_continue");
+        }
         if images.is_none() {
             if let Some(object) = upstream_body.as_object_mut() {
                 object.insert("stream".to_string(), Value::Bool(true));
@@ -449,6 +536,8 @@ impl UpstreamService {
         let proxy_override = request.proxy_override;
         let context = payload::ProviderContext {
             body: &upstream_body,
+            routing,
+            compact_routed: compact_route.is_some(),
             stream: request.stream,
             images,
             client_headers: &request.client_headers,
@@ -598,6 +687,12 @@ pub struct ForwardStream {
     /// **每个上游 chunk** 上，每次都加锁取一遍是纯浪费；而一条请求的采集器
     /// 在转发开始时就装好了，中途不会变。
     capture: Option<Arc<crate::server::core::debug_traffic::TrafficCapture>>,
+    /// 回复还原器（Task 5.3）：按本次尝试的脱敏会话把上游回显的占位符换回
+    /// 原文。`None` 会话时逐片原样透传（字节与接入前一致）。
+    ///
+    /// 位置在**采集之后、SSE 解析之前**：采集器拿到的仍是上游原样（含占位符，
+    /// 不含明文），而占位符即使被 TCP 分片切开也能在解析前拼回完整形态。
+    restorer: crate::server::core::masking::Restorer,
 }
 
 impl ForwardStream {
@@ -610,6 +705,7 @@ impl ForwardStream {
         connection: ConnectionGuard,
         telemetry: Arc<usage::RequestTelemetry>,
         policy: FramePolicy,
+        mask_session: Option<crate::server::core::masking::MaskSession>,
     ) -> Self {
         use futures::StreamExt;
         // wreq 错误在这里就地描述成文案（`describe_error_detail` 认的是
@@ -628,7 +724,8 @@ impl ForwardStream {
             ),
         );
         let capture = telemetry.capture();
-        let mut stream = Self::from_translated(guarded, slot, connection, telemetry, policy);
+        let mut stream =
+            Self::from_translated(guarded, slot, connection, telemetry, policy, mask_session);
         stream.capture = capture;
         stream
     }
@@ -645,6 +742,7 @@ impl ForwardStream {
         connection: ConnectionGuard,
         telemetry: Arc<usage::RequestTelemetry>,
         policy: FramePolicy,
+        mask_session: Option<crate::server::core::masking::MaskSession>,
     ) -> Self {
         // ── 手动终止的旁路流（本次新增）────────────────────────────
         // 把令牌的等待挂成一条「只产出一个错误项」的旁路：置位后 poll 立刻
@@ -671,6 +769,7 @@ impl ForwardStream {
             telemetry,
             // 原始字节已由翻译流采集，不能把生成的 chat 帧再次混入报文。
             capture: None,
+            restorer: crate::server::core::masking::Restorer::new(mask_session),
         }
     }
 }
@@ -694,6 +793,14 @@ impl Stream for ForwardStream {
                 std::task::Poll::Pending => return std::task::Poll::Pending,
                 std::task::Poll::Ready(None) => {
                     self.upstream_done = true;
+                    // 先把还原器压住的半截前缀吐出来（它本来就不是占位符），
+                    // 再冲刷合并器 —— 否则流尾那几个字节会被静默吞掉
+                    let tail = self.restorer.finish();
+                    if !tail.is_empty() {
+                        for frame in self.coalescer.push(&tail) {
+                            self.pending.push_back(frame);
+                        }
+                    }
                     for frame in self.coalescer.finish() {
                         self.pending.push_back(frame);
                     }
@@ -701,11 +808,26 @@ impl Stream for ForwardStream {
                 std::task::Poll::Ready(Some(Ok(bytes))) => {
                     // 调试模式：把**上游原始字节**旁路给采集器 —— 在合并器
                     // 之前，因为用户要看的是上游原样吐出来的东西，而不是
-                    // 我们改写 / 合并后的帧（那正是「上游到底发了什么」要回答的）
+                    // 我们改写 / 合并后的帧（那正是「上游到底发了什么」要回答的）。
+                    //
+                    // 采集口径跟着脱敏走：这里采的是上游**原样字节**，开启脱敏时
+                    // 其中是占位符（明文不会进采集器）。请求侧（provider_loop 的
+                    // `reset_request`）已改为采集脱敏后的 `transport.payload`，
+                    // 于是调试报文的两侧一致，磁盘上不会出现明文密钥。
                     if let Some(capture) = &self.capture {
                         capture.push(&bytes);
                     }
-                    for frame in self.coalescer.push(&bytes[..]) {
+                    // 回复还原：在 SSE 解析之前做（占位符可能横跨分片，
+                    // 解析后再拼就晚了）。未脱敏时 `None` ⇒ 原样透传。
+                    let restored = self.restorer.push(&bytes);
+                    let payload: &[u8] = match restored.as_deref() {
+                        Some(bytes) => bytes,
+                        None => bytes.as_ref(),
+                    };
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    for frame in self.coalescer.push(payload) {
                         self.pending.push_back(frame);
                     }
                 }
@@ -714,6 +836,13 @@ impl Stream for ForwardStream {
                     // 不 panic。先把已累积的 reasoning 冲刷出去，再补上
                     // 「错误帧 + [DONE]」收尾（与 Node 一致）。
                     self.upstream_done = true;
+                    // 压住的半截前缀先吐出来（宁可多几个字节，也不能吞掉正文）
+                    let tail = self.restorer.finish();
+                    if !tail.is_empty() {
+                        for frame in self.coalescer.push(&tail) {
+                            self.pending.push_back(frame);
+                        }
+                    }
                     for frame in self.coalescer.finish() {
                         self.pending.push_back(frame);
                     }

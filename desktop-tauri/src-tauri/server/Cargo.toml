@@ -1,6 +1,6 @@
 [package]
 name = "agent2api-server"
-version = "3.4.1"
+version = "3.3.0"
 description = "Agent2API 网关本体 — AI 路由网关与 Agent 客户端接管（桌面端与 headless 服务器共用）"
 authors = ["Agent2API"]
 edition = "2021"
@@ -75,23 +75,20 @@ flate2 = "1"
 url = "2"
 axum = { version = "0.8", features = ["multipart"] }
 # 提供商出站请求：wreq（reqwest 的分支）—— BoringSSL + 可编程 TLS / HTTP2 指纹。
-# 本地独有的出站链路（转发 / 更新下载 / 登录等）依赖此栈；上游 3.4.1 的 reqwest
-# 链路与之并存，各自服务对应模块（见 docs/tls-fingerprint.md）。
+# 选它而不是 reqwest 的唯一理由：上游开始按 JA3 / JA4 与 HTTP2 指纹做风控，
+# rustls 默认栈没有可编程的 ClientHello，补不了这一层（见 docs/tls-fingerprint.md）。
+# `system-proxy` 保留原有的系统代理匹配；显式出口仍显式关闭自动探测。
 # 构建前置：cmake + nasm + libclang（BoringSSL 的构建依赖，见 docs/install.md）。
-wreq = { version = "6.0.0-rc.31", default-features = false, features = ["tokio-rt", "webpki-roots", "json", "stream", "socks", "system-proxy", "gzip", "brotli", "charset", "form"] }
+wreq = { version = "6.0.0-rc.31", default-features = false, features = ["tokio-rt", "webpki-roots", "json", "stream", "socks", "system-proxy", "gzip", "brotli", "charset", "form", "multipart"] }
 wreq-util = "3.0.0-rc.14"
-# 出站请求：rustls（纯 Rust，不依赖系统 openssl）+ socks5 出网代理。
-# `system-proxy` 打开 hyper-util 的系统代理匹配器（Windows / macOS 系统设置 +
-# 环境变量）：只有「跟随系统代理」那条出口（`egress::client_for_system_proxy`，
-# 供登录链路与 Antigravity 未配代理的账号使用）依赖它 —— 显式出口（直连 /
-# 指定代理）都显式关掉了自动探测（见 `egress::build_client`），转发链路的
-# 「直连就是直连」语义不受影响。
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls", "socks", "system-proxy"] }
+# 非提供商出站（云同步 / 更新下载 / 插件包安装）仍用 reqwest + rustls（纯 Rust，
+# 不依赖系统 openssl）+ socks5 出网代理。
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks", "system-proxy"] }
 # MonkeyCode 会话转发的 WebSocket 任务流（providers/monkeycode/stream.rs）：
-# 上游是 `wss://…/api/v1/users/tasks/stream`，TLS 走 rustls —— 与 reqwest 的
-# `rustls-tls` 同一条栈（rustls + tokio-rustls 各一份；根证书同为 webpki-roots
-# 的 Mozilla 根集，只是两家依赖锁在 0.26 / 1.x 两个版本上，属同一套数据，
-# 不是第二套 TLS 栈；刻意不用 native-roots，免得再拉平台证书库那一串依赖）。
+# 上游是 `wss://…/api/v1/users/tasks/stream`。这条链路**仍走 rustls**：
+# wreq 的 BoringSSL 只管 HTTP，tokio-tungstenite 用 rustls + webpki-roots，
+# 于是二进制里同时存在两套 TLS 栈（各自只服务自己的链路，不共享会话）。
+# 刻意不用 native-roots，免得再拉平台证书库那一串依赖。
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 # 只读 Clash Verge 配置，不管理或运行代理内核。
 serde_yaml = "0.9"
@@ -166,6 +163,10 @@ ed25519-dalek = { version = "2", default-features = false, features = ["fast", "
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
     "Win32_Security_Cryptography",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
     # KukuAI 会话换发（providers/kuku/engine.rs）：LoadLibrary 引擎 DLL +
     # 枚举注册表卸载项定位客户端安装目录
     "Win32_System_LibraryLoader",
@@ -211,6 +212,8 @@ windows-service = "0.8"
 # 依赖会被链接器扔掉（仅多花几秒编译）。
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = "0.7"
+# systemd 升级通道的对端身份与进程级文件锁，不开放通用提权入口。
+libc = "0.2"
 
 [dev-dependencies]
 # 路由级测试用 `ServiceExt::oneshot` 直接打 Router（不占端口、不跑 serve），

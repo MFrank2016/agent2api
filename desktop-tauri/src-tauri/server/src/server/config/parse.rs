@@ -73,7 +73,11 @@ pub(super) fn env_captcha_enabled() -> bool {
 /// 包括空值。`AGENT2API_STRIP_NEWLINE_KEEPALIVE=` 这种"写了个空值"的 compose
 /// 写法在 Docker 里太常见了（未设置的变量插值就是这样），按非 0 即开会把它读成开。
 pub(super) fn env_strip_newline_keepalive() -> bool {
-    switch_on_from_env_text(std::env::var("AGENT2API_STRIP_NEWLINE_KEEPALIVE").ok().as_deref())
+    switch_on_from_env_text(
+        std::env::var("AGENT2API_STRIP_NEWLINE_KEEPALIVE")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// 环境变量 `AGENT2API_AUTO_CONTINUE` 的读法（**默认关**）。
@@ -109,11 +113,12 @@ pub(super) fn env_auto_continue_max_rounds() -> Option<i64> {
 ///
 /// 参数是「环境变量的值」而不是自己去读进程环境：判据要能被单测钉住。
 /// `std::env::set_var` 在同一进程里全局可见，并发用例互相踩（本仓的同类取舍见
-/// `core::providers::trae::forward::forward_at` 的注释），所以「缺失」由调用方
+/// trae provider 迁出前 `forward_at` 的注释），所以「缺失」由调用方
 /// 传 `None` 表达，测试不必碰真环境。
 pub(super) fn switch_on_from_env_text(raw: Option<&str>) -> bool {
     matches!(
-        raw.map(|value| value.trim().to_ascii_lowercase()).as_deref(),
+        raw.map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
         Some("1") | Some("true") | Some("on")
     )
 }
@@ -155,7 +160,12 @@ pub(crate) fn int_in_range(value: &Value, min: i64, max: i64) -> Option<i64> {
 /// 非整数 / 越界一律 `None`，交调用方决定下一级（环境变量或默认值）。
 ///
 /// 判据本体在 [`int_in_range`]（读写两侧共用）。
-pub(super) fn bounded_int_option(map: &Map<String, Value>, key: &str, min: i64, max: i64) -> Option<i64> {
+pub(super) fn bounded_int_option(
+    map: &Map<String, Value>,
+    key: &str,
+    min: i64,
+    max: i64,
+) -> Option<i64> {
     map.get(key).and_then(|value| int_in_range(value, min, max))
 }
 
@@ -169,7 +179,13 @@ pub(super) fn bounded_int_option(map: &Map<String, Value>, key: &str, min: i64, 
 /// 接受 `30.0` 这种整值浮点（与 `parse_retention_value` 同一口径）：JSON 里
 /// `30` 与 `30.0` 都是合法数字，为后者回落到默认值会显得莫名其妙
 /// （用户手改文件时把 30 写成 30.0 是完全可能的事）。
-pub(super) fn bounded_int_field(map: &Map<String, Value>, key: &str, default: i64, min: i64, max: i64) -> i64 {
+pub(super) fn bounded_int_field(
+    map: &Map<String, Value>,
+    key: &str,
+    default: i64,
+    min: i64,
+    max: i64,
+) -> i64 {
     bounded_int_option(map, key, min, max).unwrap_or(default)
 }
 
@@ -239,7 +255,9 @@ pub(super) fn interval_field(task: &Map<String, Value>, default: i64, min: i64, 
         }),
         _ => None,
     });
-    parsed.filter(|value| (min..=max).contains(value)).unwrap_or(default)
+    parsed
+        .filter(|value| (min..=max).contains(value))
+        .unwrap_or(default)
 }
 
 /// 从一条任务的子对象里取开关。
@@ -250,7 +268,9 @@ pub(super) fn interval_field(task: &Map<String, Value>, default: i64, min: i64, 
 /// 用户什么也没动，凭证却不再自动续期了。写侧（`PUT /api/scheduled-tasks`）
 /// 则要求显式布尔值。
 pub(super) fn task_enabled(task: &Map<String, Value>, default: bool) -> bool {
-    task.get("enabled").and_then(Value::as_bool).unwrap_or(default)
+    task.get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(default)
 }
 
 /// 由原始 JSON 解析六条间隔型任务（缺字段各自用默认值）。
@@ -474,6 +494,179 @@ pub(super) fn captcha_pool_from(map: &Map<String, Value>) -> CaptchaPoolSettings
 
 // ─── 历史路由优先级（providerRoute，只读，供账号迁移）───────────
 
+// ─── 账号选路策略（routingStrategy：全局默认 + 逐家覆盖）────────────
+
+/// 由原始 JSON 解析选路策略设置。
+///
+/// 口径与既有配置一致（**写坏回落、不报错、不影响启动**）：
+///   - 整个键缺失 / 不是对象 / 不是字符串 → 全默认（`default = priority`、逐家表为空）；
+///   - 旧字符串形态（上游 v3.0.2）：`"order"`/`"rotate"`/`"provider"`/`"usage"`
+///     迁移成 `{ default: <映射结果>, providers: {} }`（不丢数据）；映射表在
+///     `RoutingStrategy::from_config`（`rotate`→`global-round-robin`、
+///     `provider`→`round-robin`，两个轮询边界分开）；
+///   - `default` 缺失 / 非法 → `priority`；
+///   - `providers` 缺失 / 不是对象 → 空表；
+///   - 逐家项：id 空串跳过；值不是合法策略 → **回落到 `priority`**（而不是跳过 ——
+///     任务口径是「非法策略值一律回落 priority」，保留这家一个显式档位比静默
+///     跟随全局默认更符合「写坏了也要有个确定行为」）。
+///
+/// 未知 provider id **允许存在**（原样保留在表里）：它只是选路时用不上（那家
+/// 没有账号），不该在读侧被抹掉 —— 用户可能先写好配置、后加账号。
+pub(super) fn routing_strategy_from(map: &Map<String, Value>) -> RoutingStrategySettings {
+    use crate::server::core::routing::RoutingStrategy;
+
+    let Some(value) = map.get(KEY_ROUTING_STRATEGY) else {
+        return RoutingStrategySettings::default();
+    };
+    // ── 兼容上游 v3.0.2 的旧字符串形态（迁移，不丢数据）────────────
+    if let Some(text) = value.as_str() {
+        return RoutingStrategySettings {
+            default: RoutingStrategy::from_config(text),
+            providers: std::collections::BTreeMap::new(),
+        };
+    }
+    let Some(object) = value.as_object() else {
+        return RoutingStrategySettings::default();
+    };
+    let default = object
+        .get(KEY_ROUTING_STRATEGY_DEFAULT)
+        .and_then(Value::as_str)
+        .map(RoutingStrategy::from_config)
+        .unwrap_or_default();
+    let mut providers = std::collections::BTreeMap::new();
+    if let Some(entries) = object
+        .get(KEY_ROUTING_STRATEGY_PROVIDERS)
+        .and_then(Value::as_object)
+    {
+        for (id, item) in entries {
+            let id = id.trim();
+            if id.is_empty() {
+                continue;
+            }
+            let strategy = item
+                .as_str()
+                .map(RoutingStrategy::from_config)
+                .unwrap_or_default();
+            providers.insert(id.to_string(), strategy);
+        }
+    }
+    RoutingStrategySettings { default, providers }
+}
+
+#[cfg(test)]
+mod routing_strategy_tests {
+    use super::*;
+    use crate::server::core::routing::RoutingStrategy;
+    use serde_json::json;
+
+    fn object(value: Value) -> Map<String, Value> {
+        match value {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        }
+    }
+
+    #[test]
+    fn missing_key_falls_back_to_priority() {
+        let settings = routing_strategy_from(&Map::new());
+        assert_eq!(settings.default, RoutingStrategy::Priority);
+        assert!(settings.providers.is_empty());
+    }
+
+    #[test]
+    fn parses_default_and_providers() {
+        let settings = routing_strategy_from(&object(json!({
+            "routingStrategy": {
+                "default": "round-robin",
+                "providers": { "workbuddy": "least-connections" }
+            }
+        })));
+        assert_eq!(settings.default, RoutingStrategy::RoundRobin);
+        assert_eq!(
+            settings.providers.get("workbuddy"),
+            Some(&RoutingStrategy::LeastConnections)
+        );
+    }
+
+    #[test]
+    fn invalid_default_falls_back_to_priority() {
+        let settings = routing_strategy_from(&object(json!({
+            "routingStrategy": { "default": "bogus" }
+        })));
+        assert_eq!(settings.default, RoutingStrategy::Priority);
+    }
+
+    #[test]
+    fn invalid_provider_strategy_falls_back_to_priority() {
+        let settings = routing_strategy_from(&object(json!({
+            "routingStrategy": { "providers": { "workbuddy": "bogus" } }
+        })));
+        assert_eq!(
+            settings.providers.get("workbuddy"),
+            Some(&RoutingStrategy::Priority)
+        );
+    }
+
+    #[test]
+    fn unknown_provider_ids_are_kept() {
+        let settings = routing_strategy_from(&object(json!({
+            "routingStrategy": { "providers": { "future-provider": "round-robin" } }
+        })));
+        assert_eq!(
+            settings.providers.get("future-provider"),
+            Some(&RoutingStrategy::RoundRobin)
+        );
+    }
+
+    #[test]
+    fn wrong_shapes_fall_back_to_defaults() {
+        let settings = routing_strategy_from(&object(json!({ "routingStrategy": 42 })));
+        assert_eq!(settings.default, RoutingStrategy::Priority);
+        assert!(settings.providers.is_empty());
+        let settings = routing_strategy_from(&object(json!({
+            "routingStrategy": { "providers": "round-robin" }
+        })));
+        assert!(settings.providers.is_empty());
+    }
+
+    // ── 上游 v3.0.2 旧字符串形态的迁移（任务要求：不丢数据）──────────
+
+    #[test]
+    fn legacy_rotate_string_loads_as_global_round_robin() {
+        let settings = routing_strategy_from(&object(json!({ "routingStrategy": "rotate" })));
+        assert_eq!(settings.default, RoutingStrategy::GlobalRoundRobin);
+        assert!(settings.providers.is_empty());
+    }
+
+    #[test]
+    fn legacy_provider_string_loads_as_round_robin() {
+        let settings = routing_strategy_from(&object(json!({ "routingStrategy": "provider" })));
+        assert_eq!(settings.default, RoutingStrategy::RoundRobin);
+        assert!(settings.providers.is_empty());
+    }
+
+    #[test]
+    fn legacy_order_string_loads_as_priority() {
+        let settings = routing_strategy_from(&object(json!({ "routingStrategy": "order" })));
+        assert_eq!(settings.default, RoutingStrategy::Priority);
+    }
+
+    #[test]
+    fn legacy_usage_string_loads_as_balance_weighted() {
+        let settings = routing_strategy_from(&object(json!({ "routingStrategy": "usage" })));
+        assert_eq!(settings.default, RoutingStrategy::BalanceWeighted);
+    }
+
+    #[test]
+    fn legacy_unknown_string_loads_as_priority() {
+        let settings = routing_strategy_from(&object(json!({ "routingStrategy": "whatever" })));
+        assert_eq!(settings.default, RoutingStrategy::Priority);
+        assert!(settings.providers.is_empty());
+    }
+}
+
+// ─── 账号路由的解析（粘性 / 退避 / 垫底 / 熔断）────────────────
+
 // ─── 会话图片压缩的解析（开关 + 长边 / 质量 / 阈值三项）──────────────
 
 /// 由原始 JSON 解析会话图片压缩设置（缺字段各自用默认值；越界回落默认）。
@@ -523,13 +716,10 @@ pub(super) fn image_compress_from(map: &Map<String, Value>) -> ImageCompressSett
 /// 与 `timeouts_from` 同一口径：范围校验在写侧（`routing_api`）是 400 报错，
 /// 在这里是回落默认 —— 手改库写进一个离谱值时，宁可回到默认行为也不要让
 /// 选路拿到一个必然坏事的值（例如阈值 0 会让熔断第一个失败就打开）。
+///
+/// 策略维度（`routingStrategy`）不在这里 —— 它是逐家的，见 `routing_strategy_from`。
 pub(super) fn routing_from(map: &Map<String, Value>) -> RoutingSettings {
     let defaults = RoutingSettings::default();
-    // 本地混合架构：`routingStrategy` 的唯一权威形态是本地六档对象
-    // （`routing_strategy_from`），上游 RouteStrategy 三档只作展示用。这里
-    // 不再单独读那个键（否则全局保存会把对象形态覆写成字符串、丢掉逐家覆盖），
-    // 而是把本地权威默认值映射成展示档位。见 config/mod.rs 的写入口径。
-    let strategy = route_strategy_display(routing_strategy_from(map).default);
     let sticky = map
         .get(KEY_ROUTING_STICKY)
         .and_then(Value::as_str)
@@ -538,6 +728,13 @@ pub(super) fn routing_from(map: &Map<String, Value>) -> RoutingSettings {
     let bool_field = |key: &str, default: bool| -> bool {
         map.get(key).and_then(Value::as_bool).unwrap_or(default)
     };
+    // 逐模型策略覆盖：对象形态（本仓 `{default, providers}`）没有裸字符串，
+    // as_str() 为 None → 回落 Order，与上游读侧行为一致。
+    let strategy = map
+        .get(KEY_ROUTING_STRATEGY)
+        .and_then(Value::as_str)
+        .map(RouteStrategy::from_id)
+        .unwrap_or(defaults.strategy);
     RoutingSettings {
         strategy,
         sticky,
@@ -565,6 +762,154 @@ pub(super) fn routing_from(map: &Map<String, Value>) -> RoutingSettings {
             ROUTING_BREAKER_MIN_SUCCESS,
             ROUTING_BREAKER_MAX_SUCCESS,
         ),
+        shadow_quota_kind: bool_field(KEY_ROUTING_SHADOW_QUOTA_KIND, defaults.shadow_quota_kind),
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    //! 路由设置的默认值与解析口径。
+    //!
+    //! `shadow_quota_kind` 的默认值必须是 **true**：它是「新 rest 行为先只观察、
+    //! 不改变选路」的影子开关，默认 false 等于一升级就把 Task 1.3 的新作用域
+    //! 直接推到所有存量安装上 —— 那不是影子模式，而是全量切换。
+
+    use super::*;
+    use serde_json::json;
+
+    fn object(value: Value) -> Map<String, Value> {
+        match value {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        }
+    }
+
+    #[test]
+    fn shadow_quota_kind_defaults_true() {
+        assert!(RoutingSettings::default().shadow_quota_kind);
+    }
+
+    #[test]
+    fn shadow_quota_kind_missing_keeps_the_default() {
+        assert!(routing_from(&Map::new()).shadow_quota_kind);
+    }
+
+    #[test]
+    fn shadow_quota_kind_parses_an_explicit_false() {
+        let settings = routing_from(&object(json!({ "routingShadowQuotaKind": false })));
+        assert!(!settings.shadow_quota_kind, "显式关掉影子模式必须读得出来");
+    }
+
+    #[test]
+    fn shadow_quota_kind_wrong_type_falls_back_to_true() {
+        let settings = routing_from(&object(json!({ "routingShadowQuotaKind": "false" })));
+        assert!(
+            settings.shadow_quota_kind,
+            "类型写坏 = 没配，必须回落默认（true），而不是按字符串内容猜"
+        );
+    }
+}
+
+// ─── 出站脱敏（maskSecrets / maskPii / maskWords）────────────────
+
+/// 由原始 JSON 解析出站脱敏设置（缺字段用默认值；类型不符回落默认）。
+///
+/// 与路由设置同一口径：读侧不报错、不夹紧 —— 手改库写坏的项只影响它自己，
+/// 不能让整个网关起不来。词表里非字符串项直接丢弃（它不可能是用户想要的词），
+/// 空白词丢掉，重复词按首次出现保留（顺序就是界面上的顺序）。
+pub(super) fn mask_from(map: &Map<String, Value>) -> MaskSettings {
+    let defaults = MaskSettings::default();
+    let bool_field = |key: &str, default: bool| -> bool {
+        map.get(key).and_then(Value::as_bool).unwrap_or(default)
+    };
+    let mut words: Vec<String> = Vec::new();
+    if let Some(items) = map.get(KEY_MASK_WORDS).and_then(Value::as_array) {
+        for item in items {
+            let Some(word) = item.as_str() else {
+                continue;
+            };
+            let word = word.trim();
+            if word.is_empty() || words.iter().any(|seen| seen == word) {
+                continue;
+            }
+            words.push(word.to_string());
+        }
+    }
+    MaskSettings {
+        secrets: bool_field(KEY_MASK_SECRETS, defaults.secrets),
+        pii: bool_field(KEY_MASK_PII, defaults.pii),
+        words,
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    //! 出站脱敏设置的默认值与解析口径。
+    //!
+    //! 默认必须是**全关**：脱敏会改写请求体字节（关闭时连 JSON 都不解析），
+    //! 没有配置就不该发生。词表非空本身也算开启 —— 用户填了词却发现没生效，
+    //! 是这里最容易写歪的一条。
+
+    use super::*;
+    use serde_json::json;
+
+    fn object(value: Value) -> Map<String, Value> {
+        match value {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        }
+    }
+
+    #[test]
+    fn mask_defaults_are_off_with_no_words() {
+        let settings = MaskSettings::default();
+        assert!(!settings.secrets);
+        assert!(!settings.pii);
+        assert!(settings.words.is_empty());
+        assert!(!settings.enabled(), "全关时不得视为开启");
+
+        let parsed = mask_from(&Map::new());
+        assert_eq!(parsed, settings, "缺失字段必须逐项等于默认值");
+    }
+
+    #[test]
+    fn mask_flags_and_words_parse_from_config() {
+        let settings = mask_from(&object(json!({
+            "maskSecrets": true,
+            "maskPii": true,
+            "maskWords": ["Project Falcon", "a@b.com"],
+        })));
+        assert!(settings.secrets);
+        assert!(settings.pii);
+        assert_eq!(settings.words, vec!["Project Falcon", "a@b.com"]);
+        assert!(settings.enabled());
+    }
+
+    #[test]
+    fn mask_words_alone_enable_masking() {
+        let settings = mask_from(&object(json!({ "maskWords": ["secret"] })));
+        assert!(!settings.secrets);
+        assert!(!settings.pii);
+        assert!(
+            settings.enabled(),
+            "词表非空就必须开启，否则用户填了词也不生效"
+        );
+    }
+
+    #[test]
+    fn mask_wrong_types_fall_back_and_junk_words_are_dropped() {
+        let settings = mask_from(&object(json!({
+            "maskSecrets": "true",
+            "maskPii": 1,
+            "maskWords": ["  Project Falcon  ", "", 42, "Project Falcon", "a@b.com"],
+        })));
+        assert!(!settings.secrets, "类型写坏 = 没配，回落默认（关）");
+        assert!(!settings.pii);
+        assert_eq!(
+            settings.words,
+            vec!["Project Falcon", "a@b.com"],
+            "空白词 / 非字符串项丢弃，重复词按首次出现保留"
+        );
     }
 }
 
@@ -621,7 +966,9 @@ pub(super) fn auto_continue_rounds_from(map: &Map<String, Value>) -> i64 {
 /// [`switch_on_from_env_text`] 的注释）。默认值在这里显式出现一次，
 /// 也让「越界不夹紧、只是让位给下一级」这条规则有唯一一处落点。
 pub(super) fn resolve_rounds(from_file: Option<i64>, from_env: Option<i64>) -> i64 {
-    from_file.or(from_env).unwrap_or(DEFAULT_AUTO_CONTINUE_MAX_ROUNDS)
+    from_file
+        .or(from_env)
+        .unwrap_or(DEFAULT_AUTO_CONTINUE_MAX_ROUNDS)
 }
 
 #[cfg(test)]
@@ -631,7 +978,7 @@ mod tests {
     //!
     //! ── 为什么这些用例都不碰进程环境 ────────────────────────
     //! `std::env::set_var` 在同一进程里全局可见，并行用例互相踩（同类取舍见
-    //! `core::providers::trae::forward::forward_at` 的注释），而本模块里
+    //! trae provider 迁出前 `forward_at` 的注释），而本模块里
     //! 「没设环境变量」是有明确表达的输入 —— `None`。所以三段判据都被抽成
     //! 吃参数的纯函数（[`switch_on_from_env_text`] / [`bounded_int_from_env_text`] /
     //! [`resolve_auto_continue`] / [`resolve_rounds`]），`env_*` 只是把它们接到
@@ -656,12 +1003,18 @@ mod tests {
     #[test]
     fn the_env_switch_only_accepts_one_true_or_on() {
         for on in ["1", "true", "on", " TRUE ", "On", "ON "] {
-            assert!(switch_on_from_env_text(Some(on)), "{on} 应当算开启（大小写与首尾空白都要被吃掉）");
+            assert!(
+                switch_on_from_env_text(Some(on)),
+                "{on} 应当算开启（大小写与首尾空白都要被吃掉）"
+            );
         }
         for off in ["", " ", "0", "yes", "10", "2", "no", "开启", "trueX", "one"] {
             assert!(!switch_on_from_env_text(Some(off)), "{off} 不该被当成开启");
         }
-        assert!(!switch_on_from_env_text(None), "环境变量没设（None）必须是关");
+        assert!(
+            !switch_on_from_env_text(None),
+            "环境变量没设（None）必须是关"
+        );
     }
 
     /// 整数型环境变量的口径：只有**纯整数**且在范围内才算数。
@@ -670,8 +1023,16 @@ mod tests {
     /// 夹紧到 8 —— 后者会让人以为自己的 99 生效了。
     #[test]
     fn the_env_integer_must_be_a_plain_integer_in_range() {
-        assert_eq!(bounded_int_from_env_text(Some("1"), 1, 8), Some(1), "下限要收");
-        assert_eq!(bounded_int_from_env_text(Some(" 8 "), 1, 8), Some(8), "上限要收，空白要吃掉");
+        assert_eq!(
+            bounded_int_from_env_text(Some("1"), 1, 8),
+            Some(1),
+            "下限要收"
+        );
+        assert_eq!(
+            bounded_int_from_env_text(Some(" 8 "), 1, 8),
+            Some(8),
+            "上限要收，空白要吃掉"
+        );
         for unusable in ["", " ", "0", "9", "-1", "3.0", "3.5", "abc", "8.", "+"] {
             assert_eq!(
                 bounded_int_from_env_text(Some(unusable), 1, 8),
@@ -690,23 +1051,61 @@ mod tests {
     fn an_out_of_range_file_value_falls_back_to_the_default_not_the_bound() {
         let too_many = map_of(&[(KEY_AUTO_CONTINUE_MAX_ROUNDS, json!(99))]);
         assert_eq!(
-            bounded_int_option(&too_many, KEY_AUTO_CONTINUE_MAX_ROUNDS, AUTO_CONTINUE_MIN_ROUNDS, AUTO_CONTINUE_MAX_ROUNDS),
+            bounded_int_option(
+                &too_many,
+                KEY_AUTO_CONTINUE_MAX_ROUNDS,
+                AUTO_CONTINUE_MIN_ROUNDS,
+                AUTO_CONTINUE_MAX_ROUNDS
+            ),
             None,
             "越界必须表达成「这一级没给出可用值」，夹紧就不叫回落了"
         );
         assert_eq!(
-            bounded_int_field(&too_many, KEY_AUTO_CONTINUE_MAX_ROUNDS, DEFAULT_AUTO_CONTINUE_MAX_ROUNDS, AUTO_CONTINUE_MIN_ROUNDS, AUTO_CONTINUE_MAX_ROUNDS),
+            bounded_int_field(
+                &too_many,
+                KEY_AUTO_CONTINUE_MAX_ROUNDS,
+                DEFAULT_AUTO_CONTINUE_MAX_ROUNDS,
+                AUTO_CONTINUE_MIN_ROUNDS,
+                AUTO_CONTINUE_MAX_ROUNDS
+            ),
             DEFAULT_AUTO_CONTINUE_MAX_ROUNDS,
             "回落的是默认值 3，不是上限 8"
         );
         // 边界上的两个数与「写坏的类型」各归各位
         let zero = map_of(&[(KEY_AUTO_CONTINUE_MAX_ROUNDS, json!(0))]);
-        assert_eq!(bounded_int_field(&zero, KEY_AUTO_CONTINUE_MAX_ROUNDS, DEFAULT_AUTO_CONTINUE_MAX_ROUNDS, AUTO_CONTINUE_MIN_ROUNDS, AUTO_CONTINUE_MAX_ROUNDS), DEFAULT_AUTO_CONTINUE_MAX_ROUNDS, "0 在范围外（想关去关开关）");
+        assert_eq!(
+            bounded_int_field(
+                &zero,
+                KEY_AUTO_CONTINUE_MAX_ROUNDS,
+                DEFAULT_AUTO_CONTINUE_MAX_ROUNDS,
+                AUTO_CONTINUE_MIN_ROUNDS,
+                AUTO_CONTINUE_MAX_ROUNDS
+            ),
+            DEFAULT_AUTO_CONTINUE_MAX_ROUNDS,
+            "0 在范围外（想关去关开关）"
+        );
         let text = map_of(&[(KEY_AUTO_CONTINUE_MAX_ROUNDS, json!("3"))]);
-        assert_eq!(bounded_int_option(&text, KEY_AUTO_CONTINUE_MAX_ROUNDS, AUTO_CONTINUE_MIN_ROUNDS, AUTO_CONTINUE_MAX_ROUNDS), None, "字符串数字不算（与写侧同一口径）");
+        assert_eq!(
+            bounded_int_option(
+                &text,
+                KEY_AUTO_CONTINUE_MAX_ROUNDS,
+                AUTO_CONTINUE_MIN_ROUNDS,
+                AUTO_CONTINUE_MAX_ROUNDS
+            ),
+            None,
+            "字符串数字不算（与写侧同一口径）"
+        );
         // `3.0` 算 3：JSON 里 3 与 3.0 是同一个数，手改文件时写成 3.0 完全可能
         let floaty = map_of(&[(KEY_AUTO_CONTINUE_MAX_ROUNDS, json!(3.0))]);
-        assert_eq!(bounded_int_option(&floaty, KEY_AUTO_CONTINUE_MAX_ROUNDS, AUTO_CONTINUE_MIN_ROUNDS, AUTO_CONTINUE_MAX_ROUNDS), Some(3));
+        assert_eq!(
+            bounded_int_option(
+                &floaty,
+                KEY_AUTO_CONTINUE_MAX_ROUNDS,
+                AUTO_CONTINUE_MIN_ROUNDS,
+                AUTO_CONTINUE_MAX_ROUNDS
+            ),
+            Some(3)
+        );
     }
 
     /// 优先级链：文件写了就以它为准（**包括 false 与 1**），否则环境变量，否则默认。
@@ -715,15 +1114,29 @@ mod tests {
     /// 实际让用户在面板上关不掉（库里已经是 false，环境里那句 `on` 一直把它顶开）。
     #[test]
     fn the_file_value_beats_the_env_even_when_it_says_off() {
-        assert!(!resolve_auto_continue(Some(false), true), "文件里的 false 必须盖过环境变量的开");
-        assert!(resolve_auto_continue(Some(true), false), "文件里的 true 必须盖过环境变量的关");
+        assert!(
+            !resolve_auto_continue(Some(false), true),
+            "文件里的 false 必须盖过环境变量的开"
+        );
+        assert!(
+            resolve_auto_continue(Some(true), false),
+            "文件里的 true 必须盖过环境变量的关"
+        );
         assert!(resolve_auto_continue(None, true), "文件没配时环境变量说话");
         assert!(!resolve_auto_continue(None, false), "两级都没配 → 默认关");
 
-        assert_eq!(resolve_rounds(Some(1), Some(8)), 1, "文件里的 1 必须盖过环境变量的 8");
+        assert_eq!(
+            resolve_rounds(Some(1), Some(8)),
+            1,
+            "文件里的 1 必须盖过环境变量的 8"
+        );
         assert_eq!(resolve_rounds(Some(8), None), 8);
         assert_eq!(resolve_rounds(None, Some(8)), 8, "文件不可用时环境变量说话");
-        assert_eq!(resolve_rounds(None, None), DEFAULT_AUTO_CONTINUE_MAX_ROUNDS, "两级都不可用才落默认");
+        assert_eq!(
+            resolve_rounds(None, None),
+            DEFAULT_AUTO_CONTINUE_MAX_ROUNDS,
+            "两级都不可用才落默认"
+        );
         // 越界的文件值在这里已经是 None（上面试用例过了），链上表现为「让位给下一级」
         assert_eq!(resolve_rounds(None, Some(1)), 1);
     }
@@ -754,7 +1167,10 @@ mod tests {
         assert_eq!(auto_continue_rounds_from(&off), 1, "下限边界值 1 必须能用");
 
         // 类型写坏的那一项等于「没配」：越界 / 字符串都不许留下一个可感的值
-        let junk = map_of(&[(KEY_AUTO_CONTINUE_MAX_ROUNDS, json!(0)), (KEY_AUTO_CONTINUE, json!("true"))]);
+        let junk = map_of(&[
+            (KEY_AUTO_CONTINUE_MAX_ROUNDS, json!(0)),
+            (KEY_AUTO_CONTINUE, json!("true")),
+        ]);
         assert_eq!(
             auto_continue_rounds_from(&junk),
             resolve_rounds(None, env_auto_continue_max_rounds()),
@@ -767,160 +1183,3 @@ mod tests {
         );
     }
 }
-
-/// 本地权威策略 → 上游展示档位（三档）。`RouteStrategy` 仅用于
-/// `GET /api/routing` 的展示，不参与选路，也不写回 `routingStrategy` 键。
-pub(super) fn route_strategy_display(
-    strategy: crate::server::core::routing::RoutingStrategy,
-) -> RouteStrategy {
-    use crate::server::core::routing::RoutingStrategy as Local;
-    match strategy {
-        Local::GlobalRoundRobin | Local::BalanceWeighted => RouteStrategy::Rotate,
-        Local::RoundRobin => RouteStrategy::Provider,
-        _ => RouteStrategy::Order,
-    }
-}
-
-// ─── 本地独有（beta）：逐家选路策略解析（routingStrategy 的唯一权威读侧）──
-pub(super) fn routing_strategy_from(map: &Map<String, Value>) -> RoutingStrategySettings {
-    use crate::server::core::routing::RoutingStrategy;
-
-    let Some(value) = map.get(KEY_ROUTING_STRATEGY) else {
-        return RoutingStrategySettings::default();
-    };
-    // ── 兼容上游 v3.0.2 的旧字符串形态（迁移，不丢数据）────────────
-    if let Some(text) = value.as_str() {
-        return RoutingStrategySettings {
-            default: RoutingStrategy::from_config(text),
-            providers: std::collections::BTreeMap::new(),
-        };
-    }
-    let Some(object) = value.as_object() else {
-        return RoutingStrategySettings::default();
-    };
-    let default = object
-        .get(KEY_ROUTING_STRATEGY_DEFAULT)
-        .and_then(Value::as_str)
-        .map(RoutingStrategy::from_config)
-        .unwrap_or_default();
-    let mut providers = std::collections::BTreeMap::new();
-    if let Some(entries) = object.get(KEY_ROUTING_STRATEGY_PROVIDERS).and_then(Value::as_object) {
-        for (id, item) in entries {
-            let id = id.trim();
-            if id.is_empty() {
-                continue;
-            }
-            let strategy = item
-                .as_str()
-                .map(RoutingStrategy::from_config)
-                .unwrap_or_default();
-            providers.insert(id.to_string(), strategy);
-        }
-    }
-    RoutingStrategySettings { default, providers }
-}
-
-#[cfg(test)]
-mod routing_strategy_tests {
-    use super::*;
-    use crate::server::core::routing::RoutingStrategy;
-    use serde_json::json;
-
-    fn object(value: Value) -> Map<String, Value> {
-        match value {
-            Value::Object(map) => map,
-            _ => Map::new(),
-        }
-    }
-
-    #[test]
-    fn missing_key_falls_back_to_priority() {
-        let settings = routing_strategy_from(&Map::new());
-        assert_eq!(settings.default, RoutingStrategy::Priority);
-        assert!(settings.providers.is_empty());
-    }
-
-    #[test]
-    fn parses_default_and_providers() {
-        let settings = routing_strategy_from(&object(json!({
-            "routingStrategy": {
-                "default": "round-robin",
-                "providers": { "workbuddy": "least-connections" }
-            }
-        })));
-        assert_eq!(settings.default, RoutingStrategy::RoundRobin);
-        assert_eq!(settings.providers.get("workbuddy"), Some(&RoutingStrategy::LeastConnections));
-    }
-
-    #[test]
-    fn invalid_default_falls_back_to_priority() {
-        let settings = routing_strategy_from(&object(json!({
-            "routingStrategy": { "default": "bogus" }
-        })));
-        assert_eq!(settings.default, RoutingStrategy::Priority);
-    }
-
-    #[test]
-    fn invalid_provider_strategy_falls_back_to_priority() {
-        let settings = routing_strategy_from(&object(json!({
-            "routingStrategy": { "providers": { "workbuddy": "bogus" } }
-        })));
-        assert_eq!(settings.providers.get("workbuddy"), Some(&RoutingStrategy::Priority));
-    }
-
-    #[test]
-    fn unknown_provider_ids_are_kept() {
-        let settings = routing_strategy_from(&object(json!({
-            "routingStrategy": { "providers": { "future-provider": "round-robin" } }
-        })));
-        assert_eq!(settings.providers.get("future-provider"), Some(&RoutingStrategy::RoundRobin));
-    }
-
-    #[test]
-    fn wrong_shapes_fall_back_to_defaults() {
-        let settings = routing_strategy_from(&object(json!({ "routingStrategy": 42 })));
-        assert_eq!(settings.default, RoutingStrategy::Priority);
-        assert!(settings.providers.is_empty());
-        let settings = routing_strategy_from(&object(json!({
-            "routingStrategy": { "providers": "round-robin" }
-        })));
-        assert!(settings.providers.is_empty());
-    }
-
-    // ── 上游 v3.0.2 旧字符串形态的迁移（任务要求：不丢数据）──────────
-
-    #[test]
-    fn legacy_rotate_string_loads_as_global_round_robin() {
-        let settings = routing_strategy_from(&object(json!({ "routingStrategy": "rotate" })));
-        assert_eq!(settings.default, RoutingStrategy::GlobalRoundRobin);
-        assert!(settings.providers.is_empty());
-    }
-
-    #[test]
-    fn legacy_provider_string_loads_as_round_robin() {
-        let settings = routing_strategy_from(&object(json!({ "routingStrategy": "provider" })));
-        assert_eq!(settings.default, RoutingStrategy::RoundRobin);
-        assert!(settings.providers.is_empty());
-    }
-
-    #[test]
-    fn legacy_order_string_loads_as_priority() {
-        let settings = routing_strategy_from(&object(json!({ "routingStrategy": "order" })));
-        assert_eq!(settings.default, RoutingStrategy::Priority);
-    }
-
-    #[test]
-    fn legacy_usage_string_loads_as_balance_weighted() {
-        let settings = routing_strategy_from(&object(json!({ "routingStrategy": "usage" })));
-        assert_eq!(settings.default, RoutingStrategy::BalanceWeighted);
-    }
-
-    #[test]
-    fn legacy_unknown_string_loads_as_priority() {
-        let settings = routing_strategy_from(&object(json!({ "routingStrategy": "whatever" })));
-        assert_eq!(settings.default, RoutingStrategy::Priority);
-        assert!(settings.providers.is_empty());
-    }
-}
-
-// ─── 账号路由的解析（粘性 / 退避 / 垫底 / 熔断）────────────────

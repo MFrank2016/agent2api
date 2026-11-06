@@ -158,6 +158,15 @@ pub(crate) fn max_concurrent_public(value: Option<&Value>) -> u64 {
     value.and_then(Value::as_u64).unwrap_or(0)
 }
 
+/// 公开形态的数值上限读数（`maxRpm` / `maxAccounts` / `queueLimit` 共用）：
+/// 记录里没有该键 / 值不是数字 = 0（各字段语义：不限 / 不排队），与
+/// [`max_concurrent_public`] 同一口径；超过 `cap` 的脏数据按 `cap` 报 ——
+/// 写入侧（`store_crud::normalize_limit`）与选路读侧（`routing::max_rpm_of`
+/// 等）用的是**同一份**封顶值，公开形态不能报出一个选路根本不会采用的数。
+pub(crate) fn limit_public(value: Option<&Value>, cap: u64) -> u64 {
+    value.and_then(Value::as_u64).unwrap_or(0).min(cap)
+}
+
 /// 公开形态出口的 `maxConcurrent`：在 [`max_concurrent_public`] 之上套上
 /// 「本家默认并发」的口径。
 ///

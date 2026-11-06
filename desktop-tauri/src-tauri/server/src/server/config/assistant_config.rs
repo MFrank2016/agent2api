@@ -90,14 +90,23 @@ const LEGACY_DEFAULT_TOOLS: [&str; 6] = [
 ];
 
 const LEGACY_TOOL_IDS: [&str; 9] = [
-    "list_models", "list_account_balance", "set_model_enabled", "set_model_mapping",
-    "set_model_capability", "test_model", "set_provider_order", "set_account_order",
+    "list_models",
+    "list_account_balance",
+    "set_model_enabled",
+    "set_model_mapping",
+    "set_model_capability",
+    "test_model",
+    "set_provider_order",
+    "set_account_order",
     "set_account_enabled",
 ];
 
 /// 只迁移旧九项默认表；新增工具或未知键的显式选择必须保留。
 fn is_legacy_default_tools(tools: &BTreeMap<String, bool>) -> bool {
-    if tools.keys().any(|id| !LEGACY_TOOL_IDS.contains(&id.as_str())) {
+    if tools
+        .keys()
+        .any(|id| !LEGACY_TOOL_IDS.contains(&id.as_str()))
+    {
         return false;
     }
     LEGACY_TOOL_IDS.iter().all(|id| {
@@ -307,9 +316,15 @@ pub fn from_raw(raw: &Map<String, Value>) -> AssistantConfig {
         .unwrap_or_default();
     // 存量迁移：库里的值恰好是「旧默认集」时视为没调过，清空显式值让它跟着
     // 新默认集（全选）走。见 is_legacy_default_tools 的说明。
-    let mut tools = if is_legacy_default_tools(&tools) { BTreeMap::new() } else { tools };
+    let mut tools = if is_legacy_default_tools(&tools) {
+        BTreeMap::new()
+    } else {
+        tools
+    };
     // 全不选表示纯聊天，新增工具不能隐式恢复配置读取权限。
-    if LEGACY_TOOL_IDS.iter().all(|id| tools.get(*id) == Some(&false))
+    if LEGACY_TOOL_IDS
+        .iter()
+        .all(|id| tools.get(*id) == Some(&false))
         && !tools.values().any(|enabled| *enabled)
     {
         for id in ALL_TOOL_IDS {
@@ -318,13 +333,24 @@ pub fn from_raw(raw: &Map<String, Value>) -> AssistantConfig {
     }
     AssistantConfig {
         model,
-        api_key_id: block.get("apiKeyId").and_then(Value::as_str).map(str::trim)
-            .filter(|id| !id.is_empty() && id.len() <= 128).map(str::to_string),
+        api_key_id: block
+            .get("apiKeyId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty() && id.len() <= 128)
+            .map(str::to_string),
         reasoning,
-        title_model: block.get("titleModel").and_then(Value::as_str).map(str::trim)
-            .filter(|text| !text.is_empty() && text.chars().count() <= 128).map(str::to_string),
-        title_prompt: block.get("titlePrompt").and_then(Value::as_str)
-            .map(|text| clamp_chars(text, MAX_SYSTEM_PROMPT_CHARS)).unwrap_or_default(),
+        title_model: block
+            .get("titleModel")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty() && text.chars().count() <= 128)
+            .map(str::to_string),
+        title_prompt: block
+            .get("titlePrompt")
+            .and_then(Value::as_str)
+            .map(|text| clamp_chars(text, MAX_SYSTEM_PROMPT_CHARS))
+            .unwrap_or_default(),
         // 缺失 / 写坏一律回落「变更前确认」：配置被手改时不该把人悄悄推进
         // 「不再询问」那一档（见 PermissionMode::from_str_lenient）
         mode: block

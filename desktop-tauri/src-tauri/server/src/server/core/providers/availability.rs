@@ -1,6 +1,9 @@
 //! 两件事在这里被分开：**独立 FULL-auth 边界的身份**（scoped runtime）与
 //! **此刻有没有执行体**（suspended）。历史上它们是同一份名单，千问办公接入
 //! 之后必须拆开 —— 它既是 scoped runtime，又已经有执行体了。
+//!
+//! 本仓保留 `kiro` 在 scoped runtime 表：它仍用独立 FULL-auth 边界与 strict
+//! 错误投影，且 `is_runtime_identity` 让存量 kiro 账号在插件未运行时可被识别。
 
 pub const BUILTIN_SUBSCRIPTION_IDS: [&str; 5] = [
     "claude-subscription",
@@ -16,8 +19,10 @@ pub const BUILTIN_SUBSCRIPTION_IDS: [&str; 5] = [
 /// 错误走严格投影（`plugin_host/strict_errors.rs`）、目录刷新要求同一次往返
 /// 里带回真实远程快照（`plugin_host/rpc.rs`）。名单里的家可能正在跑，也可能
 /// 停用 —— 「有没有执行体」看 [`is_suspended`]。
-const SCOPED_RUNTIME_IDS: [&str; 13] = [
+const SCOPED_RUNTIME_IDS: [&str; 14] = [
     "cursor",
+    // 本仓保留 kiro 的严格错误投影与存量账号识别（插件未装时也可被认出）
+    "kiro",
     "devin",
     "factory",
     "zed",
@@ -95,4 +100,29 @@ pub(crate) fn is_runtime_identity(id: &str) -> bool {
 /// 这条路线此刻有没有执行体。
 pub fn is_suspended(id: &str) -> bool {
     SUSPENDED_IDS.contains(&id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kiro_is_no_longer_suspended() {
+        assert!(!is_suspended("kiro"), "kiro 已实现插件，必须可添加");
+    }
+
+    #[test]
+    fn other_suspended_ids_are_unchanged() {
+        for id in [
+            "cursor", "devin", "factory", "zed", "grok", "opendesign", "nous-portal",
+        ] {
+            assert!(is_suspended(id), "{id} 仍应保持停用");
+        }
+    }
+
+    #[test]
+    fn kiro_stays_a_scoped_runtime_after_unsuspend() {
+        assert!(is_runtime_identity("kiro"), "kiro 必须保留 FULL-auth 边界与 strict 错误投影");
+        assert!(!is_suspended("kiro"), "kiro 已可添加");
+    }
 }

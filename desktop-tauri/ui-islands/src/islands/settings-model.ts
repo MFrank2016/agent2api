@@ -211,6 +211,7 @@ export type SystemInfo = {
     exePath?: string | null
     installerKind?: string | null
     selfUpdate?: boolean | null
+    updateCapability?: import('../../../ui-shared/updates').UpdateCapability
   }
   security?: {
     adminRegistered?: boolean | null
@@ -324,6 +325,13 @@ export type ClineHeadersData = {
   effective: Record<string, string>
 }
 
+/** 可逆脱敏的写入入参（后端允许部分字段；界面每次发全量三项） */
+export type MaskingPatch = {
+  maskSecrets?: boolean
+  maskPii?: boolean
+  maskWords?: string[]
+}
+
 /** 本页用到的壳 / HTTP 桥（方法名与 bridge.rs 一一对应，一个都不能改） */
 export type SettingsBridge = {
   /** 'desktop' | 'web'：面板登录那一块只在网页端有意义 */
@@ -346,6 +354,9 @@ export type SettingsBridge = {
   saveDebug(enabled: boolean): Promise<unknown>
   getSanitize(): Promise<unknown>
   saveSanitize(patch: boolean | SanitizePatch): Promise<unknown>
+  /** 可逆出站脱敏（密钥 / 个人信息 / 自定义词）；GET 与 PUT 同形 */
+  getMasking(): Promise<unknown>
+  saveMasking(patch: MaskingPatch): Promise<unknown>
   getThinkStrip(): Promise<unknown>
   saveThinkStrip(enabled: boolean): Promise<unknown>
   getProviderOptions(): Promise<unknown>

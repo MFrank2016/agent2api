@@ -1,3 +1,5 @@
+pub(crate) mod global_accounts;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -5,13 +7,14 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::{RoutingProfile, RoutingProfiles, CONFIG, CONFIG_UPDATE_LOCK};
-use crate::server::core::{account_order, account_store::store::AccountStore, routing, routing_scope};
+use crate::server::core::{
+    account_order, account_store::store::AccountStore, routing, routing_scope,
+};
 
 /// 全局 profile 的 `strategy` 来自 workspace 的**展示面**（`routing_json` 只输出
 /// `order` / `rotate` / `provider` 三档）。这些展示 id 是本地 7 档的有损投影，
 /// 绝不能反推回去覆盖权威默认值 —— 否则用户在 `least-connections` 上做任何一次
-/// 全局保存（哪怕只是账号排序）都会被静默改成 `priority`，`balance-weighted`
-/// 会被改成 `global-round-robin`。
+/// 全局保存（哪怕只是账号排序）都会被静默改成 `priority`。
 ///
 /// 只有真正来自本地策略面的 7 档 id（`/api/routing-strategy` 的 `default`）才更新
 /// 权威默认值；展示 id 一律保留现状。
@@ -28,30 +31,68 @@ fn canonical_default_after_profile_strategy(
     }
 }
 
-pub fn revision(profile: &RoutingProfile, settings: super::RoutingSettings, customized: bool) -> String {
+pub fn revision(
+    profile: &RoutingProfile,
+    settings: super::RoutingSettings,
+    customized: bool,
+) -> String {
     let value = json!({ "profile": profile, "strategy": settings.strategy.as_str(), "sticky": settings.sticky.as_str(), "customized": customized });
     format!("{:x}", Sha256::digest(value.to_string().as_bytes()))
 }
 
 pub fn save_workspace(
-    store: &AccountStore, model: &str, profile: Option<RoutingProfile>, expected: &str,
+    store: &AccountStore,
+    model: &str,
+    profile: Option<RoutingProfile>,
+    expected: &str,
 ) -> Result<(), String> {
-    let _update = CONFIG_UPDATE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _update = CONFIG_UPDATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let guard = store.guard();
     let state = store.load(&guard);
-    let visible: Vec<Value> = state.accounts.iter()
-        .filter(|record| crate::server::core::account_store::store_view::account_visible(&record.provider()))
-        .map(|record| store.public_account(record)).collect();
-    let available = if model.is_empty() { routing_scope::available_providers(&visible) }
-        else { crate::server::core::providers::catalog::forwarding_providers(model) };
+    let visible: Vec<Value> = state
+        .accounts
+        .iter()
+        .filter(|record| {
+            crate::server::core::account_store::store_view::account_visible(&record.provider())
+        })
+        .map(|record| store.public_account(record))
+        .collect();
+    let available = if model.is_empty() {
+        routing_scope::available_providers(&visible)
+    } else {
+        crate::server::core::providers::catalog::forwarding_providers(model)
+    };
     let mut next = super::current();
-    let effective = routing_scope::materialize_profile_with(&visible, &available, model, &next.routing_profiles);
+    if next.routing_profiles.group_for_model(model).is_some() {
+        return Err("此模型 ID 已被自定义路由组占用".into());
+    }
+    let effective = routing_scope::materialize_profile_with(
+        &visible,
+        &available,
+        model,
+        &next.routing_profiles,
+    );
     let current_settings = next.routing_profiles.settings_for(model, next.routing);
-    if revision(&effective, current_settings, next.routing_profiles.model_profile(model).is_some()) != expected {
+    if revision(
+        &effective,
+        current_settings,
+        next.routing_profiles.model_profile(model).is_some(),
+    ) != expected
+    {
         return Err("路由配置已在其他位置修改，请刷新当前配置后重试；草稿未丢失".to_string());
     }
     let mut profiles: RoutingProfiles = (*next.routing_profiles).clone();
-    if !model.is_empty() && profile.is_some() && !profiles.models.contains_key(model) && profiles.models.len() >= super::routing_profiles::MAX_ROUTING_MODELS {
+    if model.is_empty() && (profiles.global.as_ref().is_some_and(global_accounts::has_restrictions)
+        || profile.as_ref().is_some_and(global_accounts::has_restrictions)) {
+        return Err("全局默认已改为账号启停，请先转换旧版全局参与设置；模型独立路由仍可设置参与名单".into());
+    }
+    if !model.is_empty()
+        && profile.is_some()
+        && !profiles.models.contains_key(model)
+        && profiles.models.len() >= super::routing_profiles::MAX_ROUTING_MODELS
+    {
         return Err("模型独立配置数量已达上限".to_string());
     }
     let mut priorities = Vec::new();
@@ -63,24 +104,69 @@ pub fn save_workspace(
                 if let Some(order) = profile.account_order.get(provider) {
                     let changed = effective.account_order.get(provider) != Some(order);
                     if changed {
-                        crate::server::core::routing_order::global_queue(&visible, profile, Some(provider))?;
-                        let positions: HashMap<_, _> = order.iter().enumerate().map(|(index, id)| (id.as_str(), index)).collect();
-                        members.sort_by_key(|account| routing::account_id(account).and_then(|id| positions.get(id)).copied().unwrap_or(usize::MAX));
+                        crate::server::core::routing_order::global_queue(
+                            &visible,
+                            profile,
+                            Some(provider),
+                        )?;
+                        let positions: HashMap<_, _> = order
+                            .iter()
+                            .enumerate()
+                            .map(|(index, id)| (id.as_str(), index))
+                            .collect();
+                        members.sort_by_key(|account| {
+                            routing::account_id(account)
+                                .and_then(|id| positions.get(id))
+                                .copied()
+                                .unwrap_or(usize::MAX)
+                        });
                     }
                 }
             }
-            let positions: HashMap<_, _> = profile.providers.iter().enumerate().map(|(index, id)| (id.as_str(), index)).collect();
-            let mut selected: Vec<_> = groups.iter().filter(|(id, _)| positions.contains_key(id.as_str())).cloned().collect();
-            selected.sort_by_key(|(id, _)| positions.get(id.as_str()).copied().unwrap_or(usize::MAX));
+            let positions: HashMap<_, _> = profile
+                .providers
+                .iter()
+                .enumerate()
+                .map(|(index, id)| (id.as_str(), index))
+                .collect();
+            let mut selected: Vec<_> = groups
+                .iter()
+                .filter(|(id, _)| positions.contains_key(id.as_str()))
+                .cloned()
+                .collect();
+            selected
+                .sort_by_key(|(id, _)| positions.get(id.as_str()).copied().unwrap_or(usize::MAX));
             let mut replacement = selected.into_iter();
-            for group in &mut groups { if positions.contains_key(group.0.as_str()) { if let Some(next) = replacement.next() { *group = next; } } }
-            let mut ids = groups.into_iter().flat_map(|(_, members)| members.into_iter().filter_map(|account| routing::account_id(&account).map(str::to_string)));
-            let visible_ids: std::collections::HashSet<_> = sorting.account_order.values().flatten().cloned().collect();
+            for group in &mut groups {
+                if positions.contains_key(group.0.as_str()) {
+                    if let Some(next) = replacement.next() {
+                        *group = next;
+                    }
+                }
+            }
+            let mut ids = groups.into_iter().flat_map(|(_, members)| {
+                members
+                    .into_iter()
+                    .filter_map(|account| routing::account_id(&account).map(str::to_string))
+            });
+            let visible_ids: std::collections::HashSet<_> =
+                sorting.account_order.values().flatten().cloned().collect();
             let mut records: Vec<_> = state.accounts.iter().collect();
             records.sort_by_key(|record| record.order_key());
-            priorities = records.into_iter().enumerate().map(|(index, record)| {
-                (if visible_ids.contains(record.id()) { ids.next().unwrap_or_else(|| record.id().to_string()) } else { record.id().to_string() }, index as i64)
-            }).collect();
+            priorities = records
+                .into_iter()
+                .enumerate()
+                .map(|(index, record)| {
+                    (
+                        if visible_ids.contains(record.id()) {
+                            ids.next().unwrap_or_else(|| record.id().to_string())
+                        } else {
+                            record.id().to_string()
+                        },
+                        index as i64,
+                    )
+                })
+                .collect();
         }
         let mut global = profile;
         if let Some(profile) = &mut global {
@@ -88,21 +174,32 @@ pub fn save_workspace(
                 // 展示 id（order/rotate/provider）是 workspace 面的有损投影，
                 // 保留现有权威默认值；只有本地 7 档 id 才走规范写入口。
                 let canonical = next.routing_strategy.clone();
-                let default = canonical_default_after_profile_strategy(canonical.default, Some(&strategy));
+                let default = canonical_default_after_profile_strategy(
+                    canonical.default,
+                    Some(&strategy),
+                );
                 if default != canonical.default {
                     let mut updated = canonical;
                     updated.default = default;
                     super::write_routing_strategy_canonical(&mut next, &updated);
                 }
             }
-            if let Some(sticky) = profile.sticky.take() { next.routing.sticky = super::StickyMode::from_id(&sticky); next.raw.insert(super::KEY_ROUTING_STICKY.into(), sticky.into()); }
+            if let Some(sticky) = profile.sticky.take() {
+                next.routing.sticky = super::StickyMode::from_id(&sticky);
+                next.raw
+                    .insert(super::KEY_ROUTING_STICKY.into(), sticky.into());
+            }
             profile.account_order.clear();
         }
         profiles.global = global;
-    } else if let Some(profile) = profile { profiles.models.insert(model.to_string(), profile); }
-    else { profiles.models.remove(model); }
+    } else if let Some(profile) = profile {
+        profiles.models.insert(model.to_string(), profile);
+    } else {
+        profiles.models.remove(model);
+    }
     let serialized = serde_json::to_value(&profiles).map_err(|error| error.to_string())?;
-    next.raw.insert("routingProfiles".into(), serialized.clone());
+    next.raw
+        .insert("routingProfiles".into(), serialized.clone());
     store.with_conn_mut(&guard, |conn| {
         let tx = conn.transaction()?;
         tx.execute("INSERT INTO kv(key,value) VALUES('routingProfiles',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", rusqlite::params![serialized.to_string()])?;
@@ -115,7 +212,11 @@ pub fn save_workspace(
         tx.commit()
     }).map_err(|error| error.to_string())?;
     next.routing_profiles = Arc::new(profiles);
-    *CONFIG.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(next);
+    crate::server::core::providers::catalog::invalidate();
+    *CONFIG
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(next);
+    crate::server::core::providers::catalog::invalidate();
     drop(guard);
     crate::server::core::cloud_sync::auto_sync::notify_change();
     Ok(())
@@ -126,9 +227,9 @@ mod tests {
     use super::*;
     use crate::server::core::routing::RoutingStrategy;
 
-    /// Issue 1（fix round 3）：权威默认值为 least-connections 时，任何一次
-    /// 全局 profile 保存（携带 workspace 展示面上的 order/rotate/provider）
-    /// 都必须原样保留 least-connections，不能被静默降级成 priority。
+    /// 权威默认值为 least-connections 时，任何一次全局 profile 保存（携带
+    /// workspace 展示面上的 order/rotate/provider）都必须原样保留，不能被
+    /// 静默降级成 priority。
     #[test]
     fn global_save_preserves_local_strategy_when_profile_carries_display_id() {
         let canonical = RoutingStrategy::LeastConnections;
@@ -139,13 +240,14 @@ mod tests {
                 "展示 id {display} 不得改写本地权威档位"
             );
         }
-        // 本地策略面给的真实 7 档 id 仍然可以更新权威值。
         assert_eq!(
             canonical_default_after_profile_strategy(canonical, Some("least-recently-used")),
             RoutingStrategy::LeastRecentlyUsed
         );
-        // 没带 strategy / 认不出的值也保留现状（不回落 priority）。
         assert_eq!(canonical_default_after_profile_strategy(canonical, None), canonical);
-        assert_eq!(canonical_default_after_profile_strategy(canonical, Some("nonsense")), canonical);
+        assert_eq!(
+            canonical_default_after_profile_strategy(canonical, Some("nonsense")),
+            canonical
+        );
     }
 }

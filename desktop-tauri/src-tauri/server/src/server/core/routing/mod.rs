@@ -31,14 +31,19 @@
 //! 与转发默认使用谁始终一致；仅当账号对某具体模型限额时，该模型的请求才会临时
 //! 降级到下一个候选 —— 那是按模型的一次性决策，不改写「当前账号」。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use serde_json::{json, Value};
 
 use crate::server::core::account_store::priority::{by_priority_order, normalize_priority};
+use crate::server::core::account_store::store_crud::{
+    MAX_ACCOUNTS_LIMIT, MAX_QUEUE_LIMIT, MAX_RPM_LIMIT,
+};
 use crate::server::core::account_store::store_util::js_truthy;
 
+pub mod registry;
+pub mod seat;
 pub mod strategy;
 
 // 选路策略层的公开出口：枚举 / 运行时状态 / 带策略的挑选。
@@ -223,6 +228,96 @@ pub fn max_concurrent_of(account: &Value) -> u64 {
         .unwrap_or(0)
 }
 
+/// 滚动 60 秒的请求上限（`maxRpm`）：0 = **不限**。
+///
+/// 与 [`max_concurrent_of`] 同一口径（缺键 / 非数字 = 0），另外在读侧再封顶
+/// 一次 [`MAX_RPM_LIMIT`] —— 写入侧已经挡过一遍（`store_crud` 的归一化），
+/// 但手改记录、旧数据、导入文件都能绕过写入侧；选路是最后一个能拦住
+/// 「一个账号一秒打一万次」的地方。
+pub fn max_rpm_of(account: &Value) -> u64 {
+    account
+        .get("maxRpm")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(MAX_RPM_LIMIT)
+}
+
+/// 同一 provider **同时使用**的账号数上限（`maxAccounts`）：0 = **不限**。
+///
+/// 「同时使用」按选路顺序的前 N 个账号计（其余是储备账号），见 Phase 2 的
+/// `reserve_flags`。读侧封顶 [`MAX_ACCOUNTS_LIMIT`]，理由同 [`max_rpm_of`]。
+pub fn max_accounts_of(account: &Value) -> u64 {
+    account
+        .get("maxAccounts")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(MAX_ACCOUNTS_LIMIT)
+}
+
+/// 把账号记录上的 `maxAccounts` 汇总成**逐家**上限：同一 provider 取该家所有
+/// 账号里**最小的非零值**（0 = 不限，不参与取最小）。全为 0 的家不出现在表里
+/// （= 不限）。
+///
+/// 为什么取最小非零：`maxAccounts` 存在每条账号记录上，同一家不同账号可能填了
+/// 不同的值（手改 / 旧数据 / 批量编辑）。选路只能执行一个数，取最小的那个是
+/// 唯一不会**超出**任何一条账号声明的口径；全 0 说明这家没设上限。
+///
+/// ── 只统计「会参与转发」的账号 ──────────────────────────────
+/// 禁用 / 无凭证的账号永远进不了 `plan_route` 的可用位次，却带着一个
+/// `maxAccounts` 值 —— 把它们算进汇总会让一个从未上场的账号把整家上限压小
+/// （例如 3 个启用账号 + 1 个已禁用但填了 `maxAccounts=1` 的旧记录 ⇒ 只放行
+/// 1 个，另外两个被无端标成储备）。公开形态里这两个事实是显式布尔：
+/// `enabled === false` / `hasCredentials === false`；缺键按「是」处理（与
+/// `account_usability` 的「只有显式 false 才算禁用」同一口径）。
+pub fn max_accounts_by_provider(accounts: &[Value]) -> HashMap<String, u64> {
+    let mut caps: HashMap<String, u64> = HashMap::new();
+    for account in accounts {
+        if !counts_toward_max_accounts(account) {
+            continue;
+        }
+        let cap = max_accounts_of(account);
+        if cap == 0 {
+            continue;
+        }
+        caps.entry(provider_of(account).to_string())
+            .and_modify(|current| *current = (*current).min(cap))
+            .or_insert(cap);
+    }
+    caps
+}
+
+/// 这条账号记录是否算进 `maxAccounts` 的汇总（启用且看起来有凭证）。
+fn counts_toward_max_accounts(account: &Value) -> bool {
+    !matches!(account.get("enabled"), Some(Value::Bool(false)))
+        && !matches!(account.get("hasCredentials"), Some(Value::Bool(false)))
+}
+
+/// 逐家的「储备位次」标记：前 `max_accounts` 个可用账号保持可用，其余为储备。
+/// `max_accounts == 0` = **不限**，全 false。
+///
+/// 储备是**本次调用**的标记，不是账号的永久属性：应用后 [`plan_route`] 会把
+/// 所有 `reserve` 稳定后置到 `ordered` 末尾，因此线性转发一定先走完本家 / 跨家
+/// 的全部 `usable` 位次，才会轮到储备。重试时前面的 kept 已进 `tried` / `blocked`，
+/// 重新计算后原来的储备会被提升为 `usable` —— 这正是「前面的都不可用才使用」
+/// 的实现方式，不跨调用保存原始 kept 集合。
+fn reserve_flags(len: usize, max_accounts: u64) -> Vec<bool> {
+    if max_accounts == 0 {
+        return vec![false; len];
+    }
+    (0..len).map(|index| index as u64 >= max_accounts).collect()
+}
+
+/// 账号在途已满时的排队上限（`queueLimit`）：0 = **不排队**（直接换号 / 429）。
+///
+/// 读侧封顶 [`MAX_QUEUE_LIMIT`]，理由同 [`max_rpm_of`]。
+pub fn queue_limit_of(account: &Value) -> u64 {
+    account
+        .get("queueLimit")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(MAX_QUEUE_LIMIT)
+}
+
 /// 按优先级挑选本次请求使用的账号。
 ///
 /// `accounts` 为 store.listAccounts().accounts 的公开形态；
@@ -271,6 +366,13 @@ pub fn pick_account_by_priority(
 ///
 /// 过滤判据（与改造前逐字相同）：有非空 id、不在 `exclude_ids` 里、可用
 /// （启用 + 该模型未限流）、未达并发上限。
+///
+/// ⚠️ **不处理模型级 rest**：本函数拿不到 `RouteState`（没有 model /
+/// [`PlanMeta`] 入参），只做静态过滤。模型级 rest（[`PlanMeta::model_resting`]）
+/// 由 [`plan_route`] 在调用策略层之前统一过滤；生产转发与队列端点必须走
+/// [`plan_route`]，本函数只服务于旧的扁平优先级路径
+/// （[`pick_account_by_priority`]）与策略层内部的二次过滤，**不要**把它当作
+/// 新的选路入口。
 fn usable_candidates(
     accounts: &[Value],
     keys: &CooldownKeys<'_>,
@@ -522,7 +624,7 @@ pub struct PlanEntry {
     pub name: String,
     pub provider: String,
     /// 状态码：`usable` / `tried` / `disabled` / `cooldown` / `concurrency` /
-    /// `limiter` / `no-credentials`
+    /// `limiter` / `no-credentials` / `rpm`（RPM 超限）/ `reserve`（储备账号）
     pub state: &'static str,
     /// 一句「为什么排这 / 为什么跳过」（队列面板与请求详情直接展示）
     pub reason: String,
@@ -559,10 +661,35 @@ pub struct PlanMeta<'a> {
     pub sunk: &'a HashMap<String, i64>,
     /// 休息中的账号 → 休息截止时刻（失败退避）
     pub resting: &'a HashMap<String, i64>,
+    /// 账号级**硬**休息：账号 id → 恢复截止时刻。
+    ///
+    /// 与 `resting` 分工：`resting` 是网络失败的指数退避（软垫底，仍可能被
+    /// 选中试一次），本表是「余额耗尽 / 需要人机验证」这类**换模型也没用**
+    /// 的失败 —— 直接跳过，且不分模型（额度按账号算）。
+    pub account_resting: &'a HashMap<String, i64>,
+    /// 模型级 rest：(账号 id, 模型) → 休息截止时刻。
+    ///
+    /// 与 `resting` 分工：`resting` 是**账号级**退避（对所有模型生效，只垫底），
+    /// `model_resting` 是**模型级**冷却（只跳过该模型的候选，硬过滤）。
+    pub model_resting: &'a HashMap<(String, String), i64>,
     /// 熔断打开的账号
     pub open: &'a std::collections::HashSet<String>,
     /// 被限制器软跳过的账号（余额不足 / Token 限额，调用方判好传入）
     pub limiter_blocked: &'a std::collections::HashSet<String>,
+    /// 已达滚动 RPM 上限的账号 id（`maxRpm`）：直接跳过，等窗口滚动。
+    ///
+    /// 由调用方（`UpstreamService` 持有 `RpmWindow`）算好传入 —— 选路本身
+    /// 不维护计数器，保持「读一次快照、立刻决策」的纯函数语义。
+    pub rpm_blocked: &'a HashSet<String>,
+    /// provider id → 该家**同时使用**的账号数上限（`maxAccounts`；0 / 缺键 = 不限）。
+    ///
+    /// 用**逐家**表而非单个数字：跨家队列里一家的上限不能把另一家也算成储备。
+    /// 由 [`max_accounts_by_provider`] 从账号记录汇总：同家取**最小的非零**
+    /// `maxAccounts`，全 0 的家不进表。
+    ///
+    /// 超出上限的位次标成 `reserve`，并被稳定后置到整条 `ordered` 的末尾
+    /// （不是只在本家组内后置）—— 线性转发会先用完所有 `usable`，再回头试储备。
+    pub max_accounts: &'a HashMap<String, u64>,
     /// 粘性命中的账号 id（`None` = 无命中）
     pub sticky_account: Option<&'a str>,
 }
@@ -652,6 +779,13 @@ pub fn plan_route(
             ));
             continue;
         }
+        // 滚动 RPM 超限（`maxRpm`）：本窗口内已打满，等窗口滚动再回来。
+        // 与 `limiter` 分工：那边是余额 / Token 周期用量，这边是**每分钟**的
+        // 请求速率；计数由调用方的 `RpmWindow` 维护，选路只消费结果。
+        if meta.rpm_blocked.contains(&id) {
+            blocked.push(entry("rpm", "RPM 超限，等待窗口滚动后自动回来".to_string()));
+            continue;
+        }
         let reset_at = rate_limit_reset_at(account, keys, now);
         if reset_at > 0 {
             blocked.push(entry(
@@ -660,6 +794,32 @@ pub fn plan_route(
                     "对该模型限流冷却中，{} 恢复（恢复后自动回来）",
                     clock_text(reset_at, now)
                 ),
+            ));
+            continue;
+        }
+        // 账号级**硬**休息（余额耗尽 / 需要人机验证）：换模型也没用，直接跳过。
+        // 与下面的 `model_resting` 分工：那边只停一格，这边停整个账号；
+        // 与函数末尾的 `resting`（软垫底）分工：那边只是排到队尾。
+        if meta.account_resting.contains_key(&id) {
+            blocked.push(entry(
+                "cooldown",
+                "额度耗尽/需要验证，恢复后自动回来".to_string(),
+            ));
+            continue;
+        }
+        // 模型级 rest：只跳过「这个账号 × 这个模型」这一格，同账号其他模型照常
+        // 参与。键必须是**上游真名**（与 `rateLimits` / 模型级冷却同一口径）：
+        // Task 1.3 在转发收尾时按真名 `rest_mark`，而本函数的 `meta.model` 是
+        // 请求名 —— 用请求名查会在有映射时静默漏命中。
+        // 账号级 `resting` 不在这里 —— 它是退避，对所有模型统一垫底
+        // （见函数末尾的稳定修饰），不是硬跳过。
+        if let Some(until) = meta
+            .model_resting
+            .get(&(id.clone(), keys.for_provider(&provider)))
+        {
+            blocked.push(entry(
+                "cooldown",
+                format!("模型限流至 {}（恢复后自动回来）", clock_text(*until, now)),
             ));
             continue;
         }
@@ -733,7 +893,7 @@ pub fn plan_route(
         flags
     };
 
-    let ordered_entries: Vec<PlanEntry> = arranged
+    let mut ordered_entries: Vec<PlanEntry> = arranged
         .into_iter()
         .enumerate()
         .map(|(index, account)| {
@@ -798,6 +958,39 @@ pub fn plan_route(
         })
         .collect();
 
+    // 储备账号（`maxAccounts`，**逐家**）：排序完成后按 provider 分组，每家的
+    // 前 N 个可用账号保持可用，其余标成 `reserve`。标记完成后**稳定分区**：
+    // 所有 `usable` 在前、所有 `reserve` 在后，各自保持原有相对顺序 ——
+    // 储备只在本家组内后置是不够的（`[p1 usable, p2 reserve, q1 usable]` 会让
+    // 线性转发在 q1 之前用掉 p2），必须全局后置才能兑现「kept 全部失败后才用
+    // 储备」。分区不改变策略序，只把 `reserve` 这一类整体挪到队尾。
+    // 已进 `blocked` 的候选不在这张表里，因此不会被误标。
+    {
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        for (index, entry) in ordered_entries.iter().enumerate() {
+            groups
+                .entry(entry.provider.clone())
+                .or_default()
+                .push(index);
+        }
+        for (provider, indices) in groups {
+            let Some(limit) = meta.max_accounts.get(&provider).copied() else {
+                continue;
+            };
+            let flags = reserve_flags(indices.len(), limit);
+            for (index, reserve) in indices.into_iter().zip(flags) {
+                let entry = &mut ordered_entries[index];
+                if reserve && entry.state == "usable" {
+                    entry.state = "reserve";
+                    entry.reason = "储备账号：前面的账号都不可用才使用".to_string();
+                }
+            }
+        }
+        // 稳定分区（`sort_by_key` 是稳定排序）：`false`（usable）在前，
+        // `true`（reserve）在后，同类内部保持策略序。
+        ordered_entries.sort_by_key(|entry| entry.state == "reserve");
+    }
+
     RoutePlan {
         ordered: ordered_entries,
         blocked,
@@ -856,21 +1049,50 @@ mod plan_tests {
         open: &HashSet<String>,
         sticky: Option<&str>,
     ) -> RoutePlan {
-        let keys = CooldownKeys::new("m");
+        let empty = HashMap::new();
+        plan_for_model(
+            accounts, settings, state, advance, sunk, resting, open, sticky, "m", &empty,
+        )
+    }
+
+    /// 同上，但点名模型并带上模型级 rest 表（`model_resting` 的用例需要）。
+    #[allow(clippy::too_many_arguments)]
+    fn plan_for_model(
+        accounts: &[Value],
+        settings: &RoutingStrategySettings,
+        state: &RoutingState,
+        advance: bool,
+        sunk: &HashMap<String, i64>,
+        resting: &HashMap<String, i64>,
+        open: &HashSet<String>,
+        sticky: Option<&str>,
+        model: &str,
+        model_resting: &HashMap<(String, String), i64>,
+    ) -> RoutePlan {
+        let keys = CooldownKeys::new(model);
         let counts = HashMap::new();
         let balances = HashMap::new();
         let limiter = HashSet::new();
+        // 账号级硬休息表在本 helper 里恒为空（要注入的用例自己建 `PlanMeta`，
+        // 见 `account_rest_hard_blocks_every_model`）
+        let account_resting = HashMap::new();
+        let rpm_blocked = HashSet::new();
+        let max_accounts = HashMap::new();
         let meta = PlanMeta {
             strategies: settings,
             state,
             balances: &balances,
-            model: "m",
+            model,
             advance,
             sunk,
             resting,
+            account_resting: &account_resting,
+            model_resting,
             open,
             limiter_blocked: &limiter,
             sticky_account: sticky,
+            rpm_blocked: &rpm_blocked,
+            max_accounts: &max_accounts,
         };
         plan_route(accounts, &keys, &counts, &[], 1_000, &meta)
     }
@@ -950,6 +1172,198 @@ mod plan_tests {
         assert_eq!(ids(&result), vec!["a", "c", "b"]);
     }
 
+    /// 模型级 rest：被 rest 的账号**只在该模型上**被跳过（`state = cooldown`），
+    /// 换一个模型照常排在队首 —— 这就是「不误伤同账号其他模型」。
+    #[test]
+    fn model_rest_blocks_only_the_rested_model() {
+        let accounts = vec![account("a", "p", 100), account("b", "p", 101)];
+        let settings = RoutingStrategySettings::default();
+        let state = RoutingState::new();
+        let empty_i = HashMap::new();
+        let empty_s = HashSet::new();
+        let mut model_resting = HashMap::new();
+        model_resting.insert(("a".to_string(), "model-1".to_string()), 10_000_i64);
+
+        let rested = plan_for_model(
+            &accounts,
+            &settings,
+            &state,
+            true,
+            &empty_i,
+            &empty_i,
+            &empty_s,
+            None,
+            "model-1",
+            &model_resting,
+        );
+        // 被 rest 的模型：a 进 blocked（cooldown），只剩 b
+        assert_eq!(ids(&rested), vec!["b"]);
+        let blocked = rested
+            .blocked
+            .iter()
+            .find(|entry| entry.id == "a")
+            .expect("a 应被模型级 rest 跳过");
+        assert_eq!(blocked.state, "cooldown");
+        assert!(
+            blocked.reason.contains("模型限流至"),
+            "原因句应写明模型限流：{}",
+            blocked.reason
+        );
+
+        // 同账号的另一个模型：a 仍是队首
+        let sibling = plan_for_model(
+            &accounts,
+            &settings,
+            &state,
+            true,
+            &empty_i,
+            &empty_i,
+            &empty_s,
+            None,
+            "model-2",
+            &model_resting,
+        );
+        assert_eq!(ids(&sibling), vec!["a", "b"]);
+    }
+
+    /// 模型级 rest 的键是**上游真名**，不是客户端请求名。
+    ///
+    /// Task 1.3 在 `provider_loop` 收尾时按真名 `rest_mark`（那里的注释明确
+    /// 冷却键是上游真名）；选路这边若用 `meta.model`（请求名）查，有模型映射时
+    /// 就会「写在一个键、查另一个键」—— 静默漏命中、已限流的账号被反复选中。
+    /// 这里直接注入 `CooldownKeys` 的解析缓存来模拟 `modelRules` 映射：
+    /// 请求 `alias` 在 `p` 家实际发出 `target`。
+    #[test]
+    fn model_rest_uses_the_wire_model_key() {
+        let accounts = vec![account("a", "p", 100), account("b", "p", 101)];
+        let settings = RoutingStrategySettings::default();
+        let state = RoutingState::new();
+        let empty_i = HashMap::new();
+        let empty_s = HashSet::new();
+        let mut model_resting = HashMap::new();
+        // 写入侧（Task 1.3）按真名记：("a", "target")
+        model_resting.insert(("a".to_string(), "target".to_string()), 10_000_i64);
+        // 请求名 alias 在 p 家解析为真名 target（缓存注入 = 映射已生效）
+        let keys = CooldownKeys {
+            requested: "alias",
+            resolved: Mutex::new(HashMap::from([("p".to_string(), "target".to_string())])),
+        };
+        let counts = HashMap::new();
+        let balances = HashMap::new();
+        let limiter = HashSet::new();
+        let rpm_blocked = HashSet::new();
+        let max_accounts = HashMap::new();
+        let meta = PlanMeta {
+            strategies: &settings,
+            state: &state,
+            balances: &balances,
+            model: "alias",
+            advance: true,
+            sunk: &empty_i,
+            resting: &empty_i,
+            account_resting: &empty_i,
+            model_resting: &model_resting,
+            open: &empty_s,
+            limiter_blocked: &limiter,
+            sticky_account: None,
+            rpm_blocked: &rpm_blocked,
+            max_accounts: &max_accounts,
+        };
+        let result = plan_route(&accounts, &keys, &counts, &[], 1_000, &meta);
+        // a 被真名键挡住；若按请求名查（旧实现）它会留在队首
+        assert_eq!(ids(&result), vec!["b"]);
+        let blocked = result
+            .blocked
+            .iter()
+            .find(|entry| entry.id == "a")
+            .expect("a 应被真名键的模型级 rest 跳过");
+        assert_eq!(blocked.state, "cooldown");
+        assert!(blocked.reason.contains("模型限流至"));
+    }
+
+    /// 账号级 rest（退避）仍然**跨模型**生效：同一条账号级事实不能因为模型
+    /// 不同就放行 —— 那正是模型级 rest 要区分的另一半。
+    #[test]
+    fn account_level_rest_still_applies_to_every_model() {
+        let accounts = vec![account("a", "p", 100), account("b", "p", 101)];
+        let settings = RoutingStrategySettings::default();
+        let state = RoutingState::new();
+        let empty_i = HashMap::new();
+        let empty_s = HashSet::new();
+        let empty_m: HashMap<(String, String), i64> = HashMap::new();
+        let mut resting = HashMap::new();
+        resting.insert("a".to_string(), 10_000_i64);
+        for model in ["model-1", "model-2"] {
+            let result = plan_for_model(
+                &accounts, &settings, &state, true, &empty_i, &resting, &empty_s, None, model,
+                &empty_m,
+            );
+            assert_eq!(
+                ids(&result),
+                vec!["b", "a"],
+                "账号级 rest 应对 {model} 同样生效"
+            );
+        }
+    }
+
+    /// 账号级**硬**休息（余额耗尽 / 需要验证）对**每个**模型都直接跳过 ——
+    /// 不是「排到队尾」，而是根本不进可用清单。
+    ///
+    /// 与上面 `account_level_rest_still_applies_to_every_model`（软退避只垫底）
+    /// 是两张表、两种处置：余额耗尽时换个模型再打仍然被拒，硬跳过才不白撞。
+    #[test]
+    fn account_rest_hard_blocks_every_model() {
+        let accounts = vec![account("a", "p", 100), account("b", "p", 101)];
+        let settings = RoutingStrategySettings::default();
+        let state = RoutingState::new();
+        let empty_i = HashMap::new();
+        let empty_s = HashSet::new();
+        let empty_m: HashMap<(String, String), i64> = HashMap::new();
+        let mut account_resting = HashMap::new();
+        account_resting.insert("a".to_string(), 10_000_i64);
+        for model in ["model-1", "model-2"] {
+            let keys = CooldownKeys::new(model);
+            let counts = HashMap::new();
+            let balances = HashMap::new();
+            let limiter = HashSet::new();
+            let rpm_blocked = HashSet::new();
+            let max_accounts = HashMap::new();
+            let meta = PlanMeta {
+                strategies: &settings,
+                state: &state,
+                balances: &balances,
+                model,
+                advance: true,
+                sunk: &empty_i,
+                resting: &empty_i,
+                account_resting: &account_resting,
+                model_resting: &empty_m,
+                open: &empty_s,
+                limiter_blocked: &limiter,
+                sticky_account: None,
+                rpm_blocked: &rpm_blocked,
+                max_accounts: &max_accounts,
+            };
+            let result = plan_route(&accounts, &keys, &counts, &[], 1_000, &meta);
+            assert_eq!(
+                ids(&result),
+                vec!["b"],
+                "账号级硬休息应对 {model} 同样跳过 a"
+            );
+            let blocked = result
+                .blocked
+                .iter()
+                .find(|entry| entry.id == "a")
+                .expect("a 应被账号级硬休息跳过");
+            assert_eq!(blocked.state, "cooldown");
+            assert!(
+                blocked.reason.contains("额度耗尽/需要验证"),
+                "原因句应说明是额度/验证类硬休息：{}",
+                blocked.reason
+            );
+        }
+    }
+
     #[test]
     fn breaker_demotes_open_account() {
         let accounts = vec![account("a", "p", 100), account("b", "p", 101), account("c", "p", 102)];
@@ -987,6 +1401,192 @@ mod plan_tests {
         assert_eq!(ids(&first), vec!["p1", "p2"]);
         assert_eq!(ids(&second), vec!["p2", "p1"]);
     }
+
+    /// 只带 RPM / MaxAccounts 两张表的最小 helper（其余维度留空）。
+    fn plan_with_limits(
+        accounts: &[Value],
+        settings: &RoutingStrategySettings,
+        state: &RoutingState,
+        rpm_blocked: &HashSet<String>,
+        max_accounts: &HashMap<String, u64>,
+    ) -> RoutePlan {
+        let keys = CooldownKeys::new("m");
+        let counts = HashMap::new();
+        let balances = HashMap::new();
+        let limiter = HashSet::new();
+        let empty_i = HashMap::new();
+        let empty_s = HashSet::new();
+        let empty_m: HashMap<(String, String), i64> = HashMap::new();
+        let meta = PlanMeta {
+            strategies: settings,
+            state,
+            balances: &balances,
+            model: "m",
+            advance: false,
+            sunk: &empty_i,
+            resting: &empty_i,
+            account_resting: &empty_i,
+            model_resting: &empty_m,
+            open: &empty_s,
+            limiter_blocked: &limiter,
+            sticky_account: None,
+            rpm_blocked,
+            max_accounts,
+        };
+        plan_route(accounts, &keys, &counts, &[], 1_000, &meta)
+    }
+
+    /// `reserve_flags` 是「前 N 个可用、其余储备」的纯函数；0 = 不限。
+    #[test]
+    fn reserve_only_after_kept_fail() {
+        assert_eq!(reserve_flags(3, 2), vec![false, false, true]);
+        assert_eq!(reserve_flags(3, 0), vec![false, false, false]);
+    }
+
+    /// 达到 RPM 上限的账号直接进 `blocked`（state = `rpm`），不再参与排序。
+    #[test]
+    fn rpm_blocked_accounts_are_skipped() {
+        let accounts = vec![account("a", "p", 100), account("b", "p", 101)];
+        let settings = RoutingStrategySettings::default();
+        let state = RoutingState::new();
+        let mut rpm_blocked = HashSet::new();
+        rpm_blocked.insert("a".to_string());
+        let result = plan_with_limits(&accounts, &settings, &state, &rpm_blocked, &HashMap::new());
+        assert_eq!(ids(&result), vec!["b"], "RPM 超限的账号不应留在队列里");
+        let blocked = result
+            .blocked
+            .iter()
+            .find(|entry| entry.id == "a")
+            .expect("a 应因 RPM 超限被跳过");
+        assert_eq!(blocked.state, "rpm");
+        assert!(
+            blocked.reason.contains("RPM"),
+            "原因句应写明 RPM 超限：{}",
+            blocked.reason
+        );
+    }
+
+    /// `maxAccounts` 是**逐家**口径：p 家封顶 1、q 家封顶 2 时，两家的储备
+    /// 标记互不影响（跨家队列里不能因为 p 的上限把 q 也算成储备）。
+    #[test]
+    fn max_accounts_is_per_provider() {
+        let accounts = vec![
+            account("p1", "p", 100),
+            account("p2", "p", 101),
+            account("p3", "p", 102),
+            account("q1", "q", 200),
+            account("q2", "q", 201),
+        ];
+        let settings = RoutingStrategySettings::default();
+        let state = RoutingState::new();
+        let mut max_accounts = HashMap::new();
+        max_accounts.insert("p".to_string(), 1_u64);
+        max_accounts.insert("q".to_string(), 2_u64);
+        let result = plan_with_limits(&accounts, &settings, &state, &HashSet::new(), &max_accounts);
+        // 储备全局后置：usable 保持策略序（p1、q1、q2），reserve 跟在末尾（p2、p3）
+        assert_eq!(ids(&result), vec!["p1", "q1", "q2", "p2", "p3"]);
+        assert_ne!(
+            result.ordered.first().map(|entry| entry.state),
+            Some("reserve"),
+            "只要还有 usable，队首就不能是储备"
+        );
+        let state_of = |id: &str| {
+            result
+                .ordered
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.state)
+                .expect("账号应在队列里")
+        };
+        assert_eq!(state_of("p1"), "usable");
+        assert_eq!(state_of("p2"), "reserve");
+        assert_eq!(state_of("p3"), "reserve");
+        assert_eq!(state_of("q1"), "usable");
+        assert_eq!(state_of("q2"), "usable", "q 家上限 2，不应被 p 家影响");
+        let reserve_reason = result
+            .ordered
+            .iter()
+            .find(|entry| entry.id == "p2")
+            .map(|entry| entry.reason.as_str())
+            .unwrap_or_default();
+        assert!(
+            reserve_reason.contains("储备账号"),
+            "储备位次的原因句应说明储备：{reserve_reason}"
+        );
+    }
 }
 
+#[cfg(test)]
+mod limit_tests {
+    use serde_json::json;
 
+    use super::{max_accounts_by_provider, max_accounts_of, max_rpm_of, queue_limit_of};
+
+    /// 新增的三个账号上限字段：缺键 = 0（不限 / 不排队），与 `maxConcurrent`
+    /// 的向后兼容口径一致 —— 存量记录没有这些键，读侧不能报错也不能当成非零。
+    #[test]
+    fn new_limits_default_to_zero_and_are_clamped() {
+        let account = json!({"id":"a","maxRpm": 20, "maxAccounts": 2});
+        assert_eq!(max_rpm_of(&account), 20);
+        assert_eq!(max_accounts_of(&account), 2);
+        assert_eq!(queue_limit_of(&json!({"id":"a"})), 0);
+        assert_eq!(queue_limit_of(&json!({"id":"a","queueLimit": 8})), 8);
+    }
+
+    /// 读侧也要封顶：手改记录 / 旧数据可以塞进任意数字，选路不能因此
+    /// 无限排队或把 RPM 窗口撑爆。
+    #[test]
+    fn new_limits_are_capped_and_ignore_non_numbers() {
+        let oversized = json!({"maxRpm": 99_999, "maxAccounts": 5_000, "queueLimit": 9_999});
+        assert_eq!(max_rpm_of(&oversized), 10_000);
+        assert_eq!(max_accounts_of(&oversized), 999);
+        assert_eq!(queue_limit_of(&oversized), 1_000);
+
+        let dirty = json!({"maxRpm": "20", "maxAccounts": -1, "queueLimit": 1.5});
+        assert_eq!(max_rpm_of(&dirty), 0);
+        assert_eq!(max_accounts_of(&dirty), 0);
+        assert_eq!(queue_limit_of(&dirty), 0);
+    }
+
+    /// `maxAccounts` 是账号级字段，选路要的是逐家上限：同家取**最小非零**，
+    /// 全 0 的家不进表（不限）。
+    #[test]
+    fn max_accounts_aggregates_per_provider_by_min_non_zero() {
+        let accounts = vec![
+            json!({"id": "p1", "provider": "p", "maxAccounts": 1}),
+            json!({"id": "p2", "provider": "p", "maxAccounts": 3}),
+            json!({"id": "p3", "provider": "p", "maxAccounts": 0}),
+            json!({"id": "q1", "provider": "q"}),
+            json!({"id": "q2", "provider": "q", "maxAccounts": 0}),
+            json!({"id": "r1", "provider": "r", "maxAccounts": 0}),
+            json!({"id": "r2", "provider": "r", "maxAccounts": 2}),
+        ];
+        let caps = max_accounts_by_provider(&accounts);
+        assert_eq!(caps.get("p"), Some(&1), "p 家取最小非零 1");
+        assert_eq!(caps.get("q"), None, "q 家全 0 = 不限，不进表");
+        assert_eq!(caps.get("r"), Some(&2), "r 家忽略 0 后取 2");
+    }
+
+    /// 禁用 / 无凭证的账号不参与 `maxAccounts` 汇总。
+    ///
+    /// 它们永远进不了可用位次，却带着一个上限值：算进去会让一条从未上场的
+    /// 旧记录把整家上限压小（3 个启用账号 + 1 条禁用记录填 1 ⇒ 只放行 1 个）。
+    #[test]
+    fn max_accounts_ignores_disabled_and_credential_less_accounts() {
+        let accounts = vec![
+            // 启用的三条：真正的上限来源
+            json!({"id": "a1", "provider": "p", "enabled": true, "hasCredentials": true, "maxAccounts": 3}),
+            json!({"id": "a2", "provider": "p", "enabled": true, "hasCredentials": true, "maxAccounts": 0}),
+            json!({"id": "a3", "provider": "p", "maxAccounts": 0}),
+            // 禁用：不该把上限压成 1
+            json!({"id": "off", "provider": "p", "enabled": false, "hasCredentials": true, "maxAccounts": 1}),
+            // 无凭证：同样不该参与
+            json!({"id": "empty", "provider": "p", "enabled": true, "hasCredentials": false, "maxAccounts": 1}),
+            // 另一家只剩禁用账号 ⇒ 不出现在表里（= 不限）
+            json!({"id": "q1", "provider": "q", "enabled": false, "maxAccounts": 1}),
+        ];
+        let caps = max_accounts_by_provider(&accounts);
+        assert_eq!(caps.get("p"), Some(&3), "禁用 / 无凭证记录不能压低上限");
+        assert_eq!(caps.get("q"), None, "只剩禁用账号的家不该有上限");
+    }
+}

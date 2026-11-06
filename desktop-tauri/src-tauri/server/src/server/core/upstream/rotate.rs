@@ -39,11 +39,12 @@
 //! （`provider_loop::send_with_retry`），因为「重试几次、打什么日志」
 //! 是编排职责（架构文档 §4.3）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Value};
 
 use crate::server::config;
+use crate::server::core::providers::error_kind::{classify_quota_kind, QuotaKind};
 use crate::server::core::providers::readiness;
 use crate::server::core::routing;
 use crate::server::errors::{self, GatewayError};
@@ -51,6 +52,7 @@ use crate::server::logging;
 
 use super::{account_display, format_reset_text, has_access_token, priority_of, RouteTarget,
             UpstreamService};
+use super::rpm::RpmWindow;
 
 /// 取指定账号的会话；`account_id` 为 None 时回落到**该 provider 的**默认登录态。
 ///
@@ -168,7 +170,7 @@ pub(super) async fn select_target_account(
 
     // 在途计数快照取一次（锁是纳秒级的内存操作，见 connections.rs）：
     // 第一级与第二级共用同一份，两级看到的「谁在忙」是同一时刻的事实。
-    let counts = connection_counts(service);
+    let counts = request_connection_counts(service, tried_ids, in_group(&accounts));
     let now = logging::now_ms();
     // ── 策略与运行期状态快照（route_state.rs 的那份内存，读不改写）────
     // 粘性查找在这里顺手续了最近使用时刻 —— 「auto 档 5 分钟没往来就放手」
@@ -184,6 +186,11 @@ pub(super) async fn select_target_account(
     // 整轮选路取一次 —— 同一次请求的多次重挑用同一份规则与同一份状态。
     let state = service.routing();
     let balances = balance_snapshot();
+    // RPM 窗口（只查不占）与逐家账号上限：选路、429 顺延、队列面板共用同一份判据。
+    // 账号池用 `accounts`（含被限制器拦下的）：上限是**逐家配置**，不该因为
+    // 某个账号暂时被拦就从汇总里消失。
+    let rpm_blocked = rpm_blocked_accounts(&candidates, &service.rpm, now);
+    let max_accounts = routing::max_accounts_by_provider(&accounts);
     let meta = routing::PlanMeta {
         strategies: &strategies,
         state: &state,
@@ -192,9 +199,13 @@ pub(super) async fn select_target_account(
         advance,
         sunk: &snap.sunk,
         resting: &snap.resting,
+        account_resting: &snap.account_resting,
+        model_resting: &snap.model_resting,
         open: &snap.open,
         limiter_blocked: &balance_blocked_ids,
         sticky_account: snap.sticky_hit.as_deref(),
+        rpm_blocked: &rpm_blocked,
+        max_accounts: &max_accounts,
     };
     let plan = routing::plan_route(&candidates, keys, &counts, tried_ids, now, &meta);
     let mut decision = decision_json(&plan, &settings, &strategies, now);
@@ -247,6 +258,15 @@ pub(super) async fn select_target_account(
     //   ② 一个都没有（未尝试的账号**全部**达到并发上限）→ 挑**余量最大**
     //      的账号强塞。
     //
+    // ── 账号级硬休息不参与兜底（2026-11 修）────────────────────
+    // 余额耗尽 / 需要人机验证写进 `RouteState::account_rest` 的账号是**硬跳过**
+    // 的：换模型也救不回来。兜底的存在意义是「明知可能失败也再试一次」，但它
+    // 只能对「软」状态（限额冷却 / 并发满 / 垫底）这么做 —— 把硬休息账号重新
+    // 塞回发送队列等于让一次请求按兜底节拍反复撞一个已被上游明确拒绝的账号。
+    // 因此下面两个兜底选择器都先按 `snap.account_resting` 过滤；钉住的账号
+    // （模型测试）是唯一例外，与既有 pinned 语义一致。全部候选都在硬休息时
+    // 选择器返回 None，请求按既有「无可用账号 / 限额」路径收尾。
+    //
     // ── 为什么 ② 强塞而不是报 503（本级的取舍）──────────────────
     // 限流是「等得起」的：冷却有明确恢复时间，到点账号自然回来；并发挤占
     // 则是**即刻自愈**的 —— 在途请求一轮对话结束后计数立刻回落（见
@@ -254,13 +274,32 @@ pub(super) async fn select_target_account(
     // 服务的请求直接挡在门外，而强塞只意味着短暂超载 1-2 个（软上限口径见
     // `routing::max_concurrent_of`）。所以：能等就等（①），等不了就挤（②），
     // 永不因并发上限直接 503。
+    // ── 兜底次序（Task 2.3）────────────────────────────────────
+    // `plan.ordered` 只含**可用**账号（储备在末尾），被冷却 / 并发挡下的候选在
+    // `plan.blocked` 里 —— 而本级的用途正是「明知可能失败也再试一次」，所以
+    // 候选取自 `fallback_pool`（已剔除硬休息），但用 plan 给它们定次序：
+    //   · plan 里的 usable 位次最先（它们的恢复时刻最值得赌一次）；
+    //   · 其余非储备账号其次（冷却中 / 并发满的 kept 仍优先于储备）；
+    //   · 储备最后 —— 储备可能更空闲、恢复更早，但绝不能抢在 kept 前面。
+    let fallback_pool: Vec<Value> = if pinned.is_some() {
+        enabled.clone()
+    } else {
+        enabled
+            .iter()
+            .filter(|account| {
+                routing::account_id(account)
+                    .is_none_or(|id| !snap.account_resting.contains_key(id))
+            })
+            .cloned()
+            .collect()
+    };
     let mut best_effort: Option<Value> = None;
-    let mut best_reset = f64::INFINITY;
-    for account in &enabled {
+    let mut best_key: Option<(u8, usize, i64)> = None;
+    for account in &fallback_pool {
         let Some(id) = routing::account_id(account) else {
             continue;
         };
-        if tried_ids.iter().any(|tried| tried == id) {
+        if tried_ids.iter().any(|tried| tried == &crate::server::core::routing_groups::attempt_key(account)) {
             continue;
         }
         // 已达并发上限的账号不进「正常兜底」候选 —— 它们是 ② 的原料
@@ -268,17 +307,20 @@ pub(super) async fn select_target_account(
         if limit > 0 && counts.get(id).copied().unwrap_or(0) >= limit as usize {
             continue;
         }
+        // 0 = 没有恢复时刻 → 最不值得等（同类里排最后）
         let reset = routing::rate_limit_reset_at(account, keys, now);
-        let reset = if reset > 0 { reset as f64 } else { f64::INFINITY };
-        if reset < best_reset {
-            best_reset = reset;
+        let reset = if reset > 0 { reset } else { i64::MAX };
+        let (class, rank) = fallback_class(&plan, id);
+        let key = (class, rank, reset);
+        if best_key.is_none_or(|current| key < current) {
+            best_key = Some(key);
             best_effort = Some(account.clone());
         }
     }
     if best_effort.is_none() {
         // ① 无果：在「全部达到并发上限」（或没有未尝试账号）时按余量挤占。
         // 挑出的账号走与 ① 同一条收尾（取会话 → 组装选路结果）。
-        if let Some(account) = squeeze_by_headroom(&enabled, &counts, tried_ids, keys, now) {
+        if let Some(account) = squeeze_by_headroom(&fallback_pool, &counts, tried_ids, keys, now, &plan) {
             if let Some(id) = routing::account_id(&account).map(str::to_string) {
                 if let Some(entry) = service.store.get_session_by_id(&id) {
                     return Ok(with_proxy_notice(
@@ -437,6 +479,20 @@ pub(super) fn with_proxy_notice(
 /// `model` 必须是**上游实际收到的真名**（不是客户端请求名）—— 调用方从
 /// `SendBody::wire_model` 取（见 `upstream::payload`）。传请求名会把冷却写在
 /// 上游永远不会记额度的键上，判定侧也就查不到它（见 `routing::CooldownKeys`）。
+///
+/// `vendor` 是**厂商身份**（内置 provider id，或自定义提供商的余额方案 /
+/// preset key —— 见 [`vendor_identity`]），只用于 [`classify_quota_kind`] 的
+/// 厂商特例（如智谱 1113 不带词表关键词）；`retry_after_ms` 是上游
+/// `Retry-After` 换算出的毫秒数，只有分钟级限流会用它决定模型 rest 的长度。
+///
+/// ── 落库 + 落内存，两件事一起做 ────────────────────────────
+/// 落库的 `rateLimits`（`mark_rate_limited`）是**跨重启**的事实，账号页的
+/// 「限流」列与选路判定都读它；落内存的 rest（[`apply_quota_rest`]）是**本进程**
+/// 的选路状态，按分类决定「停账号还是停模型」。两者必须同源同一次调用，
+/// 分开写就会漂移成「记录说停了、选路照打」。
+// 参数就是落库条目 + 归类输入（status/code/resetAt/message/vendor/retryAfter）：
+// 拆成结构体要在三个调用点各造一次，与 `mark_rate_limited` 同一取舍。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn mark_account_limited(
     service: &UpstreamService,
     account_id: &str,
@@ -445,6 +501,8 @@ pub(super) fn mark_account_limited(
     upstream_code: Option<i64>,
     reset_at: Option<i64>,
     message: &str,
+    vendor: &str,
+    retry_after_ms: Option<i64>,
 ) -> String {
     // Node 从 `error.body` 里再解析一次 msg 取恢复时间；Rust 侧的错误文案
     // 已经带上上游原文，`reset_at` 由适配器的 classify_error 解析后传进来，
@@ -454,13 +512,32 @@ pub(super) fn mark_account_limited(
     } else {
         errors::parse_quota_reset_at(message)
     };
+    // 归类交给 `classify_quota_kind`（词表 + 厂商特例），落进条目的 reason/scope。
+    let kind = classify_quota_kind(status as u16, upstream_code, message, vendor);
+    // rest 的**作用域与截止时刻**由分类决定（见 `apply_quota_rest`）：余额 /
+    // 验证类停整个账号，额度 / 套餐 / 分钟限流只停这个模型。
+    let until = apply_quota_rest(
+        service,
+        account_id,
+        model,
+        kind,
+        if parsed > 0 { Some(parsed) } else { None },
+        retry_after_ms,
+    );
     let entry = service.store.mark_rate_limited(
         account_id,
         model,
         status as i64,
         upstream_code,
-        if parsed > 0 { Some(parsed as f64) } else { None },
+        // 落库的恢复时刻与内存里的 rest **用同一个值**：选路先查落库条目
+        // （`plan_route` 的 `rate_limit_reset_at`），两边不一致时以它为准，
+        // 内存那份就成了摆设（改前 Rate 落 10 分钟兜底、Credit 只软垫底）。
+        // 影子模式下 `apply_quota_rest` 返回 `None` ⇒ 存储层沿用旧的 10 分钟
+        // 兜底（见那里的说明）：影子模式不该改变选路行为。
+        until.map(|value| value as f64),
         message,
+        kind,
+        retry_after_ms,
     );
     match entry {
         Some(entry) => {
@@ -469,6 +546,84 @@ pub(super) fn mark_account_limited(
         }
         None => String::new(),
     }
+}
+
+/// 额度耗尽 / 需要人机验证时，账号级硬休息的默认时长（24 小时）。
+///
+/// 比模型级兜底（10 分钟）长得多：这两类失败「等一会儿」不会好，得有人去
+/// 充值 / 过验证；短休息只会让同一个账号按分钟节拍被反复撞。
+const ACCOUNT_REST_MS: i64 = 24 * 3600 * 1000;
+/// 额度类（`Quota` / `Plan`）给不出恢复时刻时的模型级 rest（10 分钟）。
+///
+/// 与存储层兜底同一常量（`account_store::mark_rate_limited` 的 `10 * 60 * 1000`）：
+/// 落库与内存必须是同一个截止时刻，否则选路按落库那条走、内存这份白写。
+const QUOTA_REST_MS: i64 = 10 * 60 * 1000;
+/// 分钟级限流没给 `Retry-After` 时的模型级 rest（60 秒）。
+const RATE_REST_MS: i64 = 60_000;
+
+/// 一次失败所属的**厂商身份**：内置 provider id，或自定义提供商的余额方案 /
+/// preset key（`zhipu` / `zhipu_zai` / `glm` / `glm-cn` 这类）。
+///
+/// 自定义家的 provider id 是用户自取的（`custom-0c8cd27f7e10`），直接拿它当
+/// 厂商身份会让 [`classify_quota_kind`] 的厂商特例（智谱 1113 不带关键词）
+/// 永远不命中 —— 那条特例认的是**上游身份**，所以先问余额方案，问不到
+/// （这一家没接余额查询）才回落 id 本身。
+pub(super) fn vendor_identity(provider_id: &str) -> String {
+    crate::server::core::custom_providers::balance_scheme_of(provider_id)
+        .unwrap_or_else(|| provider_id.to_string())
+}
+
+/// 把一次配额类失败落到正确的 **rest 作用域**，返回统一的恢复时刻。
+///
+/// ── 三条映射（口径见 `error_kind` 的模块头）─────────────────
+///   · `Credit` / `Verification`：账号级**硬休息**（[`RouteState::account_rest_mark`]）
+///     —— 充值或人工处理之前，这个账号的**任何**模型都救不回来，只停一个模型
+///     等于让同一轮请求换个模型再撞一次。上游没给恢复时刻时按 24 小时；
+///   · `Quota` / `Plan`：模型级 —— 额度按模型计，停到上游给的重置时刻，
+///     给不出时 10 分钟（与存储层兜底同一常量）；
+///   · `Rate`：模型级短休息 —— `Retry-After` 换算值，没有就 60 秒。
+///
+/// 返回值是**落库用的 `resetAt`**（`None` = 交给存储层的 10 分钟兜底）：
+/// 内存 rest 与 `rateLimits` 必须同一个截止时刻（理由见 [`mark_account_limited`]）。
+///
+/// ── 影子模式（`routingShadowQuotaKind`，默认开）──────────────
+/// 开着时**只观察、不改变选路**：不写 rest 表，并且返回 `None` —— 落库的
+/// `resetAt` 沿用改造前的 10 分钟兜底，而不是分类算出的 60 秒 / 24 小时。
+/// 若把分类截止时刻落进 `rateLimits`，选路（读落库条目）就会按新时长冷却，
+/// 影子模式等于已经生效了。关掉后三条映射才真正落到内存 + 落库。
+///
+/// [`RouteState::account_rest_mark`]: super::route_state::RouteState::account_rest_mark
+fn apply_quota_rest(
+    service: &UpstreamService,
+    account_id: &str,
+    model: &str,
+    kind: QuotaKind,
+    reset_at: Option<i64>,
+    retry_after_ms: Option<i64>,
+) -> Option<i64> {
+    let now = logging::now_ms();
+    let shadow = config::routing_settings().shadow_quota_kind;
+    if shadow {
+        return None;
+    }
+    let until = match kind {
+        QuotaKind::Credit | QuotaKind::Verification => {
+            let until = reset_at.unwrap_or_else(|| now.saturating_add(ACCOUNT_REST_MS));
+            service.route.account_rest_mark(account_id, until);
+            until
+        }
+        QuotaKind::Rate => {
+            let until = now.saturating_add(retry_after_ms.unwrap_or(RATE_REST_MS));
+            service.route.rest_mark(account_id, model, until);
+            until
+        }
+        QuotaKind::Quota | QuotaKind::Plan => {
+            let until = reset_at.unwrap_or_else(|| now.saturating_add(QUOTA_REST_MS));
+            service.route.rest_mark(account_id, model, until);
+            until
+        }
+    };
+    Some(until)
 }
 
 /// 该账号对某模型当前的限额恢复时间戳（未限额 0）——上报事件时用，
@@ -548,9 +703,62 @@ fn earliest_limit_reset_at_in(
         .unwrap_or(0)
 }
 
+/// 选路用的「RPM 已打满」账号集合：`maxRpm > 0` 且窗口剩余等待 > 0 的账号。
+///
+/// ── 为什么只 `wait_ms`、不 `allow` ───────────────────────────
+/// 选路是**预演**：一次请求会选路多次（429 顺延、粘性命中、失败重挑），
+/// 队列面板还会额外预演一遍。若在这里 `allow`，一条请求会吃掉好几份配额，
+/// 面板刷新也会偷偷消耗真实额度。占名额只发生在发送前那一道闸门
+/// （`provider_loop::rpm_gate`），两处分工见 `rpm` 模块头。
+///
+/// `limit == 0`（不限速）的账号不进集合 —— `wait_ms` 对它恒为 0，这里提前
+/// 跳过只是为了少一次查表。
+pub(super) fn rpm_blocked_accounts(
+    accounts: &[Value],
+    rpm: &RpmWindow,
+    now: i64,
+) -> HashSet<String> {
+    accounts
+        .iter()
+        .filter_map(|account| {
+            let id = routing::account_id(account)?;
+            let limit = routing::max_rpm_of(account);
+            (limit > 0 && rpm.wait_ms(id, limit, now) > 0).then(|| id.to_string())
+        })
+        .collect()
+}
+
+/// 兜底候选的优先类：`(0, plan 位次)` = 本次 plan 的 `usable`；
+/// `(1, usize::MAX)` = 其它非储备账号（被冷却 / 并发挡下的，兜底仍可试一次）；
+/// `(2, plan 位次)` = 储备（`maxAccounts` 之外的位次）。
+///
+/// 类越小越优先，同类内按 plan 位次（其次由调用方按恢复时间 / 余量决定）。
+/// 这条次序兑现「储备只在 kept 全部不可用后才用」：储备可能比某个 kept
+/// 更空闲、恢复更早，但绝不能因此抢在 kept 前面被选中。
+fn fallback_class(plan: &routing::RoutePlan, id: &str) -> (u8, usize) {
+    plan.ordered
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| entry.id == id)
+        .map(|(index, entry)| {
+            if entry.state == "reserve" {
+                (2, index)
+            } else {
+                (0, index)
+            }
+        })
+        .unwrap_or((1, usize::MAX))
+}
+
 /// 全部账号达到并发上限时的**挤占**挑选：余量（`limit - count`）最大者优先。
 ///
+/// `candidates` 是调用方已剔除「账号级硬休息」与已尝试账号后的兜底池
+/// （见 `select_target_account` 的说明）；本函数只按并发余量 / 兜底次序挑。
+///
 /// ── 排序口径（任务约定，改动前先读）──────────────────────────
+///   · **兜底优先类**（[`fallback_class`]）先于余量：usable 优先、储备最后 ——
+///     储备账号即便更空闲，也不能抢在 kept 前面被挤占（`maxAccounts` 的口径是
+///     「同时只用前 N 个」，挤占一个储备等于把在用的账号数抬过上限）；
 ///   · **不限（maxConcurrent == 0）= 无穷大余量**，永远排在有限上限之前 ——
 ///     用 `i64::MAX` 近似：任何真实的 `limit - count` 都比它小；
 ///   · 同余量挑**恢复最早**的（与 ① 的「恢复最早试一次」同一偏好：优先选
@@ -562,20 +770,22 @@ fn earliest_limit_reset_at_in(
 /// 设了上限还打到这个账号」的答案）。没有可挤的账号（全部已尝试过）时
 /// 返回 None，由调用方落到尾部的「无账号」兜底。
 fn squeeze_by_headroom(
-    enabled: &[Value],
+    candidates: &[Value],
     counts: &HashMap<String, usize>,
     tried_ids: &[String],
     keys: &routing::CooldownKeys<'_>,
     now: i64,
+    plan: &routing::RoutePlan,
 ) -> Option<Value> {
     let mut squeezed: Option<Value> = None;
+    let mut best_class = u8::MAX;
     let mut best_headroom = i64::MIN;
     let mut best_reset = f64::INFINITY;
-    for account in enabled {
+    for account in candidates {
         let Some(id) = routing::account_id(account) else {
             continue;
         };
-        if tried_ids.iter().any(|tried| tried == id) {
+        if tried_ids.iter().any(|tried| tried == &crate::server::core::routing_groups::attempt_key(account)) {
             continue;
         }
         let count = counts.get(id).copied().unwrap_or(0) as i64;
@@ -583,7 +793,12 @@ fn squeeze_by_headroom(
         let headroom = if limit > 0 { limit - count } else { i64::MAX };
         let reset = routing::rate_limit_reset_at(account, keys, now);
         let reset = if reset > 0 { reset as f64 } else { f64::INFINITY };
-        if headroom > best_headroom || (headroom == best_headroom && reset < best_reset) {
+        let (class, _) = fallback_class(plan, id);
+        let better = class < best_class
+            || (class == best_class
+                && (headroom > best_headroom || (headroom == best_headroom && reset < best_reset)));
+        if better {
+            best_class = class;
             best_headroom = headroom;
             best_reset = reset;
             squeezed = Some(account.clone());
@@ -623,9 +838,23 @@ fn balance_snapshot() -> HashMap<String, f64> {
         .collect()
 }
 
+fn in_group(accounts: &[Value]) -> bool {
+    accounts.iter().any(|account| account.get("routingCandidateId").is_some())
+}
+
+fn request_connection_counts(service: &UpstreamService, tried: &[String], group: bool) -> HashMap<String, usize> {
+    let mut counts = connection_counts(service);
+    // 顺延时当前请求还持有前一轮连接；同账号的另一模型不能被这一个槽位挡住。
+    if group {
+        if let Some(id) = tried.last().map(|key| crate::server::core::routing_groups::account_key(key)) {
+            if let Some(count) = counts.get_mut(id) { *count = count.saturating_sub(1); }
+        }
+    }
+    counts
+}
+
 pub(super) fn allows_route_skip(service: &UpstreamService, account_id: &str) -> bool {
-    let accounts = routing::accounts_of(&service.store.list_accounts());
-    !accounts.iter().find(|account| routing::account_id(account) == Some(account_id))
+    !service.store.route_account(crate::server::core::routing_groups::account_key(account_id))
         .is_some_and(|account| account.get("allowRouteSkip") == Some(&Value::Bool(false)))
 }
 
@@ -654,7 +883,7 @@ pub(super) fn pick_next_account(
     // 换号顺延与第一级选路同一份候选剔除：被限制器拦下的账号不会在 429 之后
     // 被当作「下一个」重新塞进来
     let (candidates, balance_blocked_ids) = filter_limiter_blocked(&accounts, keys, pinned);
-    let counts = connection_counts(service);
+    let counts = request_connection_counts(service, tried_ids, in_group(&accounts));
     let now = logging::now_ms();
     let strategies = config::routing_strategy_settings();
     // 顺延不走粘性（粘住的是「答对了的账号」，刚失败的那个不该被粘回来）；
@@ -664,6 +893,10 @@ pub(super) fn pick_next_account(
     // 顺延**不推进**有状态策略（游标 / LRU / 加权轮询沿用第一级的起点）
     let state = service.routing();
     let balances = balance_snapshot();
+    // 顺延同样跳过 RPM 打满的账号（只查不占）—— 否则刚被限流的账号会立刻
+    // 被当成「下一个」再撞一次；储备账号的次序也由同一份 plan 决定。
+    let rpm_blocked = rpm_blocked_accounts(&candidates, &service.rpm, now);
+    let max_accounts = routing::max_accounts_by_provider(&accounts);
     let meta = routing::PlanMeta {
         strategies: &strategies,
         state: &state,
@@ -672,9 +905,13 @@ pub(super) fn pick_next_account(
         advance: false,
         sunk: &snap.sunk,
         resting: &snap.resting,
+        account_resting: &snap.account_resting,
+        model_resting: &snap.model_resting,
         open: &snap.open,
         limiter_blocked: &balance_blocked_ids,
         sticky_account: None,
+        rpm_blocked: &rpm_blocked,
+        max_accounts: &max_accounts,
     };
     let plan = routing::plan_route(&candidates, keys, &counts, tried_ids, now, &meta);
     plan.ordered.into_iter().next().map(|entry| entry.account)
@@ -699,6 +936,9 @@ fn decision_json(
             "id": entry.id,
             "name": entry.name,
             "provider": entry.provider,
+            "candidateId": crate::server::core::routing_groups::attempt_key(&entry.account),
+            "memberId": entry.account.get("routingMemberId"),
+            "model": entry.account.get("routingModel"),
             "state": entry.state,
             "reason": entry.reason,
         })
@@ -754,7 +994,7 @@ fn filter_limiter_blocked(
         .filter(|account| crate::server::core::limiter::evaluate::blocked(
             account, &keys.for_account(account), &facts, &counts, now,
         ))
-        .filter_map(|account| routing::account_id(account).map(str::to_string))
+        .map(crate::server::core::routing_groups::attempt_key)
         .collect();
     if blocked_ids.is_empty() {
         return (accounts.to_vec(), blocked_ids);
@@ -762,9 +1002,7 @@ fn filter_limiter_blocked(
     let candidates = accounts
         .iter()
         .filter(|account| {
-            routing::account_id(account)
-                .map(|id| !blocked_ids.contains(id))
-                .unwrap_or(true)
+            !blocked_ids.contains(&crate::server::core::routing_groups::attempt_key(account))
         })
         .cloned()
         .collect();
@@ -895,6 +1133,68 @@ mod tests {
         let now = 1_000_000i64;
         let accounts = vec![limited("a", "modelscope", "other-model", now + 600_000)];
         assert_eq!(earliest_limit_reset_at_in(&accounts, &keys, now), 0);
+    }
+
+    /// 兜底次序的类：plan 里的 usable 最先、其它非储备账号其次、储备最后。
+    ///
+    /// 反了会怎样：储备可能更空闲 / 恢复更早，若只按恢复时间挑，它会抢在
+    /// 冷却中的 kept 前面被选中 —— 等于把 `maxAccounts` 的「只用前 N 个」作废。
+    #[test]
+    fn fallback_ranks_usable_before_kept_before_reserve() {
+        use super::fallback_class;
+        use crate::server::core::routing::{PlanEntry, RoutePlan};
+
+        let entry = |id: &str, state: &'static str| PlanEntry {
+            account: json!({"id": id, "provider": "p", "enabled": true}),
+            id: id.to_string(),
+            name: id.to_string(),
+            provider: "p".to_string(),
+            state,
+            reason: String::new(),
+            reset_at: 0,
+        };
+        let plan = RoutePlan {
+            ordered: vec![entry("u1", "usable"), entry("r1", "reserve")],
+            blocked: vec![],
+            sticky_hit: false,
+        };
+        assert_eq!(fallback_class(&plan, "u1"), (0, 0), "usable 是第 0 类");
+        assert_eq!(fallback_class(&plan, "r1"), (2, 1), "储备是第 2 类");
+        assert_eq!(
+            fallback_class(&plan, "cooling"),
+            (1, usize::MAX),
+            "冷却 / 并发挡下的非储备账号夹在中间（兜底仍可试一次）"
+        );
+    }
+
+    /// 选路用的 RPM 阻塞集合：只收 `maxRpm > 0` 且窗口已满的账号，且**只查不占**
+    /// —— 预演（选路 / 队列面板）不该吃掉一次真实配额。
+    #[test]
+    fn rpm_blocked_accounts_only_reports_full_windows_without_consuming() {
+        use super::rpm_blocked_accounts;
+        use crate::server::core::upstream::rpm::RpmWindow;
+        use std::collections::HashSet;
+
+        let rpm = RpmWindow::new();
+        let accounts = vec![
+            json!({"id": "a", "provider": "p", "enabled": true, "maxRpm": 1}),
+            json!({"id": "b", "provider": "p", "enabled": true}),
+            json!({"id": "c", "provider": "p", "enabled": true, "maxRpm": 2}),
+        ];
+        assert!(rpm.allow("a", 1, 1_000));
+        assert!(rpm.allow("c", 2, 1_000));
+
+        let blocked = rpm_blocked_accounts(&accounts, &rpm, 2_000);
+        assert_eq!(
+            blocked,
+            HashSet::from(["a".to_string()]),
+            "只有打满的 a 被挡；b 不限速、c 只用掉 1/2"
+        );
+        // 只查不占：重复预演结果不变，c 的名额也没被吃掉
+        assert_eq!(rpm_blocked_accounts(&accounts, &rpm, 2_000), blocked);
+        assert!(rpm.allow("c", 2, 2_000), "预演不该消耗 c 的第二个名额");
+        // 不限速的账号一次都不记（`max_rpm_of == 0`）
+        assert_eq!(rpm.wait_ms("b", 0, 2_000), 0);
     }
 
     /// 多账号时取全体最早（这条覆盖的是「取 min 而不是取第一个」）

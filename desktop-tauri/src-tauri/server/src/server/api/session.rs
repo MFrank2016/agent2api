@@ -27,6 +27,7 @@
 //!   models          ← 模型目录（切片 4 起为真实清单，含远程刷新结果）
 //!   sanitizeBlacklistFingerprints ← 出站指纹脱敏开关（与 GET /api/sanitize 同源）
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -1228,9 +1229,15 @@ pub async fn login_loomy_sms_verify(State(state): State<ServerState>, body: Byte
 
 /// 发送短信验证码（**Tabbit 国内站专用**）。
 ///
-/// body `{phone}` → `{uuid}`。uuid 是这次登录的会话标识：上游把刚发的码
-/// 绑在它上面，登录时必须带同一个；网关不保存这个中间态，回给前端随
-/// 下一次请求带回即可。
+/// body `{phone, uuid?, supportsCaptcha?}` → `{uuid}`。uuid 是这次登录的会话
+/// 标识：上游把刚发的码绑在它上面，登录时必须带同一个；网关不保存这个中间态，
+/// 回给前端随下一次请求带回即可。
+///
+/// ── 第二种成功形态：`{status:"captcha", captcha:{requestCode, verifyUrl}}` ──
+/// 风控判定人机可疑时上游不会发码，而是给一个滑块验证页。用户在那边手动完成
+/// 后**重新发一次码**才成功（官方网页版同样如此，见插件的 `challenge_of`）。
+/// 声明了 `supportsCaptcha` 的界面会拿到这个 200 + 状态，自己去开验证页并
+/// 引导用户再点一次；没声明的（旧缓存前端）收到 409 与一句可读提示。
 pub async fn login_tabbit_sms_send(State(state): State<ServerState>, body: Bytes) -> Response {
     let payload = parse_body(&body).unwrap_or(Value::Null);
     tabbit_sms_send_inner(&state, &payload).await
@@ -1240,6 +1247,14 @@ pub async fn login_tabbit_sms_send(State(state): State<ServerState>, body: Bytes
 /// （旧缓存的前端会把 `provider: tabbit` 发到 AutoClaw 的端点）。
 async fn tabbit_sms_send_inner(state: &ServerState, payload: &Value) -> Response {
     let phone = payload.get("phone").and_then(Value::as_str).unwrap_or("");
+    // 过完滑块重发时要沿用同一个 uuid（同一轮登录），前端会带回来。
+    let uuid = payload.get("uuid").and_then(Value::as_str);
+    // 新界面声明自己认识「发码前要先过滑块」这种结果；不声明的一律按错误回，
+    // 免得旧缓存前端把它当成「已发送」而让用户等一条不会来的短信。
+    let supports_captcha = payload
+        .get("supportsCaptcha")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let Some(adapter) =
         crate::server::core::providers::adapter::adapter_by_id("tabbit")
     else {
@@ -1250,11 +1265,21 @@ async fn tabbit_sms_send_inner(state: &ServerState, payload: &Value) -> Response
             state.store(),
             "",
             "login.sms-send",
-            &json!({ "phone": phone }),
+            &json!({ "phone": phone, "uuid": uuid }),
         )
         .await
     {
-        Ok(result) => ok_json(result),
+        Ok(result) => {
+            let needs_captcha =
+                result.get("status").and_then(Value::as_str) == Some("captcha");
+            if needs_captcha && !supports_captcha {
+                return management_error(
+                    409,
+                    "发送验证码前需要先完成滑块验证。请刷新页面后再试，或改用「填写凭证」粘贴 Cookie",
+                );
+            }
+            ok_json(result)
+        }
         Err(error) => management_error(error.status_code, error.message),
     }
 }
@@ -1491,6 +1516,21 @@ pub async fn login_oauth_captcha_config(State(state): State<ServerState>, body: 
     }
 }
 
+/// 管理界面里的浏览器是否与网关在同一台机器上（决定 OAuth 回调该不该占本机
+/// 登记端口）。判据逐字沿用插件化迁移前的 `login_oauth_start`：桌面壳恒 true，
+/// headless 回落按监听地址是不是 loopback。
+fn oauth_local_browser(local_panel: bool, host: &IpAddr) -> bool {
+    local_panel || host.is_loopback()
+}
+
+/// 远程形态下交给上游的回调基址。回调路由挂在管理面那套路由上
+/// （`http.rs::panel_router`），分端口时必须用面板端口，否则监听器转发目标
+/// 会落进主端口的 404。
+fn oauth_navigate_base(port: u16, panel_port: Option<u16>) -> String {
+    let api_port = panel_port.filter(|p| *p != port).unwrap_or(port);
+    format!("http://localhost:{api_port}")
+}
+
 /// `POST /api/session/login/oauth/start` —— 带验证码参数发起 OAuth 登录。
 ///
 /// body `{provider, vendor, captchaVerifyParam}` → `{state, authUrl, provider,
@@ -1533,12 +1573,19 @@ pub async fn login_oauth_start(State(state): State<ServerState>, body: Bytes) ->
             ),
         );
     }
+    let local_browser = oauth_local_browser(state.local_panel, &state.host);
+    let navigate_base = oauth_navigate_base(state.port, state.panel_port);
     let started = match adapter
         .admin_action(
             state.store(),
             "",
             "login.oauth-start",
-            &json!({ "vendor": vendor, "captchaVerifyParam": captcha }),
+            &json!({
+                "vendor": vendor,
+                "captchaVerifyParam": captcha,
+                "localBrowser": local_browser,
+                "navigateBase": navigate_base,
+            }),
         )
         .await
     {
@@ -1963,5 +2010,36 @@ pub async fn auth_login(State(_state): State<ServerState>, body: Bytes) -> Respo
             }
             Err(error) => return management_error(error.status_code, error.message),
         }
+    }
+}
+
+#[cfg(test)]
+mod autoclaw_oauth_start_vectors {
+    use super::{oauth_local_browser, oauth_navigate_base};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn local_browser_flag_desktop_shell_with_lan_access_is_local() {
+        assert!(oauth_local_browser(true, &IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
+    }
+    #[test]
+    fn local_browser_flag_headless_bound_to_loopback_is_local() {
+        assert!(oauth_local_browser(false, &IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    }
+    #[test]
+    fn local_browser_flag_container_on_all_interfaces_is_remote() {
+        assert!(!oauth_local_browser(false, &IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
+    }
+    #[test]
+    fn navigate_base_uses_the_main_port_by_default() {
+        assert_eq!("http://localhost:3065", oauth_navigate_base(3065, None));
+    }
+    #[test]
+    fn navigate_base_uses_the_panel_port_when_split() {
+        assert_eq!("http://localhost:3066", oauth_navigate_base(3065, Some(3066)));
+    }
+    #[test]
+    fn navigate_base_ignores_a_panel_port_equal_to_main() {
+        assert_eq!("http://localhost:3065", oauth_navigate_base(3065, Some(3065)));
     }
 }

@@ -64,10 +64,14 @@ pub struct AggregatedCompletion {
 /// 开头 think 块的剥离同样走 `policy`：流式在 `ReasoningCoalescer` 里剥，
 /// 非流式在这里（`into_completion`）剥 —— **两条路径都要改**，只改一条会让
 /// 一半响应保留标签（见 `core::middleware::think_tags`）。
+///
+/// `mask_session` 是**这一次尝试**的脱敏会话（Task 5.3）：开启脱敏时上游
+/// 回显的是占位符，聚合前按它还原；`None` 表示未脱敏，字节与接入前一致。
 pub async fn aggregate_sse_completion(
     response: wreq::Response,
     telemetry: Arc<RequestTelemetry>,
     policy: FramePolicy,
+    mask_session: Option<crate::server::core::masking::MaskSession>,
 ) -> Result<AggregatedCompletion, GatewayError> {
     // 与 `ForwardStream::new` 同款：wreq 错误在这里就地描述成文案折进
     // io::Error（`describe_error_detail` 只认 wreq::Error）
@@ -81,7 +85,7 @@ pub async fn aggregate_sse_completion(
         }
         item
     });
-    aggregate_frame_stream(Box::pin(stream), telemetry, policy).await
+    aggregate_frame_stream(Box::pin(stream), telemetry, policy, mask_session).await
 }
 
 /// 聚合一条**标准 chat SSE** 字节流（不限定来源）。
@@ -96,6 +100,7 @@ pub async fn aggregate_frame_stream(
     stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
     telemetry: Arc<RequestTelemetry>,
     policy: FramePolicy,
+    mask_session: Option<crate::server::core::masking::MaskSession>,
 ) -> Result<AggregatedCompletion, GatewayError> {
     // 非流式响应总超时（设置页「请求超时」第四项）：**一次性计时、不重置**
     // —— 与流式的空闲超时是两种语义（那是「两次数据之间」，这里读完整份
@@ -105,8 +110,11 @@ pub async fn aggregate_frame_stream(
     let budget = std::time::Duration::from_millis(
         crate::server::config::timeout_settings().body_ms(),
     );
-    match tokio::time::timeout(budget, aggregate_frame_stream_inner(stream, telemetry, policy))
-        .await
+    match tokio::time::timeout(
+        budget,
+        aggregate_frame_stream_inner(stream, telemetry, policy, mask_session),
+    )
+    .await
     {
         Ok(result) => result,
         Err(_elapsed) => Err(GatewayError::with_status(
@@ -121,6 +129,7 @@ async fn aggregate_frame_stream_inner(
     stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
     telemetry: Arc<RequestTelemetry>,
     policy: FramePolicy,
+    mask_session: Option<crate::server::core::masking::MaskSession>,
 ) -> Result<AggregatedCompletion, GatewayError> {
     // ── 手动终止的旁路流（与 `ForwardStream::from_translated` 同一手法）──
     // 聚合是 `while let Some(item) = stream.next().await` 的拉取循环：没有
@@ -136,6 +145,11 @@ async fn aggregate_frame_stream_inner(
     // 非流式总超时（默认 300 秒）才报 502（详见 `cancellable` 的说明）。
     let mut stream = cancellation::cancellable(stream, telemetry.cancel_token());
     let mut buffer = String::new();
+    // 回复还原器（Task 5.3）：**只在聚合完成后**对 body 做还原（见文件末尾）。
+    // 不在原始字节上还原：`restore_json` 已经覆盖「占位符被分片切开 / 被拆进
+    // 两个 delta 事件」两种情形，而在解析前把明文塞回 `data: {…}` 会因为原文
+    // 含 `"` / `\` / 控制字符破坏 JSON 外壳（帧被静默丢弃 → 200 少内容）。
+    let restorer = crate::server::core::masking::Restorer::new(mask_session);
     let mut acc = CompletionAccumulator {
         rewrite: policy.rewrite,
         strip_newline_chunks: policy.strip_newline_chunks,
@@ -169,6 +183,7 @@ async fn aggregate_frame_stream_inner(
             telemetry.note_first_frame();
         }
         // 原始字节由输入侧（HTTP 字节流或协议翻译流）采集，聚合器只消费 chat 帧。
+        // 还原**不在这里做**（见 `restorer` 的说明与文件末尾的 `restore_json`）。
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         // 逐行消费（只处理到最后一个 '\n' 之前的内容）
         while let Some(index) = buffer.find('\n') {
@@ -189,7 +204,12 @@ async fn aggregate_frame_stream_inner(
         acc.consume_line(&tail, &telemetry)?;
     }
 
-    Ok(acc.into_completion())
+    let mut completion = acc.into_completion();
+    // 非流式出口**唯一**的还原点：占位符无论被分片切开、还是被拆进两个 delta
+    // 事件，聚合后都已拼回完整字符串；在 Value 上还原由 serde 负责转义，
+    // 原文含 `"` / `\` / 控制字符也不会破坏 JSON（含 `tool_calls[].function.arguments`）。
+    restorer.restore_json(&mut completion.body);
+    Ok(completion)
 }
 
 /// 聚合状态（Node 的局部变量集中到这里，便于 `consume_line` 返回 Result）

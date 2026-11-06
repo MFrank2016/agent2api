@@ -20,7 +20,7 @@ fn safe_token(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"._-[]".contains(&byte))
 }
 
-pub(super) fn request_form(payload: &str) -> Result<reqwest::multipart::Form, String> {
+pub(super) fn request_form(payload: &str) -> Result<wreq::multipart::Form, String> {
     const MAX_BYTES: usize = 14 * 1024 * 1024;
     let body: Value =
         serde_json::from_str(payload).map_err(|_| "插件上传信封不是合法 JSON".to_string())?;
@@ -40,7 +40,7 @@ pub(super) fn request_form(payload: &str) -> Result<reqwest::multipart::Form, St
         return Err("插件上传需要 1 至 16 个内联文件".to_string());
     }
     let mut total = 0usize;
-    let mut form = reqwest::multipart::Form::new();
+    let mut form = wreq::multipart::Form::new();
     for (name, value) in fields {
         if !safe_token(name) {
             return Err("插件上传字段名无效".to_string());
@@ -71,7 +71,7 @@ pub(super) fn request_form(payload: &str) -> Result<reqwest::multipart::Form, St
         if data.is_empty() || total > MAX_BYTES {
             return Err("插件上传文件为空或总大小超过 14 MiB".to_string());
         }
-        let part = reqwest::multipart::Part::bytes(data)
+        let part = wreq::multipart::Part::bytes(data)
             .file_name(file.filename)
             .mime_str(&file.content_type)
             .map_err(|_| "插件上传文件类型无效".to_string())?;

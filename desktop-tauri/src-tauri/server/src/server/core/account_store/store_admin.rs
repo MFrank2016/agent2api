@@ -51,6 +51,7 @@ use crate::server::core::account_store::state::{
 use crate::server::core::account_store::store::AccountStore;
 use crate::server::core::account_store::store_util::{token_tail_of, truncate_chars};
 use crate::server::core::providers::{provider_index, DEFAULT_PROVIDER_ID};
+use crate::server::core::providers::error_kind::QuotaKind;
 use crate::server::logging;
 
 /// ── 限额冷却的参数（2026-11 参考 magpie / CLIProxyAPI 的做法）──────────
@@ -68,6 +69,38 @@ const RATE_LIMIT_FORGET_MS: f64 = 30.0 * 60_000.0;
 /// 上游**明确给的**恢复时刻的宽松上限：防上游手滑给出离谱值（magpie 的
 /// `longestQuota` 同理）。它只用于「上游明确值」，兜底退避另有更低的上限。
 const RATE_LIMIT_GIVEN_MAX_MS: f64 = 8.0 * 24.0 * 60.0 * 60_000.0;
+
+/// 构造一条 `rateLimits[model]` 条目（纯函数，不碰库，便于单测 JSON 形状）。
+///
+/// `kind` 决定 `reason`（归类名）与 `scope`（冷却作用域）；`retryAfterMs` 是
+/// 上游 `Retry-After` 换算出的毫秒（没给就是 null）。旧条目缺这三个字段时
+/// 按「未知」处理，属纯增量，不需要迁移数据。
+fn rate_limit_entry(
+    status: i64,
+    code: Option<i64>,
+    reset_at: Option<f64>,
+    message: &str,
+    kind: QuotaKind,
+    retry_after_ms: Option<i64>,
+) -> Value {
+    let (reason, scope) = match kind {
+        QuotaKind::Credit => ("credit", "account"),
+        QuotaKind::Verification => ("verification", "account"),
+        QuotaKind::Quota => ("quota", "model"),
+        QuotaKind::Rate => ("rate", "model"),
+        QuotaKind::Plan => ("plan", "model"),
+    };
+    json!({
+        "status": if status == 0 { 429 } else { status },
+        "code": code.map(Value::from).unwrap_or(Value::Null),
+        "resetAt": reset_at.map(json_number).unwrap_or(Value::Null),
+        "message": truncate_chars(message, 300),
+        "at": logging::now_ms(),
+        "reason": reason,
+        "scope": scope,
+        "retryAfterMs": retry_after_ms.map(Value::from).unwrap_or(Value::Null),
+    })
+}
 
 impl AccountStore {
     // ─── 凭证回写与限额标记 ──────────────────────────────────
@@ -242,6 +275,8 @@ impl AccountStore {
         code: Option<i64>,
         reset_at: Option<f64>,
         message: &str,
+        kind: QuotaKind,
+        retry_after_ms: Option<i64>,
     ) -> Option<Value> {
         let _guard = self.guard();
         // 只读目标那一行。这一条在改造前是全量写盘里**最亏**的一个：一次 429
@@ -296,15 +331,11 @@ impl AccountStore {
         } else {
             fresh.max(prev_reset_at)
         };
-        let entry = json!({
-            "status": if status == 0 { 429 } else { status },
-            "code": code.map(Value::from).unwrap_or(Value::Null),
-            "resetAt": json_number(until),
-            "message": truncate_chars(message, 300),
-            "at": now,
-            "strikes": strikes,
-            "guessed": given.is_none(),
-        });
+        let mut entry = rate_limit_entry(status, code, Some(until), message, kind, retry_after_ms);
+        if let Some(object) = entry.as_object_mut() {
+            object.insert("strikes".to_string(), Value::from(strikes));
+            object.insert("guessed".to_string(), Value::from(given.is_none()));
+        }
         let mut limits = match record.get("rateLimits") {
             Some(Value::Object(map)) => map.clone(),
             _ => Map::new(),
@@ -1264,5 +1295,50 @@ fn rewrite_models_arrays(value: &mut Value, mapping: &HashMap<String, String>) -
             changed
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limit_entry_carries_reason_and_scope() {
+        let entry = rate_limit_entry(
+            429, Some(1113), Some(1_800_000_000_000.0), "余额不足", QuotaKind::Credit, Some(60_000),
+        );
+        assert_eq!(entry["reason"], "credit");
+        assert_eq!(entry["scope"], "account");
+        assert_eq!(entry["retryAfterMs"], 60_000);
+    }
+
+    #[test]
+    fn rate_limit_entry_maps_every_kind_to_reason_and_scope() {
+        for (kind, reason, scope) in [
+            (QuotaKind::Credit, "credit", "account"),
+            (QuotaKind::Verification, "verification", "account"),
+            (QuotaKind::Quota, "quota", "model"),
+            (QuotaKind::Rate, "rate", "model"),
+            (QuotaKind::Plan, "plan", "model"),
+        ] {
+            let entry = rate_limit_entry(429, None, Some(1_800_000_000_000.0), "", kind, None);
+            assert_eq!(entry["reason"], reason);
+            assert_eq!(entry["scope"], scope);
+        }
+    }
+
+    #[test]
+    fn rate_limit_entry_keeps_retry_after_and_defaults_zero_status() {
+        let entry = rate_limit_entry(0, None, None, "", QuotaKind::Rate, Some(1234));
+        assert_eq!(entry["status"], 429);
+        assert_eq!(entry["retryAfterMs"], 1234);
+        assert!(entry["resetAt"].is_null());
+    }
+
+    #[test]
+    fn rate_limit_entry_without_reset_at_leaves_it_null() {
+        let entry = rate_limit_entry(429, None, None, "", QuotaKind::Quota, None);
+        assert!(entry["resetAt"].is_null());
+        assert!(entry["retryAfterMs"].is_null());
     }
 }

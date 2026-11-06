@@ -325,8 +325,37 @@ pub fn is_reserved(key: &str) -> bool {
 /// 助手从「一次性对话」变成「有历史记录的会话」：左边一列会话、右边一条消息流，
 /// 关掉页面再回来还能接着聊。存**整条消息流的 JSON**（而不是逐条消息一行）的
 /// 理由与 `kv` 表同一取向：读写单元天然是「一整个会话」，逐条存只会让每次保存
-/// 变成 N 次写入 + 一次事务，而没有任何一处需要「按单条消息查询」。
+/// 变成 N 次写入 + 一次事务，而没有任何一处需要「按单条消息查」。
 ///
+/// ── v17～v20：上游的限额事件 / 来源统计 / 助手图片 / 原始报文截断 ──
+/// 这一段在合并时以**上游 schema v20 为基线**：v17 建 `account_limiter_events`
+/// （把旧 `requests` 行回填成限额事件），v18 给 `requests` 补 `api_key_id` /
+/// `api_key_name` / `api_key_source` 与 `request_daily` 的来源统计列，
+/// v19 建助手图片表，v20 给 `request_raw` 补截断标记。
+///
+/// ── v21：网关 Key 配额落位（本 fork）────────────────────────
+/// 本 fork 原有的「网关 Key 身份」迁移曾占用 v17（`key_id` / `key_name`），
+/// 与上游 v17 撞号。合并时**不重放那两个列名**：身份统一落到上游 v18 已经
+/// 建好的 `api_key_id` / `api_key_name` / `api_key_source` 上，v21 只做两件事：
+///
+///   · 把 fork 线存量库里的 `key_id` / `key_name` **映射回填**到 `api_key_*`
+///     （`api_key_source = 'key'`）—— 数据不丢，列名不重复；
+///   · 为停在 fork v17 的库补建上游 v17 的 `account_limiter_events`（该库跳过了
+///     上游 v17 分支），并清掉已被 v18 索引取代的 `idx_requests_key_ts`。
+///
+/// 配额规则本身仍存在配置（`apiKeys` 的 `quotaRules`），不建库表：见
+/// `core::api_keys` / `core::key_quota`。请求统计里的 `api_key_source`
+/// 由 v18 提供，v21 不再加列。
+///
+/// ── v22：上游 beta.6 的 schema 增量（本 fork 顺延）─────────────────
+/// 上游把 `assistant_sessions.title_generated` 放在它的 v21；本 fork 的 v21
+/// 已被 Key 身份归并占用，所以这里**不重放旧迁移**，把上游 v21 的列与上游
+/// v22 的数据修复合并成一个新的 v22：
+///   · 幂等补建 `assistant_sessions.title_generated`（先查 `pragma_table_info`，
+///     上游 v21 已建过则跳过）；
+///   · 清掉模型目录刷新在旧成败判据下累积的假失败冷却（`reset_model_refresh_cooldown`）。
+pub const SCHEMA_VERSION: i64 = 24;
+
 /// ── 版本 22：清掉模型目录刷新的假失败冷却（[`reset_model_refresh_cooldown`]）
 /// 这是一次**纯数据修复**（无 DDL）：旧成败判据把「任一家失败」当成整轮失败，
 /// 于是一家的长期 401 就能把整条任务按到 24 小时冷却上，界面上显示成「冷却中」。
@@ -338,7 +367,8 @@ pub fn is_reserved(key: &str) -> bool {
 /// 请求日志新增「积分」列读它。与 token 四列刻意不同：这一列**可空 REAL** ——
 /// `NULL` = 这一家没上报（旧行 / 不提供该读数），0 = 确实零消耗；用 0 兜底会
 /// 把「没读到」画成「花了 0 积分」，比缺一列更难排查。
-pub const SCHEMA_VERSION: i64 = 23;
+
+
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -865,6 +895,11 @@ CREATE TABLE IF NOT EXISTS assistant_sessions (
 CREATE INDEX IF NOT EXISTS idx_assistant_sessions_updated ON assistant_sessions(updated_at DESC);
 ";
 
+/// 版本 17：限额事件表（上游 v17）。
+///
+/// 把「按账号 / 渠道 / 模型」的 Token 周期消耗从 `requests` 明细里抽成一张
+/// 独立事件表，限额判定读它。旧库在此一次性回填（`INSERT OR IGNORE`，
+/// 以 `legacy:<row_id>` 作幂等键）。
 const V17_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS account_limiter_events (
   row_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -883,17 +918,11 @@ SELECT 'legacy:' || row_id, account_id,
        ts, MAX(total_tokens, 0), 1
 FROM requests WHERE account_id != '' AND status != 0 AND attempts > 0;
 ";
+
 /// 版本 21：fork 线 Key 身份归并到上游 `api_key_*`（schema v21）。
 ///
 /// 见 [`SCHEMA_VERSION`] 的 v21 段。可重复执行：建表 / 建索引用
 /// `IF NOT EXISTS`，回填用 `WHERE ... = ''`，旧索引用 `DROP INDEX IF EXISTS`。
-///
-/// **不在这里重放 `account_limiter_events` 的历史回填**：那段
-/// `INSERT OR IGNORE ... SELECT 'legacy:' || row_id` 与上游 `V17_SCHEMA` 逐字相同，
-/// 而 v17 之后 `limiter::counter::note` 已经用 `request_id` 作为 `id` 写过新行；
-/// 再插一遍 `legacy:<row_id>` 会与同一批请求形成两份事件，把 token / 请求计数
-/// 翻倍、限额提前熔断。v17 已保证建表与回填，这里只补「停在 fork v17 的库」
-/// 缺失的表/索引（CREATE IF NOT EXISTS）与旧索引清理。
 const V21_SCHEMA: &str = "
 -- ── 补建上游 v17 的限额事件表（停在 fork v17 的库跳过了该分支）──
 CREATE TABLE IF NOT EXISTS account_limiter_events (
@@ -907,6 +936,11 @@ CREATE TABLE IF NOT EXISTS account_limiter_events (
   requests INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_limiter_events_account_time ON account_limiter_events(account_id, ts, channel);
+INSERT OR IGNORE INTO account_limiter_events (id, account_id, model, ts, tokens, requests)
+SELECT 'legacy:' || row_id, account_id,
+       CASE WHEN upstream_model != '' THEN upstream_model ELSE model END,
+       ts, MAX(total_tokens, 0), 1
+FROM requests WHERE account_id != '' AND status != 0 AND attempts > 0;
 -- ── fork 线旧索引已被 v18 的 idx_requests_api_key_ts 取代 ──
 DROP INDEX IF EXISTS idx_requests_key_ts;
 ";
@@ -921,8 +955,6 @@ WHERE api_key_id = '' AND key_id != '';
 UPDATE requests SET api_key_name = key_name
 WHERE api_key_name = '' AND key_name != '';
 ";
-
-
 
 /// 版本 23：requests 补「积分消耗」一列（schema v23）。
 ///
@@ -1107,115 +1139,36 @@ fn apply_version(
         18 => conn.execute_batch(include_str!("schema_source_stats.sql")),
         19 => conn.execute_batch(include_str!("schema_assistant_images.sql")),
         20 => conn.execute_batch(include_str!("schema_debug_raw.sql")),
-        // v21：上游 assistant_sessions.title_generated + 本地 fork 线 Key 身份
-        // 归并（补建限额事件表 / 清旧索引 / api_key_* 条件回填）。两者都幂等。
+        // v21：fork 线 Key 身份映射到 api_key_*（见 V21_SCHEMA 与
+        // SCHEMA_VERSION 的 v21 段）。列是否存在要查 pragma_table_info，
+        // 所以这一段不是一条静态 batch。
         21 => migrate_v21(conn),
-        // v22：清掉模型目录刷新的假失败冷却；无 kv 表的极简库跳过数据修复。
+        // v22：上游 beta.6 的 assistant_sessions.title_generated（幂等补列）
+        // + 模型目录刷新假失败冷却修复（见 SCHEMA_VERSION 的 v22 段）。
         22 => migrate_v22(conn),
         // v23：requests 补「积分消耗」一列（请求日志的积分列，见 V23_SCHEMA）
         23 => conn.execute_batch(V23_SCHEMA),
+        24 => conn.execute_batch(include_str!("schema_client_identification.sql")),
         _ => Ok(()),
     }
 }
 
-/// v21 并集：上游 3.4.1 的 `assistant_sessions.title_generated`（其 v21）与
-/// 本 fork 的「Key 身份归并 + 补建上游 v17 限额事件表」（fork v21）都执行。
-/// 全部幂等，停在 fork v17 的库不会丢 Key 明细。
-
+/// v21 的实际动作：先跑无条件部分（补建上游 v17 表、清旧索引），再在
+/// `requests` 仍带 fork 线 `key_id` 列时做映射回填。
+///
+/// 列是否存在必须用 `pragma_table_info` 查 —— SQLite 没有 `ADD COLUMN IF
+/// NOT EXISTS`，也没有「列存在才 UPDATE」的 DDL 语法；把条件留在 Rust 侧
+/// 才能让上游线与 fork 线共用同一个版本号。
 fn migrate_v21(conn: &Connection) -> rusqlite::Result<()> {
-    let sessions_exists: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'assistant_sessions'",
-        [], |row| row.get(0),
-    )?;
-    if sessions_exists > 0 {
-        let has_title: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('assistant_sessions') WHERE name = 'title_generated'",
-            [], |row| row.get(0),
-        )?;
-        if has_title == 0 {
-            conn.execute_batch(include_str!("schema_assistant_title.sql"))?;
-        }
-    }
     conn.execute_batch(V21_SCHEMA)?;
     let legacy_key_column: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('requests') WHERE name = 'key_id'",
-        [], |row| row.get(0),
+        [],
+        |row| row.get(0),
     )?;
     if legacy_key_column > 0 {
         conn.execute_batch(V21_LEGACY_KEY_BACKFILL)?;
     }
-    Ok(())
-}
-
-/// v22：清掉模型目录刷新的假失败冷却。无 kv 表（测试夹具 / 极简库）时跳过，
-/// 避免 `no such table: kv` 挡住整个升级。
-fn migrate_v22(conn: &Connection) -> rusqlite::Result<()> {
-    let kv_exists: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'kv'",
-        [], |row| row.get(0),
-    )?;
-    if kv_exists > 0 {
-        reset_model_refresh_cooldown(conn)?;
-    }
-    Ok(())
-}
-
-/// 版本 22：把「模型目录刷新」那条任务的**失败冷却**清掉（数据修复，无 DDL）。
-///
-/// ── 修的是什么 ──────────────────────────────────────────────
-/// 旧判据是 `failed == 0`（`core::scheduled_tasks::run_backend` 的
-/// `TASK_MODEL_REFRESH` 分支）：**任何一家**提供商刷新失败就把整轮算作失败。
-/// 而逐家失败是常态 —— 一家的登录态被上游作废（例如 CatPaw 的长期 401）就足以
-/// 让每一轮都失败一次，`failures` 于是按 `1h × 2^(n-1)` 一路顶到 24 小时上限，
-/// 其余能刷的家跟着一起停在旧清单上。界面上表现为「冷却中，N 小时后重试」，
-/// 看起来就是刷新功能坏了。
-///
-/// 判据已改成与凭证维护同一条（`round_succeeded`：有成功就不算整轮失败），
-/// 但**存量库里那串失败计数与 `retryAt` 还在**：不在这里清一次，用户升级后
-/// 仍要干等到旧冷却到期（实测能到二十多小时），等于修复不生效。
-///
-/// ── 为什么只清模型刷新这一条 ─────────────────────────────────
-/// 别的任务没有这个误判来源，它们的冷却记的是真实失败（断网 / 上游故障），
-/// 一并清掉等于替用户提前解封、白打一轮上游。
-///
-/// ── 为什么在这里做而不是写个一次性标记键 ─────────────────────
-/// `user_version` 本身就是「每个版本只跑一次」的事实来源（见 [`migrate`]），
-/// 复用它零新增状态；而 kv 里再放一个标记键还要登记进 `RESERVED_KV_KEYS`，
-/// 否则一次配置写入就会把它当「已删除的键」清掉、下次启动重跑一遍。
-///
-/// 失败不致命：状态是 `kv.backgroundTaskState` 里的一份 JSON，读不到 / 解析不出
-/// 就当作「没有要修的」，不让它挡住整个升级。
-
-fn reset_model_refresh_cooldown(conn: &Connection) -> rusqlite::Result<()> {
-    use rusqlite::OptionalExtension;
-    use serde_json::{json, Map, Value};
-
-    let text: Option<String> = conn
-        .query_row("SELECT value FROM kv WHERE key = 'backgroundTaskState'", [], |row| row.get(0))
-        .optional()?;
-    let Some(text) = text else { return Ok(()) };
-    let Ok(mut states) = serde_json::from_str::<Map<String, Value>>(&text) else {
-        return Ok(());
-    };
-    // 任务级键就是任务 id 本身（`scheduled_tasks::state_key`：模型刷新不是更新
-    // 检查那种带仓库前缀的特例）。逐家的 `modelRefresh:<provider>` 键不动 ——
-    // 它们的冷却记的是各家自己的失败，与这条误判无关。
-    let Some(state) = states.get_mut("modelRefresh").and_then(Value::as_object_mut) else {
-        return Ok(());
-    };
-    let had_cooldown = state.get("retryAt").and_then(Value::as_i64).unwrap_or(0) > 0
-        || state.get("failures").and_then(Value::as_u64).unwrap_or(0) > 0;
-    if !had_cooldown {
-        return Ok(());
-    }
-    state.insert("retryAt".to_string(), json!(0));
-    state.insert("failures".to_string(), json!(0));
-    let encoded = serde_json::to_string(&states)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    conn.execute(
-        "UPDATE kv SET value = ?1 WHERE key = 'backgroundTaskState'",
-        rusqlite::params![encoded],
-    )?;
     Ok(())
 }
 
@@ -1265,7 +1218,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("user_version 应当可读");
-        assert_eq!(version, 23);
+        assert_eq!(version, 24);
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))
@@ -1295,96 +1248,108 @@ mod tests {
         assert_eq!(rows.len(), 3);
         for (key_id, api_key_id, key_name, api_key_name, api_key_source) in rows {
             assert_eq!(api_key_id, key_id, "api_key_id 必须由 key_id 映射而来");
-            assert_eq!(api_key_name, key_name, "api_key_name 必须由 key_name 映射而来");
+            assert_eq!(
+                api_key_name, key_name,
+                "api_key_name 必须由 key_name 映射而来"
+            );
             assert_eq!(api_key_source, "key", "回填行的来源必须是 key");
         }
     }
-
-    /// B（fix round 3）：v17 已经回填过 `account_limiter_events`，v21 不得再插
-    /// 一遍 `legacy:<row_id>` —— 否则同一批请求被计两次，限额提前熔断。
-    ///
-    /// **判别性夹具**：3 条 requests 在 v17 之前插入（v17 回填成 legacy:1..3），
-    /// 之后**再插入一条全新的 r4** 并让 `limiter::counter::note` 用 `id='r4'`
-    /// 写一条事件。此时若 V21_SCHEMA 仍带那条重复 INSERT，回放会为 r4 生成
-    /// 一个全新的 `legacy:4`（不与任何已有 id 冲突，INSERT OR IGNORE 拦不住），
-    /// 事件数 4 → 5；删掉重复 INSERT 后必须保持 4。
-    #[test]
-    fn v21_does_not_double_limiter_events_after_v17() {
-        let conn = Connection::open_in_memory().expect("内存库应当能建起来");
-        conn.execute_batch(
-            "CREATE TABLE requests (
-                row_id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                id             TEXT NOT NULL,
-                ts             INTEGER NOT NULL DEFAULT 0,
-                model          TEXT NOT NULL DEFAULT '',
-                upstream_model TEXT NOT NULL DEFAULT '',
-                account_id     TEXT NOT NULL DEFAULT '',
-                status         INTEGER NOT NULL DEFAULT 0,
-                attempts       INTEGER NOT NULL DEFAULT 1,
-                total_tokens   INTEGER NOT NULL DEFAULT 0,
-                key_id         TEXT NOT NULL DEFAULT '',
-                key_name       TEXT NOT NULL DEFAULT '',
-                api_key_id     TEXT NOT NULL DEFAULT '',
-                api_key_name   TEXT NOT NULL DEFAULT '',
-                api_key_source TEXT NOT NULL DEFAULT ''
-            );
-            INSERT INTO requests (id, account_id, status, attempts, total_tokens) VALUES
-                ('r1', 'acc-1', 200, 1, 100),
-                ('r2', 'acc-1', 200, 1, 200),
-                ('r3', 'acc-2', 500, 1, 50);
-            PRAGMA user_version = 16;",
-        )
-        .expect("v16 fixture 应当能建起来");
-
-        // 模拟上游 v17：建表 + 历史回填（3 条 legacy:1..3）。
-        conn.execute_batch(V17_SCHEMA).expect("v17 应当能建表并回填");
-
-        // v17 **之后**才发生的新请求：它不在 v17 的回填快照里。
-        conn.execute_batch(
-            "INSERT INTO requests (id, account_id, status, attempts, total_tokens)
-             VALUES ('r4', 'acc-1', 200, 1, 999);
-             INSERT INTO account_limiter_events (id, account_id, ts, tokens, requests)
-             VALUES ('r4', 'acc-1', 2000, 999, 1);",
-        )
-        .expect("v17 之后的新请求与 note 事件应当能插入");
-
-        let before: i64 = conn
-            .query_row("SELECT COUNT(*) FROM account_limiter_events", [], |row| row.get(0))
-            .expect("事件数应当可读");
-        assert_eq!(before, 4, "v17 的 3 条 legacy + 1 条 note = 4");
-        let legacy_before: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM account_limiter_events WHERE id LIKE 'legacy:%'",
-                [], |row| row.get(0),
-            )
-            .expect("legacy 事件数应当可读");
-        assert_eq!(legacy_before, 3, "v17 只回填了 3 条 legacy");
-
-        // 走到 v21（只跑 v21 动作，避免 migrate() 连带 v18~v23 需要更多表）。
-        migrate_v21(&conn).expect("v21 应当成功");
-
-        let after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM account_limiter_events", [], |row| row.get(0))
-            .expect("事件数应当可读");
-        assert_eq!(
-            after, before,
-            "v21 重放历史回填会为 r4 生成新的 legacy:4，把事件数 4 顶到 5"
-        );
-
-        let legacy_after: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM account_limiter_events WHERE id LIKE 'legacy:%'",
-                [], |row| row.get(0),
-            )
-            .expect("legacy 事件数应当可读");
-        assert_eq!(legacy_after, 3, "v21 不得新增任何 legacy:% 行");
-
-        // 条件 Key 回填仍然生效（fork 线的 key_id 不能丢）；本夹具 key_id 为空，不应误回填。
-        let mapped: i64 = conn
-            .query_row("SELECT COUNT(*) FROM requests WHERE api_key_source = 'key'", [], |row| row.get(0))
-            .expect("回填结果应当可读");
-        assert_eq!(mapped, 0, "本夹具 key_id 为空，不应误回填");
+}
+/// v22 的实际动作：幂等补建上游 beta.6 的 `assistant_sessions.title_generated`
+/// 列（上游 v21），再清掉模型目录刷新的假失败冷却（上游 v22）。
+///
+/// `ALTER TABLE ... ADD COLUMN` 没有 IF NOT EXISTS，所以列是否存在必须先查
+/// `pragma_table_info`；上游 v21 已经建过的库直接跳过这一半。
+fn migrate_v22(conn: &Connection) -> rusqlite::Result<()> {
+    let table_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'assistant_sessions'",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_exists > 0 {
+        let has_title: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('assistant_sessions') WHERE name = 'title_generated'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_title == 0 {
+            conn.execute_batch(include_str!("schema_assistant_title.sql"))?;
+        }
     }
+    // 测试夹具等极简库可能没有 kv 表：数据修复对这类库无事可做。
+    let kv_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'kv'",
+        [],
+        |row| row.get(0),
+    )?;
+    if kv_exists > 0 {
+        reset_model_refresh_cooldown(conn)?;
+    }
+    Ok(())
+}
 
+/// 版本 22：把「模型目录刷新」那条任务的**失败冷却**清掉（数据修复，无 DDL）。
+///
+/// ── 修的是什么 ──────────────────────────────────────────────
+/// 旧判据是 `failed == 0`（`core::scheduled_tasks::run_backend` 的
+/// `TASK_MODEL_REFRESH` 分支）：**任何一家**提供商刷新失败就把整轮算作失败。
+/// 而逐家失败是常态 —— 一家的登录态被上游作废（例如 CatPaw 的长期 401）就足以
+/// 让每一轮都失败一次，`failures` 于是按 `1h × 2^(n-1)` 一路顶到 24 小时上限，
+/// 其余能刷的家跟着一起停在旧清单上。界面上表现为「冷却中，N 小时后重试」，
+/// 看起来就是刷新功能坏了。
+///
+/// 判据已改成与凭证维护同一条（`round_succeeded`：有成功就不算整轮失败），
+/// 但**存量库里那串失败计数与 `retryAt` 还在**：不在这里清一次，用户升级后
+/// 仍要干等到旧冷却到期（实测能到二十多小时），等于修复不生效。
+///
+/// ── 为什么只清模型刷新这一条 ─────────────────────────────────
+/// 别的任务没有这个误判来源，它们的冷却记的是真实失败（断网 / 上游故障），
+/// 一并清掉等于替用户提前解封、白打一轮上游。
+///
+/// ── 为什么在这里做而不是写个一次性标记键 ─────────────────────
+/// `user_version` 本身就是「每个版本只跑一次」的事实来源（见 [`migrate`]），
+/// 复用它零新增状态；而 kv 里再放一个标记键还要登记进 `RESERVED_KV_KEYS`，
+/// 否则一次配置写入就会把它当「已删除的键」清掉、下次启动重跑一遍。
+///
+/// 失败不致命：状态是 `kv.backgroundTaskState` 里的一份 JSON，读不到 / 解析不出
+/// 就当作「没有要修的」，不让它挡住整个升级。
+fn reset_model_refresh_cooldown(conn: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::OptionalExtension;
+    use serde_json::{json, Map, Value};
 
+    let text: Option<String> = conn
+        .query_row(
+            "SELECT value FROM kv WHERE key = 'backgroundTaskState'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(text) = text else { return Ok(()) };
+    let Ok(mut states) = serde_json::from_str::<Map<String, Value>>(&text) else {
+        return Ok(());
+    };
+    // 任务级键就是任务 id 本身（`scheduled_tasks::state_key`：模型刷新不是更新
+    // 检查那种带仓库前缀的特例）。逐家的 `modelRefresh:<provider>` 键不动 ——
+    // 它们的冷却记的是各家自己的失败，与这条误判无关。
+    let Some(state) = states
+        .get_mut("modelRefresh")
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    let had_cooldown = state.get("retryAt").and_then(Value::as_i64).unwrap_or(0) > 0
+        || state.get("failures").and_then(Value::as_u64).unwrap_or(0) > 0;
+    if !had_cooldown {
+        return Ok(());
+    }
+    state.insert("retryAt".to_string(), json!(0));
+    state.insert("failures".to_string(), json!(0));
+    let encoded = serde_json::to_string(&states)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    conn.execute(
+        "UPDATE kv SET value = ?1 WHERE key = 'backgroundTaskState'",
+        rusqlite::params![encoded],
+    )?;
+    Ok(())
 }
