@@ -65,7 +65,7 @@
       // 不要再按 manifest 循环一遍。
       if (locale === 'zh-Hans') return;
       window.__WB_I18N_INJECTED = true;
-      document.write('<script src="i18n/combined/' + locale + '.js?v=3.3.0"><\/script>');
+      document.write('<script src="i18n/combined/' + locale + '.js?v=3.4.1"><\/script>');
     })();
   </script>
   <link rel="stylesheet" href="css/tokens.css">
@@ -106,12 +106,12 @@
   <!-- 移动端适配层：最后加载，断点 768px。不动既有 900px 折叠规则，
        只处理 768px 以下真机小屏：侧边栏抽屉化 + 表格卡片化 + 卡片堆叠 -->
   <link rel="stylesheet" href="css/mobile.css">
-  <link rel="stylesheet" href="islands/ui.css?v=3.3.0">
+  <link rel="stylesheet" href="islands/ui.css?v=3.4.1">
   <!-- 多语言运行时：查表 t() + 静态文案扫描器（data-i18n 系列）。
        词典已由上面 head 里的引导脚本同步注入（document.write），这里只放运行时逻辑。
        必须排在 units.js / app.js 等业务脚本之前 —— 它们在加载期就可能读 window.wbI18n；
        排在 head 末尾天然满足。 -->
-  <script src="i18n.js?v=3.3.0"></script>
+  <script src="i18n.js?v=3.4.1"></script>
 </head>
 <body>
   <div id="desktop-app"></div>
@@ -119,7 +119,7 @@
   <script src="units.js"></script>
   <script src="sidebar-layout.js"></script>
   <script src="filter-memory.js"></script>
-  <script src="islands/ui.js?v=3.3.0"></script>
+  <script src="islands/ui.js?v=3.4.1"></script>
   <script src="app.js"></script>
   <script src="clipboard.js"></script>
   <script src="web-login.js"></script>
