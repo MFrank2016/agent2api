@@ -80,13 +80,76 @@ struct Running {
     restart_rx: tokio::sync::mpsc::Receiver<()>,
 }
 
-fn main() -> ExitCode {
-    if std::env::args().nth(1).as_deref() == Some("--systemd-updater") {
-        return ExitCode::from(agent2api_server::server::core::update::systemd::run_helper() as u8);
+/// 启动参数的解析结果。`cli_action` 是纯函数，便于单测钉死「查版本不能起服务」。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CliAction {
+    /// 前台启动网关（无参数）
+    Run,
+    /// 打印版本后立即退出
+    Version,
+    /// 打印用法后立即退出
+    Help,
+    /// Windows 服务形态（SCM 用 `--service` 拉起；仅 Windows 走服务分派）
+    Service,
+    /// systemd 容器内自更新的受限升级进程
+    SystemdUpdater,
+    /// Windows 服务内自更新的受限升级进程（带任务 id）
+    WindowsUpdater(String),
+    /// 不认识的 flag：报错退出，绝不静默忽略后照常启动服务
+    Unknown(String),
+}
+
+fn cli_action(args: &[String]) -> CliAction {
+    match args.first().map(String::as_str) {
+        None => CliAction::Run,
+        Some("--version") | Some("-V") => CliAction::Version,
+        Some("--help") | Some("-h") => CliAction::Help,
+        Some(flag) if flag.trim().eq_ignore_ascii_case("--service") => CliAction::Service,
+        Some("--systemd-updater") => CliAction::SystemdUpdater,
+        Some("--windows-updater") => {
+            CliAction::WindowsUpdater(args.get(1).cloned().unwrap_or_default())
+        }
+        Some(other) => CliAction::Unknown(other.to_string()),
     }
-    if std::env::args().nth(1).as_deref() == Some("--windows-updater") {
-        let id = std::env::args().nth(2).unwrap_or_default();
-        return ExitCode::from(agent2api_server::server::core::update::windows_service::run_helper(&id) as u8);
+}
+
+/// `--help` 的输出。与模块头的「两种起法」说明保持同一口径。
+fn print_help() {
+    let version = env!("CARGO_PKG_VERSION");
+    println!("agent2api-server {version}");
+    println!();
+    println!("用法：");
+    println!("  agent2api-server                  前台启动网关（日志到 stderr，Ctrl+C / SIGTERM 停止）");
+    println!("  agent2api-server --version, -V    打印版本后退出");
+    println!("  agent2api-server --help, -h       显示本帮助后退出");
+    println!("  agent2api-server --service        Windows 服务形态（仅 Windows，交给 SCM 托管）");
+    println!();
+    println!("配置与数据目录等环境变量见源码模块头 / docs/install.md。");
+}
+
+fn main() -> ExitCode {
+    match cli_action(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        CliAction::Version => {
+            println!("agent2api-server {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        CliAction::Help => {
+            print_help();
+            return ExitCode::SUCCESS;
+        }
+        CliAction::Unknown(flag) => {
+            eprintln!("❌ 未知参数：{flag}（用 --help 查看用法）");
+            return ExitCode::FAILURE;
+        }
+        CliAction::SystemdUpdater => {
+            return ExitCode::from(agent2api_server::server::core::update::systemd::run_helper() as u8);
+        }
+        CliAction::WindowsUpdater(id) => {
+            return ExitCode::from(
+                agent2api_server::server::core::update::windows_service::run_helper(&id) as u8,
+            );
+        }
+        CliAction::Run | CliAction::Service => {}
     }
     // Windows 服务形态判定放在**参数解析之前**：服务进程没有控制台，
     // 配置写错（端口非法之类）时 eprintln 会全部丢掉，而「配置错导致起不来」
@@ -426,5 +489,60 @@ async fn wait_for_shutdown_signal(mut restart: tokio::sync::mpsc::Receiver<()>) 
             _ = tokio::signal::ctrl_c() => {}
             _ = restart.recv() => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    /// `--version` / `-V` 必须被识别为「打印版本后退出」，
+    /// 绝不能落到前台启动网关的路径上（否则查版本却起了个服务）。
+    #[test]
+    fn version_flag_is_recognized_instead_of_launching_gateway() {
+        assert_eq!(cli_action(&["--version".to_string()]), CliAction::Version);
+        assert_eq!(cli_action(&["-V".to_string()]), CliAction::Version);
+    }
+
+    /// `--help` / `-h` 打印用法后退出。
+    #[test]
+    fn help_flag_is_recognized() {
+        assert_eq!(cli_action(&["--help".to_string()]), CliAction::Help);
+        assert_eq!(cli_action(&["-h".to_string()]), CliAction::Help);
+    }
+
+    /// 无参数时正常启动。
+    #[test]
+    fn no_args_runs_gateway() {
+        assert_eq!(cli_action(&[]), CliAction::Run);
+    }
+
+    /// 未知参数必须显式报错退出，不能被静默吞掉后照常启动服务。
+    #[test]
+    fn unknown_flag_is_rejected() {
+        assert_eq!(
+            cli_action(&["--bogus".to_string()]),
+            CliAction::Unknown("--bogus".to_string())
+        );
+    }
+
+    /// 已有的 updater 子命令不受影响。
+    #[test]
+    fn updater_subcommands_still_route_to_helpers() {
+        assert_eq!(
+            cli_action(&["--systemd-updater".to_string()]),
+            CliAction::SystemdUpdater
+        );
+        assert_eq!(
+            cli_action(&["--windows-updater".to_string(), "id-1".to_string()]),
+            CliAction::WindowsUpdater("id-1".to_string())
+        );
+    }
+
+    /// Windows SCM 用 `"exe" --service` 拉起服务；该 flag 必须被识别为
+    /// 正常启动（服务分派在 cfg(windows) 内），不能被当成未知参数拒绝。
+    #[test]
+    fn service_flag_does_not_break_windows_service_launch() {
+        assert_eq!(cli_action(&["--service".to_string()]), CliAction::Service);
     }
 }
