@@ -766,6 +766,22 @@ pub(super) fn routing_from(map: &Map<String, Value>) -> RoutingSettings {
     }
 }
 
+/// 本地 7 档选路策略 → 上游**展示档位**（`order` / `rotate` / `provider`）。
+///
+/// 这是「本地权威 → 上游契约」的**唯一投影**：`RoutingProfile::validate_shape`
+/// 只认这三档，把本地 id（如 `priority`、`least-connections`）直接塞进
+/// profile 会让 `PUT /api/routing/profile` 一律 400。有损投影，**不可反推**。
+pub(super) fn route_strategy_display(
+    strategy: crate::server::core::routing::RoutingStrategy,
+) -> RouteStrategy {
+    use crate::server::core::routing::RoutingStrategy as Local;
+    match strategy {
+        Local::GlobalRoundRobin | Local::BalanceWeighted => RouteStrategy::Rotate,
+        Local::RoundRobin => RouteStrategy::Provider,
+        _ => RouteStrategy::Order,
+    }
+}
+
 #[cfg(test)]
 mod routing_tests {
     //! 路由设置的默认值与解析口径。

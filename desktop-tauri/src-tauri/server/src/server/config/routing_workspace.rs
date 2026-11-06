@@ -11,6 +11,26 @@ use crate::server::core::{
     account_order, account_store::store::AccountStore, routing, routing_scope,
 };
 
+/// 全局 profile 的 `strategy` 来自 workspace 的**展示面**（`routing_json` 只输出
+/// `order` / `rotate` / `provider` 三档）。这些展示 id 是本地 7 档的有损投影，
+/// 绝不能反推回去覆盖权威默认值 —— 否则用户在 `least-connections` 上做任何一次
+/// 全局保存（哪怕只是账号排序）都会被静默改成 `priority`。
+///
+/// 只有真正来自本地策略面的 7 档 id（`/api/routing-strategy` 的 `default`）才更新
+/// 权威默认值；展示 id 一律保留现状。
+fn canonical_default_after_profile_strategy(
+    existing: routing::RoutingStrategy,
+    incoming: Option<&str>,
+) -> routing::RoutingStrategy {
+    const DISPLAY_IDS: [&str; 3] = ["order", "rotate", "provider"];
+    match incoming {
+        Some(id) if !DISPLAY_IDS.contains(&id.trim().to_ascii_lowercase().as_str()) => {
+            routing::RoutingStrategy::parse(id).unwrap_or(existing)
+        }
+        _ => existing,
+    }
+}
+
 pub fn revision(
     profile: &RoutingProfile,
     settings: super::RoutingSettings,
@@ -151,9 +171,18 @@ pub fn save_workspace(
         let mut global = profile;
         if let Some(profile) = &mut global {
             if let Some(strategy) = profile.strategy.take() {
-                next.routing.strategy = super::RouteStrategy::from_id(&strategy);
-                next.raw
-                    .insert(super::KEY_ROUTING_STRATEGY.into(), strategy.into());
+                // 展示 id（order/rotate/provider）是 workspace 面的有损投影，
+                // 保留现有权威默认值；只有本地 7 档 id 才走规范写入口。
+                let canonical = next.routing_strategy.clone();
+                let default = canonical_default_after_profile_strategy(
+                    canonical.default,
+                    Some(&strategy),
+                );
+                if default != canonical.default {
+                    let mut updated = canonical;
+                    updated.default = default;
+                    super::write_routing_strategy_canonical(&mut next, &updated);
+                }
             }
             if let Some(sticky) = profile.sticky.take() {
                 next.routing.sticky = super::StickyMode::from_id(&sticky);
@@ -191,4 +220,34 @@ pub fn save_workspace(
     drop(guard);
     crate::server::core::cloud_sync::auto_sync::notify_change();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::core::routing::RoutingStrategy;
+
+    /// 权威默认值为 least-connections 时，任何一次全局 profile 保存（携带
+    /// workspace 展示面上的 order/rotate/provider）都必须原样保留，不能被
+    /// 静默降级成 priority。
+    #[test]
+    fn global_save_preserves_local_strategy_when_profile_carries_display_id() {
+        let canonical = RoutingStrategy::LeastConnections;
+        for display in ["order", "rotate", "provider"] {
+            assert_eq!(
+                canonical_default_after_profile_strategy(canonical, Some(display)),
+                canonical,
+                "展示 id {display} 不得改写本地权威档位"
+            );
+        }
+        assert_eq!(
+            canonical_default_after_profile_strategy(canonical, Some("least-recently-used")),
+            RoutingStrategy::LeastRecentlyUsed
+        );
+        assert_eq!(canonical_default_after_profile_strategy(canonical, None), canonical);
+        assert_eq!(
+            canonical_default_after_profile_strategy(canonical, Some("nonsense")),
+            canonical
+        );
+    }
 }

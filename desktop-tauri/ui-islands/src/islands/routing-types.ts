@@ -174,6 +174,8 @@ export type RoutingBridge = {
   saveRoutingProfile(payload: { model: string | null; profile: RouteProfile | null; orderChange?: RouteOrderChange; revision?: string } | { migrateGlobalAccounts: string }): Promise<RoutingWorkspace>
   batchAccounts(payload: BatchAccountsPayload): Promise<BatchAccountsResult | null | undefined>
   setRoutingConfig(patch: Partial<RouteSettings>): Promise<RouteSettings>
+  /** 本地 7 档权威策略面（GET /api/routing-strategy）：default 是 7 档 id，不是 workspace 的 3 档展示值。 */
+  getRoutingStrategy(): Promise<{ default?: string; [key: string]: unknown }>
   getRoutingReplays(query: { model?: string; offset: number; limit: number; status?: string }): Promise<{ entries: ReplayRow[]; matched: number; available?: boolean }>
   getRoutingTrace(query: { model?: string; offset: number; limit: number; status?: string; search?: string; startDate?: string; endDate?: string }): Promise<{ entries: ReplayRow[]; matched: number; available?: boolean }>
   getRoutingTraceRequest(query: { id: string; ts?: number }): Promise<ReplayRow>

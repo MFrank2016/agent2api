@@ -233,7 +233,7 @@ docker run -d --name agent2api --restart unless-stopped --memory=1g \
   aimodcc/agent2api:latest
 ```
 
-compose 使用者在服務裡加一行 `mem_limit: 1g`（`docker-compose.yml` 已附註解示例）；swarm 或 `docker compose --compatibility` 用 `deploy.resources.limits.memory`。1g 只是起點，依實際併發量調整。
+儲存庫自帶的 `docker-compose.yml` 已經實設 `mem_limit: 1g`（生效值，不是註解示例）；自行另寫 compose 時依實際併發量調整這個值，swarm 或 `docker compose --compatibility` 用 `deploy.resources.limits.memory`。
 
 兩處常駐記憶體的圖片快取上限都能用環境變數調小（預設各 `128` MiB）：`AGENT2API_IMAGE_CACHE_MB`（生成圖片的下載快取）、`AGENT2API_IMAGE_COMPRESS_CACHE_MB`（工作階段圖片壓縮結果快取）。寫壞或越界會回落預設值，不會讓服務起不來。
 

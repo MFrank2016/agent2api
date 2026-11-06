@@ -1604,7 +1604,7 @@ pub async fn start(
         provider,
         "cline-free" | "cline-pass" | "zcode" | "zcode-intl" | "codearts" | "trae" | "qoder"
         | "qoder-intl" | "qwenwork" | "qwenwork-intl" | "antigravity" | "officeace" | "lobsterai"
-        | "atomcode" | "nous
+        | "atomcode" | "nous"
     ) {
         format!("登录 {provider_label} 账号")
     } else {
