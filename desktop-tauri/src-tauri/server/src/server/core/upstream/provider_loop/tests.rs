@@ -223,23 +223,29 @@ fn codearts_daily_pool_envelope_cools_to_the_boundary_instead_of_ten_minutes() {
     let _guard = hold_config();
     let _shadow = ShadowQuotaKind::set(false);
     let (_dir, service, id) = temp_service();
-    // 生产库里那条真实文案（HTTP 200 的 SSE 里折出 403，首包门送进会话式分支）
-    let error = GatewayError::with_status(403, "上游报告 InferHub.4291.200：insufficient quota");
-    let class = adapter_for(ProviderKind::CodeArts).classify_conversation_error(&error);
-    let UpstreamErrorClass::QuotaLimited { reset_at: Some(reset_at), .. } = &class else {
-        panic!("福利池耗尽的文案应分类为带恢复时刻的 QuotaLimited，实际 {class:?}");
+    let now = crate::server::core::beijing::now();
+    let tomorrow = now.date_naive().succ_opt().expect("次日有效");
+    let midnight = tomorrow.and_hms_opt(0, 0, 0).unwrap()
+        .and_local_timezone(crate::server::core::beijing::offset()).single().unwrap();
+    let reset_at = midnight.timestamp_millis();
+    let message = "日额度已用尽";
+    let class = UpstreamErrorClass::QuotaLimited {
+        reset_at: Some(reset_at),
+        message: message.into(),
+        upstream_code: Some(4291200),
+        status: 403,
     };
     mark_conversation_limited(
         &service,
         &id,
         &single("glm-5.3-flash"),
         &class,
-        &error.message,
+        message,
         "codearts",
     );
 
     let stored = rotate::account_limit_reset_at(&service, &id, "glm-5.3-flash");
-    assert_eq!(stored, *reset_at, "落库的恢复时刻必须是适配器算出的日池重置点");
+    assert_eq!(stored, reset_at, "落库的恢复时刻必须是适配器算出的日池重置点");
     // ── 断言「是下一个北京零点」，而不是「距现在 > 10 分钟」（2026-10-13 修）──
     //
     // 原断言写的是 `minutes > 10`，本意是「不是 10 分钟兜底常量」；但它有个
@@ -940,6 +946,7 @@ async fn a_real_413_response_is_sent_once_and_handed_back() {
         mock_upstream(413, "application/json; charset=utf-8", APIG_TOO_LARGE_BODY).await;
     let mut budget = RetryBudget::new(3);
     let capture = crate::server::core::debug_traffic::TrafficCapture::begin("payload-too-large");
+    let telemetry = Arc::new(RequestTelemetry::new());
     // 适配器只提供「怎么判上游错误」这一半；413 的处置在**编排层**
     // （`transport::RetryBudget` + `fallback_retry_advice`），因此随便挑一个
     // 内置家即可。原先这里用 ZCode 的实例，它随实现搬到插件了 —— 换成本家
@@ -949,8 +956,9 @@ async fn a_real_413_response_is_sent_once_and_handed_back() {
         &transport,
         &mut budget,
         Some(&capture),
-        &std::sync::Arc::new(RequestTelemetry::new()),
+        &telemetry,
         false,
+        None,
         None,
     )
     .await;
@@ -1376,7 +1384,8 @@ async fn the_last_resort_selector_skips_hard_resting_accounts() {
 
     let keys = rotate::CooldownKeys::new("m-rest");
     let providers = [PROVIDER];
-    let target = rotate::select_target_account(&service, &providers, &keys, &[], None, "")
+    let routing = crate::server::core::upstream::route_context::RequestRouting::capture("m-rest", &service.store);
+    let target = rotate::select_target_account(&service, &providers, &keys, &[], None, "", &routing)
         .await
         .expect("兜底应当能选出未被硬休息的账号");
     assert_eq!(
@@ -1393,6 +1402,7 @@ async fn the_last_resort_selector_skips_hard_resting_accounts() {
         &[],
         Some(&rested),
         "",
+        &routing,
     )
     .await
     .expect("钉住的账号应当照常被选中");
@@ -1534,6 +1544,9 @@ async fn stateful_provider_refuses_to_send_when_masking_is_enabled() {
         prompt,
         preserve_system_prompt: false,
         key_scope: None,
+        vision: None,
+        direct_provider: None,
+        direct_model: None,
         pinned_account: None,
         ignore_model_gate: false,
         proxy_override: None,

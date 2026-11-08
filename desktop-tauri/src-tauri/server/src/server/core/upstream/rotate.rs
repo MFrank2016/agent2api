@@ -137,8 +137,54 @@ pub(super) async fn select_target_account(
     tried_ids: &[String],
     pinned: Option<&str>,
     conv_key: &str,
+    request_routing: &super::route_context::RequestRouting,
 ) -> Result<RouteTarget, GatewayError> {
-    let accounts = scoped_accounts(service, providers, keys.requested(), pinned);
+    let service = service.clone();
+    let providers: Vec<String> = providers.iter().map(|id| id.to_string()).collect();
+    let model = keys.requested().to_string();
+    let tried_ids = tried_ids.to_vec();
+    let pinned = pinned.map(str::to_string);
+    let conv_key = conv_key.to_string();
+    let request_routing = request_routing.clone();
+    crate::server::core::blocking::run(move || {
+        let providers: Vec<&str> = providers.iter().map(String::as_str).collect();
+        select_target_account_sync(&service, &providers, &routing::CooldownKeys::new(&model),
+            &tried_ids, pinned.as_deref(), &conv_key, &request_routing)
+    }).await?
+}
+
+fn select_target_account_sync(
+    service: &UpstreamService,
+    providers: &[&str],
+    keys: &routing::CooldownKeys<'_>,
+    tried_ids: &[String],
+    pinned: Option<&str>,
+    conv_key: &str,
+    request_routing: &super::route_context::RequestRouting,
+) -> Result<RouteTarget, GatewayError> {
+    let accounts = scoped_accounts(service, providers, keys.requested(), pinned, Some(request_routing));
+    if accounts.is_empty() && request_routing.strict_vision {
+        return Err(GatewayError::with_status(503, "当前权限和路由范围内没有可用的图片处理账号；未回退默认登录态")
+            .with_code("vision_target_unavailable"));
+    }
+    if accounts.is_empty() && request_routing.requires_account() {
+        return Err(GatewayError::with_status(503,
+            "指定生图账号不可用、处于冷却或已退出当前路由；未切换其他账号")
+            .with_code("image_account_unavailable"));
+    }
+    if accounts.is_empty() && request_routing.group.is_some() {
+        let reasons: Vec<_> = request_routing.group_projection.blocked.iter().take(3)
+            .filter_map(|entry| entry.get("reason").and_then(Value::as_str)).collect();
+        return Err(GatewayError::with_status(503, format!("此路由组没有可用成员，未回退全局或默认提供商{}", if reasons.is_empty() {
+            String::new()
+        } else { format!("：{}", reasons.join("；")) })).with_code("route_empty"));
+    }
+    if accounts.is_empty() && accounts_in_providers(service, providers, pinned).iter().any(|account| {
+        account.get("upstreamCooldownUntil").and_then(Value::as_i64).is_some_and(|until| until > logging::now_ms())
+    }) {
+        return Err(GatewayError::with_status(429, "候选账号处于上游账号级冷却，请等待恢复后重试")
+            .with_code("account_cooling_down"));
+    }
     if pinned.is_some_and(|id| !accounts.iter().any(|account| routing::account_id(account) == Some(id))) {
         return Err(GatewayError::with_status(401,
             "指定账号不存在或不属于当前提供商；未回退到队首或默认登录态")
@@ -250,6 +296,15 @@ pub(super) async fn select_target_account(
         ));
     }
 
+    if request_routing.strict_vision {
+        return Err(GatewayError::with_status(503, "图片处理候选账号受冷却、并发或额度限制；未强行发送或扩大路由范围")
+            .with_code("vision_target_unavailable"));
+    }
+    if request_routing.account_id().is_some() {
+        return Err(GatewayError::with_status(429,
+            "固定生图账号受冷却、并发或额度限制，或已无可用凭证；未自动换号")
+            .with_code("image_account_unavailable"));
+    }
     // ── 第二级兜底（并发感知）──────────────────────────────────
     // 启用中的账号都在限额冷却期内 / 已达并发上限时，仍挑一个试一次：
     //   ① 先在「启用 + 未尝试 + 未达并发上限」的账号里挑**恢复最早**的
@@ -347,6 +402,11 @@ pub(super) async fn select_target_account(
             }
         }
     }
+    if request_routing.requires_account() {
+        return Err(GatewayError::with_status(503,
+            "当前生图账号均无可用凭证；未使用默认登录态或其他账号")
+            .with_code("image_account_unavailable"));
+    }
     if pinned.is_some() {
         return Err(GatewayError::with_status(401,
             "指定账号没有可用凭证；未回退到队首或默认登录态")
@@ -425,9 +485,12 @@ fn scoped_accounts(
     providers: &[&str],
     model: &str,
     pinned: Option<&str>,
+    request_routing: Option<&super::route_context::RequestRouting>,
 ) -> Vec<Value> {
     let accounts = accounts_in_providers(service, providers, pinned);
-    let accounts = if pinned.is_some() { accounts } else {
+    let accounts = if pinned.is_some() && !request_routing.is_some_and(|routing| routing.strict_vision) { accounts } else if let Some(request_routing) = request_routing {
+        request_routing.accounts(accounts)
+    } else {
         crate::server::core::routing_scope::apply_accounts(&accounts, model)
     };
     let routable: Vec<Value> = accounts.iter()
@@ -678,7 +741,7 @@ pub(super) fn earliest_limit_reset_at(
     keys: &routing::CooldownKeys<'_>,
 ) -> i64 {
     let now = logging::now_ms();
-    let accounts: Vec<Value> = scoped_accounts(service, providers, keys.requested(), None)
+    let accounts: Vec<Value> = scoped_accounts(service, providers, keys.requested(), None, None)
         .into_iter()
         .filter(|account| !matches!(account.get("enabled"), Some(Value::Bool(false))))
         .collect();
@@ -879,7 +942,7 @@ pub(super) fn pick_next_account(
     if tried_ids.last().is_some_and(|last| !allows_route_skip(service, last)) {
         return None;
     }
-    let accounts = scoped_accounts(service, providers, keys.requested(), pinned);
+    let accounts = scoped_accounts(service, providers, keys.requested(), pinned, None);
     // 换号顺延与第一级选路同一份候选剔除：被限制器拦下的账号不会在 429 之后
     // 被当作「下一个」重新塞进来
     let (candidates, balance_blocked_ids) = filter_limiter_blocked(&accounts, keys, pinned);

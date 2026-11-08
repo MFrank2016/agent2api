@@ -1,4 +1,13 @@
 {
+  "启用（禁用后，使用此代理的账号请求将失败；仍可测试）": "Enabled (disabling blocks requests from accounts using this proxy; testing remains available)",
+  "有 <strong>{n}</strong> 个账号正在使用它（{names}）—— 删除后需重新设置这些账号的代理，不会自动直连。": "<strong>{n}</strong> accounts use this proxy ({names}). After deletion, reconfigure their proxies; they will not connect directly automatically.",
+  "其中 <strong>{n}</strong> 条正被账号使用 —— 删除后需重新设置相关账号的代理，不会自动直连。": "<strong>{n}</strong> selected proxies are in use. After deletion, reconfigure the affected accounts; they will not connect directly automatically.",
+  "有 {n} 个账号正在使用它，删除后需重新设置这些账号的代理，不会自动直连。": "{n} accounts use this proxy. After deletion, reconfigure their proxies; they will not connect directly automatically.",
+  "支持手动地址与 Clash Verge 端点同步，不接管代理服务的安装与运行。": "Supports manually entered addresses and Clash Verge endpoint sync; proxy service installation and execution are not managed here.",
+  "添加手动 HTTP / SOCKS5 地址，或同步 Clash Verge 的端点，供账号与服务线路使用。": "Add a manual HTTP / SOCKS5 address or sync Clash Verge endpoints for use by accounts and service routes.",
+  "手动代理与 Clash Verge 同步仍然保留": "Manual proxies and Clash Verge sync remain available",
+  "已有手动配置和 Clash Verge 端点引用不受影响。仍可添加 HTTP / SOCKS5 地址、同步 Clash Verge 端点并测试连通性；Clash Verge 由你自行安装和运行。": "Existing manual configurations and Clash Verge endpoint references are not affected. You can still add HTTP / SOCKS5 addresses, sync Clash Verge endpoints and test connectivity. Install and run Clash Verge separately.",
+  "请填写已有代理服务的 HTTP / SOCKS5 地址，或自行运行 Clash Verge 后同步端点，并重新为相关账号和服务线路选择代理。": "Enter the HTTP / SOCKS5 address of an existing proxy service, or run Clash Verge separately and sync its endpoints, then select a proxy again for the affected accounts and service routes.",
   " AI 账号专用静态住宅 IP：Scamalytics 低欺诈评分，不限流量，首单 75 折（AGENT2API25）": " native static residential IPs for AI accounts: low Scamalytics fraud score, unlimited traffic, 25% off your first purchase (AGENT2API25)",
   " 提供 AI 账号专用的原生静态住宅 IP（Static Residential ISP）：IP 来自真实家庭宽带运营商，Scamalytics 低欺诈评分，每个 IP 独享，不限流量，$3.90 起。": " offers native static residential ISP proxies for AI accounts (Static Residential ISP): IPs come from real home broadband operators with low Scamalytics fraud scores, each IP is dedicated to you, with unlimited traffic, from $3.90.",
   " 那一类由「同步 Clash Verge」 镜像进来（进入本页时会自动同步一次）：名称、端口、启用都跟随 Clash， 在 Clash 里改或删，这里跟着变 —— 所以它们只读，改请到 Clash Verge 里改。": " entries are mirrored in by \"Sync Clash Verge\" (auto-synced once when you enter this page): name, port, and enabled state all follow Clash — edit or delete them there and they change here too, so these entries are read-only; make your changes in Clash Verge.",

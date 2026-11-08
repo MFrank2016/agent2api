@@ -7,8 +7,6 @@ export const SUSPENDED_PROVIDER_IDS: ReadonlySet<string> = new Set([
   'factory',
   'zed',
   'grok',
-  'minimax-code',
-  'minimax-code-global',
   // 千问办公国际版：登录链路被上游挡住（只认它自己的回调地址），
   // 添加不了账号，先从可见列表摘掉；国内版 (`qwenwork`) 不受影响。
   'qwenwork-intl',
@@ -27,9 +25,6 @@ export function isSuspendedProvider(id: string): boolean {
   return SUSPENDED_PROVIDER_IDS.has(id)
 }
 
-// LobsterAI 封号严重；只隐藏新增入口，不影响存量账号的显示与调用。
-const HIDDEN_ADD_ACCOUNT_PROVIDER_IDS: ReadonlySet<string> = new Set(['lobsterai'])
-
 export function isAddAccountProviderHidden(id: string): boolean {
-  return isSuspendedProvider(id) || HIDDEN_ADD_ACCOUNT_PROVIDER_IDS.has(id)
+  return isSuspendedProvider(id)
 }

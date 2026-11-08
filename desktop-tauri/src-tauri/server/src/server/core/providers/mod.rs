@@ -433,6 +433,7 @@ pub fn is_known_provider_id(id: &str) -> bool {
     kind_from_id(id).is_some()
         || availability::is_suspended(id)
         || availability::is_runtime_identity(id)
+        || crate::server::core::plugin_host::script::known_provider(id)
         || is_executable_provider(id)
 }
 
@@ -486,6 +487,7 @@ pub fn label_of(id: &str) -> String {
         // runtime id 不靠占位 kind 取名：插件登记优先，最后回显原 ID。
         None => crate::server::core::plugin_host::lookup(id)
             .map(|adapter| adapter.label().to_string())
+            .or_else(|| crate::server::core::plugin_host::provider_label(id))
             .unwrap_or_else(|| id.to_string()),
     }
 }

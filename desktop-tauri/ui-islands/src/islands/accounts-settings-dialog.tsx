@@ -1358,7 +1358,7 @@ export function AccountSettingsDialog({
                         />
                         {account.proxy?.error ? (
                           <p className="detail text-destructive acct-dlg-block">
-                            {t("当前代理不可用：{error}（转发时会回退直连）", {
+                            {t("当前代理不可用：{error}（不会自动改为直连）", {
                               error: account.proxy.error,
                             })}
                           </p>

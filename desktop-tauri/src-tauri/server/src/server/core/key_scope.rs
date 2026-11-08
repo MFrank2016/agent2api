@@ -57,6 +57,9 @@ pub struct KeyScope {
     /// 与 `account_name` 同一理由：Key 可以改名、可以被删除，但明细的寿命长于
     /// 配置，报表仍要显示一个可读的名字而不是一串 id。
     key_name: String,
+    /// 指定账号（含「必须带账号」标记）：路由范围只在账号级生效时用
+    account_id: Option<String>,
+    require_account: bool,
 }
 
 impl KeyScope {
@@ -67,6 +70,8 @@ impl KeyScope {
             allowed_models: normalize(&entry.allowed_models),
             key_id: entry.id.clone(),
             key_name: entry.name.clone(),
+            account_id: None,
+            require_account: false,
         }
     }
 
@@ -89,6 +94,8 @@ impl KeyScope {
             // （报表按 `is_test` 排除，不会污染 Key 用量）
             key_id: String::new(),
             key_name: String::new(),
+            account_id: None,
+            require_account: false,
         }
     }
     /// 命中记录的 id（空串 = 没有可归属的 Key）
@@ -109,6 +116,30 @@ impl KeyScope {
         let mut scope = Self::provider_only(provider);
         scope.allowed_models = self.allowed_models.clone();
         Some(scope)
+    }
+
+    pub fn restrict_image_target(&self, provider: &str, account: &str) -> Option<Self> {
+        if provider.trim().is_empty() || !self.allows_provider(provider) {
+            return None;
+        }
+        let mut scope = self.clone();
+        scope.allowed_providers = HashSet::from([normalize_one(provider)]);
+        scope.require_account = true;
+        if !account.is_empty() {
+            if scope.account_id.as_deref().is_some_and(|id| id != account) {
+                return None;
+            }
+            scope.account_id = Some(account.to_string());
+        }
+        Some(scope)
+    }
+
+    pub fn requires_account(&self) -> bool {
+        self.require_account
+    }
+
+    pub fn account_id(&self) -> Option<&str> {
+        self.account_id.as_deref()
     }
 
     /// 是否限制提供商（界面上「有没有勾」的判据，也用于日志措辞）
@@ -142,6 +173,11 @@ impl KeyScope {
     /// 启停门禁不适用于这一跳。
     pub fn allowed_provider_ids(&self) -> Vec<String> {
         sorted(&self.allowed_providers)
+    }
+
+    pub(crate) fn cache_identity(&self) -> String {
+        serde_json::json!({ "providers": sorted(&self.allowed_providers), "models": sorted(&self.allowed_models),
+            "account": self.account_id, "requireAccount": self.require_account }).to_string()
     }
 
     /// 白名单的可读摘要（日志与错误文案用；空 = `不限制`）

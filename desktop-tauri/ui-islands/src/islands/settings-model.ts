@@ -229,6 +229,7 @@ export type SystemInfo = {
     sanitizeFingerprints?: boolean | null
     cors?: boolean | null
     developerRoleCompat?: boolean | null
+    thirdPartyReasoningCollapse?: boolean | null
     keepaliveStrip?: boolean | null
     autoContinue?: boolean | null
     autoContinueMaxRounds?: number | null
@@ -254,6 +255,8 @@ export type ImportError = { id?: string; message?: string; customProvider?: bool
 /** 导入结果（壳命令 import_accounts） */
 export type ImportResult = {
   canceled?: boolean
+  importNotice?: string
+  warning?: string
   total?: number
   added?: number
   updated?: number
@@ -363,6 +366,8 @@ export type SettingsBridge = {
   saveProviderOption(providerId: string, key: string, value: boolean | null): Promise<unknown>
   getDeveloperRoleCompat(): Promise<unknown>
   saveDeveloperRoleCompat(enabled: boolean): Promise<unknown>
+  getReasoningCollapse(): Promise<unknown>
+  saveReasoningCollapse(enabled: boolean): Promise<unknown>
   getClineHeaders(): Promise<unknown>
   saveClineHeaders(overrides: Record<string, string>): Promise<unknown>
   getZcodeVersion(): Promise<unknown>
@@ -439,7 +444,7 @@ export type SettingsBridge = {
 export type SharedWindow = {
   workbuddyDesktop?: SettingsBridge
   wbApp?: {
-    toast?: (message: string, kind?: 'err' | 'ok') => void
+    toast?: (message: string, kind?: 'err' | 'ok' | 'warn') => void
     /** 账号被导入改动后让主界面重绘（账号列表、导航计数） */
     refresh?: () => Promise<void> | void
     /** 当前页标识：脚本加载时若已停在设置页，补一次 load() */
@@ -454,7 +459,7 @@ export type SharedWindow = {
   /** Token 计量单位的展示口径（units.js）：本页只负责拨开关，格式化在那边 */
   wbUnits?: { isChinese?: () => boolean; setChinese?: (on: boolean) => void }
   /** 软件更新面板的岛（update-panel.tsx）：切到设置页时让它自己刷新一次 */
-  wbUpdatePanel?: { load?: () => Promise<void> | void }
+  wbUpdatePanel?: { load?: () => Promise<void> | void; check?: () => Promise<unknown> }
   /** 版本信息面板的岛（system-info-pane.tsx）：同上 */
   wbSystemInfoPane?: { load?: () => Promise<void> | void }
   /** 内联图标集（icons.js）：左栏分类图标由它渲染（返回 SVG 串，注入用） */
@@ -481,7 +486,7 @@ export function errorMessage(error: unknown): string {
 }
 
 /** toast 的统一出口（运行期读 wbApp，不在模块顶层解构） */
-export function toast(message: string, kind?: 'err' | 'ok'): void {
+export function toast(message: string, kind?: 'err' | 'ok' | 'warn'): void {
   shared().wbApp?.toast?.(message, kind)
 }
 
@@ -905,6 +910,7 @@ export const TIPS = {
   thinkStrip: t('开启后，响应开头那块 <think>…</think> 会被剥掉再下发给客户端。默认关闭——开启后下发正文不再与上游逐字一致。'),
   providerOptions: t('全局开关对所有家同时生效，但不同上游对同一策略的反应并不一致（例如某家本来不做内容审核，脱敏只是白改字节）。这里按家覆盖单项：每一档都可以选「跟随全局」（没有单独设置过，随全局开关变化）、「开」或「关」（这一家固定，不受全局开关影响）。逐家覆盖只影响该家的出站请求与下发字节，与上面那几条全局开关是同一组语义。'),
   developerRoleCompat: t('OpenAI 新版 API 用 developer 角色取代 system 承载指令，新版 OpenAI SDK 与部分客户端发的对话里会出现 role 为 developer 的消息；不少 OpenAI 兼容上游（尤其是自定义提供商的透传路径）不认识这个角色，收到就报 400。开启本项后，网关在每次转发前把 developer 角色的消息改写为 system —— 两类角色在 OpenAI 语义上等价（OpenAI 自己的迁移指南也是这么映射的），改写不影响对话内容与语义；对本来就只认 system 的各家内置上游同样无害。默认开启；关掉后 developer 消息会原样发往上游，不认识它的上游会报「角色不存在」一类的错误。'),
+  reasoningCollapse: t('让 Codex 在收到最终答案后收起中间过程。仅为严格识别的 Codex Responses 请求补阶段标记，报表归类和来源声明不影响此判断。正常结束且没有工具调用的非空回答才补 final_answer，工具调用前的说明补 commentary；错误、截断、缺少结束信号或未知结束原因不补最终答案标记。默认关闭，不改变回答文字，也不减少模型思考或用量。'),
   imageCompress: t('对话里内嵌的 base64 大图（截图、照片）既撑大请求体，也拉高按像素折算的上游计费。开启后，网关在转发前把超过阈值的图等比缩到长边上限、重新存成 JPEG —— 只改发给上游的副本，请求日志里保存的仍是你发来的原图。同一张原图在多轮对话里重复出现时复用上一次的压缩结果，不会每轮重算。http 链接图片、GIF 动图、SVG 一律不动；压完反而更大的图也保留原图。只作用在对话场景，生图与图片编辑不受影响。默认开启；不想要的话把开关关掉即可。'),
   clineHeaders: t('Cline 上游按请求头判定「调用方是不是 Cline 自家产品」：X-CLIENT-TYPE: cline-sdk 是硬门槛（缺了它免费池模型一律 403），版本号与平台标识让请求更贴近官方客户端的形态。这里列出的是网关默认会发的头：改某一行的值 = 覆盖默认值（也可以新增默认清单之外的自定义头）；把值清空保存 = 这个头不发送；在界面删掉被改过的行 = 回落默认值。改完点「保存」，下一个 Cline 请求立即生效。不懂某一行的含义就不要动它 —— 伪装头的价值在「与官方客户端逐字一致」。'),
   cors: t('网关面（/v1/*）默认不应答浏览器跨源请求：页面直连会被预检拦下，只报「无法连接 API」。注意来源是 * —— 未配「网关 Key」时任何网页都能借本机网关打上游，故默认关闭；只给自己用的话，让页面与网关同源（本地反代 /v1）更稳妥。面板接口（/api/*）不受影响。'),
@@ -929,6 +935,7 @@ export const NOTES = {
   sanitize: t('默认开启并应用全部提供商。编辑词表或应用范围后点击「保存设置」，下一次请求立即生效，不用重启。命中明细仍记进请求日志的「敏」标签。'),
   providerOptions: t('「跟随全局」与「显式设为关」是两种不同的语义：前者这一家没有单独设置过，全局开关一变它跟着变；后者固定为关，无论全局怎么改。所以三档不能压成两档 —— 否则一旦覆盖过就再也回不到跟随全局。自定义提供商只读「指纹脱敏」与「剥离思考标签」，不读「保活换行丢弃」（丢帧依据只来自 WorkBuddy / AutoClaw 两家的实测），所以那一项对它们不显示。'),
   developerRoleCompat: t('默认开启。只改 role 字段本身，消息内容与顺序都不动；本项只改发给上游的副本，客户端看到的响应内容不变。'),
+  reasoningCollapse: t('默认关闭。开启后下一次 Codex 请求立即生效，不用重启；只对 Codex 来源的 /v1/responses 请求补阶段标记，其它客户端与 /v1/chat/completions 不受影响。'),
   imageCompress: t('默认开启。只改发给上游的副本，客户端看到的响应与原图都不变；请求日志里保存的是客户端发来的原图，不是压缩后的版本。只作用在对话链路，生图 / 图片编辑不经过这里。改完对下一个请求立即生效，不用重启。'),
   clineHeaders: t('值与默认值相同的行不占覆盖（存的是「改过的键」，不是全量配置）；值留空保存表示这个头不发送，删除改过的行表示回落默认值。改完立即生效，不用重启。'),
   zcodeVersion: t('留空 = 用插件内置的默认版本号（每期活动由插件跟随官方更新）。只有遇到「官方客户端里能看到活动、这里探测为空」时才需要填：那种情况几乎都是上游抬高了版本门槛，而版本落后的表现是一份空列表而不是报错。按官方客户端当前版本填（形如 3.16.2），保存后回到套餐明细刷新一次即刻生效。环境变量 ZCODE_APP_VERSION 若已设置，优先级高于这里。'),
@@ -974,6 +981,9 @@ export const STATES = {
   roleCompatUnavailable: t('未能读取开发者角色兼容设置，请稍后重试'),
   roleCompatOn: t('正在归一角色：developer 角色消息转发前改写为 system。'),
   roleCompatOff: t('未开启，developer 角色消息会原样发往上游，不认识该角色的上游会报错（400）。'),
+  reasoningCollapseUnavailable: t('未能读取第三方模型回答完自动折叠过程设置，请稍后重试'),
+  reasoningCollapseOn: t('已开启：为正常完成的 Codex 回答补阶段标记。'),
+  reasoningCollapseOff: t('已关闭：不额外补阶段标记，由客户端决定过程展示。'),
   corsUnavailable: t('未能读取网关跨域访问设置，请稍后重试'),
   corsOn: t('正在应答跨源请求：浏览器跨域请求可直连 /v1/*。'),
   corsOff: t('未开启，浏览器跨域无法直连网关。'),

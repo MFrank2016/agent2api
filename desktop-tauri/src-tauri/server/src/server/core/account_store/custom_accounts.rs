@@ -55,7 +55,7 @@ use crate::server::core::account_store::state::{mark_name_custom, StoredAccount}
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
 use crate::server::core::account_store::store_util::{token_tail_of, truncate_chars};
 use crate::server::core::custom_providers;
-use crate::server::core::proxies::{resolve_account_egress, AccountEgress};
+use crate::server::core::proxies::{resolve_account_egress, AccountEgress, ResolvedProxy};
 use crate::server::logging;
 
 /// 账号 id 前缀。**与 provider id 的 `custom-` 不同形**（理由见模块头）。
@@ -168,13 +168,18 @@ impl AccountStore {
         };
 
         let _guard = self.guard();
-        let existing = self.with_conn(&_guard, |conn| identity::existing(conn, provider_id, &api_key))?;
+        let existing = self.with_conn(&_guard, |conn| {
+            identity::existing(conn, provider_id, &api_key)
+        })?;
         let id = match existing.as_ref() {
             Some(record) => record.id().to_string(),
             None => {
                 let id = identity::new_id(provider_id, &api_key)
                     .map_err(|error| AccountStoreError::new(error, 500))?;
-                if self.with_conn(&_guard, |conn| sql::load_by_id(conn, &id))?.is_some() {
+                if self
+                    .with_conn(&_guard, |conn| sql::load_by_id(conn, &id))?
+                    .is_some()
+                {
                     return Err(AccountStoreError::new(
                         format!("账号 id「{id}」已被占用，请重试或检查已有记录"),
                         409,
@@ -271,7 +276,9 @@ impl AccountStore {
         if let Some(value) = object.get("balanceQuery") {
             if !value.is_null() {
                 let Some(patch) = value.as_object() else {
-                    return Err(AccountStoreError::bad_request("balanceQuery 必须是 JSON 对象"));
+                    return Err(AccountStoreError::bad_request(
+                        "balanceQuery 必须是 JSON 对象",
+                    ));
                 };
                 let mut query = fields
                     .get("balanceQuery")
@@ -304,7 +311,12 @@ impl AccountStore {
         fields.insert("priority".to_string(), Value::from(priority));
         fields.insert(
             "enabled".to_string(),
-            Value::Bool(existing.as_ref().map(StoredAccount::enabled).unwrap_or(true)),
+            Value::Bool(
+                existing
+                    .as_ref()
+                    .map(StoredAccount::enabled)
+                    .unwrap_or(true),
+            ),
         );
         fields.insert(
             "addedAt".to_string(),
@@ -327,10 +339,13 @@ impl AccountStore {
             &format!(
                 "{} 自定义账号{}: {}（{}）",
                 if existing.is_some() { "🔄" } else { "✅" },
-                if existing.is_some() { "已更新" } else { "已添加" },
+                if existing.is_some() {
+                    "已更新"
+                } else {
+                    "已添加"
+                },
                 record_name,
-                custom_providers::label_of(provider_id)
-                    .unwrap_or_else(|| provider_id.to_string()),
+                custom_providers::label_of(provider_id).unwrap_or_else(|| provider_id.to_string()),
             ),
         );
         Ok(CustomAccountUpsert {
@@ -720,7 +735,8 @@ impl AccountStore {
             .cloned()
             .unwrap_or_default();
         let mut after = before.clone();
-        normalize_balance_query_patch(&mut after, object).map_err(AccountStoreError::bad_request)?;
+        normalize_balance_query_patch(&mut after, object)
+            .map_err(AccountStoreError::bad_request)?;
         if after == before {
             return Ok(Vec::new());
         }
@@ -735,7 +751,10 @@ impl AccountStore {
         self.with_conn(&_guard, |conn| sql::update_in_place(conn, &record))?;
         logging::log(
             "[Accounts]",
-            &format!("🔎 自定义账号余额查询配置已更新: {name}（{}）", changes.join("，")),
+            &format!(
+                "🔎 自定义账号余额查询配置已更新: {name}（{}）",
+                changes.join("，")
+            ),
         );
         Ok(changes)
     }
@@ -832,7 +851,8 @@ fn balance_query_of_record(record: &StoredAccount) -> CustomBalanceQuery {
 /// 五个字段横跨三种方案（NewAPI 用前两个、商汤用中间两个、智谱用最后一个），
 /// 合成一张表而不是按方案分开：写入侧不认识方案（它只认字段），按方案建表会
 /// 让「同一字段属于谁」在两处各写一遍。
-pub const BALANCE_QUERY_FIELDS: &[&str] = &["userId", "accessToken", "username", "password", "token"];
+pub const BALANCE_QUERY_FIELDS: &[&str] =
+    &["userId", "accessToken", "username", "password", "token"];
 
 /// 字段的界面/日志名（变更说明与错误文案用；键名对用户没有意义）
 fn balance_query_field_label(key: &str) -> &'static str {
@@ -859,7 +879,9 @@ fn normalize_balance_query_patch(
 ) -> Result<(), String> {
     let mut identity_changed = false;
     for key in BALANCE_QUERY_FIELDS {
-        let Some(value) = patch.get(*key) else { continue };
+        let Some(value) = patch.get(*key) else {
+            continue;
+        };
         let next = match value {
             Value::Null => String::new(),
             Value::String(text) => text.trim().to_string(),
@@ -923,10 +945,8 @@ fn describe_balance_query_changes(
 /// 自定义账号的**内部凭证快照**（`custom_credential_by_id` /
 /// `first_custom_credential` 的返回值）。
 ///
-/// 与公开形态（`to_custom_public_account`）的字段差别只有两个：
-/// `apiKey`（明文，出网鉴权用）与代理的**已解析形态**（`ResolvedProxy`，
-/// 直接可交给 egress；解析失败按直连兜底 —— 公开形态里那是给用户看的
-/// 「解析失败」气泡，这里是转发可执行的出口）。
+/// 与公开形态相比，这里保留出网鉴权所需的 API Key、已解析出口及代理异常原因。
+/// 代理异常不能被查询与目录刷新误当成未配置代理。
 pub struct CustomCredential {
     /// 账号 id
     pub account_id: String,
@@ -941,17 +961,23 @@ pub struct CustomCredential {
     pub base_url_override: Option<String>,
     /// 出网出口（`Direct` = 未配置 / 解析失败 → 直连）
     pub egress: AccountEgress,
+    /// 出网代理（None = 直连或轮询档；异常原因单独保留）。
+    pub proxy: Option<ResolvedProxy>,
+    pub proxy_error: Option<String>,
 }
 
 /// 一条记录 → 凭证快照（两个入口共用一份取数口径，不会各漂一份）
 fn credential_of_record(record: &StoredAccount) -> CustomCredential {
     let fields = record.fields();
-    let egress = match resolve_account_egress(Some(&record.proxy())) {
-        crate::server::core::proxies::EgressResolution::Resolved(egress) => egress,
-        // 无代理配置 / 解析失败 → 直连（与「解析失败回退直连」在出网行为上等价，
-        // 区别只在日志：这里没有请求上下文可挂 notice，静默直连即可）
-        crate::server::core::proxies::EgressResolution::Failed(_) => AccountEgress::Direct,
+    let (egress, proxy_error) = match resolve_account_egress(Some(&record.proxy())) {
+        crate::server::core::proxies::EgressResolution::Resolved(egress) => (egress, None),
+        // 解析失败：出口坏了必须明确失败，不能悄悄改走直连（与出网层同一口径）
+        crate::server::core::proxies::EgressResolution::Failed(_) => (
+            AccountEgress::Direct,
+            Some("账号代理不可用，请检查账号设置；本次操作未改走直连".to_string()),
+        ),
     };
+    let proxy = egress.primary().cloned();
     CustomCredential {
         account_id: record.id().to_string(),
         account_name: record.name(),
@@ -967,5 +993,7 @@ fn credential_of_record(record: &StoredAccount) -> CustomCredential {
             .map(str::to_string)
             .filter(|text| !text.is_empty()),
         egress,
+        proxy,
+        proxy_error,
     }
 }

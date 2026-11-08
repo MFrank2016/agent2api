@@ -71,6 +71,7 @@ pub mod api_keys;
 pub mod auth;
 pub mod auth_http;
 pub mod assistant_sessions;
+pub mod assistant_coding;
 pub mod assistant_images;
 pub mod auto_checkin;
 pub mod beijing;
@@ -106,6 +107,7 @@ pub mod login;
 pub mod masking;
 /// 下发内容的通用后处理（与具体上游无关的内容改写，见模块头）。
 pub mod middleware;
+pub mod maintenance;
 pub mod model_meta;
 pub mod model_rules;
 pub mod models;

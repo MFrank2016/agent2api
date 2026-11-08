@@ -41,6 +41,7 @@ use crate::server::core::upstream::cancellation;
 use crate::server::core::upstream::continuation::{self, Continuation};
 use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::core::upstream::{ForwardOutcome, ForwardRequest};
+use crate::server::config;
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 use crate::server::ServerState;
@@ -154,6 +155,9 @@ pub async fn responses_endpoint(
     let started_at = logging::now_ms();
     // 请求来源客户端（UA 识别，见 `core::client`）：早失败路径与收尾记账共用
     let source = pipeline::request_source(&headers, key_identity);
+    // 协议兼容只看严格客户端识别，不跟随报表规则或来源声明。
+    let reasoning_collapse = source.behavior_client == crate::server::core::client::CLIENT_CODEX
+        && config::third_party_reasoning_collapse();
     let path = "/v1/responses";
     let raw = match parse_object(&state, started_at, path, &body, &source) {
         Ok(value) => value,
@@ -208,6 +212,9 @@ pub async fn responses_endpoint(
         ),
     );
     pipeline::write_debug_files(&body, "POST", path, &user_agent);
+    let dedupe_key = pipeline::sha256_hex(&body);
+    let raw_request = pipeline::capture_raw_body(&body);
+    drop(body);
 
     // 上游恒走流式（理由见模块头）
     // scope 的**提供商**那一半进转发层（选路时按承载家过滤）；
@@ -246,10 +253,9 @@ pub async fn responses_endpoint(
     if let Some(token) = cancellation::register(&telemetry_id) {
         telemetry.set_cancel_token(token);
     }
-    let mut guard = DisconnectGuard::new(state.request_stats(), telemetry_id.clone());
+    let mut guard = DisconnectGuard::new(state.request_stats(), telemetry.clone(), started_at);
     // 保活流要求 future 是 'static：把状态与请求头 clone 进 async 块，
     // 而不是把 handler 的借用带进去（与 `api::chat` 的 `async move` 同一做法）。
-    let dedupe_key = pipeline::sha256_hex(&body);
     let forward_state = state.clone();
     let forward_headers = headers.clone();
     let forward_telemetry = telemetry.clone();
@@ -280,7 +286,7 @@ pub async fn responses_endpoint(
                     client_model: client_model.clone(),
                     client_reasoning: client_reasoning.clone(),
                     status: 200,
-                    raw_request: pipeline::capture_raw_body(&body),
+                    raw_request: raw_request.clone(),
                     raw_response: None,
                     is_test: false,
                     source: source.clone(),
@@ -314,7 +320,7 @@ pub async fn responses_endpoint(
         // 下游原始请求体：客户端发来的那一份（协议翻译前）——仅调试模式
         // 开启时采集（`capture_raw_body`）。响应侧非流式在聚合完成后补，
         // 流式由 RecordingStream 在流结束时定稿
-        raw_request: pipeline::capture_raw_body(&body),
+        raw_request,
         raw_response: None,
         // 真实流量：不是模型测试（见 `RecordContext::is_test`）
         is_test: false,
@@ -330,7 +336,8 @@ pub async fn responses_endpoint(
             // 状态码进记账上下文（明细里记的必须是客户端实际看到的那个码）
             let context = RecordContext { status: i64::from(status.as_u16()), ..context };
             if stream {
-                let mut machine = responses::ResponsesStream::new(&model, &request);
+                let mut machine =
+                    responses::ResponsesStream::new(&model, &request, reasoning_collapse);
                 let transformed = pipeline::transformed_stream(
                     source,
                     context,
@@ -343,9 +350,9 @@ pub async fn responses_endpoint(
             }
             // 下游要非流式：内部收流，聚合成本协议的 JSON
             let mut collector = responses::ResponsesCollector::new();
-            collect_stream(source, &mut |chunk| collector.push(chunk)).await;
+            let received = collect_stream(source, &mut |chunk| collector.push(chunk)).await;
             collector.finish();
-            let body = collector.into_response(&model, &request);
+            let body = collector.into_response(&model, &request, reasoning_collapse && received);
             // 响应正文在记账前定稿（完整 JSON 文本；序列化失败或调试模式
             // 关着给 None，见 `capture_raw_json`）
             let context = RecordContext {
@@ -360,7 +367,12 @@ pub async fn responses_endpoint(
         Ok(ForwardOutcome::Completion { body: chat }) => {
             // 上游走了聚合路径（本不该发生：我们恒要流式，但 CatPaw 等
             // 有状态适配器可能直接给 Completion）。照样翻译，不丢请求。
-            let response = responses::responses_from_chat(&chat, &requested_model, &original);
+            let response = responses::responses_from_chat(
+                &chat,
+                &requested_model,
+                &original,
+                reasoning_collapse,
+            );
             let context = RecordContext {
                 raw_response: pipeline::capture_raw_json(&response),
                 ..context
@@ -441,6 +453,9 @@ pub async fn messages_endpoint(
         ),
     );
     pipeline::write_debug_files(&body, "POST", path, &user_agent);
+    let dedupe_key = pipeline::sha256_hex(&body);
+    let raw_request = pipeline::capture_raw_body(&body);
+    drop(body);
 
     // scope 的**提供商**那一半进转发层（选路时按承载家过滤）；
     // 模型那一半已在上面判过（分工见 forward_chat 的说明）。
@@ -482,10 +497,9 @@ pub async fn messages_endpoint(
     if let Some(token) = cancellation::register(&telemetry_id) {
         telemetry.set_cancel_token(token);
     }
-    let mut guard = DisconnectGuard::new(state.request_stats(), telemetry_id.clone());
+    let mut guard = DisconnectGuard::new(state.request_stats(), telemetry.clone(), started_at);
     // 保活流要求 future 是 'static：把状态与请求头 clone 进 async 块，
     // 而不是把 handler 的借用带进去（与 `api::chat` 的 `async move` 同一做法）。
-    let dedupe_key = pipeline::sha256_hex(&body);
     let forward_state = state.clone();
     let forward_headers = headers.clone();
     let forward_telemetry = telemetry.clone();
@@ -516,7 +530,7 @@ pub async fn messages_endpoint(
                     client_model: client_model.clone(),
                     client_reasoning: client_reasoning.clone(),
                     status: 200,
-                    raw_request: pipeline::capture_raw_body(&body),
+                    raw_request: raw_request.clone(),
                     raw_response: None,
                     is_test: false,
                     source: source.clone(),
@@ -549,7 +563,7 @@ pub async fn messages_endpoint(
         // 下游原始请求体：客户端发来的那一份（协议翻译前）——仅调试模式
         // 开启时采集（`capture_raw_body`）。响应侧非流式在聚合完成后补，
         // 流式由 RecordingStream 在流结束时定稿
-        raw_request: pipeline::capture_raw_body(&body),
+        raw_request,
         raw_response: None,
         // 真实流量：不是模型测试（见 `RecordContext::is_test`）
         is_test: false,
@@ -621,19 +635,19 @@ pub async fn messages_endpoint(
 async fn collect_stream(
     mut source: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin>,
     sink: &mut impl FnMut(&[u8]),
-) {
+) -> bool {
     use futures::StreamExt;
     while let Some(item) = source.next().await {
         match item {
             Ok(chunk) => sink(&chunk),
-            // 上游中断：已收的内容保留（聚合层会把已有的部分成形），
-            // 与流式路径「不丢用户已经看到的部分」同一取向
+            // 部分内容保留，但接收失败不能用于推断最终回答阶段。
             Err(error) => {
                 logging::verbose("[Model]", &format!("聚合时上游中断: {error}"));
-                break;
+                return false;
             }
         }
     }
+    true
 }
 
 /// Anthropic 形态的错误响应（`{type:"error", error:{type, message}}`）
@@ -667,7 +681,7 @@ fn materialize_responses(
     match outcome {
         Ok(ForwardOutcome::Stream { status, stream: source }) => {
             context.status = i64::from(status);
-            let mut machine = responses::ResponsesStream::new(model, request);
+            let mut machine = responses::ResponsesStream::new(model, request, crate::server::config::third_party_reasoning_collapse());
             pipeline::transformed_stream(
                 source,
                 context,
@@ -677,7 +691,7 @@ fn materialize_responses(
         }
         Ok(ForwardOutcome::Completion { body }) => {
             context.status = 200;
-            let response = responses::responses_from_chat(&body, model, request);
+            let response = responses::responses_from_chat(&body, model, request, crate::server::config::third_party_reasoning_collapse());
             let payload = serde_json::to_string(&json!({ "response": response }))
                 .unwrap_or_else(|_| "{}".to_string());
             let frames: Vec<Result<Bytes, std::io::Error>> = vec![Ok(Bytes::from(format!(
