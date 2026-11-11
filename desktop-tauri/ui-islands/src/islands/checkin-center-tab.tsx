@@ -4,7 +4,7 @@ import {
 } from '@ui'
 import {
   growthOf, loadCenter, queryGrowth, runAllCheckin, runGrowth, runGrowthBatch,
-  runSchool, runTravelOnce, store,
+  runSchool, runTravelOnce, signProviderGroup, store,
 } from './checkin-store'
 import {
   formatShort, formatTime,
@@ -488,6 +488,12 @@ export function CenterTab({ center }: { center: CheckinCenter }): React.ReactEle
     return cache.status === 'loading' || cache.running || cache.runningSchool
   })
 
+  /** 每日签到：左栏选中某一家时的整组动作（选中「全部提供商」时没有） */
+  const dailyGroup = section === 'daily' && providerId
+    ? daily.providers.find(group => group.id === providerId)
+    : undefined
+  const groupRunning = dailyGroup !== undefined && store.signing.has(`group:${dailyGroup.id}`)
+
   /* ── 左栏：当前任务里的提供商（切任务时跟着变）── */
 
   const campaignRows = extras.campaigns ?? []
@@ -623,11 +629,23 @@ export function CenterTab({ center }: { center: CheckinCenter }): React.ReactEle
               <CardTitle>{sectionMeta.title}</CardTitle>
               <span className="text-[11.5px] text-muted-foreground">{sectionMeta.summary}</span>
               <CardAction>
-                {section === 'daily' ? (
+                {section === 'daily' ? <>
                   <Button size="sm" disabled={runningAll} onClick={() => void runAllCheckin()}>
                     {runningAll ? t('签到中…') : t('全部签到')}
                   </Button>
-                ) : null}
+                  {/* 整组签到只在左栏选中某一家时出现（「全部」就是上面那颗） */}
+                  {dailyGroup ? (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={groupRunning || runningAll}
+                      title={t('对这一家的全部账号逐个签到')}
+                      onClick={() => void signProviderGroup(dailyGroup)}
+                    >
+                      {groupRunning ? t('签到中…') : t('整组签到')}
+                    </Button>
+                  ) : null}
+                </> : null}
                 {section === 'onboarding' && extras.onboarding.length > 0 ? <>
                   <Button
                     size="sm"

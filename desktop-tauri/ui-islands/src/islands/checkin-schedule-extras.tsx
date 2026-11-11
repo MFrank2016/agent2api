@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { Button, Card, CardHeader, Empty, Input, Switch } from '@ui'
-import { patch, saveKeepaliveModels, saveTravel, runTravelNow, store } from './checkin-store'
+import { patch, saveKeepaliveModels, saveLobsteraiKeepalive, saveTravel, runTravelNow, store } from './checkin-store'
 import { formatTime, type CheckinCenter } from './checkin-types'
 import { t } from '../i18n'
 import { callJson } from './assistant-state'
@@ -311,13 +311,73 @@ function TravelPanel({ center }: { center: CheckinCenter }): React.ReactElement 
   )
 }
 
-export function CheckinScheduleExtras({ center }: { center: CheckinCenter }): React.ReactElement | null {
+/* ─── LobsterAI 令牌保活（有道龙虾）────────── */
+
+/**
+ * LobsterAI 令牌保活面板。
+ *
+ * 与旅行同构：**独立于多条目定时签到**的一条链路，有自己的开关与触发时刻，
+ * 到点替全部 LobsterAI 账号主动续期一次 access token —— 所以同样独立成卡，
+ * 而不是塞进某条条目的编辑表单里。
+ *
+ * 后端没给该字段时按「开」渲染（缺失 = 缺省开启，默认 22:00，见
+ * `core::auto_checkin` 的 `read_lobsterai_keepalive_state`）。
+ */
+function LobsteraiKeepalivePanel({ center }: { center: CheckinCenter }): React.ReactElement {
+  const keepalive = center.auto.lobsteraiKeepalive
+  const enabled = keepalive?.enabled !== false
+  // 草稿只在输入过程中存在（提交成功即清空）；快照刷新不清它，否则正在输入的时刻会被
+  // 后台轮询抹掉
+  const time = store.lobsteraiTimeDraft ?? keepalive?.time ?? ''
+  return (
+    <Card render={<section />} className="panel">
+      <CardHeader className="panel-head">
+        <h2>{t('LobsterAI 令牌保活')}</h2>
+        <span className="panel-sub">{t('LobsterAI（有道龙虾）：每天替全部账号主动续期一次令牌')}</span>
+      </CardHeader>
+      <div className="ck-panel-pad">
+        <div className="ck-set-line">
+          <span className="ck-set-k">{t('开关')}</span>
+          <span className="ck-set-v ck-set-row">
+            <Switch
+              checked={enabled}
+              disabled={store.saving}
+              onCheckedChange={next => void saveLobsteraiKeepalive({ enabled: next === true })}
+            />
+            <span className="ck-sub">{t('到点自动执行 · 错过会补跑')}</span>
+          </span>
+        </div>
+        <div className="ck-set-line">
+          <span className="ck-set-k">{t('保活时刻')}</span>
+          <span className="ck-set-v ck-set-row">
+            <Input
+              type="time"
+              className="w-[96px] max-w-[96px] font-mono tabular-nums"
+              value={time}
+              disabled={store.saving}
+              onChange={event => patch({ lobsteraiTimeDraft: event.currentTarget.value })}
+              onBlur={event => void saveLobsteraiKeepalive({ time: event.currentTarget.value })}
+              onKeyDown={event => {
+                if (event.key === 'Enter') event.currentTarget.blur()
+              }}
+            />
+            <span className="ck-sub">{t('每天到点主动续期一次令牌（北京时间）')}</span>
+          </span>
+        </div>
+        <div className="ck-note">
+          {t('与「凭证自动维护」的区别：后者只碰已过期或临期的账号，保活是无条件地把每个账号的令牌刷一遍，保证长期不开桌面端时账号也不会因令牌到期而显得不可用。续期被上游拒绝（登录态失效）的账号会自动禁用，需重新登录。')}
+        </div>
+      </div>
+    </Card>
+  )
+}
+
+export function CheckinScheduleExtras({ center }: { center: CheckinCenter }): React.ReactElement {
   const panels = new Set(center.adminPanels ?? [])
   const keepalive = panels.has('daily_keepalive') ? <KeepalivePanel center={center} /> : null
   const travel = panels.has('growth_tasks') ? <TravelPanel center={center} /> : null
-  if (!keepalive && !travel) return null
   return <section className='ck-schedule-extras'>
     <div className='ck-schedule-heading'><div><h2>{t('其他自动任务')}</h2><p>{t('保活模型链为全局配置，猫猫旅行有独立的开关与时刻。')}</p></div></div>
-    <div className='ck-region-row'>{keepalive}{travel}</div>
+    <div className='ck-region-row'>{keepalive}{travel}<LobsteraiKeepalivePanel center={center} /></div>
   </section>
 }

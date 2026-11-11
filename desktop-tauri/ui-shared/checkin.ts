@@ -214,6 +214,22 @@ export type AutoState = {
   /** 缺省补签时刻（「补签时刻」输入框的 placeholder） */
   defaultRetryTime?: string
   schedules: ScheduleEntry[]
+  /** LobsterAI 令牌保活（后端 `autoCheckin.lobsteraiKeepalive`；缺失 = 缺省开启） */
+  lobsteraiKeepalive?: LobsteraiKeepaliveState
+}
+
+/**
+ * LobsterAI（有道龙虾）令牌保活的配置。
+ *
+ * 与旅行同构：独立于多条目定时签到的一条链路，有自己的开关与触发时刻
+ * （`time`，北京时间），到点替全部 LobsterAI 账号主动续期一次 access token。
+ * **缺失 = 缺省开启**（默认 22:00），所以界面读 `enabled !== false`。
+ */
+export type LobsteraiKeepaliveState = {
+  enabled: boolean
+  time: string
+  lastFiredDate?: string | null
+  lastResult?: CheckinResult | null
 }
 
 export type KeepaliveState = {

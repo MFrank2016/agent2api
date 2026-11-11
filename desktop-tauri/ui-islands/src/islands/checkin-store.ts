@@ -18,14 +18,15 @@
  */
 
 import type {
-  AutoState, CheckinCenter, CheckinSection, KeepaliveState, OnboardingTask, RecordsPage, RecordRow, TravelRunResult,
-  TravelState,
+  AutoState, CheckinCenter, CheckinSection, KeepaliveState, OnboardingTask, ProviderGroup, RecordsPage, RecordRow,
+  TravelRunResult, TravelState,
 } from './checkin-types'
 import { t } from '../i18n'
 import { DEFAULT_PAGE_SIZE, SERVER_PAGE_SIZES, readPageSize } from './table-shell'
 import type { CheckinResultRow } from '../../../ui-shared/checkin'
 import { growthTaskRunnable } from '../../../ui-shared/checkin'
 import { rowCompleted, rowPending, rowMessage as resultMessage } from '../../../ui-shared/checkin-result'
+import { callJson } from './assistant-api'
 import { onboardingFromCenter } from './checkin-onboarding-cache'
 
 /** 新手福利的按账号缓存（明细要打上游，查一次存一次） */
@@ -219,6 +220,8 @@ export type Store = {
   keepaliveDraft: string[] | null
   /** 猫猫旅行时刻草稿（null = 跟随快照） */
   travelTimesDraft: string | null
+  /** LobsterAI 保活时刻草稿（null = 跟随后端值） */
+  lobsteraiTimeDraft: string | null
   /** 签到记录（独立于聚合快照：它有分页与筛选） */
   records: RecordRow[]
   recordsTotal: number
@@ -243,6 +246,8 @@ export type Store = {
   /** 成长任务的缓存：账号 id → 缓存 */
   growth: Map<string, GrowthCache>
   growthBatch: { mode: 'full' | 'claim'; accountIds: string[] } | null
+  /** 派猫猫旅行的按账号缓存：账号 id → 缓存（展开时惰性查询） */
+  travel: Map<string, TravelCache>
 }
 
 const recordsPageSize = readPageSize('checkin-records', SERVER_PAGE_SIZES)
@@ -259,6 +264,7 @@ export const store: Store = {
   runningAll: false,
   keepaliveDraft: null,
   travelTimesDraft: null,
+  lobsteraiTimeDraft: null,
   records: [],
   recordsTotal: 0,
   recordsLoaded: false,
@@ -273,6 +279,7 @@ export const store: Store = {
   plansBatch: null,
   growth: new Map(),
   growthBatch: null,
+  travel: new Map(),
 }
 
 const listeners = new Set<() => void>()
@@ -383,41 +390,127 @@ async function run<T>(
   }
 }
 
+/**
+ * 签到成功之后的跟进钩子：自动查询 / 补领这些账号的新手福利。
+ *
+ * 由 `checkin-onboarding` 在加载时注册（见那个模块的 `setAfterSignHook`）——
+ * 它依赖本模块的 store，静态反向 import 会成环，这与 `assistant-api` 抽出直连
+ * 请求层是同一类理由。没注册时静默跳过：签到本身不依赖这一步。
+ */
+let afterSignHook: ((ids: string[]) => void) | null = null
+
+export function setAfterSignHook(hook: (ids: string[]) => void): void {
+  afterSignHook = hook
+}
+
+/**
+ * 快照的新手福利清单里，与这些账号 id 相交的那部分（`null` = 清单全部）。
+ *
+ * 清单外的家在这里被滤掉 —— 那是「发一次注定没有结果的查询」的来源。
+ */
+function onboardingIds(candidates: string[] | null): string[] {
+  const rows = store.center?.extras.onboarding ?? []
+  if (!candidates) return rows.map(row => row.id)
+  const wanted = new Set(candidates)
+  return rows.filter(row => wanted.has(row.id)).map(row => row.id)
+}
+
 /** 全部签到（`id` 为空 = 签全部可签账号） */
 export async function runAllCheckin(accountId?: string): Promise<void> {
   if (store.runningAll) return
   patch({ runningAll: true })
+  let signed = false
   try {
     const result = await bridge().checkinAllAccounts?.(accountId)
     reportRunResult(result)
+    signed = result !== null && result !== undefined
   } catch (error) {
     toast(`签到失败：${errorMessage(error)}`, 'err')
   } finally {
     patch({ runningAll: false })
     await loadCenter()
   }
+  // 签到成功后自动跟进新手福利（失败不触发；见 `checkin-onboarding` 的说明）
+  if (signed) afterSignHook?.(onboardingIds(accountId ? [accountId] : null))
 }
 
-/** 单账号动作（`mode` = 插件申报的档位） */
-export async function signSingle(accountId: string, mode: string): Promise<void> {
+/**
+ * 单账号动作（`mode` = 插件申报的档位）。
+ *
+ * `silent` 给「整组签到」的循环用：那时逐账号弹一条提示会把屏幕刷满、逐账号各查
+ * 一次新手福利也会与后面几个账号的签到请求叠在一起 —— 两件事都交给调用方在末尾
+ * 统一收尾。返回值同样给调用方做汇总。
+ */
+export async function signSingle(
+  accountId: string, mode: string, silent = false,
+): Promise<CheckinRunResult | null | undefined> {
   const key = `${accountId}:${mode}`
-  if (store.signing.has(key)) return
+  if (store.signing.has(key)) return undefined
   const next = new Set(store.signing)
   next.add(key)
   patch({ signing: next })
+  let result: CheckinRunResult | null | undefined
   try {
-    const result = mode === 'checkin'
+    result = mode === 'checkin'
       ? await bridge().checkinAllAccounts?.(accountId)
       : await bridge().runCheckinActivity?.(accountId, mode)
-    reportRunResult(result, true)
+    if (!silent) reportRunResult(result, true)
   } catch (error) {
-    toast(`签到失败：${errorMessage(error)}`, 'err')
+    if (!silent) toast(`签到失败：${errorMessage(error)}`, 'err')
   } finally {
     const after = new Set(store.signing)
     after.delete(key)
     patch({ signing: after })
     await loadCenter()
   }
+  // 签到成功后自动跟进这个账号的新手福利（失败不触发；整组签到由调用方统一收尾）
+  if (!silent && result !== null && result !== undefined) afterSignHook?.(onboardingIds([accountId]))
+  return result
+}
+
+/**
+ * 按提供商整组签到（每日签到右栏选中某一家时的动作）。
+ *
+ * ── 为什么是逐个账号串行 ────────────────────────────────────
+ * 端点只有「单账号」与「全部账号」两档，没有「按提供商」这一档 —— 所以复用单账号
+ * 签到动作逐个串行：串行与批量签到是同一条防风控口径（多账号同时打上游会触发
+ * 风控），结果按账号粒度聚合，一次点击只播报一句（逐账号各弹一条会把屏幕刷满）。
+ *
+ * 在途键是 `group:${id}`：与单账号的 `${id}:${mode}` 共用同一份 `signing`，前缀
+ * 区分、互不牵连（账号 id 与 `group:` 不会撞）。单个账号的在途标记照旧生效，所以
+ * 整组执行时行上的按钮也一起禁用。
+ */
+export async function signProviderGroup(group: ProviderGroup): Promise<void> {
+  const key = `group:${group.id}`
+  if (store.signing.has(key) || group.accounts.length === 0) return
+  const next = new Set(store.signing)
+  next.add(key)
+  patch({ signing: next })
+  const total = group.accounts.length
+  let done = 0
+  let failed = 0
+  try {
+    for (const account of group.accounts) {
+      const result = await signSingle(account.id, 'checkin', true)
+      const row: CheckinResultRow | null = result?.results?.[0] ?? result ?? null
+      // 与后端 run_checkin 同一口径：真领取与「今日已领取」都算今天已完成
+      // （判据复用共享的 `rowCompleted`，不在这里另立一套）
+      if (row && rowCompleted(row)) done += 1
+      else failed += 1
+    }
+    toast(failed > 0
+      ? t('{label} 签到完成：{done}/{total} 个账号已签到，{failed} 个失败', {
+        label: group.label, done, total, failed,
+      })
+      : t('✅ {label} 签到完成：{done}/{total} 个账号已签到', { label: group.label, done, total }),
+    failed > 0 ? 'err' : 'ok')
+  } finally {
+    const after = new Set(store.signing)
+    after.delete(key)
+    patch({ signing: after })
+  }
+  // 整组只跟进一次新手福利（与逐账号签到的收尾同一口径；一个都没签上就不查）
+  if (done > 0) afterSignHook?.(onboardingIds(group.accounts.map(account => account.id)))
 }
 
 function rowMessage(row: CheckinResultRow): string {
@@ -538,6 +631,22 @@ export async function saveTravel(body: Record<string, unknown>): Promise<void> {
           ...(body.times ? { travelTimesDraft: null } : {}),
         })
       }
+    },
+    { success: '✅ 已保存', reload: false, failure: '保存失败' },
+  )
+}
+
+/**
+ * LobsterAI 令牌保活（有道龙虾）：开关 / 保活时刻。
+ *
+ * 与旅行同构：独立于多条目定时签到的一条链路，走同一条 `POST /api/auto-checkin`
+ * （只带 `lobsteraiKeepalive` 子对象，其它字段不动）。
+ */
+export async function saveLobsteraiKeepalive(body: { enabled?: boolean; time?: string }): Promise<void> {
+  await run(
+    async () => {
+      const data = await bridge().saveAutoCheckin?.({ lobsteraiKeepalive: body })
+      if (data) patch({ center: withAuto(store.center, data), lobsteraiTimeDraft: null })
     },
     { success: '✅ 已保存', reload: false, failure: '保存失败' },
   )
@@ -745,6 +854,77 @@ export async function runTravelOnce(id: string): Promise<void> {
     toast(`执行失败：${errorMessage(error)}`, 'err')
   } finally {
     await queryGrowth(id)
+  }
+}
+
+/* ─── 派猫猫旅行（WorkBuddy 国内版）─────────── */
+
+/**
+ * `GET /api/accounts/{id}/travel` 的 `status` 块（字段可能缺，读时逐个兜底）。
+ *
+ * 旅行状态刻意不进 `checkin-center` 快照（那必须「零上游请求」，见模块头），
+ * 所以卡片展开时才惰性拉一次。
+ */
+export type TravelStatus = {
+  available: boolean
+  /** idle | traveling | arrived（无活动时为空串） */
+  state: string
+  rewardCredit: number
+  dailyLimitReached: boolean
+  /** 到达时刻（秒）；traveling 时 `arriveAt - serverNow` 即剩余秒数 */
+  arriveAt: number
+  /** 上游的当前时刻（秒）—— 倒计时的基准，不拿本机时钟直接减 arriveAt */
+  serverNow: number
+}
+
+/** 一个账号的旅行缓存（没拉过时给一份空壳） */
+export type TravelCache = {
+  loading: boolean
+  status: TravelStatus | null
+  /** 同响应里的旅行配置：`enabled` 是总开关，关着时卡片只读、不给按钮 */
+  auto: { enabled?: boolean } | null
+  error?: string
+}
+
+/** `GET /api/accounts/{id}/travel` 的返回体（`callJson` 已剥掉 `data` 信封） */
+type TravelPayload = { status?: TravelStatus | null; auto?: TravelCache['auto'] }
+
+/** 读一个账号的旅行缓存（没拉过时给空壳） */
+export function travelOf(id: string): TravelCache {
+  return store.travel.get(id) ?? { loading: false, status: null, auto: null }
+}
+
+function patchTravel(id: string, next: Partial<TravelCache>): void {
+  const map = new Map(store.travel)
+  map.set(id, { ...travelOf(id), ...next })
+  patch({ travel: map })
+}
+
+/**
+ * 拉一次旅行状态（卡片展开时惰性调用；只读，零写）。
+ *
+ * 走 `callJson` 而不是裸 `fetch`：桌面端的页面来自 `tauri://` 协议，裸 fetch
+ * 打的是 tauri asset，根本到不了后端（见 `assistant-api` 的模块头）。
+ */
+export async function fetchTravel(id: string): Promise<void> {
+  patchTravel(id, { loading: true })
+  try {
+    const data = await callJson<TravelPayload>('GET', `/api/accounts/${encodeURIComponent(id)}/travel`)
+    patchTravel(id, { loading: false, status: data?.status ?? null, auto: data?.auto ?? null, error: '' })
+  } catch (error) {
+    patchTravel(id, { loading: false, error: errorMessage(error) })
+  }
+}
+
+/** 手动跑一次 travel_auto（派发 / 领取二合一，上游幂等），跑完重拉状态 */
+export async function runTravel(id: string): Promise<void> {
+  patchTravel(id, { loading: true })
+  try {
+    await callJson<unknown>('POST', `/api/accounts/${encodeURIComponent(id)}/travel`)
+  } catch (error) {
+    toast(`旅行失败：${errorMessage(error)}`, 'err')
+  } finally {
+    await fetchTravel(id)
   }
 }
 
