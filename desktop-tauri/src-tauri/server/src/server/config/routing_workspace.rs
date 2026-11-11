@@ -46,24 +46,15 @@ pub fn save_workspace(
     profile: Option<RoutingProfile>,
     expected: &str,
 ) -> Result<(), String> {
-    let _update = CONFIG_UPDATE_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _update = CONFIG_UPDATE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // 模型目录可能回读账号状态，必须在获取账号锁前解析。
+    let available = (!model.is_empty()).then(|| crate::server::core::providers::catalog::forwarding_providers(model));
     let guard = store.guard();
     let state = store.load(&guard);
-    let visible: Vec<Value> = state
-        .accounts
-        .iter()
-        .filter(|record| {
-            crate::server::core::account_store::store_view::account_visible(&record.provider())
-        })
-        .map(|record| store.public_account(record))
-        .collect();
-    let available = if model.is_empty() {
-        routing_scope::available_providers(&visible)
-    } else {
-        crate::server::core::providers::catalog::forwarding_providers(model)
-    };
+    let visible: Vec<Value> = state.accounts.iter()
+        .filter(|record| crate::server::core::account_store::store_view::account_visible(&record.provider()))
+        .map(|record| store.public_account(record)).collect();
+    let available = available.unwrap_or_else(|| routing_scope::available_providers(&visible));
     let mut next = super::current();
     if next.routing_profiles.group_for_model(model).is_some() {
         return Err("此模型 ID 已被自定义路由组占用".into());

@@ -264,6 +264,7 @@ pub(crate) struct RpcStream {
     usage: UsageSniffer,
     failure: Option<FailureSlot>,
     private_failure: Option<PrivateFailureSlot>,
+    raw: bool,
 }
 
 impl RpcStream {
@@ -315,7 +316,13 @@ impl RpcStream {
             usage,
             failure,
             private_failure,
+            raw: false,
         }
+    }
+
+    pub(super) fn raw(mut self) -> Self {
+        self.raw = true;
+        self
     }
 
     fn capture_failure(&self, error: GatewayError) {
@@ -411,6 +418,26 @@ impl Stream for RpcStream {
             }
             if this.ended {
                 return Poll::Ready(None);
+            }
+            if this.raw {
+                match this.events.poll_recv(context) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Some(StreamEvent::Chunk(bytes))) => {
+                        let _ = this.credit.send(bytes.len() + proto::FRAME_OVERHEAD_BYTES);
+                        return Poll::Ready(Some(Ok(Bytes::from(bytes))));
+                    }
+                    Poll::Ready(Some(StreamEvent::Done(Ok(_)))) => { this.ended = true; return Poll::Ready(None); }
+                    Poll::Ready(Some(StreamEvent::Head(_))) => continue,
+                    event => {
+                        let message = match event {
+                            Poll::Ready(Some(StreamEvent::Done(Err(error)))) => error.message,
+                            Poll::Ready(Some(StreamEvent::Failed(message))) => message,
+                            _ => "插件流在收尾信号之前中断".to_string(),
+                        };
+                        this.ended = true;
+                        return Poll::Ready(Some(Err(std::io::Error::other(message))));
+                    }
+                }
             }
             match this.events.poll_recv(context) {
                 Poll::Pending => return Poll::Pending,

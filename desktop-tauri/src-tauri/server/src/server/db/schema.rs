@@ -62,6 +62,10 @@
 
 use rusqlite::Connection;
 
+#[cfg(test)]
+#[path = "schema_tests.rs"]
+mod tests;
+
 /// `kv` 表里**不属于网关配置**的固定键名（模块头「两类键名绝不能相撞」讲的
 /// 就是它与配置顶层键的关系）。
 ///
@@ -93,6 +97,8 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 属于「其它零散状态」：配置写入绝不能动它（否则用户改一次 API Key
     // 侧边栏就退回默认布局）。
     "sidebarLayout",
+    // 品牌图片与名称独立保存，避免每次转发克隆整份图片；整库备份仍会保留。
+    "panelBranding",
     // 事件日志的下一个 id 水位（logs_store::sql）
     "logsNextId",
     // 整份桌面设置 JSON（壳侧 settings）—— 一个键而不是拆成三个：
@@ -369,7 +375,7 @@ pub fn is_reserved(key: &str) -> bool {
 /// 请求日志新增「积分」列读它。与 token 四列刻意不同：这一列**可空 REAL** ——
 /// `NULL` = 这一家没上报（旧行 / 不提供该读数），0 = 确实零消耗；用 0 兜底会
 /// 把「没读到」画成「花了 0 积分」，比缺一列更难排查。
-pub const SCHEMA_VERSION: i64 = 27;
+pub const SCHEMA_VERSION: i64 = 29;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -1155,6 +1161,8 @@ fn apply_version(
         25 => conn.execute_batch(include_str!("schema_tool_images.sql")),
         26 => conn.execute_batch(include_str!("schema_maintenance.sql")),
         27 => conn.execute_batch(include_str!("schema_coding.sql")),
+        28 => conn.execute_batch(include_str!("schema_model_recency.sql")),
+        29 => conn.execute_batch(include_str!("schema_usage_query.sql")),
         _ => Ok(()),
     }
 }
@@ -1176,188 +1184,6 @@ fn migrate_v21(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(V21_LEGACY_KEY_BACKFILL)?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// v20 存量库的最小形态：上游 v18 已建好 `api_key_*` 列，但 fork 线留下的
-    /// `key_id` / `key_name` 里还躺着 3 把 Key 的身份。v21 只该做映射回填。
-    ///
-    /// 实际承载 Key 身份的表是 `requests`（没有单独的 `keys` 表）——
-    /// 每行一次请求，`key_id` / `key_name` 是那次请求命中的 Key 快照。
-    fn open_v20_fixture() -> Connection {
-        let conn = Connection::open_in_memory().expect("内存库应当能建起来");
-        conn.execute_batch(
-            "CREATE TABLE requests (
-                row_id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                id             TEXT NOT NULL,
-                ts             INTEGER NOT NULL DEFAULT 0,
-                model          TEXT NOT NULL DEFAULT '',
-                upstream_model TEXT NOT NULL DEFAULT '',
-                account_id     TEXT NOT NULL DEFAULT '',
-                status         INTEGER NOT NULL DEFAULT 0,
-                attempts       INTEGER NOT NULL DEFAULT 1,
-                total_tokens   INTEGER NOT NULL DEFAULT 0,
-                key_id         TEXT NOT NULL DEFAULT '',
-                key_name       TEXT NOT NULL DEFAULT '',
-                api_key_id     TEXT NOT NULL DEFAULT '',
-                api_key_name   TEXT NOT NULL DEFAULT '',
-                api_key_source TEXT NOT NULL DEFAULT ''
-            );
-            INSERT INTO requests (id, key_id, key_name) VALUES
-                ('r1', 'k-1', 'Key One'),
-                ('r2', 'k-2', 'Key Two'),
-                ('r3', 'k-3', 'Key Three');
-            PRAGMA user_version = 20;",
-        )
-        .expect("v20 fixture 应当能建起来");
-        conn
-    }
-
-    #[test]
-    fn migrates_v20_to_v21_without_losing_keys() {
-        let conn = open_v20_fixture();
-        migrate(&conn).expect("v20 → v21 迁移应当成功");
-
-        let version: i64 = conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .expect("user_version 应当可读");
-        assert_eq!(version, 24);
-
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))
-            .expect("明细行数应当可读");
-        assert_eq!(count, 3, "迁移不能丢任何一行 Key 明细");
-
-        let mut statement = conn
-            .prepare(
-                "SELECT key_id, api_key_id, key_name, api_key_name, api_key_source \
-                 FROM requests ORDER BY id",
-            )
-            .expect("回填结果应当可查");
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })
-            .expect("回填结果应当可读")
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .expect("回填结果应当可收集");
-
-        assert_eq!(rows.len(), 3);
-        for (key_id, api_key_id, key_name, api_key_name, api_key_source) in rows {
-            assert_eq!(api_key_id, key_id, "api_key_id 必须由 key_id 映射而来");
-            assert_eq!(
-                api_key_name, key_name,
-                "api_key_name 必须由 key_name 映射而来"
-            );
-            assert_eq!(api_key_source, "key", "回填行的来源必须是 key");
-        }
-    }
-
-    /// B（fix round 3）：v17 已经回填过 `account_limiter_events`，v21 不得再插
-    /// 一遍 `legacy:<row_id>` —— 否则同一批请求被计两次，限额提前熔断。
-    ///
-    /// **判别性夹具**：3 条 requests 在 v17 之前插入（v17 回填成 legacy:1..3），
-    /// 之后**再插入一条全新的 r4** 并让 `limiter::counter::note` 用 `id='r4'`
-    /// 写一条事件。此时若 V21_SCHEMA 仍带那条重复 INSERT，回放会为 r4 生成
-    /// 一个全新的 `legacy:4`（不与任何已有 id 冲突，INSERT OR IGNORE 拦不住），
-    /// 事件数 4 → 5；删掉重复 INSERT 后必须保持 4。
-    #[test]
-    fn v21_does_not_double_limiter_events_after_v17() {
-        let conn = Connection::open_in_memory().expect("内存库应当能建起来");
-        conn.execute_batch(
-            "CREATE TABLE requests (
-                row_id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                id             TEXT NOT NULL,
-                ts             INTEGER NOT NULL DEFAULT 0,
-                model          TEXT NOT NULL DEFAULT '',
-                upstream_model TEXT NOT NULL DEFAULT '',
-                account_id     TEXT NOT NULL DEFAULT '',
-                status         INTEGER NOT NULL DEFAULT 0,
-                attempts       INTEGER NOT NULL DEFAULT 1,
-                total_tokens   INTEGER NOT NULL DEFAULT 0,
-                key_id         TEXT NOT NULL DEFAULT '',
-                key_name       TEXT NOT NULL DEFAULT '',
-                api_key_id     TEXT NOT NULL DEFAULT '',
-                api_key_name   TEXT NOT NULL DEFAULT '',
-                api_key_source TEXT NOT NULL DEFAULT ''
-            );
-            INSERT INTO requests (id, account_id, status, attempts, total_tokens) VALUES
-                ('r1', 'acc-1', 200, 1, 100),
-                ('r2', 'acc-1', 200, 1, 200),
-                ('r3', 'acc-2', 500, 1, 50);
-            PRAGMA user_version = 16;",
-        )
-        .expect("v16 fixture 应当能建起来");
-
-        // 模拟上游 v17：建表 + 历史回填（3 条 legacy:1..3）。
-        conn.execute_batch(V17_SCHEMA)
-            .expect("v17 应当能建表并回填");
-
-        // v17 **之后**才发生的新请求：它不在 v17 的回填快照里。
-        conn.execute_batch(
-            "INSERT INTO requests (id, account_id, status, attempts, total_tokens)
-             VALUES ('r4', 'acc-1', 200, 1, 999);
-             INSERT INTO account_limiter_events (id, account_id, ts, tokens, requests)
-             VALUES ('r4', 'acc-1', 2000, 999, 1);",
-        )
-        .expect("v17 之后的新请求与 note 事件应当能插入");
-
-        let before: i64 = conn
-            .query_row("SELECT COUNT(*) FROM account_limiter_events", [], |row| {
-                row.get(0)
-            })
-            .expect("事件数应当可读");
-        assert_eq!(before, 4, "v17 的 3 条 legacy + 1 条 note = 4");
-        let legacy_before: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM account_limiter_events WHERE id LIKE 'legacy:%'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("legacy 事件数应当可读");
-        assert_eq!(legacy_before, 3, "v17 只回填了 3 条 legacy");
-
-        // 走到 v21（只跑 v21 动作，避免 migrate() 连带 v18~v23 需要更多表）。
-        migrate_v21(&conn).expect("v21 应当成功");
-
-        let after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM account_limiter_events", [], |row| {
-                row.get(0)
-            })
-            .expect("事件数应当可读");
-        assert_eq!(
-            after, before,
-            "v21 重放历史回填会为 r4 生成新的 legacy:4，把事件数 4 顶到 5"
-        );
-
-        let legacy_after: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM account_limiter_events WHERE id LIKE 'legacy:%'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("legacy 事件数应当可读");
-        assert_eq!(legacy_after, 3, "v21 不得新增任何 legacy:% 行");
-
-        // 条件 Key 回填仍然生效（fork 线的 key_id 不能丢）；本夹具 key_id 为空，不应误回填。
-        let mapped: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM requests WHERE api_key_source = 'key'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("回填结果应当可读");
-        assert_eq!(mapped, 0, "本夹具 key_id 为空，不应误回填");
-    }
 }
 
 /// v22 的实际动作：幂等补建上游 beta.6 的 `assistant_sessions.title_generated`

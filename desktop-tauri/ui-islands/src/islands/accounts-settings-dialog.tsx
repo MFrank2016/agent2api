@@ -59,6 +59,7 @@ import {
   readBalanceQueryChanges,
   type BalanceFieldKey,
 } from "./balance-query";
+import { UserAgentInput, useUserAgentPresets, userAgentEditable } from './add-account-user-agent'
 import {
   limiterDraftOf,
   LimiterSection,
@@ -136,6 +137,11 @@ export function AccountSettingsDialog({
     account?.allowRouteSkip !== false,
   );
   const [name, setName] = React.useState(account?.name || "");
+  /** 账号级自定义 User-Agent 草稿（空串 = 用该家自己的默认值） */
+  const [userAgent, setUserAgent] = React.useState(account?.userAgent || '')
+  const uaPresets = useUserAgentPresets()
+  // 会话式家由插件自己拼出站头，网关覆盖不到 —— 整段不渲染
+  const uaEditable = userAgentEditable(providerOf(account || { id }))
   const [proxyDraft, setProxyDraft] = React.useState<ProxyDraft>(() =>
     draftOfProxy(account?.proxy),
   );
@@ -195,6 +201,7 @@ export function AccountSettingsDialog({
     enabled,
     allowRouteSkip,
     name,
+    userAgent,
     proxyDraft,
     planChannel,
     usageDraft,
@@ -225,7 +232,7 @@ export function AccountSettingsDialog({
     },
     query: {
       title: t("查询设置"),
-      description: t("配置余额查询凭证与自动刷新间隔。"),
+      description: t("配置余额查询凭证、自动刷新间隔与失败重试。"),
       icon: "refresh",
     },
     limiter: {
@@ -359,6 +366,7 @@ export function AccountSettingsDialog({
       enabled !== before.enabled ||
       allowRouteSkip !== before.allowRouteSkip ||
       (name.trim() || before.name) !== before.name ||
+      userAgent.trim() !== before.userAgent ||
       concDraft !== before.concDraft ||
       rpmDraft !== before.rpmDraft ||
       accountsCapDraft !== before.accountsCapDraft ||
@@ -797,8 +805,12 @@ export function AccountSettingsDialog({
       // accounts-data 的 reorderQueue）。设置弹窗只改「账号自身」的属性，
       // 一次「改备注名」不该顺手把顺序也提交一遍
       const nextName = name.trim() || target.name;
+      // 空串 = 清除自定义 UA（后端 `apply_patch` 把空串解释成「回到该家默认」）。
+      // 只在真的改了时带上，避免每次保存都多一条「User-Agent → 默认」的变更日志。
+      const nextUserAgent = userAgent.trim()
       const saved = await updateAccountConfirmed(id, {
         ...(nextName !== target.name ? { name: nextName } : {}),
+        ...(nextUserAgent !== (target.userAgent || '').trim() ? { userAgent: nextUserAgent } : {}),
         enabled,
         allowRouteSkip,
         proxy,
@@ -1209,6 +1221,16 @@ export function AccountSettingsDialog({
                             })
                           : t("0 = 不限")}
                       </p>
+                      {uaEditable ? <SettingGroup title={t('请求标识')}>
+                        <Field className='acct-dlg-field'>
+                          <FieldLabel htmlFor='account-user-agent'>User-Agent</FieldLabel>
+                          <UserAgentInput id='account-user-agent' value={userAgent}
+                            onChange={setUserAgent} presets={uaPresets} disabled={interactionBusy} />
+                          <FieldDescription>
+                            {t('用于当前账号的对话、余额查询、模型拉取、模型测试、签到及凭证刷新等上游请求。留空使用提供商默认值；可选预置或直接填写。')}
+                          </FieldDescription>
+                        </Field>
+                      </SettingGroup> : null}
                       {routeContext ? (
                         <div className="acct-dlg-route-context">
                           {routeContext}

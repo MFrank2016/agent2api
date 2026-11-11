@@ -22,6 +22,7 @@ export type ProxyPoolItem = ProxyUsage & {
   group?: string
   /** 每请求换出口 IP：不复用连接池（代理出口每条请求新建隧道）。默认 false。 */
   noReuse?: boolean
+  nonDirect?: boolean
   createdAt: number
   updatedAt: number
   lastTest: {
@@ -43,6 +44,7 @@ export type ProxyPoolPayload = {
   clash?: ClashProxySnapshot
   changes?: number
   syncError?: string | null
+  imported?: import('../../../ui-shared/proxy-import').ProxyImportReport
 }
 
 export type ProxyTestResult = {

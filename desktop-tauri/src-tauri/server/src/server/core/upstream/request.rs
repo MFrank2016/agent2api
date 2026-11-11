@@ -128,6 +128,9 @@ impl TransportRequest {
 pub struct UpstreamErrorDetail {
     pub code: Option<i64>,
     pub message: String,
+    /// 原始错误报文（能解析成 JSON 时保留）：原生协议直通要把上游错误体
+    /// 原样交给客户端，而不是只回一句摘要。
+    pub payload: Option<Value>,
 }
 
 impl UpstreamErrorDetail {
@@ -163,6 +166,7 @@ pub async fn read_upstream_error(
     } else {
         text.chars().take(500).collect()
     };
+    let mut parsed = None;
     if let Ok(payload) = serde_json::from_str::<Value>(&text) {
         code = payload.get("code").and_then(Value::as_i64);
         // Node: `payload?.message || payload?.msg || payload?.error?.message || message`
@@ -186,8 +190,9 @@ pub async fn read_upstream_error(
         if let Some(candidate) = candidate {
             message = candidate.to_string();
         }
+        parsed = Some(payload);
     }
-    UpstreamErrorDetail { code, message }
+    UpstreamErrorDetail { code, message, payload: parsed }
 }
 
 /// 轮询计划一次请求会尝试的出口数（spec §9 的 N）：`onError=next` 试全部成员，

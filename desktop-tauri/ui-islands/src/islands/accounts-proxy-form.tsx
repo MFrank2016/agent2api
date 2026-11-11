@@ -14,16 +14,28 @@ import {
 import { proxyPoolOptions } from './accounts-data'
 import { DIALOG_SEG_CLASS } from './dialog-segmented'
 import type { ClashProxySnapshot } from '../../../ui-shared/clash-proxy'
+import { readSystemProxy } from '../../../ui-shared/proxy-system'
+import { accountRequest } from './add-account-bridge'
 
 /** 每条候选都会真实出网，一轮最多测 8 条。 */
 const ROTATE_TEST_LIMIT = 8
+
+function testSucceeded<Result extends { success?: boolean; status?: unknown }>(result: Result | null | undefined): result is Result {
+  if (!result?.success) return false
+  return result.status === undefined || result.status === ''
+    || Number(result.status) >= 200 && Number(result.status) < 300
+}
+
+function testFailure(result?: { error?: string; status?: unknown } | null): string {
+  return result?.error || (result?.status ? `HTTP ${String(result.status)}` : t('连接失败'))
+}
 
 export type ProxyPayload =
   | null
   | { source: 'pool'; proxyId: string }
   | { source: 'rotate'; all: boolean; proxyIds?: string[] }
   | { source: 'clash'; listenerUid: string }
-  | { source: 'custom'; protocol: 'http' | 'socks5'; host: string; port: number; username: string; password: string; noReuse?: boolean }
+  | { source: 'custom'; protocol: 'http' | 'socks5'; host: string; port: number; username: string; password: string; noReuse?: boolean; nonDirect?: boolean }
   | { source: 'pool-rotate'; group: string; proxyIds: string[]; strategy: 'round-robin' | 'random' | 'least-latency'; onError: 'next' | 'none' }
 
 export type ProxyDraft = {
@@ -50,6 +62,7 @@ export type ProxyDraft = {
   strategy: 'round-robin' | 'random' | 'least-latency'
   /** 失败自动换出口（mode === 'pool-rotate'；缺省 next） */
   onError: 'next' | 'none'
+  nonDirect?: boolean
 }
 
 /** 账号 proxy 字段 → 表单草稿（形态与后端 workbuddy-proxy.mjs 一致） */
@@ -84,6 +97,7 @@ export function draftOfProxy(proxy: AccountRecord['proxy']): ProxyDraft {
     proxyIds,
     strategy: config?.strategy === 'random' || config?.strategy === 'least-latency' ? config.strategy : 'round-robin',
     onError: config?.onError === 'none' ? 'none' : 'next',
+    nonDirect: config?.nonDirect === true,
   }
 }
 
@@ -123,6 +137,7 @@ export function readProxyDraft(draft: ProxyDraft): ProxyPayload {
     username: draft.username.trim(),
     password: draft.password,
     noReuse: draft.noReuse,
+    nonDirect: draft.nonDirect === true,
   }
 }
 
@@ -135,14 +150,31 @@ export function ProxyForm({
   onChange,
   idPrefix,
   allowRotate = false,
+  allowSystemImport = false,
+  onSystemImportBusy,
 }: {
   draft: ProxyDraft
   onChange: (next: ProxyDraft) => void
   idPrefix: string
   /** 是否给出「轮询」档（只有 OpenCode Zen 账号为真，见函数说明） */
   allowRotate?: boolean
+  allowSystemImport?: boolean
+  onSystemImportBusy?: (busy: boolean) => void
 }) {
   const [testing, setTesting] = React.useState(false)
+  const [readingSystem, setReadingSystem] = React.useState(false)
+  const [systemError, setSystemError] = React.useState('')
+  const latest = React.useRef({ draft, onChange, onSystemImportBusy })
+  latest.current = { draft, onChange, onSystemImportBusy }
+  const systemRequest = React.useRef(0)
+  const systemReading = React.useRef(false)
+  React.useEffect(() => () => {
+    systemRequest.current += 1
+    if (systemReading.current) {
+      systemReading.current = false
+      latest.current.onSystemImportBusy?.(false)
+    }
+  }, [])
   const [testResult, setTestResult] = React.useState<React.ReactNode>(null)
   /** 池列表：「已保存的代理」「轮询组」与「轮询」三档共用的选项（模块级缓存，见 accounts-data） */
   const [pool, setPool] = React.useState<PoolItem[] | null>(null)
@@ -150,6 +182,8 @@ export function ProxyForm({
   const [clash, setClash] = React.useState<ClashProxySnapshot | null>(null)
   const [clashError, setClashError] = React.useState('')
   const options = clash?.options || []
+  const selection = JSON.stringify(draft)
+  const [testedSelection, setTestedSelection] = React.useState('')
   const set = (patch: Partial<ProxyDraft>): void => onChange({ ...draft, ...patch })
   /** 池里出现过的分组名（轮询组的快捷选择；按名字去重，去掉空值） */
   const groupNames = React.useMemo(
@@ -196,9 +230,37 @@ export function ProxyForm({
     return [...draft.rotateIds]
   }
 
+  async function importSystemProxy(): Promise<void> {
+    if (systemReading.current) return
+    systemReading.current = true
+    const request = ++systemRequest.current
+    const before = JSON.stringify(latest.current.draft)
+    setReadingSystem(true)
+    setSystemError('')
+    latest.current.onSystemImportBusy?.(true)
+    try {
+      const proxy = readSystemProxy(await accountRequest('GET', '/api/proxies/system'), t)
+      if (request !== systemRequest.current || JSON.stringify(latest.current.draft) !== before) return
+      latest.current.onChange({
+        ...latest.current.draft, mode: 'custom', protocol: proxy.protocol, host: proxy.host,
+        port: String(proxy.port), username: proxy.username, password: proxy.password, nonDirect: false,
+      })
+    } catch (error) {
+      if (request === systemRequest.current) setSystemError(errorMessage(error))
+    } finally {
+      if (request === systemRequest.current) {
+        systemReading.current = false
+        setReadingSystem(false)
+        latest.current.onSystemImportBusy?.(false)
+      }
+    }
+  }
+
   /** 用当前表单内容测试出口连通性 */
   async function test(): Promise<void> {
     if (testing) return
+    setTestedSelection(selection)
+    setTestResult(null)
     // 轮询档：逐条测候选（每条都走 testProxyPoolItem —— 结果会记进那条代理的
     // 「上次测试」，与代理页那颗按钮同一个动作）。候选可能几十条，全测一遍是
     // 几十次往返，所以只测前 ROTATE_TEST_LIMIT 条并把「还有几条没测」说出来；
@@ -218,8 +280,8 @@ export function ProxyForm({
         const name = pool?.find(item => item.id === id)?.name || id
         try {
           const data = await shared().workbuddyDesktop?.testProxyPoolItem?.(id)
-          if (data?.success) ok += 1
-          else failures.push(`${name}（${data?.error || t('连接失败')}）`)
+          if (testSucceeded(data)) ok += 1
+          else failures.push(`${name}（${testFailure(data)}）`)
         } catch (error) {
           failures.push(`${name}（${errorMessage(error)}）`)
         }
@@ -246,7 +308,7 @@ export function ProxyForm({
       setTestResult(t('正在连接上游…'))
       try {
         const data = await shared().workbuddyDesktop?.testProxyPoolItem?.(draft.proxyId)
-        setTestResult(data?.success
+        setTestResult(testSucceeded(data)
           ? (
               <span className='text-success'>
                 {t('✅ 出口可用')}
@@ -254,7 +316,7 @@ export function ProxyForm({
                 {data.durationMs !== undefined && data.durationMs !== '' ? `　${esc(String(data.durationMs))}ms` : ''}
               </span>
             )
-          : <span className='text-destructive'>❌ {esc(data?.error || t('连接失败'))}</span>)
+          : <span className='text-destructive'>❌ {esc(testFailure(data))}</span>)
       } catch (error) {
         setTestResult(<span className='text-destructive'>❌ {esc(errorMessage(error))}</span>)
       } finally {
@@ -273,7 +335,7 @@ export function ProxyForm({
     setTestResult(t('正在连接上游…'))
     try {
       const data = await shared().workbuddyDesktop?.testProxy?.({ proxy })
-      if (data?.success) {
+      if (testSucceeded(data)) {
         setTestResult(
           <span className='text-success'>
             {t('✅ 出口可用')}
@@ -283,7 +345,7 @@ export function ProxyForm({
           </span>,
         )
       } else {
-        setTestResult(<span className='text-destructive'>❌ {esc(data?.error || t('连接失败'))}</span>)
+        setTestResult(<span className='text-destructive'>❌ {esc(testFailure(data))}</span>)
       }
     } catch (error) {
       setTestResult(<span className='text-destructive'>❌ {esc(errorMessage(error))}</span>)
@@ -315,6 +377,15 @@ export function ProxyForm({
           { value: 'custom', label: t('自定义') },
         ]}
       />
+
+      {allowSystemImport ? <div className='mt-3 flex flex-col items-start gap-1.5'>
+        <Button variant='outline' size='sm' disabled={readingSystem} onClick={() => void importSystemProxy()}>
+          {readingSystem ? t('正在读取…') : t('填入系统代理')}
+        </Button>
+        <p className='detail'>{t('读取网关电脑当前的 HTTPS 系统代理，填入自定义地址；后续系统设置变化不会自动同步。')}</p>
+        {systemError ? <p className='text-xs text-destructive' role='alert'>{systemError}</p> : null}
+      </div> : null}
+
       {draft.mode === 'pool' ? (
         <div className='mt-3'>
           <Field orientation='horizontal' className='field-row'>
@@ -525,6 +596,10 @@ export function ProxyForm({
               onChange={event => set({ noReuse: event.currentTarget.checked })} />
             <span className='detail'>{t('不复用连接（代理出口每条请求新建隧道，适合会轮换出口的代理）')}</span>
           </div>
+          <Label className='mt-3 flex cursor-pointer items-center gap-2 text-xs font-normal'>
+            <Checkbox checked={draft.nonDirect === true} onCheckedChange={value => set({ nonDirect: value })} />{t('非直连代理')}
+          </Label>
+          <p className='detail mt-1.5'>{t('非直连会先经过网关所在设备的系统代理，再连接到此代理；系统代理不可用时不会改走直连。')}</p>
         </div>
       ) : null}
 
@@ -532,7 +607,7 @@ export function ProxyForm({
         <Button variant='outline' size='sm' disabled={testing} onClick={() => void test()}>
           {testing ? t('测试中…') : t('测试出口')}
         </Button>
-        <span className='detail'>{testResult}</span>
+        <span className='detail'>{testedSelection === selection ? testResult : null}</span>
       </FieldGroup>
     </div>
   )

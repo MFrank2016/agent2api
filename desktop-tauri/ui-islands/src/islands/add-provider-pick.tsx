@@ -21,8 +21,10 @@ import * as React from 'react'
 import { Alert, InputGroup, InputGroupAddon, InputGroupInput, SegmentedControl, Button, Item } from '@ui'
 
 import { isAddAccountProviderHidden } from '../../../ui-shared/provider-availability'
+import { groupAntigravityCards } from '../../../ui-shared/antigravity-login'
 import { accountCountOf, shared } from './add-account-bridge'
 import { presetOfProvider, providerPresetIcon, providerSiteLabel } from './add-provider-metadata'
+import { useProviderIcon } from './provider-icon'
 import { WORKBUDDY_ENTRY_LABEL, WORKBUDDY_PROVIDER } from './add-account-configs'
 import { DIALOG_SEG_CLASS } from './dialog-segmented'
 import { AddGroup } from './add-account-kit'
@@ -254,7 +256,7 @@ function providerCards(accountType: AccountType): CardItem[] {
   // providerSummaries、models-page 的左栏），不经过这里，所以存量 cline-pass
   // 账号仍照常成组显示。
   const list = (providers?.all?.() || [])
-    .filter(item => !isAddAccountProviderHidden(String(item?.id || '')))
+    .filter(item => !isAddAccountProviderHidden(String(item?.id || '')) && item.loginAvailable !== false)
     .filter(item => (item.category === 'web') === (accountType === TYPE_WEB))
     .filter(item => accountType === TYPE_WEB || !HIDDEN_AGENT_PROVIDERS.has(String(item?.id || '')))
   // WorkBuddy 这张卡与它的弹窗标题用**中性品牌名**（不带地区）而不是注册名：
@@ -298,7 +300,7 @@ function providerCards(accountType: AccountType): CardItem[] {
   // 拆家后它是独立 provider，但**添加入口**仍然是同一个块 —— 与 AutoClaw /
   // Accio / ZCode 那三家（各自一块、没有地区分段）的形态不同，这是刻意的：
   // WorkBuddy 两地的登录页与凭证形态完全一致，合成一块对用户更省事。
-  const visible = cards.filter(item => item.id !== 'workbuddy-intl')
+  const visible = groupAntigravityCards(cards.filter(item => item.id !== 'workbuddy-intl'))
   // 展示顺序微调：AutoClaw 与 Qoder 的两个版本都要挨着（两列网格里同处一行）
   // 且**国内版在前** —— 摘要给的是注册表顺序，Qoder 国际版注册在 Qoder 后面
   // 本就相邻（拆家后无需再挪）；AutoClaw 国际版排在 Cline 之后，仍要前移。
@@ -310,13 +312,14 @@ function providerCards(accountType: AccountType): CardItem[] {
 
 /** 卡片图标：收录过的家出真实图标（预置家问预置目录要），其余用首字母徽章 */
 function Logo({ item }: { item: CardItem }): React.ReactElement {
-  const icon = item.id.startsWith(PRESET_CARD_PREFIX)
+  const fallback = item.id.startsWith(PRESET_CARD_PREFIX)
     ? shared().wbPresetProviders?.iconOf?.(item.id.slice(PRESET_CARD_PREFIX.length)) || ''
-    : item.icon || PROVIDER_ICONS[item.id]
+    : item.icon
+  const { src: icon, onError } = useProviderIcon(item.id, fallback)
   if (icon) {
     return (
       <span className='add-provider-logo has-icon'>
-        <img src={icon} alt='' loading='lazy' />
+        <img src={icon} alt='' loading='lazy' onError={onError} />
       </span>
     )
   }
@@ -421,8 +424,9 @@ export function PickStep({
   const hit = shownGroups.flatMap(group => group.items)
   // 四个分类合起来命中多少家：「全部」那一档的计数徽标就是它（没搜索时即总家数）。
   // 徽标不只是装饰 —— 在「API 模板」段搜 Cline 时它显示 1，等于替「全部」喊了一声
-  const allHitCount = GROUPED_TYPES
-    .reduce((sum, type) => sum + providerCards(type).filter(hitOf).length, 0)
+  const hitCounts = new Map<AccountType, number>(GROUPED_TYPES
+    .map(type => [type, providerCards(type).filter(hitOf).length]))
+  const allHitCount = [...hitCounts.values()].reduce((sum, count) => sum + count, 0)
   // 当前分段里一家没有、别的分类里有：这正是「全部」段要解决的那件事，
   // 所以给一条提示把人送过去，而不是指望他自己想到去点「全部」。
   // 此分支下当前分段命中为 0，所以全量命中数就是「其它分类」的命中数
@@ -443,10 +447,10 @@ export function PickStep({
             // 默认落在「全部」：搜索一次跨全部分类，不必先猜自己该进哪一段
             { value: TYPE_ALL, label: typeLabelOf(TYPE_ALL), count: allHitCount },
             // Agent 段只在内置家真的存在时出现（判据见 hasAgentCards）
-            ...(hasAgentCards ? [{ value: TYPE_PROXY, label: typeLabelOf(TYPE_PROXY) }] : []),
-            ...(hasWebCards ? [{ value: TYPE_WEB, label: typeLabelOf(TYPE_WEB) }] : []),
-            { value: TYPE_PRESET, label: typeLabelOf(TYPE_PRESET) },
-            { value: TYPE_CUSTOM, label: typeLabelOf(TYPE_CUSTOM) },
+            ...(hasAgentCards ? [{ value: TYPE_PROXY, label: typeLabelOf(TYPE_PROXY), count: hitCounts.get(TYPE_PROXY) }] : []),
+            ...(hasWebCards ? [{ value: TYPE_WEB, label: typeLabelOf(TYPE_WEB), count: hitCounts.get(TYPE_WEB) }] : []),
+            { value: TYPE_PRESET, label: typeLabelOf(TYPE_PRESET), count: hitCounts.get(TYPE_PRESET) },
+            { value: TYPE_CUSTOM, label: typeLabelOf(TYPE_CUSTOM), count: hitCounts.get(TYPE_CUSTOM) },
             // 「导入」分段暂时收起（见 IMPORT_SEGMENT_ENABLED）：整段不生成
             ...(IMPORT_SEGMENT_ENABLED ? [{ value: TYPE_IMPORT, label: typeLabelOf(TYPE_IMPORT) }] : []),
           ]}

@@ -147,8 +147,12 @@ pub mod errors;
 pub mod http;
 pub mod logging;
 pub mod logs_store;
+mod panel_captcha;
 pub mod request_stats;
 mod static_files;
+
+#[cfg(test)]
+mod native_gateway_tests;
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -536,6 +540,7 @@ impl ServerState {
         // 启动即收尾上次运行遗留的进行中行（详情见方法注释）：不等到第一条
         // 请求进来才清理，界面打开时看到的就已经是「已中断」的终态
         core::billing::keepalive::install_stats(request_stats.clone());
+        core::plugin_host::script::install_stats(request_stats.clone());
         request_stats.sweep_stale_running();
         // ── 僵尸行的主动周期清扫（每 5 分钟一次）─────────────────────
         // 清扫的判定（1 小时阈值）此前只在「下一条请求进来」时顺带跑：
@@ -1051,7 +1056,6 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
         None => None,
     };
 
-    let codex_owner = core::assistant_coding::client::allow_start();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     // 停机广播：oneshot 只有一个 receiver，而分端口形态有两个 serve 都要
     // 收到停机信号。协调任务把 oneshot 信号（send 或发送端被 drop）转成
@@ -1066,7 +1070,6 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
             _ = stop_requested.wait_for(|stop| *stop) => {}
         }
         stop_from_signal.send_replace(true);
-        core::assistant_coding::client::shutdown(codex_owner).await;
     });
 
     // 停机收尾要用的统计句柄：先克隆出来再移进任务（`state` 是借用，不能

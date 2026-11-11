@@ -18,16 +18,24 @@ pub enum CreditSortDirection {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum AddedSortDirection {
-    New,
-    Old,
-}
+pub enum BalanceSortDirection { High, Low }
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AddedSortDirection { New, Old }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "key", rename_all = "camelCase", deny_unknown_fields)]
 pub enum AccountSortRule {
     Credit { on: bool, dir: CreditSortDirection },
+    Balance { on: bool, dir: BalanceSortDirection },
     Added { on: bool, dir: AddedSortDirection },
+}
+
+impl AccountSortRule {
+    pub fn key(&self) -> &'static str {
+        match self { Self::Credit { .. } => "credit", Self::Balance { .. } => "balance", Self::Added { .. } => "added" }
+    }
 }
 
 pub fn validate_account_sort(provider: &str, rules: &[AccountSortRule]) -> Result<(), String> {
@@ -38,18 +46,11 @@ pub fn validate_account_sort(provider: &str, rules: &[AccountSortRule]) -> Resul
     {
         return Err("提供商标识无效".to_string());
     }
-    if rules.len() > 2 {
-        return Err("账号排序最多允许两条规则".to_string());
-    }
+    if rules.len() > 3 { return Err("账号排序最多允许三条规则".to_string()); }
     let mut keys = HashSet::new();
     for rule in rules {
-        let key = match rule {
-            AccountSortRule::Credit { .. } => "credit",
-            AccountSortRule::Added { .. } => "added",
-        };
-        if !keys.insert(key) {
-            return Err(format!("账号排序包含重复规则「{key}」"));
-        }
+        let key = rule.key();
+        if !keys.insert(key) { return Err(format!("账号排序包含重复规则「{key}」")); }
     }
     Ok(())
 }

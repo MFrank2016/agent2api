@@ -67,6 +67,8 @@ use crate::server::db::Db;
 
 mod account_sort;
 mod assistant_config;
+pub(crate) mod captcha;
+pub(crate) mod title_routes;
 pub(crate) mod client_identification;
 pub(crate) mod compact_routes;
 pub(crate) mod vision_compat;
@@ -83,8 +85,8 @@ mod types;
 mod update_policy;
 
 pub use account_sort::{
-    account_sort_settings, save_account_sort, validate_account_sort, AccountSortRule,
-    AccountSortSettings, AddedSortDirection, CreditSortDirection,
+    account_sort_settings, save_account_sort, validate_account_sort, AccountSortRule, AccountSortSettings,
+    AddedSortDirection, BalanceSortDirection, CreditSortDirection,
 };
 pub use assistant_config::*;
 pub use github_access::{
@@ -175,6 +177,7 @@ pub struct RuntimeConfig {
     mask: MaskSettings,
     routing_profiles: std::sync::Arc<RoutingProfiles>,
     compact_routes: std::sync::Arc<compact_routes::CompactRoutesSnapshot>,
+    title_routes: std::sync::Arc<title_routes::TitleRoutesSnapshot>,
     client_identification: std::sync::Arc<client_identification::ClientIdentificationSnapshot>,
     vision_compat: std::sync::Arc<vision_compat::VisionSnapshot>,
     account_sort: std::sync::Arc<AccountSortSettings>,
@@ -627,6 +630,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         mask,
         routing_profiles: routing_profiles::from_raw(&raw),
         compact_routes: compact_routes::from_raw(&raw),
+        title_routes: title_routes::from_raw(&raw),
         client_identification: client_identification::from_raw(&raw),
         vision_compat: vision_compat::from_raw(&raw),
         account_sort: account_sort::from_raw(&raw),
@@ -1354,6 +1358,7 @@ fn update<F>(mutate: F) -> bool
 where
     F: FnOnce(&mut RuntimeConfig),
 {
+    let _usage_guard = crate::server::core::usage_query::config::lock();
     // 读改写必须串行，否则两个模型的独立配置会互相覆盖。
     let _update_guard = CONFIG_UPDATE_LOCK
         .lock()
@@ -1590,6 +1595,9 @@ pub(crate) fn update_raw_field_with(key: &str, mutate: impl FnOnce(&mut Value)) 
         }
         if key == compact_routes::KEY_COMPACT_ROUTES {
             config.compact_routes = compact_routes::from_raw(&config.raw);
+        }
+        if key == title_routes::KEY_TITLE_ROUTES {
+            config.title_routes = title_routes::from_raw(&config.raw);
         }
         if key == client_identification::KEY_CLIENT_IDENTIFICATION {
             config.client_identification = client_identification::from_raw(&config.raw);

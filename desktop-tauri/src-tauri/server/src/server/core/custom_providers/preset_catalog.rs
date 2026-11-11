@@ -591,6 +591,161 @@ static CATALOG: &[PresetDef] = &[
     .with_icon("sensenova.png")
     .with_hint("商汤日日新的 OpenAI 兼容端点；余额查询走控制台账号密码（见下方「余额查询」一段）")
     .with_balance(super::BALANCE_SCHEME_SENSENOVA),
+    preset(
+        "moonshot-cn",
+        "Kimi / Moonshot 国内版",
+        PresetKind::Vendor,
+        &[PresetProtocol {
+            protocol: CHAT,
+            base_url: "https://api.moonshot.cn/v1",
+        }],
+    )
+    .with_icon("kimi.svg")
+    .with_hint("Kimi / Moonshot 国内站 API Key，使用 moonshot.cn 按量接口；不是 Kimi Code 会员入口"),
+    preset(
+        "moonshot",
+        "Kimi / Moonshot 国际版",
+        PresetKind::Vendor,
+        &[PresetProtocol {
+            protocol: CHAT,
+            base_url: "https://api.moonshot.ai/v1",
+        }],
+    )
+    .with_icon("kimi.svg")
+    .with_hint("Kimi / Moonshot 国际站 API Key，使用 moonshot.ai 按量接口；不是 Kimi Code 会员入口"),
+    preset(
+        "stepfun-cn",
+        "StepFun 国内版（按量）",
+        PresetKind::Vendor,
+        &[PresetProtocol {
+            protocol: CHAT,
+            base_url: "https://api.stepfun.com/v1",
+        }],
+    )
+    .with_icon("stepfun-color.svg")
+    .with_hint("StepFun 国内站按量 API；请使用按量 API Key，不要填 Step Plan 套餐 Key"),
+    preset(
+        "stepfun",
+        "StepFun 国际版（按量）",
+        PresetKind::Vendor,
+        &[PresetProtocol {
+            protocol: CHAT,
+            base_url: "https://api.stepfun.ai/v1",
+        }],
+    )
+    .with_icon("stepfun-color.svg")
+    .with_hint("StepFun 国际站按量 API；请使用按量 API Key，不要填 Step Plan 套餐 Key"),
+    preset(
+        "longcat",
+        "LongCat",
+        PresetKind::Vendor,
+        &[PresetProtocol {
+            protocol: CHAT,
+            base_url: "https://api.longcat.chat/openai/v1",
+        }],
+    )
+    .with_icon("longcat.svg")
+    .with_hint("LongCat 的 OpenAI 兼容端点，使用 LongCat 平台的 API Key"),
+    preset(
+        "tencent-tokenhub-cn",
+        "腾讯 TokenHub 国内版（按量）",
+        PresetKind::Vendor,
+        &[PresetProtocol {
+            protocol: CHAT,
+            base_url: "https://tokenhub.tencentmaas.com/v1",
+        }],
+    )
+    .with_icon("tencentcloud-color.svg")
+    .with_hint("腾讯 TokenHub 国内站按量 API；使用 TokenHub API Key，不是 Token Plan 套餐或 WorkBuddy 凭证"),
+    preset(
+        "tencent-tokenhub",
+        "腾讯 TokenHub 国际版（按量）",
+        PresetKind::Vendor,
+        &[PresetProtocol {
+            protocol: CHAT,
+            base_url: "https://tokenhub-intl.tencentmaas.com/v1",
+        }],
+    )
+    .with_icon("tencentcloud-color.svg")
+    .with_hint("腾讯 TokenHub 国际站按量 API；使用 TokenHub API Key，不是 Token Plan 套餐或 WorkBuddy 凭证"),
+    preset(
+        "xai",
+        "xAI",
+        PresetKind::Vendor,
+        &[PresetProtocol {
+            protocol: CHAT,
+            base_url: "https://api.x.ai/v1",
+        }],
+    )
+    .with_icon("xai.svg")
+    .with_hint("xAI 的 OpenAI 兼容端点，使用 xAI 控制台的 API Key；不是 Grok 网页订阅"),
+    preset(
+        "mistral",
+        "Mistral",
+        PresetKind::Vendor,
+        &[PresetProtocol {
+            protocol: CHAT,
+            base_url: "https://api.mistral.ai/v1",
+        }],
+    )
+    .with_icon("mistral-color.svg")
+    .with_hint("Mistral 的 OpenAI 兼容端点，使用 Mistral 控制台的 API Key"),
+    preset(
+        "groq",
+        "Groq",
+        PresetKind::Vendor,
+        &[PresetProtocol {
+            protocol: CHAT,
+            base_url: "https://api.groq.com/openai/v1",
+        }],
+    )
+    .with_icon("groq.svg")
+    .with_hint("Groq 的 OpenAI 兼容端点，使用 GroqCloud 的 API Key"),
+    preset(
+        "nous",
+        "Nous Portal",
+        PresetKind::Vendor,
+        &[PresetProtocol {
+            protocol: CHAT,
+            base_url: "https://inference-api.nousresearch.com/v1",
+        }],
+    )
+    .with_icon("nous-portal.svg")
+    .with_hint("Nous Portal 的按量 API，使用 Portal 的 API Key；不是旧的订阅登录方式"),
+    preset(
+        "aihubmix",
+        "AiHubMix",
+        PresetKind::Relay,
+        &[PresetProtocol {
+            protocol: CHAT,
+            base_url: "https://aihubmix.com/v1",
+        }],
+    )
+    .with_icon("aihubmix-color.svg")
+    .with_hint("AiHubMix 的 OpenAI 兼容端点，使用 AiHubMix 的 API Key；模型 ID 以平台清单为准"),
+    preset(
+        "lmstudio",
+        "LM Studio（本地）",
+        PresetKind::Local,
+        &[PresetProtocol {
+            protocol: CHAT,
+            base_url: "http://localhost:1234/v1",
+        }],
+    )
+    .with_icon("lmstudio.svg")
+    .with_hint("先在网关所在机器启动 LM Studio 服务；localhost 指向网关所在机器，远程或容器部署请改为网关可访问的地址。默认无需鉴权；启用认证后请取消「该上游无需鉴权」并填写真实 API Key")
+    .with_no_key(),
+    preset(
+        "xiaomi",
+        "小米 MiMo（按量）",
+        PresetKind::Vendor,
+        &[PresetProtocol {
+            protocol: CHAT,
+            base_url: "https://api.xiaomimimo.com/v1",
+        }],
+    )
+    .with_icon("xiaomi-tokenplan.png")
+    .with_hint("小米 MiMo 按量 API；使用按量 API Key，不要混用 Token Plan 套餐 Key"),
 ];
 
 /// 逐项设置可选字段的小工具。
@@ -640,8 +795,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_has_all_24_presets() {
-        assert_eq!(all().len(), 24);
+    fn catalog_has_all_38_presets() {
+        assert_eq!(all().len(), 38);
         assert!(find("openai").is_some());
         assert!(find("opencode-zen").unwrap().no_key);
     }
@@ -677,6 +832,20 @@ mod tests {
                 "sub2api",
                 "newapi",
                 "sensenova",
+                "moonshot-cn",
+                "moonshot",
+                "stepfun-cn",
+                "stepfun",
+                "longcat",
+                "tencent-tokenhub-cn",
+                "tencent-tokenhub",
+                "xai",
+                "mistral",
+                "groq",
+                "nous",
+                "aihubmix",
+                "lmstudio",
+                "xiaomi",
             ]
         );
     }

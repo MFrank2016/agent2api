@@ -798,7 +798,7 @@ export async function saveToggle(
   const patch: AppSettings = {
     closeToTray: kind === "tray" ? next : previous.closeToTray,
     autostart: kind === "autostart" ? next : previous.autostart,
-    // 局域网访问归「局域网访问」面板管（它有自己的确认与重启流程），
+    // 网络访问归「网关 → 网络访问」面板管（它有自己的确认与重启流程），
     // 全量覆盖的 patch 里原样带上磁盘现值，避免把它悄悄抹掉
     lanAccess: previous.lanAccess,
     lanPanel: previous.lanPanel,
@@ -882,7 +882,7 @@ export function resolveLanConfirm(accepted: boolean): void {
 async function proceedEnable(): Promise<void> {
   const api = shared().workbuddyDesktop;
   if (!api?.panelAdminStatus) {
-    toast(t("当前环境不支持局域网访问设置"), "err");
+    toast(t("当前环境不支持网络访问设置"), "err");
     return;
   }
   beginBusy("lan");
@@ -957,7 +957,7 @@ async function applyLan(enabled: boolean, panel: boolean): Promise<void> {
   if (busyScope) return;
   const api = shared().workbuddyDesktop;
   if (!api?.changeLanAccess) {
-    toast(t("当前环境不支持局域网访问设置"), "err");
+    toast(t("当前环境不支持网络访问设置"), "err");
     return;
   }
   beginBusy("lan");
@@ -2597,71 +2597,6 @@ export async function saveClineHeaders(
   }
 }
 
-/* ─── ZCode 客户端版本号（上游按它决定活动套餐下不下发）── */
-
-export function renderZcodeVersion(data?: unknown): void {
-  if (data === undefined) return;
-  if (!data || typeof data !== "object") {
-    publish({
-      zcodeVersion: { status: "unavailable", version: "", envOverride: "" },
-    });
-    return;
-  }
-  const source = data as { version?: unknown; envOverride?: unknown };
-  publish({
-    zcodeVersion: {
-      status: "ready",
-      version: typeof source.version === "string" ? source.version : "",
-      // null / 缺失统一成空串：视图层只需判「非空 = 环境变量压着」
-      envOverride:
-        typeof source.envOverride === "string" ? source.envOverride : "",
-    },
-  });
-}
-
-async function loadZcodeVersion(): Promise<void> {
-  try {
-    renderZcodeVersion(await shared().workbuddyDesktop?.getZcodeVersion());
-  } catch (error) {
-    console.warn("读取 ZCode 客户端版本号失败:", errorMessage(error));
-    renderZcodeVersion(null);
-  }
-}
-
-export async function refreshZcodeVersion(): Promise<void> {
-  await loadZcodeVersion();
-  toast(t("ZCode 版本号已刷新"));
-}
-
-/**
- * 保存版本号（空串 = 清空覆盖、回落插件内置默认值）。
- *
- * 后端只校验长度与字符集，**不校验「这个版本存在」** —— 上游的版本号对我们
- * 是黑盒。填错的表现是「还是探不到套餐」，所以保存后如实回读后端值，
- * 让用户看到落库的到底是什么。
- */
-export async function saveZcodeVersion(version: string): Promise<void> {
-  if (busyScope) {
-    repaint();
-    return;
-  }
-  beginBusy("zcodeVersion");
-  try {
-    const saved = await shared().workbuddyDesktop?.saveZcodeVersion(version);
-    renderZcodeVersion(saved);
-    toast(
-      version.trim()
-        ? t("✅ ZCode 版本号已保存")
-        : t("已清空，回落插件内置默认值"),
-    );
-  } catch (error) {
-    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
-    await loadZcodeVersion(); // 回滚到后端的真实值
-  } finally {
-    endBusy();
-  }
-}
-
 /* ─── 网关面跨域访问（/v1/* 的 CORS，默认关）── */
 
 export function renderCors(data?: unknown): void {
@@ -3530,11 +3465,9 @@ export async function load({ checkUpdate = false }: { checkUpdate?: boolean } = 
     loadDeveloperRoleCompat(),
     loadReasoningCollapse(),
     loadClineHeaders(),
-    loadZcodeVersion(),
     loadCors(),
     loadPrompt(),
     loadStorage(),
-    loadCaptcha(),
     loadAccount(),
     loadModelsDev(),
     reconnectDbRestore(),

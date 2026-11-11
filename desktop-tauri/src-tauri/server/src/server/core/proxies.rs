@@ -34,6 +34,9 @@ use serde_json::{json, Map, Value};
 
 pub use crate::server::core::clash::{clash_proxy_options, CLASH_MIXED_UID};
 
+pub(crate) mod system;
+pub(crate) mod chain;
+
 const MAX_HOST_LENGTH: usize = 255;
 const MAX_USER_LENGTH: usize = 200;
 const MAX_LABEL_LENGTH: usize = 100;
@@ -93,6 +96,35 @@ fn valid_port(value: Option<&Value>) -> Option<u16> {
         return None;
     }
     Some(number as u16)
+}
+
+pub(crate) fn normalize_non_direct(value: Option<&Value>) -> Result<bool, String> {
+    match value {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        _ => Err("非直连代理选项必须是布尔值".to_string()),
+    }
+}
+
+pub(crate) fn normalize_credential(value: Option<&Value>) -> Result<String, String> {
+    match value {
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(text)) if text.chars().count() <= MAX_USER_LENGTH => Ok(text.clone()),
+        Some(Value::String(_)) => Err("代理账号和密码不能超过 200 个字符".to_string()),
+        _ => Err("代理账号和密码必须是文本".to_string()),
+    }
+}
+
+pub(crate) fn normalize_host(host: &str) -> Result<String, String> {
+    let host = host.trim();
+    if host.is_empty() { return Err("缺少代理主机地址".to_string()); }
+    let bare = host.strip_prefix('[').and_then(|value| value.strip_suffix(']')).unwrap_or(host);
+    if let Ok(address) = bare.parse::<std::net::IpAddr>() { return Ok(address.to_string()); }
+    if host.len() > MAX_HOST_LENGTH || host.chars().any(|ch| ch.is_whitespace() || ch.is_control() || ":/@?#\\[]%".contains(ch)) {
+        return Err("代理主机只能填写域名或 IP 地址，不能包含协议、端口或路径".to_string());
+    }
+    url::Host::parse(host).map(|value| value.to_string())
+        .map_err(|_| "代理主机地址无效".to_string())
 }
 
 /// 归一账号代理配置（来自 API 的原始输入）。
@@ -252,10 +284,10 @@ pub fn normalize_account_proxy(input: &Value) -> Result<Option<Value>, ProxyConf
     if protocol != "http" && protocol != "socks5" {
         return Err(ProxyConfigError::new("代理协议只支持 http 或 socks5"));
     }
-    let host = clean_string(object.get("host"), MAX_HOST_LENGTH);
-    if host.is_empty() {
-        return Err(ProxyConfigError::new("缺少代理主机地址"));
-    }
+    let host = normalize_host(object.get("host").and_then(Value::as_str).unwrap_or(""))
+        .map_err(ProxyConfigError::new)?;
+    let non_direct = normalize_non_direct(object.get("nonDirect"))
+        .map_err(ProxyConfigError::new)?;
     let Some(port) = valid_port(object.get("port")) else {
         return Err(ProxyConfigError::new("代理端口必须是 1-65535 的整数"));
     };
@@ -274,17 +306,18 @@ pub fn normalize_account_proxy(input: &Value) -> Result<Option<Value>, ProxyConf
     normalized.insert("port".to_string(), Value::from(port));
     normalized.insert(
         "username".to_string(),
-        Value::String(clean_string(object.get("username"), MAX_USER_LENGTH)),
+        Value::String(normalize_credential(object.get("username")).map_err(ProxyConfigError::new)?),
     );
     normalized.insert(
         "password".to_string(),
-        Value::String(clean_string(object.get("password"), MAX_USER_LENGTH)),
+        Value::String(normalize_credential(object.get("password")).map_err(ProxyConfigError::new)?),
     );
     normalized.insert(
         "noReuse".to_string(),
         Value::Bool(object.get("noReuse").and_then(Value::as_bool).unwrap_or(false)),
     );
     normalized.insert("label".to_string(), Value::String(label));
+    normalized.insert("nonDirect".to_string(), Value::Bool(non_direct));
     Ok(Some(Value::Object(normalized)))
 }
 
@@ -305,6 +338,8 @@ pub struct ResolvedProxy {
     pub label: String,
     /// 每请求换出口 IP：不复用连接池（代理出口每次新建隧道）。默认 false。
     pub no_reuse: bool,
+    /// 该出口不是直连（链式出口的标记，见 `proxies::chain`）。
+    pub non_direct: bool,
 }
 
 impl ResolvedProxy {
@@ -355,6 +390,7 @@ impl ResolvedProxy {
             password: text("password"),
             label: text("label"),
             no_reuse: value.get("noReuse").and_then(Value::as_bool).unwrap_or(false),
+            non_direct: normalize_non_direct(value.get("nonDirect"))?,
         }))
     }
 }
@@ -548,6 +584,7 @@ impl ProxyResolution {
                 "username": proxy.username,
                 "password": proxy.password,
                 "label": proxy.label,
+                "nonDirect": proxy.non_direct,
             }),
             ProxyResolution::Failed(message) => json!({ "error": message }),
         }
@@ -653,6 +690,10 @@ pub fn resolve_account_proxy(config: Option<&Value>) -> Option<ProxyResolution> 
                 .to_string(),
             label,
             no_reuse: object.get("noReuse").and_then(Value::as_bool).unwrap_or(false),
+            non_direct: match normalize_non_direct(object.get("nonDirect")) {
+                Ok(value) => value,
+                Err(message) => return Some(ProxyResolution::Failed(message)),
+            },
         }));
     }
     if source != "clash" {
@@ -698,6 +739,7 @@ pub fn resolve_account_proxy(config: Option<&Value>) -> Option<ProxyResolution> 
         password: String::new(),
         label,
         no_reuse: false,
+        non_direct: false,
     }))
 }
 
@@ -874,6 +916,7 @@ pub fn describe_account_proxy(config: Option<&Value>) -> Value {
             "host": proxy.host,
             "port": proxy.port,
             "label": proxy.label,
+            "nonDirect": proxy.non_direct,
             "error": Value::Null,
             "config": config,
         }),
@@ -920,7 +963,7 @@ mod tests {
             members: vec![ResolvedProxy {
                 source: "pool".into(), protocol: "http".into(), host: "1.2.3.4".into(),
                 port: Some(8080), username: "u".into(), password: "p".into(), label: "a".into(),
-                no_reuse: false,
+                no_reuse: false, non_direct: false,
             }],
             strategy: Strategy::LeastLatency,
             on_error: OnError::Next,
@@ -943,7 +986,7 @@ mod tests {
         let member = |host: &str, port: u16| ResolvedProxy {
             source: "pool".into(), protocol: "http".into(), host: host.into(),
             port: Some(port), username: String::new(), password: String::new(), label: String::new(),
-            no_reuse: false,
+            no_reuse: false, non_direct: false,
         };
         // 同一组成员、两种书写顺序 → 同一个键（否则游标 / EWMA 不共享）
         let forward = rotation_group_key(&[member("1.2.3.4", 8080), member("5.6.7.8", 9090)]);

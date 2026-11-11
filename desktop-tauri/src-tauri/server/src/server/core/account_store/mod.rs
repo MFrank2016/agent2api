@@ -112,8 +112,10 @@ pub mod nous_accounts;
 pub mod officeace_accounts;
 pub mod orcaterm_accounts;
 pub mod plugin_accounts;
+mod plugin_contract;
 mod plugin_identity;
 mod plugin_public;
+mod plugin_state;
 pub mod priority;
 pub mod qoder_accounts;
 pub mod raccoon_accounts;
@@ -130,6 +132,7 @@ pub mod store_order;
 pub mod store_util;
 pub mod store_view;
 pub mod trae_accounts;
+mod usage_settings;
 pub mod zcode_accounts;
 
 pub use store::{AccountStore, AccountStoreError};
