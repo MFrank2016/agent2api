@@ -67,21 +67,29 @@ pub(super) async fn session_for(
     account_id: Option<&str>,
 ) -> Result<Value, GatewayError> {
     if let Some(id) = account_id {
-        let unavailable = || GatewayError::with_status(
-            401, "指定账号不存在、无可用凭证或不属于当前提供商；未回退到其他账号",
-        );
-        if service.store.account_provider_of(id).as_deref() != Some(provider) {
-            return Err(unavailable());
-        }
-        // 读取会话后复核归属，防止两次读盘之间账号迁移；显式 id 绝不落回默认登录态。
-        let mut entry = service.store.get_session_by_id(id)
-            .filter(|_| service.store.account_provider_of(id).as_deref() == Some(provider))
-            .ok_or_else(unavailable)?;
-        // 账号主键只随转发会话传递，不改管理接口的会话形态。
-        if let Some(session) = entry.session.as_object_mut() {
-            session.insert("id".to_string(), Value::String(entry.id));
-        }
-        return Ok(entry.session);
+        let service = service.clone();
+        let id = id.to_string();
+        let provider = provider.to_string();
+        return crate::server::core::blocking::run(move || {
+            let unavailable = || GatewayError::with_status(
+                401, "指定账号不存在、无可用凭证或不属于当前提供商；未回退到其他账号",
+            );
+            if service.store.account_provider_of(&id).as_deref() != Some(provider.as_str()) {
+                return Err(unavailable());
+            }
+            if crate::server::core::providers::subscriptions::contains(&provider) {
+                return service.store.plugin_account(&id)
+                    .filter(|account| account.get("provider").and_then(Value::as_str) == Some(provider.as_str()))
+                    .ok_or_else(unavailable);
+            }
+            let mut entry = service.store.get_session_by_id(&id)
+                .filter(|_| service.store.account_provider_of(&id).as_deref() == Some(provider.as_str()))
+                .ok_or_else(unavailable)?;
+            if let Some(session) = entry.session.as_object_mut() {
+                session.insert("id".to_string(), Value::String(entry.id));
+            }
+            Ok(entry.session)
+        }).await?;
     }
     let session = service
         .auth
@@ -296,6 +304,11 @@ fn select_target_account_sync(
         ));
     }
 
+    if super::account_admission::all_busy(&candidates, &counts, tried_ids) {
+        return Err(GatewayError::with_status(503, "当前路由内的账号均已达到并发上限")
+            .with_code("account_busy"));
+    }
+
     if request_routing.strict_vision {
         return Err(GatewayError::with_status(503, "图片处理候选账号受冷却、并发或额度限制；未强行发送或扩大路由范围")
             .with_code("vision_target_unavailable"));
@@ -469,18 +482,18 @@ pub(super) fn accounts_in_providers(
     providers: &[&str],
     pinned: Option<&str>,
 ) -> Vec<Value> {
-    let snapshot = service.store.list_visible_accounts();
-    routing::accounts_of(&snapshot)
-        .into_iter()
-        .filter(|account| providers.contains(&provider_of(account)))
-        .filter(|account| match pinned {
-            Some(id) => routing::account_id(account) == Some(id),
-            None => true,
-        })
-        .collect()
+    let snapshot = service.store.routing_snapshot();
+    if let Some(id) = pinned {
+        return snapshot.by_id.get(id).filter(|account| providers.contains(&provider_of(account)))
+            .filter(|account| crate::server::core::account_store::store_view::account_visible(provider_of(account)))
+            .map(|account| vec![account.as_ref().clone()]).unwrap_or_default();
+    }
+    providers.iter().flat_map(|provider| snapshot.by_provider.get(*provider).into_iter().flatten())
+        .filter(|account| crate::server::core::account_store::store_view::account_visible(provider_of(account)))
+        .map(|account| account.as_ref().clone()).collect()
 }
 
-fn scoped_accounts(
+pub(super) fn scoped_accounts(
     service: &UpstreamService,
     providers: &[&str],
     model: &str,
@@ -493,6 +506,17 @@ fn scoped_accounts(
     } else {
         crate::server::core::routing_scope::apply_accounts(&accounts, model)
     };
+    let keys = routing::CooldownKeys::new(model);
+    let accounts: Vec<Value> = accounts.into_iter().map(|mut account| {
+        let provider = provider_of(&account).to_string();
+        if let Some(entry) = service.store.policy_cooldown_for(&provider, &keys.for_account(&account)) {
+            account["providerCooldown"] = entry;
+        }
+        account
+    }).filter(|account| {
+        pinned.is_some() || !account.get("upstreamCooldownUntil").and_then(Value::as_i64)
+            .is_some_and(|until| until > logging::now_ms())
+    }).collect();
     let routable: Vec<Value> = accounts.iter()
         .filter(|account| !readiness::gated(provider_of(account)))
         .cloned().collect();
@@ -938,11 +962,12 @@ pub(super) fn pick_next_account(
     keys: &routing::CooldownKeys<'_>,
     tried_ids: &[String],
     pinned: Option<&str>,
+    request_routing: &super::route_context::RequestRouting,
 ) -> Option<Value> {
     if tried_ids.last().is_some_and(|last| !allows_route_skip(service, last)) {
         return None;
     }
-    let accounts = scoped_accounts(service, providers, keys.requested(), pinned, None);
+    let accounts = scoped_accounts(service, providers, keys.requested(), pinned, Some(request_routing));
     // 换号顺延与第一级选路同一份候选剔除：被限制器拦下的账号不会在 429 之后
     // 被当作「下一个」重新塞进来
     let (candidates, balance_blocked_ids) = filter_limiter_blocked(&accounts, keys, pinned);

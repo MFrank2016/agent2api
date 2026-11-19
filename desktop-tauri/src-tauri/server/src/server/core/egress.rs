@@ -53,6 +53,9 @@ use crate::server::config::TimeoutSettings;
 use crate::server::core::proxies::{AccountEgress, OnError, ResolvedProxy};
 use crate::server::logging;
 
+pub(crate) mod managed;
+mod resolved_cache;
+
 /// 默认 User-Agent，**必须设置**。
 ///
 /// ── 为什么这条不是「顺手加的」而是必需 ────────────────────────
@@ -68,18 +71,16 @@ use crate::server::logging;
 ///
 /// 客户端级默认头**不会覆盖**请求级头（wreq 只在 HeaderMap 空缺时插入），
 /// 所以 banner 的 `whitelistHeaders` 里那个真正的 WorkBuddy UA 依然生效。
-const DEFAULT_USER_AGENT: &str = "undici";
+pub(crate) const DEFAULT_USER_AGENT: &str = "undici";
 
 /// Client 缓存上限（对照 Node 版 MAX_DISPATCHERS）
 const MAX_CLIENTS: usize = 24;
 
 /// 出口 IP 查询服务：拿不到只当作附加信息缺失，不影响连通性结论
 const IP_ECHO_URL: &str = "https://api.ipify.org?format=json";
-/// 连通性测试的默认目标：**上游站点**而不是第三方站点（判据见 test_connectivity）。
-/// 用户可在「网络代理」页的设置里换成自家上游（`core::proxy_settings::test_url`），
 /// 未配置（空）时回落到这里 —— 字面量与 `core::proxy_settings::DEFAULT_TEST_URL`
 /// 保持一致，改一处要同步另一处。
-const DEFAULT_TEST_URL: &str = "https://copilot.tencent.com/v2/config";
+const DEFAULT_TEST_URL: &str = "https://www.google.com/";
 /// 连通性测试默认超时
 const DEFAULT_TEST_TIMEOUT_MS: u64 = 15_000;
 /// 出口 IP 查询的超时上限（即便测试超时给得更大，也不要在这里耗太久）
@@ -358,7 +359,7 @@ pub fn image_download_client(
     host: &str,
     addresses: &[std::net::SocketAddr],
 ) -> Result<wreq::Client, String> {
-    resolved_client(proxy, system_proxy_when_unset, host, addresses)
+    resolved_transport_client(proxy, system_proxy_when_unset, host, addresses)
 }
 
 /// 用「已解析的候选地址」构造出站客户端（`network_fallback` 换备用入口时用）。
@@ -368,14 +369,64 @@ pub fn resolved_client(
     system_proxy_when_unset: bool,
     host: &str,
     addresses: &[std::net::SocketAddr],
-) -> Result<wreq::Client, String> {
-    resolved_builder(proxy, system_proxy_when_unset, host, addresses)?
-        .build().map_err(|_| "无法创建出站连接".to_string())
+) -> Result<reqwest::Client, String> {
+    resolved_cache::client(proxy, system_proxy_when_unset, host, addresses, false)
 }
 
-pub fn websocket_client(proxy: Option<&ResolvedProxy>) -> Result<wreq::Client, String> {
-    resolved_builder(proxy, false, "", &[])?.http1_only()
-        .build().map_err(|_| "无法创建 WebSocket 出站连接".to_string())
+pub fn websocket_client(proxy: Option<&ResolvedProxy>, system_proxy_when_unset: bool) -> Result<reqwest::Client, String> {
+    resolved_cache::client(proxy, system_proxy_when_unset, "", &[], true)
+}
+
+/// 转发链路专用的「已解析地址」客户端（`wreq` 栈，带 TLS 指纹模拟）。
+///
+/// 与 [`resolved_client`] 的分工：那条服务非转发出站（插件 / 更新 / 订阅），
+/// 用 `reqwest`；这条服务上游转发（换备用入口、图片下载），必须走 `wreq` ——
+/// 上游按 JA3/JA4 风控，转发链路不能换成 rustls 栈。
+pub fn resolved_transport_client(
+    proxy: Option<&ResolvedProxy>,
+    system_proxy_when_unset: bool,
+    host: &str,
+    addresses: &[std::net::SocketAddr],
+) -> Result<wreq::Client, String> {
+    resolved_builder(proxy, system_proxy_when_unset, host, addresses)?
+        .build()
+        .map_err(|_| "无法创建出站连接".to_string())
+}
+
+/// `reqwest` 版 builder（非转发出站）：与 [`resolved_builder`] 同一套出口 / 地址策略，
+/// 但不带 wreq 的 TLS 指纹模拟。
+pub(super) fn resolved_reqwest_builder(
+    proxy: Option<&ResolvedProxy>,
+    system_proxy_when_unset: bool,
+    host: &str,
+    addresses: &[std::net::SocketAddr],
+) -> Result<reqwest::ClientBuilder, String> {
+    let timeouts = crate::server::config::timeout_settings();
+    let mut builder = base_reqwest_builder(&timeouts)
+        .redirect(reqwest::redirect::Policy::none());
+    if !addresses.is_empty() {
+        builder = builder.resolve_to_addrs(host, addresses);
+    }
+    if let Some(proxy) = proxy {
+        let url = build_proxy_url(proxy);
+        let parsed = reqwest::Proxy::all(url).map_err(|_| "代理地址无效".to_string())?;
+        builder = builder.no_proxy().proxy(parsed);
+    } else if !system_proxy_when_unset {
+        builder = builder.no_proxy();
+    }
+    Ok(builder)
+}
+
+/// 非转发出站的基座（`reqwest` + rustls，与 Cargo.toml 里 reqwest 的特性一致）。
+pub(super) fn base_reqwest_builder(
+    timeouts: &crate::server::config::TimeoutSettings,
+) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(timeouts.connect_ms()))
+        .read_timeout(Duration::from_millis(timeouts.read_timeout_backstop_ms()))
+        .user_agent(DEFAULT_USER_AGENT)
+        .pool_idle_timeout(Some(Duration::from_secs(90)))
+        .pool_max_idle_per_host(8)
 }
 
 fn resolved_builder(
@@ -396,52 +447,6 @@ fn resolved_builder(
         builder = builder.no_proxy();
     }
     Ok(builder)
-}
-
-pub fn client_for_github(proxy: Option<&ResolvedProxy>) -> Result<Arc<wreq::Client>, String> {
-    let transport = proxy.map(crate::server::core::proxies::chain::endpoint).transpose()?;
-    let proxy = transport.as_ref();
-    let timeouts = crate::server::config::timeout_settings();
-    let key = format!("github|{}", cache_key(proxy, &timeouts));
-    {
-        let mut guard = lock_clients();
-        let cache = guard.get_or_insert_with(ClientCache::default);
-        cache.clock += 1;
-        let now = cache.clock;
-        if let Some(entry) = cache.entries.get_mut(&key) {
-            entry.used_at = now;
-            return Ok(entry.client.clone());
-        }
-    }
-    // 跳转逐跳检查域名和凭证，客户端构造失败不能回落到自动跟转的客户端。
-    let client = Arc::new(build_client_with(proxy, &timeouts, true)?);
-    let mut guard = lock_clients();
-    let cache = guard.get_or_insert_with(ClientCache::default);
-    cache.clock += 1;
-    let now = cache.clock;
-    if let Some(entry) = cache.entries.get_mut(&key) {
-        entry.used_at = now;
-        return Ok(entry.client.clone());
-    }
-    while cache.entries.len() >= MAX_CLIENTS {
-        let Some(oldest) = cache
-            .entries
-            .iter()
-            .min_by_key(|(_, entry)| entry.used_at)
-            .map(|(key, _)| key.clone())
-        else {
-            break;
-        };
-        cache.entries.remove(&oldest);
-    }
-    cache.entries.insert(
-        key,
-        CacheEntry {
-            used_at: now,
-            client: client.clone(),
-        },
-    );
-    Ok(client)
 }
 
 /// 跟随系统代理的 Client（进程级缓存一份）。
@@ -675,7 +680,7 @@ async fn read_exit_ip(client: &wreq::Client, proxy: Option<&ResolvedProxy>, time
 /// 测试目标必须返回成功状态（2xx）；收到 HTTP 响应不等于目标可用。
 /// 重定向由客户端跟随，以最终响应状态为准。
 ///
-/// `target_url` 为 None 时用 `https://copilot.tencent.com/v2/config`。
+/// `target_url` 为 None 时用 `DEFAULT_TEST_URL`。
 pub async fn test_connectivity(
     proxy: Option<&ResolvedProxy>,
     timeout_ms: u64,
@@ -756,8 +761,17 @@ pub async fn test_proxy(proxy: Option<&ResolvedProxy>) -> ConnectivityResult {
 ///
 /// 去重是必要的：wreq 的若干层 source 文案会重复（如 `error sending request`）。
 pub fn describe_error_detail(error: &wreq::Error) -> String {
+    describe_error_chain(error)
+}
+
+/// `reqwest` 侧的同一份描述（非转发出站：插件 / 更新 / 订阅用 reqwest 栈）。
+pub fn describe_reqwest_error(error: &reqwest::Error) -> String {
+    describe_error_chain(error)
+}
+
+fn describe_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut parts: Vec<String> = Vec::new();
-    // 顶层 wreq 错误自己的文案（含 URL 与超时语义）
+    // 顶层错误自己的文案（含 URL 与超时语义）
     let head = error.to_string();
     if !head.is_empty() {
         parts.push(head);

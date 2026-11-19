@@ -1,4 +1,5 @@
 import type { CampaignEntry } from './checkin-campaign-types'
+import type { PluginTaskRow } from './plugin-task-types'
 
 export type DailyCheckinStatus = 'claimed' | 'done' | 'confirming' | 'inactive' | 'ineligible' | 'captcha' | 'failed'
 
@@ -242,6 +243,7 @@ export type KeepaliveState = {
 }
 
 export type TravelState = {
+  engine?: 'wasm_tasks'
   enabled: boolean
   available?: boolean
   pausedReason?: string | null
@@ -305,6 +307,7 @@ export type CheckinCenter = {
   auto: AutoState
   keepalive: KeepaliveState
   travel: TravelState
+  pluginTasks?: PluginTaskRow[]
   history: HistoryRow[]
   adminPanels: string[]
   checkinFeatures: Record<string, {

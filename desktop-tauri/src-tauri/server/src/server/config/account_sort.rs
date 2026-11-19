@@ -117,5 +117,6 @@ pub fn save_account_sort(
     if !saved {
         return Err("账号排序落盘失败，本次修改仅在当前进程生效".to_string());
     }
+    crate::server::core::panel_events::notify(crate::server::core::panel_events::Change::Accounts);
     Ok(())
 }

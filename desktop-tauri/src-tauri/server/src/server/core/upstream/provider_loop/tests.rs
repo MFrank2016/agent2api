@@ -940,7 +940,6 @@ async fn a_real_413_response_is_sent_once_and_handed_back() {
         &mut budget,
         Some(&capture),
         &telemetry,
-        false,
         None,
         None,
     )
@@ -1266,8 +1265,9 @@ fn reserve_is_only_reached_after_the_kept_account_is_tried() {
     }
     let keys = rotate::CooldownKeys::new("m");
     let providers = [PROVIDER];
+    let routing = crate::server::core::upstream::route_context::RequestRouting::capture("m", &service.store);
 
-    let first = rotate::pick_next_account(&service, &providers, &keys, &[], None)
+    let first = rotate::pick_next_account(&service, &providers, &keys, &[], None, &routing)
         .expect("队首应当有可用账号");
     assert_eq!(
         first.get("id").and_then(Value::as_str),
@@ -1276,7 +1276,7 @@ fn reserve_is_only_reached_after_the_kept_account_is_tried() {
     );
 
     let after_failure =
-        rotate::pick_next_account(&service, &providers, &keys, &[kept.clone()], None)
+        rotate::pick_next_account(&service, &providers, &keys, &[kept.clone()], None, &routing)
             .expect("kept 失败顺延后储备应当被提升");
     assert_eq!(
         after_failure.get("id").and_then(Value::as_str),
@@ -1516,6 +1516,7 @@ async fn stateful_provider_refuses_to_send_when_masking_is_enabled() {
     let ctx = ProviderContext {
         body: &body,
         native: None,
+        error_policy: std::sync::Arc::new(crate::server::config::error_policy::ErrorPolicySnapshot::default()),
         title_routed: false,
         routing: crate::server::core::upstream::route_context::RequestRouting::capture("m", &service.store),
         compact_routed: false,

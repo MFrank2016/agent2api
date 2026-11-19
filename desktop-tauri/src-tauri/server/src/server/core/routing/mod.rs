@@ -176,20 +176,33 @@ pub fn is_rate_limited(account: &Value, keys: &CooldownKeys<'_>, now: i64) -> bo
 /// 冷却键按 [`CooldownKeys`] 解析（真名，不是请求名）。
 pub fn rate_limit_reset_at(account: &Value, keys: &CooldownKeys<'_>, now: i64) -> i64 {
     let key = keys.for_account(account);
-    let Some(limit) = account
-        .get("rateLimits")
-        .and_then(|limits| limits.get(key.as_str()))
-    else {
-        return 0;
-    };
-    let reset_at = limit
-        .get("resetAt")
-        .and_then(js_number)
-        .unwrap_or(0.0);
-    if reset_at > now as f64 {
-        reset_at as i64
+    // 三个来源：账号级冷却、提供商级冷却、该模型自己的限流；取最晚的一个。
+    let candidates = [
+        account.pointer("/routingCooldowns/@account/resetAt"),
+        account.pointer("/providerCooldown/resetAt"),
+        account
+            .get("rateLimits")
+            .and_then(|limits| limits.get(key.as_str()))
+            .and_then(|limit| limit.get("resetAt")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .filter_map(js_number)
+        .filter(|reset| *reset > now as f64)
+        .map(|reset| reset as i64)
+        .max()
+        .unwrap_or(0)
+}
+
+/// 冷却来自哪一级：账号级 / 提供商级 / 该账号的当前模型（与 \`rate_limit_reset_at\` 的三来源同序）。
+fn cooldown_scope(account: &Value, reset_at: i64) -> &'static str {
+    if account.pointer("/providerCooldown/resetAt").and_then(Value::as_i64).unwrap_or(0) == reset_at {
+        "提供商"
+    } else if account.pointer("/routingCooldowns/@account/resetAt").and_then(Value::as_i64).unwrap_or(0) == reset_at {
+        "账号"
     } else {
-        0
+        "该账号的当前模型"
     }
 }
 
@@ -789,6 +802,10 @@ pub fn plan_route(
         // 滚动 RPM 超限（`maxRpm`）：本窗口内已打满，等窗口滚动再回来。
         // 与 `limiter` 分工：那边是余额 / Token 周期用量，这边是**每分钟**的
         // 请求速率；计数由调用方的 `RpmWindow` 维护，选路只消费结果。
+        if meta.open.contains(&id) {
+            blocked.push(entry("breaker", "连续失败保护中，到保护结束后才允许重新尝试".to_string()));
+            continue;
+        }
         if meta.rpm_blocked.contains(&id) {
             blocked.push(entry("rpm", "RPM 超限，等待窗口滚动后自动回来".to_string()));
             continue;
@@ -798,7 +815,8 @@ pub fn plan_route(
             blocked.push(entry(
                 "cooldown",
                 format!(
-                    "对该模型限流冷却中，{} 恢复（恢复后自动回来）",
+                    "{}冷却中，{} 恢复（恢复后自动回来）",
+                    cooldown_scope(account, reset_at),
                     clock_text(reset_at, now)
                 ),
             ));

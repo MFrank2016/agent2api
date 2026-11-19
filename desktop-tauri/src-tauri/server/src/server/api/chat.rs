@@ -79,6 +79,7 @@ pub async fn chat_completions(
     // 裸 `Extension<T>` 那样直接拒绝请求（那会把整个免鉴权模式打回 500）。
     key_scope: Option<Extension<crate::server::core::key_scope::KeyScope>>,
     key_identity: Option<Extension<crate::server::request_stats::ApiKeyIdentity>>,
+    key_source: Option<Extension<Arc<crate::server::config::model_key_source::Source>>>,
     body: Bytes,
 ) -> Response {
     let scope = key_scope.map(|Extension(scope)| scope);
@@ -164,6 +165,8 @@ pub async fn chat_completions(
     );
 
     // 原始请求的去重键已在模型改写前计算。
+    let telemetry = Arc::new(RequestTelemetry::with_model_key(key_source.map(|Extension(source)| source)));
+    telemetry.capture_prompt_request(&request_source, &client_model);
     let telemetry = Arc::new(RequestTelemetry::with_id());
     // 命中的网关 Key 身份（schema v17）：挂到 telemetry 旁路，记账点从快照里读。
     // `None`（免鉴权 / 环境变量 Key / 未知 Key）时不挂，槽位保持空串。
@@ -307,6 +310,7 @@ pub async fn chat_completions(
                 Some(context) => context.stream(source),
                 None => source,
             };
+            let source = pipeline::catpaw_output::observe_stream(source, &telemetry);
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
             let context = RecordContext {
                 stats,
@@ -349,6 +353,7 @@ pub async fn chat_completions(
             // 响应正文在记账前抄一份（完整 JSON 文本；序列化失败或调试模式
             // 关着给 None，那一侧少存一份正文不影响明细）
             let raw_response = pipeline::capture_raw_json(&body);
+            let response = pipeline::catpaw_output::json_response(body, &telemetry);
             record_entry(
                 &RecordContext {
                     stats,
@@ -357,7 +362,7 @@ pub async fn chat_completions(
                     model: requested_model.clone(),
                     client_model: client_model.clone(),
                     client_reasoning: client_reasoning.clone(),
-                    status: 200,
+                    status: i64::from(response.status().as_u16()),
                     raw_request,
                     raw_response,
                     // 转发主链路：不是模型测试
@@ -369,7 +374,7 @@ pub async fn chat_completions(
             );
             // 记账已完成：解除断线兜底并注销取消令牌（请求不再在途）
             guard.complete();
-            json_response(body)
+            response
         }
         Err(error) => {
             // headers 还没发出（流式还没开始）→ 直接给 OpenAI 风格错误。

@@ -90,7 +90,7 @@ impl Fallback {
         if addresses.is_empty() {
             return request::send_chat_request(&self.current).await;
         }
-        let client = egress::resolved_client(
+        let client = egress::resolved_transport_client(
             self.current.egress.primary(),
             self.current.system_proxy_when_unset,
             &host,

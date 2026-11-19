@@ -136,6 +136,8 @@ export type AppState = {
   lanPanel: boolean;
   /** 轻量模式：关窗销毁界面进程（释放 WebView2 内存），托盘按需重建 */
   lightweightMode: boolean;
+  /** 硬件加速（关闭后需重启生效） */
+  hardwareAcceleration: boolean;
   /** 本机在局域网里的 IP（查不到为 null，地址展示退化为占位符） */
   lanIp: string | null;
   /** 网关端口（0 = 还没查到），拼局域网地址用 */
@@ -494,6 +496,7 @@ const INITIAL: SettingsSnapshot = {
     lanAccess: false,
     lanPanel: false,
     lightweightMode: false,
+    hardwareAcceleration: true,
     lanIp: null,
     port: 0,
     adminRegistered: null,
@@ -673,6 +676,16 @@ function endBusy(): void {
  * 那不该改用户手点的默认分类（写偏好的是 selectCategory）。
  */
 export function showCategory(category?: string | null): void {
+  // 「重试」分类已并入「路由 → 错误处理」：老 localStorage / 深链仍可能给 'retry'，
+  // 直接切到那一页并把错误处理面板打开，而不是回落到首项。
+  if (category === "retry") {
+    const app = (
+      window as unknown as { wbApp?: { showPage(page: string): void } }
+    ).wbApp;
+    app?.showPage("routing");
+    window.dispatchEvent(new Event("wb:routing-errors-open"));
+    return;
+  }
   const target = CATEGORIES.some((item) => item.id === category)
     ? String(category)
     : CATEGORIES[0].id;
@@ -731,7 +744,8 @@ export function renderSettings(data?: unknown): void {
     return;
   }
   const record = data as Record<string, unknown>;
-  // 主进程返回的字段一律按「严格 true」判定，缺字段时按关闭处理（与后端默认值一致）。
+  // 主进程返回的字段一律按「严格 true」判定，缺字段时按关闭处理（与后端默认值一致）；
+  // 硬件加速例外：缺字段按开启（旧后端没有这个键，不该把用户的面板画成「关」）。
   // lanIp / port / adminRegistered 是旁路读数，不在启动设置的响应里 —— 保留当前值。
   publishApp({
     status: "ready",
@@ -740,6 +754,7 @@ export function renderSettings(data?: unknown): void {
     lanAccess: record.lanAccess === true,
     lanPanel: record.lanPanel === true,
     lightweightMode: record.lightweightMode === true,
+    hardwareAcceleration: record.hardwareAcceleration !== false,
   });
 }
 
@@ -803,6 +818,7 @@ export async function saveToggle(
     lanAccess: previous.lanAccess,
     lanPanel: previous.lanPanel,
     lightweightMode: kind === "lightweight" ? next : previous.lightweightMode,
+    hardwareAcceleration: previous.hardwareAcceleration,
   };
   beginBusy("app");
   publishApp(patch);
@@ -3452,7 +3468,6 @@ export async function load({ checkUpdate = false }: { checkUpdate?: boolean } = 
     loadSettings(),
     loadLanExtras(),
     loadRetention(),
-    loadRetry(),
     loadTimeouts(),
     loadQueue(),
     loadImageCompress(),
@@ -3466,7 +3481,6 @@ export async function load({ checkUpdate = false }: { checkUpdate?: boolean } = 
     loadReasoningCollapse(),
     loadClineHeaders(),
     loadCors(),
-    loadPrompt(),
     loadStorage(),
     loadAccount(),
     loadModelsDev(),

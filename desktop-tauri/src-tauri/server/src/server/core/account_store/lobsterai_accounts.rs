@@ -204,7 +204,10 @@ impl AccountStore {
             existing.as_ref(),
         );
         if !access_token.is_empty() {
-            record.insert("accessToken".to_string(), Value::String(access_token.clone()));
+            record.insert(
+                "accessToken".to_string(),
+                Value::String(access_token.clone()),
+            );
         }
         if !refresh_token.is_empty() {
             record.insert(
@@ -340,8 +343,69 @@ impl AccountStore {
     /// 尾 4 位）与两个存在性标记；`expiresAt`、`userId`、`deviceId` 是展示 / 排障
     /// 需要的事实。
     pub fn to_lobsterai_public_account(&self, record: &StoredAccount) -> Value {
+        let mut value = record.to_value();
+        let can_refresh = record.get("refreshToken").is_some()
+            && record.get("firstKeyfrom").is_some()
+            && record.get("latestKeyfrom").is_some();
+        if let Some(object) = value.as_object_mut() {
+            object.remove("accessToken");
+            object.remove("refreshToken");
+            object.remove("uuid");
+            object.remove("firstKeyfrom");
+            object.remove("latestKeyfrom");
+            object.insert(
+                "available".to_string(),
+                Value::Bool(record.has_credentials()),
+            );
+            object.insert("hasSession".to_string(), Value::Bool(true));
+            object.insert("canRefresh".to_string(), Value::Bool(can_refresh));
+        }
+        value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Map};
+
+    /// 公开形态必须把**令牌本体 + 载荷件**都摘掉（只留一个 canRefresh 布尔）。
+    #[test]
+    fn public_shape_never_leaks_tokens_or_payload_fields() {
+        let record = StoredAccount::from_map({
+            let mut map = Map::new();
+            map.insert("id".into(), Value::String("lobsterai-42".into()));
+            map.insert(
+                "provider".into(),
+                Value::String(LOBSTERAI_PROVIDER_ID.into()),
+            );
+            map.insert("accessToken".into(), Value::String("at".into()));
+            map.insert("refreshToken".into(), Value::String("rt".into()));
+            map.insert("uuid".into(), Value::String("u-1".into()));
+            map.insert("firstKeyfrom".into(), Value::String("fk".into()));
+            map.insert("latestKeyfrom".into(), Value::String("lk".into()));
+            map
+        });
         let refresh_token = record.refresh_token();
-        let mut public = Map::new();
+        // 上游改成「整份 to_value + 摘字段」，本仓后续仍按 Map 写回展示字段：
+        // 这里把对象取成 Map，最后再包回 Value。
+        let mut public = match record.to_value() {
+            Value::Object(map) => map,
+            other => return other,
+        };
+        let can_refresh = public.get("refreshToken").is_some()
+            && public.get("firstKeyfrom").is_some()
+            && public.get("latestKeyfrom").is_some();
+        for key in [
+            "accessToken",
+            "refreshToken",
+            "uuid",
+            "firstKeyfrom",
+            "latestKeyfrom",
+        ] {
+            public.remove(key);
+        }
+        public.insert("canRefresh".into(), Value::Bool(can_refresh));
         for key in [
             "id",
             "provider",
@@ -384,7 +448,10 @@ impl AccountStore {
         );
         public.insert(
             "rateLimits".to_string(),
-            record.get("rateLimits").cloned().unwrap_or_else(|| json!({})),
+            record
+                .get("rateLimits")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
         );
         // 可用 = 有 access token（转发主凭证）或 refresh token（可续期）
         let usable = record

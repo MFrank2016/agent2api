@@ -168,6 +168,8 @@ impl Harness {
             login: LoginService::new(store.clone()),
             upstream: UpstreamService::new(store.clone(), auth.clone()),
             auto_checkin: AutoCheckin::new(store.clone(), billing.clone()),
+            advertisements: Default::default(),
+            panel_events_stop: tokio_util::sync::CancellationToken::new(),
             update: UpdateManager::new(directory.path().join("updates")),
             store,
             auth,

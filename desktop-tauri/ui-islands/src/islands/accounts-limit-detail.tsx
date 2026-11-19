@@ -30,34 +30,38 @@
  * 就不画（`progress: null`），与余额明细「画不出比例就不装作有」同一处置。
  */
 
-import * as React from 'react'
-import { Button, Meter, Popover, PopoverContent, PopoverTrigger } from '@ui'
-import { t } from '../i18n'
-import { activeLimits, formatResetText, RESET_UNKNOWN } from './accounts-domain'
-import type { AccountRecord } from './accounts-shared'
-import type { AccountCooldown } from '../../../ui-shared/account-upstream-state'
+import * as React from "react";
+import { Button, Meter, Popover, PopoverContent, PopoverTrigger } from "@ui";
+import { t } from "../i18n";
+import {
+  activeLimits,
+  formatResetText,
+  RESET_UNKNOWN,
+} from "./accounts-domain";
+import type { AccountRecord } from "./accounts-shared";
+import type { AccountCooldown } from "../../../ui-shared/account-upstream-state";
 
 /** 明细里的一行（`limitRowsOf` 的产物） */
 export type LimitRow = {
   /** 被限流的模型名（后端给的键，原样透出） */
-  model: string
+  model: string;
   /** 右侧读数：相对倒计时；恢复时刻读不到时是「恢复时间未知」 */
-  wait: string
+  wait: string;
   /** 读数语义档：正常有恢复时刻 = warn，读不到 = muted */
-  tone: 'warn' | 'muted'
+  tone: "warn" | "muted";
   /** 第二行左半：`今天 14:20 恢复`；读不到时为空串 */
-  reset: string
+  reset: string;
   /** 第二行右半：上游给的原因（可能为空） */
-  reason: string
+  reason: string;
   /** 原因标签：额度不足 / 额度 / 限流 / 套餐 / 验证（旧记录回落「限流」） */
-  reasonLabel: string
+  reasonLabel: string;
   /** 作用域标签：账号级 / 模型级（旧记录回落「模型级」） */
-  scopeLabel: string
+  scopeLabel: string;
   /** 悬停全文（相对 + 绝对 + 原因 + 这条标记怎么解除） */
-  title: string
+  title: string;
   /** 冷却进度（0–100）；读不到触发时刻时 null = 不画线 */
-  progress: number | null
-}
+  progress: number | null;
+};
 
 /**
  * 剩余毫秒 → 倒计时文案。
@@ -67,15 +71,17 @@ export type LimitRow = {
  * 「还有 1 分钟」比「还有 0 分钟」有意义，而后者会让已经等了 30 秒的人以为该好了。
  */
 function waitText(remainingMs: number): string {
-  const minutes = Math.round(remainingMs / 60000)
-  if (minutes < 1) return t('不到 1 分钟')
-  if (minutes < 60) return t('还有 {n} 分钟', { n: minutes })
-  const hours = Math.floor(minutes / 60)
-  const rest = minutes % 60
+  const minutes = Math.round(remainingMs / 60000);
+  if (minutes < 1) return t("不到 1 分钟");
+  if (minutes < 60) return t("还有 {n} 分钟", { n: minutes });
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
   if (hours < 24) {
-    return rest ? t('还有 {h} 小时 {m} 分', { h: hours, m: rest }) : t('还有 {h} 小时', { h: hours })
+    return rest
+      ? t("还有 {h} 小时 {m} 分", { h: hours, m: rest })
+      : t("还有 {h} 小时", { h: hours });
   }
-  return t('还有 {d} 天', { d: Math.floor(hours / 24) })
+  return t("还有 {d} 天", { d: Math.floor(hours / 24) });
 }
 
 /**
@@ -86,12 +92,18 @@ function waitText(remainingMs: number): string {
  */
 function reasonLabelOf(reason: string | undefined): string {
   switch (reason) {
-    case 'credit': return t('额度不足')
-    case 'quota': return t('额度')
-    case 'rate': return t('限流')
-    case 'plan': return t('套餐')
-    case 'verification': return t('验证')
-    default: return t('限流')
+    case "credit":
+      return t("额度不足");
+    case "quota":
+      return t("额度");
+    case "rate":
+      return t("限流");
+    case "plan":
+      return t("套餐");
+    case "verification":
+      return t("验证");
+    default:
+      return t("限流");
   }
 }
 
@@ -102,7 +114,7 @@ function reasonLabelOf(reason: string | undefined): string {
  * 那时一条冷却只停一个模型，不能反过来把整号说成停用。
  */
 function scopeLabelOf(scope: string | undefined): string {
-  return scope === 'account' ? t('账号级') : t('模型级')
+  return scope === "account" ? t("账号级") : t("模型级");
 }
 
 /**
@@ -111,26 +123,39 @@ function scopeLabelOf(scope: string | undefined): string {
  * 顺序照 `activeLimits` 给的（按恢复时间升序，最早恢复的排最前）：先回来的排最前，
  * 与列上那句「最早 … 恢复」说的是同一条记录，两处不会对不上。
  */
-export function limitRowsOf(account: AccountRecord | null | undefined): LimitRow[] {
-  const now = Date.now()
-  return activeLimits(account).map(entry => {
-    const resetAt = Number(entry.resetAt)
-    const started = Number(entry.at)
-    const reset = formatResetText(entry.resetAt)
-    const unknown = reset === RESET_UNKNOWN
-    const reason = entry.message || (entry.status ? t('上游返回 {status}', { status: entry.status }) : '')
-    const reasonLabel = reasonLabelOf(entry.reason)
-    const scopeLabel = scopeLabelOf(entry.scope)
-    const span = resetAt - started
-    const progress = started > 0 && Number.isFinite(span) && span > 0
-      ? Math.max(0, Math.min(100, ((now - started) / span) * 100))
-      : null
-    const wait = unknown ? t('恢复时间未知') : waitText(resetAt - now)
-    const resetLine = unknown ? '' : t('{time} 恢复', { time: reset })
+export function limitRowsOf(
+  account: AccountRecord | null | undefined,
+): LimitRow[] {
+  const now = Date.now();
+  return activeLimits(account).map((entry) => {
+    const resetAt = Number(entry.resetAt);
+    const started = Number(entry.at);
+    const reset = formatResetText(entry.resetAt);
+    const unknown = reset === RESET_UNKNOWN;
+    const reason = [
+      entry.message ||
+        (entry.status ? t("上游返回 {status}", { status: entry.status }) : ""),
+      entry.timeSource === "upstream"
+        ? t("冷却来自上游时间")
+        : entry.timeSource === "fallback"
+          ? t("冷却来自本机估算")
+          : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    const reasonLabel = reasonLabelOf(entry.reason);
+    const scopeLabel = scopeLabelOf(entry.scope);
+    const span = resetAt - started;
+    const progress =
+      started > 0 && Number.isFinite(span) && span > 0
+        ? Math.max(0, Math.min(100, ((now - started) / span) * 100))
+        : null;
+    const wait = unknown ? t("恢复时间未知") : waitText(resetAt - now);
+    const resetLine = unknown ? "" : t("{time} 恢复", { time: reset });
     return {
       model: entry.model,
       wait,
-      tone: unknown ? 'muted' : 'warn',
+      tone: unknown ? "muted" : "warn",
       reset: resetLine,
       reason,
       reasonLabel,
@@ -141,11 +166,13 @@ export function limitRowsOf(account: AccountRecord | null | undefined): LimitRow
         wait,
         resetLine,
         reason,
-        t('到恢复时间后自动解除，无需手动操作'),
-      ].filter(Boolean).join(' · '),
+        t("到恢复时间后自动解除，无需手动操作"),
+      ]
+        .filter(Boolean)
+        .join(" · "),
       progress,
-    }
-  })
+    };
+  });
 }
 
 /**
@@ -156,97 +183,172 @@ export function limitRowsOf(account: AccountRecord | null | undefined): LimitRow
  *
  * `soonest` 在账号冷却时读账号恢复时刻，否则读最早解除的模型记录。
  */
-export function LimitDetailButton({ accountName, rows, count, cooldown, soonest, onClear }: {
-  accountName: string
-  rows: LimitRow[]
-  count: number
-  cooldown: AccountCooldown | null
-  soonest: string
-  onClear: (model: string) => void
+export function LimitDetailButton({
+  accountName,
+  rows,
+  count,
+  cooldown,
+  soonest,
+  onClear,
+}: {
+  accountName: string;
+  rows: LimitRow[];
+  count: number;
+  cooldown: AccountCooldown | null;
+  soonest: string;
+  onClear: (model: string) => void;
 }) {
-  const [open, setOpen] = React.useState(false)
+  const [open, setOpen] = React.useState(false);
 
   /**
    * 初始焦点落在滚动容器上而不是「第一个可聚焦的元素」，与积分明细同一处置
    * （理由见 accounts-credit-detail.tsx：库的默认行为会把焦点给第一个可聚焦元素、
    * 浏览器再把它滚进视野，列表一长就"一开就停在中间"）。容器带 `tabIndex={-1}`。
    */
-  const boxRef = React.useRef<HTMLDivElement | null>(null)
+  const boxRef = React.useRef<HTMLDivElement | null>(null);
   const attachBox = React.useCallback((node: HTMLDivElement | null) => {
-    boxRef.current = node
-    if (node) node.scrollTop = 0
-  }, [])
-  const initialFocus = React.useCallback(() => boxRef.current ?? null, [])
+    boxRef.current = node;
+    if (node) node.scrollTop = 0;
+  }, []);
+  const initialFocus = React.useCallback(() => boxRef.current ?? null, []);
 
-  const earliest = soonest === RESET_UNKNOWN ? t('待定') : soonest
+  const cooldownLabel =
+    cooldown?.scope === "provider" ? t("提供商共享冷却") : t("账号冷却");
+  const cooldownSource =
+    cooldown?.timeSource === "upstream"
+      ? t("冷却来自上游时间")
+      : cooldown?.timeSource === "fallback"
+        ? t("冷却来自本机估算")
+        : "";
+  const earliest = soonest === RESET_UNKNOWN ? t("待定") : soonest;
 
   return (
     <>
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger
-          render={<Button size='default' variant='ghost' type='button' className='usage-toggle warn'
-            title={cooldown ? t('点击查看账号冷却与模型限流明细') : t('点击查看各模型的限流明细')} aria-label={t('限流明细')} />}
+          render={
+            <Button
+              size="default"
+              variant="ghost"
+              type="button"
+              className="usage-toggle warn"
+              title={
+                cooldown
+                  ? t("点击查看账号冷却与模型限流明细")
+                  : t("点击查看各模型的限流明细")
+              }
+              aria-label={t("限流明细")}
+            />
+          }
         >
-          <span className='val'>{cooldown ? t('账号冷却') : t('{n} 个模型', { n: count })}</span>
-          <span className='caret' aria-hidden>▾</span>
+          <span className="val">
+            {cooldown ? cooldownLabel : t("{n} 个模型", { n: count })}
+          </span>
+          <span className="caret" aria-hidden>
+            ▾
+          </span>
         </PopoverTrigger>
         {/* `align='center'`：与「积分明细」同一处置（理由见 accounts-credit-detail
             的同名参数）—— 这两列的按钮都靠右，'end' 会把弹层甩到表格右外侧。 */}
-        <PopoverContent align='center' sideOffset={6} className='w-[320px]' initialFocus={initialFocus}>
-
-          <div className='usage-pop-limit' ref={attachBox} tabIndex={-1}>
-            {accountName ? <div className='usage-pop-sub'>{accountName}</div> : null}
-            <div className='usage-pop-group'>{t('限流明细')}</div>
+        <PopoverContent
+          align="center"
+          sideOffset={6}
+          className="w-[320px]"
+          initialFocus={initialFocus}
+        >
+          <div className="usage-pop-limit" ref={attachBox} tabIndex={-1}>
+            {accountName ? (
+              <div className="usage-pop-sub">{accountName}</div>
+            ) : null}
+            <div className="usage-pop-group">{t("限流明细")}</div>
             {cooldown ? (
-              <div className='usage-pop-row'>
-                <div className='usage-pop-line'>
-                  <span className='usage-pop-name'>{t('账号冷却')}</span>
-                  <span className='usage-pop-view warn'>{waitText(cooldown.resetAt - Date.now())}</span>
+              <div className="usage-pop-row">
+                <div className="usage-pop-line">
+                  <span className="usage-pop-name">{cooldownLabel}</span>
+                  <span className="usage-pop-view warn">
+                    {waitText(cooldown.resetAt - Date.now())}
+                  </span>
                 </div>
-                <div className='lp-pop-subline'>
-                  <span className='lp-pop-reason'>
-                    {t('{time} 恢复', { time: soonest })}{cooldown.message ? ` · ${cooldown.message}` : ''}
+                <div className="lp-pop-subline">
+                  <span className="lp-pop-reason">
+                    {t("{time} 恢复", { time: soonest })}
+                    {cooldown.message ? ` · ${cooldown.message}` : ""}
+                    {cooldownSource ? ` · ${cooldownSource}` : ""}
                   </span>
                 </div>
               </div>
             ) : null}
-            {rows.map(row => (
-              <div className='usage-pop-row' key={row.model} title={row.title}>
-                <div className='usage-pop-line'>
-                  <span className='usage-pop-name lp-pop-model'>{row.model}</span>
-                  <span className={`usage-pop-view ${row.tone}`}>{row.wait}</span>
+            {rows.map((row) => (
+              <div className="usage-pop-row" key={row.model} title={row.title}>
+                <div className="usage-pop-line">
+                  <span className="usage-pop-name lp-pop-model">
+                    {row.model}
+                  </span>
+                  <span className={`usage-pop-view ${row.tone}`}>
+                    {row.wait}
+                  </span>
                 </div>
-                <div className='lp-pop-subline'>
-                  <span className='lp-pop-tags'>
-                    <span className='lp-pop-tag'>{row.reasonLabel}</span>
-                    <span className='lp-pop-tag'>{row.scopeLabel}</span>
+                <div className="lp-pop-subline">
+                  <span className="lp-pop-tags">
+                    <span className="lp-pop-tag">{row.reasonLabel}</span>
+                    <span className="lp-pop-tag">{row.scopeLabel}</span>
                   </span>
-                  <span className='lp-pop-reason'>
-                    {row.reset ? `${row.reset} · ` : ''}{row.reason}
+                  <span className="lp-pop-reason">
+                    {row.reset ? `${row.reset} · ` : ""}
+                    {row.reason}
                   </span>
-                  <Button variant='ghost' size='xs'
-                    title={t('清掉本机的限流标记，立刻重新尝试该模型（上游若仍在限流会再次被标记）')}
-                    onClick={() => onClear(row.model)}>{t('清除')}</Button>
+                  <Button
+                    variant="ghost"
+                    size="xs"
+                    title={t(
+                      "清掉本机的限流标记，立刻重新尝试该模型（上游若仍在限流会再次被标记）",
+                    )}
+                    onClick={() => onClear(row.model)}
+                  >
+                    {t("清除")}
+                  </Button>
                 </div>
                 {row.progress !== null ? (
-                  <Meter value={row.progress} variant='muted' className='mt-1.5' trackClassName='h-[3px]'
-                    aria-label={t('冷却进度 {percent}%', { percent: Math.round(row.progress) })} />
+                  <Meter
+                    value={row.progress}
+                    variant="muted"
+                    className="mt-1.5"
+                    trackClassName="h-[3px]"
+                    aria-label={t("冷却进度 {percent}%", {
+                      percent: Math.round(row.progress),
+                    })}
+                  />
                 ) : null}
               </div>
             ))}
-            <div className='lp-pop-foot'>
-              <span className='lp-pop-note'>{cooldown
-                ? t('账号全部模型暂时停止转发 · 到恢复时间自动解除')
-                : t('{n} 个模型限流中 · 到恢复时间自动解除', { n: count })}</span>
-              <Button variant='outline' size='xs' title={t('清除该账号的冷却与全部模型限流标记')}
-                onClick={() => onClear('')}>{t('全部清除')}</Button>
+            <div className="lp-pop-foot">
+              <span className="lp-pop-note">
+                {cooldown
+                  ? cooldown.scope === "provider"
+                    ? t("同一提供商的账号暂时停止转发 · 到恢复时间自动解除")
+                    : t("账号全部模型暂时停止转发 · 到恢复时间自动解除")
+                  : t("{n} 个模型限流中 · 到恢复时间自动解除", { n: count })}
+              </span>
+              <Button
+                variant="outline"
+                size="xs"
+                title={t("清除该账号的冷却与全部模型限流标记")}
+                onClick={() => onClear("")}
+              >
+                {t("全部清除")}
+              </Button>
             </div>
           </div>
         </PopoverContent>
       </Popover>
-      <span className='lim-sub' title={cooldown ? t('账号冷却') : t('最早恢复')}>
-        {cooldown ? t('{time} 恢复', { time: earliest }) : t('最早 {soonest} 恢复', { soonest: earliest })}
+      <span
+        className="lim-sub"
+        title={cooldown ? cooldownLabel : t("最早恢复")}
+      >
+        {cooldown
+          ? t("{time} 恢复", { time: earliest })
+          : t("最早 {soonest} 恢复", { soonest: earliest })}
       </span>
     </>
-  )
+  );
 }

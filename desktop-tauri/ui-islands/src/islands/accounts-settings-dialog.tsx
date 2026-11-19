@@ -60,6 +60,7 @@ import {
   type BalanceFieldKey,
 } from "./balance-query";
 import { UserAgentInput, useUserAgentPresets, userAgentEditable } from './add-account-user-agent'
+import { AccountUsageRecovery, AccountClineCredentials } from './accounts-usage-recovery'
 import {
   limiterDraftOf,
   LimiterSection,
@@ -140,8 +141,9 @@ export function AccountSettingsDialog({
   /** 账号级自定义 User-Agent 草稿（空串 = 用该家自己的默认值） */
   const [userAgent, setUserAgent] = React.useState(account?.userAgent || '')
   const uaPresets = useUserAgentPresets()
-  // 会话式家由插件自己拼出站头，网关覆盖不到 —— 整段不渲染
-  const uaEditable = userAgentEditable(providerOf(account || { id }))
+  // 会话式家由插件自己拼出站头，网关覆盖不到 —— 整段不渲染；
+  // 后端给了逐家判定（userAgentOverridable）时以后端为准
+  const uaEditable = account?.userAgentOverridable ?? userAgentEditable(providerOf(account || { id }))
   const [proxyDraft, setProxyDraft] = React.useState<ProxyDraft>(() =>
     draftOfProxy(account?.proxy),
   );
@@ -151,6 +153,7 @@ export function AccountSettingsDialog({
     zcodePlanOf(account),
   );
   const [busy, setBusy] = React.useState(false);
+  const [recoveryBusy, setRecoveryBusy] = React.useState(false);
   const [status, setStatus] = React.useState<React.ReactNode>("");
   const [provider, setProvider] = React.useState<ProviderSettings | null>(null);
   const [providerName, setProviderName] = React.useState("");
@@ -213,9 +216,11 @@ export function AccountSettingsDialog({
     accountsCapDraft,
     queueDraft,
   });
-  const credentialLabel = providerOf(account).startsWith("custom-")
-    ? t("凭证设置")
-    : t("凭证与套餐");
+  const credentialLabel =
+    providerOf(account).startsWith("custom-") ||
+    providerOf(account) === "cline-free"
+      ? t("凭证设置")
+      : t("凭证与套餐");
   const paneInfo: Record<
     PaneId,
     { title: string; description: string; icon: string }
@@ -389,7 +394,7 @@ export function AccountSettingsDialog({
     ),
   };
   const dirtyCount = Object.values(dirtyPanes).filter(Boolean).length;
-  const interactionBusy = busy || confirming;
+  const interactionBusy = busy || confirming || recoveryBusy;
 
   async function askConfirmation(
     title: string,
@@ -810,7 +815,7 @@ export function AccountSettingsDialog({
       const nextUserAgent = userAgent.trim()
       const saved = await updateAccountConfirmed(id, {
         ...(nextName !== target.name ? { name: nextName } : {}),
-        ...(nextUserAgent !== (target.userAgent || '').trim() ? { userAgent: nextUserAgent } : {}),
+        ...(uaEditable && nextUserAgent !== (target.userAgent || '').trim() ? { userAgent: nextUserAgent } : {}),
         enabled,
         allowRouteSkip,
         proxy,
@@ -898,7 +903,10 @@ export function AccountSettingsDialog({
   const concDefault =
     Number(providerFeatures(providerOf(target)).concurrencyDefault) || 0;
   const hasCredentialPane =
-    isCatpaw || isCustomAccount || supportsPlanChannel(target);
+    isCatpaw ||
+    isCustomAccount ||
+    supportsPlanChannel(target) ||
+    providerOf(target) === "cline-free";
   const accountPanes: PaneId[] = [
     "basic",
     ...(hasCredentialPane ? ["credential" as const] : []),
@@ -1246,6 +1254,15 @@ export function AccountSettingsDialog({
 
                   {pane === "credential" && hasCredentialPane ? (
                     <>
+                      {/* Cline 免费池：上游没给刷新入口，这里单独提供一次凭证续期 */}
+                      {providerOf(target) === "cline-free" ? (
+                        <AccountClineCredentials
+                          account={target}
+                          disabled={busy || confirming}
+                          onBusyChange={setRecoveryBusy}
+                          onSaved={setAccount}
+                        />
+                      ) : null}
                       {isCatpaw ? (
                         <BalanceTokenField
                           configured={account.hasBalanceToken === true}
@@ -1307,7 +1324,16 @@ export function AccountSettingsDialog({
 
                   {pane === "query" && supportsUsage(target) ? (
                     <>
-                      <SettingGroup title={t("自动查询余额")}>
+                      {/* OfficeAce / Cline 免费池：上游不给余额查询，只能补一次读数 */}
+                      {["officeace", "cline-free"].includes(providerOf(target)) ? (
+                        <AccountUsageRecovery
+                          account={target}
+                          disabled={busy || confirming}
+                          onBusyChange={setRecoveryBusy}
+                          onCredential={() => selectPane("credential")}
+                        />
+                      ) : null}
+                      <SettingGroup title={t("余额查询")}>
                         <UsageSettingsSection
                           draft={usageDraft}
                           onChange={setUsageDraft}
