@@ -60,7 +60,6 @@ import {
   type BalanceFieldKey,
 } from "./balance-query";
 import { UserAgentInput, useUserAgentPresets, userAgentEditable } from './add-account-user-agent'
-import { AccountUsageRecovery, AccountClineCredentials } from './accounts-usage-recovery'
 import {
   limiterDraftOf,
   LimiterSection,
@@ -117,18 +116,10 @@ function labelOf(account: AccountLike | null | undefined): string {
   return displayNameOf(account) || account?.id || "";
 }
 
-export function AccountSettingsDialog({
-  id,
-  onClose,
-  initialAccount,
-  initialPane = "basic",
-  routeContext,
-}: {
-  id: string;
-  onClose: () => void;
-  initialAccount?: AccountRecord;
-  initialPane?: PaneId;
-  routeContext?: React.ReactNode;
+export function AccountSettingsDialog({ id, onClose, initialAccount, routeContext }: {
+  id: string; onClose: () => void
+  initialAccount?: AccountRecord
+  routeContext?: React.ReactNode
 }) {
   const [account, setAccount] = React.useState(
     () => initialAccount || findAccount(id),
@@ -149,17 +140,13 @@ export function AccountSettingsDialog({
   );
   const [balanceToken, setBalanceToken] = React.useState("");
   // ZCode 的「使用哪个套餐」草稿（非 ZCode 账号恒为空串，那一段也不渲染）
-  const [planChannel, setPlanChannel] = React.useState(() =>
-    zcodePlanOf(account),
-  );
-  const [busy, setBusy] = React.useState(false);
-  const [recoveryBusy, setRecoveryBusy] = React.useState(false);
-  const [status, setStatus] = React.useState<React.ReactNode>("");
-  const [provider, setProvider] = React.useState<ProviderSettings | null>(null);
-  const [providerName, setProviderName] = React.useState("");
-  const [providerProtocol, setProviderProtocol] =
-    React.useState("chat_completions");
-  const [providerBaseUrl, setProviderBaseUrl] = React.useState("");
+  const [planChannel, setPlanChannel] = React.useState(() => zcodePlanOf(account))
+  const [busy, setBusy] = React.useState(false)
+  const [status, setStatus] = React.useState<React.ReactNode>('')
+  const [provider, setProvider] = React.useState<ProviderSettings | null>(null)
+  const [providerName, setProviderName] = React.useState('')
+  const [providerProtocol, setProviderProtocol] = React.useState('chat_completions')
+  const [providerBaseUrl, setProviderBaseUrl] = React.useState('')
   /** 客户端形态伪装草稿（'' = 不伪装；'opencode' = 按官方 CLI 形状补齐请求） */
   const [providerEmulation, setProviderEmulation] = React.useState("");
   /** 自定义账号的凭证草稿：新 Key（留空 = 不改，走「清除」按钮）与「无需鉴权」勾选 */
@@ -182,7 +169,7 @@ export function AccountSettingsDialog({
     limiterDraftOf(account),
   );
   // 分组导航的当前页（弹窗按账号 id 挂载，切账号自然回到「基本」）
-  const [pane, setPane] = React.useState<PaneId>(initialPane);
+  const [pane, setPane] = React.useState<PaneId>('basic')
   // 并发上限草稿（原列表 ⋯ 菜单的 conc-dialog 迁入「基本」分组）：0~999，0 = 不限
   const [concDraft, setConcDraft] = React.useState(() =>
     String(Number(account?.maxConcurrent) || 0),
@@ -201,62 +188,20 @@ export function AccountSettingsDialog({
   const paneScroll = React.useRef<HTMLDivElement | null>(null);
   const panePositions = React.useRef<Partial<Record<PaneId, number>>>({});
   const initial = React.useRef({
-    enabled,
-    allowRouteSkip,
-    name,
-    userAgent,
-    proxyDraft,
-    planChannel,
-    usageDraft,
-    balanceQueryDraft,
-    limiterDraft,
-    concDraft,
-    noAuthDraft,
-    rpmDraft,
-    accountsCapDraft,
-    queueDraft,
-  });
-  const credentialLabel =
-    providerOf(account).startsWith("custom-") ||
-    providerOf(account) === "cline-free"
-      ? t("凭证设置")
-      : t("凭证与套餐");
-  const paneInfo: Record<
-    PaneId,
-    { title: string; description: string; icon: string }
-  > = {
-    basic: {
-      title: t("基本信息"),
-      description: t("设置账号名称、启用状态与转发行为。"),
-      icon: "sliders",
-    },
-    credential: {
-      title: credentialLabel,
-      description: t("管理当前账号的凭证与可用套餐。"),
-      icon: "key",
-    },
-    query: {
-      title: t("查询设置"),
-      description: t("配置余额查询凭证、自动刷新间隔与失败重试。"),
-      icon: "refresh",
-    },
-    limiter: {
-      title: t("限制器"),
-      description: t("用明确的规则保护当前账号的额度。"),
-      icon: "shield",
-    },
-    network: {
-      title: t("网络"),
-      description: t("设置当前账号访问上游的出网方式。"),
-      icon: "proxies",
-    },
-    provider: {
-      title: t("连接设置"),
-      description: t("统一管理提供商的协议、地址与兼容选项。"),
-      icon: "agent",
-    },
-  };
-  const currentPane = paneInfo[pane];
+    enabled, allowRouteSkip, name, userAgent, proxyDraft, planChannel, usageDraft,
+    balanceQueryDraft, limiterDraft, concDraft, noAuthDraft,
+    rpmDraft, accountsCapDraft, queueDraft,
+  })
+  const credentialLabel = providerOf(account).startsWith('custom-') ? t('凭证设置') : t('凭证与套餐')
+  const paneInfo: Record<PaneId, { title: string; description: string; icon: string }> = {
+    basic: { title: t('基本信息'), description: t('设置账号名称、启用状态与转发行为。'), icon: 'sliders' },
+    credential: { title: credentialLabel, description: t('管理当前账号的凭证与可用套餐。'), icon: 'key' },
+    query: { title: t('查询设置'), description: t('配置余额查询凭证、自动刷新间隔与失败重试。'), icon: 'refresh' },
+    limiter: { title: t('限制器'), description: t('用明确的规则保护当前账号的额度。'), icon: 'shield' },
+    network: { title: t('网络'), description: t('设置当前账号访问上游的出网方式。'), icon: 'proxies' },
+    provider: { title: t('连接设置'), description: t('统一管理提供商的协议、地址与兼容选项。'), icon: 'agent' },
+  }
+  const currentPane = paneInfo[pane]
   React.useLayoutEffect(() => {
     if (paneScroll.current)
       paneScroll.current.scrollTop = panePositions.current[pane] || 0;
@@ -385,16 +330,13 @@ export function AccountSettingsDialog({
       !same(balanceQueryDraft, before.balanceQueryDraft),
     limiter: !same(limiterDraft, before.limiterDraft),
     network: !same(proxyDraft, before.proxyDraft),
-    provider: Boolean(
-      provider &&
-      (providerName.trim() !== (provider.name || "") ||
-        providerProtocol !== (provider.protocol || "chat_completions") ||
-        providerBaseUrl.trim() !== (provider.baseUrl || "") ||
-        providerEmulation !== (provider.clientEmulation || "")),
-    ),
-  };
-  const dirtyCount = Object.values(dirtyPanes).filter(Boolean).length;
-  const interactionBusy = busy || confirming || recoveryBusy;
+    provider: Boolean(provider && (
+      providerName.trim() !== (provider.name || '') || providerProtocol !== (provider.protocol || 'chat_completions')
+      || providerBaseUrl.trim() !== (provider.baseUrl || '') || providerEmulation !== (provider.clientEmulation || '')
+    )),
+  }
+  const dirtyCount = Object.values(dirtyPanes).filter(Boolean).length
+  const interactionBusy = busy || confirming
 
   async function askConfirmation(
     title: string,
@@ -900,24 +842,11 @@ export function AccountSettingsDialog({
   }
 
   // 内置账号仅在有余额凭证或套餐通道时显示凭证分区。
-  const concDefault =
-    Number(providerFeatures(providerOf(target)).concurrencyDefault) || 0;
-  const hasCredentialPane =
-    isCatpaw ||
-    isCustomAccount ||
-    supportsPlanChannel(target) ||
-    providerOf(target) === "cline-free";
-  const accountPanes: PaneId[] = [
-    "basic",
-    ...(hasCredentialPane ? ["credential" as const] : []),
-    ...(supportsUsage(target) ? ["query" as const] : []),
-    "limiter",
-    "network",
-  ];
-  const providerLabel =
-    provider?.name ||
-    shared().wbProviders?.labelOf?.(providerOf(target)) ||
-    providerOf(target);
+  const concDefault = Number(providerFeatures(providerOf(target)).concurrencyDefault) || 0
+  const hasCredentialPane = isCatpaw || isCustomAccount || supportsPlanChannel(target)
+  const accountPanes: PaneId[] = ['basic', ...(hasCredentialPane ? ['credential' as const] : []),
+    ...(supportsUsage(target) ? ['query' as const] : []), 'limiter', 'network']
+  const providerLabel = provider?.name || shared().wbProviders?.labelOf?.(providerOf(target)) || providerOf(target)
 
   async function removeProvider(): Promise<void> {
     if (interactionBusy || actionLock.current || !provider) return;
@@ -1252,131 +1181,35 @@ export function AccountSettingsDialog({
                     </>
                   ) : null}
 
-                  {pane === "credential" && hasCredentialPane ? (
-                    <>
-                      {/* Cline 免费池：上游没给刷新入口，这里单独提供一次凭证续期 */}
-                      {providerOf(target) === "cline-free" ? (
-                        <AccountClineCredentials
-                          account={target}
-                          disabled={busy || confirming}
-                          onBusyChange={setRecoveryBusy}
-                          onSaved={setAccount}
-                        />
-                      ) : null}
-                      {isCatpaw ? (
-                        <BalanceTokenField
-                          configured={account.hasBalanceToken === true}
-                          value={balanceToken}
-                          onChange={setBalanceToken}
-                          clearBusy={interactionBusy}
-                          onClear={() => void clearBalanceToken()}
-                        />
-                      ) : null}
-                      {isCustomAccount ? (
-                        <CustomCredentialFields
-                          hasApiKey={target.hasApiKey === true}
-                          noAuth={noAuthDraft}
-                          value={apiKeyDraft}
-                          clearBusy={interactionBusy}
-                          onClear={() => void clearApiKey()}
-                          onValue={(next) => {
-                            setApiKeyDraft(next);
-                            if (next.trim()) setNoAuthDraft(false);
-                          }}
-                          onToggleNoAuth={(next) => {
-                            setNoAuthDraft(next);
-                            if (next) setApiKeyDraft("");
-                          }}
-                        />
-                      ) : null}
-                      {supportsPlanChannel(target) ? (
-                        <SettingGroup title={t("使用套餐")}>
-                          <PlanChannelField
-                            plan={planChannel}
-                            hasJwt={account.canClaim === true}
-                            onChange={setPlanChannel}
-                          />
-                        </SettingGroup>
-                      ) : null}
-                      {provider ? (
-                        <div className="acct-dlg-related">
-                          <AccountSettingsIcon name="agent" size={18} />
-                          <div>
-                            <h3>{t("要修改连接地址或协议？")}</h3>
-                            <p>
-                              {t("{count} 个账号共用提供商的连接配置。", {
-                                count: providerCount,
-                              })}
-                            </p>
-                          </div>
-                          <Button
-                            variant="link"
-                            size="xs"
-                            onClick={() => selectPane("provider")}
-                          >
-                            {t("连接设置")}
-                            <AccountSettingsIcon name="caretRight" size={12} />
-                          </Button>
-                        </div>
-                      ) : null}
-                    </>
-                  ) : null}
+                  {pane === 'credential' && hasCredentialPane ? <>
+                    {isCatpaw ? <BalanceTokenField configured={account.hasBalanceToken === true} value={balanceToken}
+                      onChange={setBalanceToken} clearBusy={interactionBusy} onClear={() => void clearBalanceToken()} /> : null}
+                    {isCustomAccount ? <CustomCredentialFields hasApiKey={target.hasApiKey === true} noAuth={noAuthDraft}
+                      value={apiKeyDraft} clearBusy={interactionBusy} onClear={() => void clearApiKey()}
+                      onValue={next => { setApiKeyDraft(next); if (next.trim()) setNoAuthDraft(false) }}
+                      onToggleNoAuth={next => { setNoAuthDraft(next); if (next) setApiKeyDraft('') }} /> : null}
+                    {supportsPlanChannel(target) ? <SettingGroup title={t('使用套餐')}>
+                      <PlanChannelField plan={planChannel} hasJwt={account.canClaim === true} onChange={setPlanChannel} />
+                    </SettingGroup> : null}
+                    {provider ? <div className='acct-dlg-related'>
+                      <AccountSettingsIcon name='agent' size={18} />
+                      <div><h3>{t('要修改连接地址或协议？')}</h3><p>{t('{count} 个账号共用提供商的连接配置。', { count: providerCount })}</p></div>
+                      <Button variant='link' size='xs' onClick={() => selectPane('provider')}>{t('连接设置')}<AccountSettingsIcon name='caretRight' size={12} /></Button>
+                    </div> : null}
+                  </> : null}
 
-                  {pane === "query" && supportsUsage(target) ? (
-                    <>
-                      {/* OfficeAce / Cline 免费池：上游不给余额查询，只能补一次读数 */}
-                      {["officeace", "cline-free"].includes(providerOf(target)) ? (
-                        <AccountUsageRecovery
-                          account={target}
-                          disabled={busy || confirming}
-                          onBusyChange={setRecoveryBusy}
-                          onCredential={() => selectPane("credential")}
-                        />
-                      ) : null}
-                      <SettingGroup title={t("余额查询")}>
-                        <UsageSettingsSection
-                          draft={usageDraft}
-                          onChange={setUsageDraft}
-                        />
-                      </SettingGroup>
-                      {balanceSpec ? (
-                        <SettingGroup
-                          title={t("查询凭证")}
-                          action={
-                            <Badge variant="secondary" shape="tag">
-                              {balanceSpec.label}
-                            </Badge>
-                          }
-                        >
-                          <BalanceQuerySection
-                            spec={balanceSpec}
-                            values={balanceQueryDraft}
-                            configured={balanceConfigured}
-                            onValue={(key, next) =>
-                              setBalanceQueryDraft((prev) => ({
-                                ...prev,
-                                [key]: next,
-                              }))
-                            }
-                            onClear={(key) => void clearBalanceQueryField(key)}
-                            clearBusy={interactionBusy}
-                            idPrefix="account-balance-query"
-                          />
-                          {balanceNeedsCredentials ? (
-                            <p className="detail acct-dlg-inline-note">
-                              {t(
-                                "查询凭证还没配齐：填好后余额列才有读数，在此之前会显示「未配置」。",
-                              )}
-                            </p>
-                          ) : null}
-                        </SettingGroup>
-                      ) : null}
-                      <p className="detail acct-dlg-group-note">
-                        <AccountSettingsIcon name="info" size={14} />
-                        {t("余额读数也是限制器余额规则的数据来源。")}
-                      </p>
-                    </>
-                  ) : null}
+                  {pane === 'query' && supportsUsage(target) ? <>
+                    <SettingGroup title={t('余额查询')}>
+                      <UsageSettingsSection draft={usageDraft} onChange={setUsageDraft} />
+                    </SettingGroup>
+                    {balanceSpec ? <SettingGroup title={t('查询凭证')} action={<Badge variant='secondary' shape='tag'>{balanceSpec.label}</Badge>}>
+                      <BalanceQuerySection spec={balanceSpec} values={balanceQueryDraft} configured={balanceConfigured}
+                        onValue={(key, next) => setBalanceQueryDraft(prev => ({ ...prev, [key]: next }))}
+                        onClear={key => void clearBalanceQueryField(key)} clearBusy={interactionBusy} idPrefix='account-balance-query' />
+                      {balanceNeedsCredentials ? <p className='detail acct-dlg-inline-note'>{t('查询凭证还没配齐：填好后余额列才有读数，在此之前会显示「未配置」。')}</p> : null}
+                    </SettingGroup> : null}
+                    <p className='detail acct-dlg-group-note'><AccountSettingsIcon name='info' size={14} />{t('余额读数也是限制器余额规则的数据来源。')}</p>
+                  </> : null}
 
                   {pane === "limiter" ? (
                     <>

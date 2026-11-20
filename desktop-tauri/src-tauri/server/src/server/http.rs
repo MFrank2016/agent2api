@@ -708,10 +708,6 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/plugins/enrollment/codearts/confirm", post(api::plugin_codearts_enrollment::confirm))
         .route("/api/plugins/enrollment/codearts/cancel", post(api::plugin_codearts_enrollment::cancel))
         .route("/api/plugins/enrollment/codearts/status", get(api::plugin_codearts_enrollment::status))
-        .route("/api/plugins/enrollment/cline-free/prepare", post(api::plugin_cline_free_enrollment::prepare))
-        .route("/api/plugins/enrollment/cline-free/confirm", post(api::plugin_cline_free_enrollment::confirm))
-        .route("/api/plugins/enrollment/cline-free/cancel", post(api::plugin_cline_free_enrollment::cancel))
-        .route("/api/plugins/enrollment/cline-free/status", get(api::plugin_cline_free_enrollment::status))
         .route("/api/plugins/permissions", get(api::plugin_permissions::list).patch(api::plugin_permissions::configure))
         .route("/api/plugins/settings", get(api::plugins::settings).patch(api::plugins::save_settings))
         .route("/api/plugins/capacity", get(api::runtime_capacity::get).patch(api::runtime_capacity::save))
@@ -1595,6 +1591,7 @@ mod cors_tests {
     }
 
     async fn gateway_cors_cases() {
+        crate::server::config::init(None);
         // ── 关闭（默认）：行为与修复前逐字一致 ──
         crate::server::config::set_cors_enabled(false);
         let router = probe_router();

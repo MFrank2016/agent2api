@@ -395,9 +395,13 @@ let telemetry = Arc::new(RequestTelemetry::with_model_key(key_source.map(|Extens
             let response = error_response(context, &error, |status, error| {
                 if let Some(response) = native_response::error_response(WireProtocol::Responses, status, error) { return response; }
                 let code = anthropic::responses_error_code(status);
-                GatewayError::with_status(i32::from(status), error.message.clone())
+                let mut mapped = GatewayError::with_status(i32::from(status), error.message.clone())
                     .with_code(code)
-                    .payload_response()
+                    .with_optional_reason(error.reason.clone());
+                if let Some(seconds) = error.retry_after_secs {
+                    mapped = mapped.with_retry_after_seconds(seconds);
+                }
+                mapped.payload_response()
             });
             // 记账已完成（含手动终止的 408）：解除兜底并注销令牌
             guard.complete();
@@ -648,7 +652,7 @@ let telemetry = Arc::new(RequestTelemetry::with_model_key(key_source.map(|Extens
             logging::console_line("[Model]", &format!("❌ {message}"));
             let response = error_response(context, &error, |status, error| {
                 if let Some(response) = native_response::error_response(WireProtocol::Anthropic, status, error) { return response; }
-                anthropic_error_response_with_status(status, &error.message)
+                anthropic_error_response_with_status(status, error)
             });
             // 记账已完成（含手动终止的 408）：解除兜底并注销令牌
             guard.complete();
@@ -680,18 +684,33 @@ async fn collect_stream(
 
 /// Anthropic 形态的错误响应（`{type:"error", error:{type, message}}`）
 fn anthropic_error_response(error: &GatewayError) -> Response {
-    anthropic_error_response_with_status(error.http_status().as_u16(), &error.message)
+    anthropic_error_response_with_status(error.http_status().as_u16(), error)
 }
 
-fn anthropic_error_response_with_status(status: u16, message: &str) -> Response {
+fn anthropic_error_response_with_status(status: u16, error: &GatewayError) -> Response {
     let kind = anthropic::error_kind_for_status(status);
+    let mut detail = serde_json::Map::new();
+    detail.insert("type".to_string(), json!(kind));
+    detail.insert("message".to_string(), json!(error.message));
+    let retry_after = error.retry_after_secs.filter(|seconds| *seconds > 0);
+    if let Some(reason) = &error.reason {
+        detail.insert("reason".to_string(), json!(reason));
+        if let Some(seconds) = retry_after {
+            detail.insert("retry_after".to_string(), json!(seconds));
+        }
+    }
     let body = json!({
         "type": "error",
-        "error": { "type": kind, "message": message },
+        "error": Value::Object(detail),
     });
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut response = json_response(body);
     *response.status_mut() = code;
+    if let Some(seconds) = retry_after {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&seconds.to_string()) {
+            response.headers_mut().insert(axum::http::header::RETRY_AFTER, value);
+        }
+    }
     response
 }
 /// 慢分支：把转发结果变成 Responses 协议的下游字节流（`keepalive::Materialize` 实现）。
