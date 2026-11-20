@@ -58,7 +58,7 @@ import { UsageWindowsCell, usageWindows } from './accounts-usage-windows'
 import { GroupBalanceBadge, groupBalanceOf } from './accounts-usage-group'
 import { accountReloginText } from './accounts-authorization'
 import { credentialExpiryRowsOf, credentialExpiryText, type CredentialExpiryRow } from '../../../ui-shared/credential-expiry'
-import { creditStatisticsWalletsOf, isSnapshotWallet, snapshotReadingsOf, usageAggregateOf, usageAvailableViewOf, usageEmptyStateOf, usageSupplementReadingsOf, usageUnitLabel, usageWarningsOf, usageWindowLabel, usageWindowView } from '../../../ui-shared/usage-readings'
+import { balanceWalletOf, creditStatisticsWalletsOf, isSnapshotWallet, snapshotReadingsOf, usageAggregateOf, usageAvailableViewOf, usageEmptyStateOf, usageSupplementReadingsOf, usageUnitLabel, usageWarningsOf, usageWindowLabel, usageWindowView } from '../../../ui-shared/usage-readings'
 import { LimitDetailButton, limitRowsOf } from './accounts-limit-detail'
 import { upstreamCooldownOf, upstreamSuspendedReasonOf } from '../../../ui-shared/account-upstream-state'
 import { LimiterStatus } from './accounts-limiter-status'
@@ -75,7 +75,6 @@ import { exportAccountFiles } from './accounts-export'
 import { useProviderIcon } from './provider-icon'
 import { usageTaskPending, usageTaskText } from '../../../ui-shared/usage-query-task'
 import { usageRowOf } from './accounts-usage-cache'
-import { usageRecoveryPane } from '../../../ui-shared/usage-query-state'
 import { cancelUsageQuery } from './accounts-usage-tasks'
 import { DesktopLaunchButton } from './accounts-desktop-launch'
 import { t } from '../i18n'
@@ -625,9 +624,7 @@ export function usageSummary(entry: UsageEntry): { text: string; kind: string; t
     // `usagePercent`：issue #242 的「可用 — %」）—— 此时读**钱包里的实际读数**
     // （`balance` + 自己的 `unit`），有可读的钱包就不再拼「—」。钱包也没有
     // （真读空了）才落回「—」，如实说没读到。
-    const fallbackWallet = data.available == null
-      ? wallets.find(wallet => numberOrNull(wallet?.balance) !== null)
-      : undefined
+    const fallbackWallet = data.available == null ? balanceWalletOf(wallets) : null
     const availableView = usageAvailableViewOf(data, t)
     const available = availableView
       ? availableView
@@ -1052,7 +1049,6 @@ export function UsageCell({ account }: { account: AccountRecord }) {
   const task = getStore().usageTasks.get(account.id)
   const querying = usageTaskPending(task)
   const stale = usageRowOf(account.id)?.stale
-  const recoveryPane = usageRecoveryPane(usageRowOf(account.id)?.code)
   const configChanged = task?.status === 'config_changed' || stale && !task
   const stateText = configChanged ? t('配置已变更，请重新查询')
     : task?.status === 'queued' ? usageTaskText(task, t)
@@ -1066,8 +1062,6 @@ export function UsageCell({ account }: { account: AccountRecord }) {
         title={failureStatus.detail}>
         {failureStatus.text}
       </span> : null}
-      {recoveryPane ? <Button type='button' variant='link' size='xs' className='self-start h-auto px-0 text-[11px]'
-        onClick={() => openSettingsDialog(account.id, recoveryPane)}>{t('处理查询问题')}</Button> : null}
       {stateText ? <span className='text-[11px] text-subtle' role='status'>{stateText}</span> : null}
     </span>
   )

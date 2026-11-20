@@ -47,8 +47,9 @@ fn load(state: &mut State) {
         .and_then(|bytes| serde_json::from_slice::<Cache>(&bytes).ok())
         .filter(|cache| cache.version == 1).unwrap_or_default();
     if cache.github.iter().any(|entry| !entry.is_provider()) {
+        // 旧版本可能留下非提供商条目，直接丢弃即可；
+        // 但不要顺带把 github_at 清零，否则升级后的第一次启动会立刻重扫全部仓库。
         cache.github.retain(Entry::is_provider);
-        cache.github_at = 0;
     }
     let entries = Arc::new(types::merge(&cache.market, &cache.github));
     *state = State { root, cache, entries, ..State::default() };
@@ -100,6 +101,6 @@ pub(super) fn status() -> Value {
         "marketCheckedAt": state.cache.market_at, "githubCheckedAt": state.cache.github_at,
         "marketError": state.cache.market_error, "githubError": state.cache.github_error,
         "marketRetryAt": state.cache.market_retry, "githubRetryAt": state.cache.github_retry,
-        "githubMissing": state.cache.github_missing, "topic": super::github::TOPIC,
+        "githubMissing": state.cache.github_missing, "topic": "magpie-plugin",
     })
 }

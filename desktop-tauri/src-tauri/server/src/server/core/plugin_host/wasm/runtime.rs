@@ -13,6 +13,8 @@ struct State {
     budget: super::fuel::Budget,
     diagnostics: Arc<super::diagnostics::Invocation>,
     input_bytes: usize,
+    // 入站消息超过单次调用上限时在这里留下尺寸；不借用文案判断。
+    input_oversize: Option<(usize, usize)>,
     reply: Vec<u8>,
     reply_memory: crate::server::core::runtime_capacity::MemoryBudget,
 }
@@ -71,7 +73,6 @@ enum InvocationContext {
     DesktopImport(super::native::chatglm::DesktopCall),
     DesktopLaunch(super::desktop_launch::binding::Call),
     CodeArtsRefresh(Arc<super::codearts_refresh::Call>),
-    ClineFreeRefresh(Arc<super::cline_free_refresh::Call>),
     DoubaoRewards(Arc<super::doubao_rewards::Call>),
 }
 
@@ -198,13 +199,6 @@ impl Runtime {
             InvocationContext::CodeArtsRefresh(call)).await
     }
 
-    pub(super) async fn invoke_cline_free_refresh(&self, call: Arc<super::cline_free_refresh::Call>,
-        params: Value, timeout: Duration,
-    ) -> Result<Value, proto::WireError> {
-        self.invoke_inner(proto::methods::gateway::TOKEN_REFRESH, params, timeout, None,
-            InvocationContext::ClineFreeRefresh(call)).await
-    }
-
     pub(super) async fn invoke_doubao_rewards(&self, call: Arc<super::doubao_rewards::Call>,
         params: Value, timeout: Duration,
     ) -> Result<Value, proto::WireError> {
@@ -262,16 +256,46 @@ impl Runtime {
         let query_reserved = !interactive && super::query_queue::reserved(&self.shared, &account, method)?;
         let diagnostics = super::diagnostics::Invocation::new(&self.shared.options.provider, method, &self.module_digest);
         let work = async {
+            let wait_started = tokio::time::Instant::now();
             let queue_deadline = (tokio::time::Instant::now() + Duration::from_secs(capacity::limits().queue_wait_seconds)).min(call_deadline);
             let _hard_limit = if matches!(class, Class::Conversation | Class::Image) {
                 match &self.shared.execution_slots {
-                    Some(slots) => Some(tokio::time::timeout_at(queue_deadline, slots.acquire()).await
-                        .map_err(|_| capacity::busy())?.map_err(|_| capacity::busy())?),
+                    Some(slots) => match tokio::time::timeout_at(queue_deadline, slots.acquire()).await {
+                        Ok(Ok(permit)) => Some(permit),
+                        Ok(Err(_)) | Err(_) => {
+                            let rejection = capacity::record_slot_rejection(class, wait_started.elapsed());
+                            crate::server::logging::log_with_level(
+                                "[Plugin]",
+                                &format!(
+                                    "⚠️ 插件执行槽位已满 (503 plugin_busy): 提供商={} 方法={} {}",
+                                    self.shared.options.provider, method, rejection.describe(),
+                                ),
+                                "warn",
+                            );
+                            return Err(rejection.into_wire_error());
+                        }
+                    },
                     None => None,
                 }
             } else { None };
             let _ticket = if interactive || query_reserved { None } else {
-                Some(capacity::acquire(class, &self.shared.options.provider, &caller, input_bytes, queue_deadline, &cancel).await?)
+                match capacity::acquire_detailed(class, &self.shared.options.provider, &caller, input_bytes, queue_deadline, &cancel).await {
+                    Ok(ticket) => Some(ticket),
+                    Err(capacity::AcquireError::Cancelled) => {
+                        return Err(capacity::AcquireError::Cancelled.into_wire_error());
+                    }
+                    Err(capacity::AcquireError::Rejected(rejection)) => {
+                        crate::server::logging::log_with_level(
+                            "[Plugin]",
+                            &format!(
+                                "⚠️ 插件容量排队超时/拒绝 (503 plugin_busy): 提供商={} 方法={} {}",
+                                self.shared.options.provider, method, rejection.describe(),
+                            ),
+                            "warn",
+                        );
+                        return Err(rejection.into_wire_error());
+                    }
+                }
             };
             let _input_memory = capacity::Allocation::new(input_bytes)?;
             diagnostics.phase("preparing");
@@ -312,10 +336,6 @@ impl Runtime {
                         InvocationContext::DoubaoRewards(call) => {
                             call.enter(self, method, &context.account)?;
                             context.doubao_rewards = Some(call);
-                        }
-                        InvocationContext::ClineFreeRefresh(call) => {
-                            call.enter(self, method, &context.account)?;
-                            context.cline_free_refresh = Some(call);
                         }
                         InvocationContext::CodeArtsRefresh(call) => {
                             call.enter_once(self, method, &context.account)?;
@@ -376,14 +396,13 @@ impl Runtime {
                 context.permission("resources.cookie-file.v1")?;
                 context.supplied_cookie_file = Some(super::desktop_credentials::cookie_file::prepare(&params)?);
             }
-            if !context.account.is_empty() && context.codearts_refresh.is_none() && context.cline_free_refresh.is_none() && context.doubao_rewards.is_none() {
+            if !context.account.is_empty() && context.codearts_refresh.is_none() && context.doubao_rewards.is_none() {
                 context.invoke("account.get", json!({})).await?;
             }
             if let Some(call) = &context.conversation { call.validate_context(&self.shared, &context.account)?; }
             if let Some(call) = &context.checkin_call { call.observe_context(&context)?; }
             let mut params = params;
             if context.supplied_cookie_file.is_some() { params["source"]["content"] = Value::Null; }
-            if context.cline_free_refresh.is_some() { params["desktopRefresh"] = json!(false); }
             if let Some(map) = params.as_object_mut() {
                 for key in ["proxy", "proxy_override", "plugin_trace", "client_stream"] { map.remove(key); }
                 if self.shared.options.provider == "raccoon" {
@@ -496,10 +515,20 @@ impl Runtime {
             let adaptive = class == Class::Conversation && context.conversation.is_some();
             let budget = super::fuel::Budget::new(adaptive, interactive);
             let mut store = InvocationStore(Store::new(self.module.engine(), State { context, limits, budget, diagnostics: diagnostics.clone(),
-                input_bytes: 0, reply: Vec::new(), reply_memory: capacity::MemoryBudget::new() }));
+                input_bytes: 0, input_oversize: None, reply: Vec::new(), reply_memory: capacity::MemoryBudget::new() }));
             store.limiter(|state| &mut state.limits);
             store.fuel_async_yield_interval(Some(super::fuel::YIELD_INTERVAL)).map_err(|_| super::error("Wasm 调度配置失败"))?;
             let result = self.execute(&mut store, method, params).await;
+            if let Some((size, limit)) = store.data().input_oversize {
+                // 消息在实例化前就放不下：明确告诉调用方尺寸，而不是折成笼统的资源错误。
+                let hint = if method == proto::methods::gateway::CONVERSATION {
+                    "；请新建会话或减少图片后重试"
+                } else { "" };
+                let message = format!("本次请求约 {:.1} MiB，超过插件单次调用上限 {:.0} MiB{hint}",
+                    size as f64 / capacity::MIB as f64, limit as f64 / capacity::MIB as f64);
+                store.data().capture(store.get_fuel().ok(), Some("input"));
+                return Err(proto::WireError::with_code(message, "plugin_request_too_large"));
+            }
             let reason = if store.data().limits.exhausted { store.data().limits.reason }
                 else { result.as_ref().err().and_then(|error| match error.downcast_ref::<wasmtime::Trap>() {
                     Some(wasmtime::Trap::OutOfFuel) => Some(store.data().budget.exhausted()),
@@ -526,12 +555,22 @@ impl Runtime {
                     Ok(value)
                 }
                 Err(_) if store.data().limits.exhausted => {
-                    let message = match store.data().limits.reason {
-                        Some("table") => "Wasm 插件表容量超限",
-                        Some("host_memory") => "Wasm 插件共享内存预算超限",
-                        _ => "Wasm 插件内存超限",
+                    let reason = store.data().limits.reason;
+                    let limit_mib = self.shared.options.manifest.memory_mib;
+                    let input = store.data().input_bytes;
+                    let (message, code) = match reason {
+                        Some("table") => ("Wasm 插件表容量超限".to_string(), "plugin_resource_limit"),
+                        Some("host_memory") => ("Wasm 插件共享内存预算超限".to_string(), "plugin_resource_limit"),
+                        // 对话撞上内存上限，真正原因是正文/图片太大。给出尺寸与下一步，
+                        // 既便于用户处理，也避免被通用策略当成服务故障去换号重试。
+                        _ if method == proto::methods::gateway::CONVERSATION => (
+                            format!("本次对话上下文或图片过大：请求约 {:.1} MiB，插件内存上限 {limit_mib} MiB；请新建会话或减少图片后重试",
+                                input as f64 / capacity::MIB as f64),
+                            "plugin_request_too_large",
+                        ),
+                        _ => ("Wasm 插件内存超限".to_string(), "plugin_resource_limit"),
                     };
-                    Err(proto::WireError::with_code(message, "plugin_resource_limit"))
+                    Err(proto::WireError::with_code(message, code))
                 }
                 Err(error) => Err(super::errors::interrupted(&error)),
             }
@@ -551,8 +590,12 @@ impl Runtime {
         let input = json!({ "method": method, "params": params });
         let bytes = serde_json::to_vec(&input)?;
         drop(input);
-        if bytes.len() > store.data().context.message_limit() { return Err(wasmtime::Error::msg("Wasm 输入消息过大")); }
         store.data_mut().input_bytes = bytes.len();
+        if bytes.len() > store.data().context.message_limit() {
+            let limit = store.data().context.message_limit();
+            store.data_mut().input_oversize = Some((bytes.len(), limit));
+            return Err(wasmtime::Error::msg("Wasm 输入消息过大"));
+        }
         let fuel = store.data_mut().budget.input(bytes.len());
         store.set_fuel(fuel)?;
         store.data().diagnostics.phase("instantiating");
