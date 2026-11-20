@@ -13,10 +13,12 @@
 //!   · 注入的桥接脚本只在 index.html 上发生，其它原样透出。
 //!
 //! ── 缓存 ────────────────────────────────────────────────────
-//! 文件带 ETag（程序版本 + 修改时间 + 大小），`Cache-Control` 为 `no-cache`：
-//! 浏览器可以存下来，但每次使用前必须回源校验。文件没变时回 304、不传正文；
-//! 部署新 `ui/` 后 mtime 变化、ETag 随之变化，浏览器立刻拿到新版 —— 既不会
-//! 出现「发新版后页面引用了旧 js」，也不必每次打开都重下几 MB。
+//! 文件带 ETag（程序版本 + 修改时间 + 大小）。`Cache-Control` 分两种：
+//!   · HTML / 不带版本参数的资源 → `no-cache`，每次回源校验，文件没变回 304；
+//!     发版后 mtime / 程序版本变化，浏览器立刻拿到新版。
+//!   · 带 `?v=` 版本参数的静态资源（js/css/字体/图片）→ 长缓存 `immutable`。
+//!     `?v=` 在发版时与版本号同步更新，URL 变了就是新文件；这样经 CDN 时
+//!     静态资源能直接命中缓存，不必每个文件都跨公网回源校验。
 //! 压缩由 `compression` 中间件统一处理，这里只声明 `Vary: Accept-Encoding`。
 
 use std::path::PathBuf;
@@ -29,6 +31,9 @@ use crate::server::errors;
 
 /// 可以缓存，但每次使用前都要回源校验（详见模块头的「缓存」段）。
 const CACHE_CONTROL: &str = "no-cache";
+/// 带 `?v=` 版本参数的静态资源：版本随发版更新，URL 变了就是新文件，可长缓存，
+/// 避免每次打开面板都经 CDN 回源校验（详见模块头的「缓存」段）。
+const CACHE_CONTROL_VERSIONED: &str = "public, max-age=31536000, immutable";
 /// 同一路径的正文随客户端是否接受 gzip 而不同，缓存必须按这个头分桶。
 const VARY: &str = "Accept-Encoding";
 
@@ -55,10 +60,17 @@ pub async fn serve(request: Request<Body>, ui_dir: PathBuf) -> AxumResponse {
         .get(header::IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    // `?v=` 是发版时同步更新的缓存戳：带它的静态资源 URL 随版本变化，可长缓存；
+    // HTML / 无版本参数的资源保持 no-cache，保证发版后能拿到新的版本戳。
+    let versioned = request
+        .uri()
+        .query()
+        .is_some_and(|query| query.split('&').any(|pair| pair.split_once('=').is_some_and(|(k, _)| k == "v")));
     let Some(file_path) = resolve_file(&ui_dir, &path) else {
         return not_found(request).await;
     };
-    read_response(&file_path, if_none_match.as_deref()).await
+    let cache_control = if versioned { CACHE_CONTROL_VERSIONED } else { CACHE_CONTROL };
+    read_response(&file_path, if_none_match.as_deref(), cache_control).await
 }
 
 /// 把 URL 路径解析到 `ui/` 内的具体文件（`None` = 不存在 / 非法）。
@@ -110,7 +122,11 @@ fn resolve_file(ui_dir: &PathBuf, url_path: &str) -> Option<PathBuf> {
 ///
 /// ETag 命中时直接回 304，不读文件正文 —— 这是「第二次打开面板不再重下
 /// 几 MB 资源」的关键路径。
-async fn read_response(file_path: &PathBuf, if_none_match: Option<&str>) -> AxumResponse {
+async fn read_response(
+    file_path: &PathBuf,
+    if_none_match: Option<&str>,
+    cache_control: &str,
+) -> AxumResponse {
     let metadata = match tokio::fs::metadata(file_path).await {
         Ok(metadata) => metadata,
         Err(_) => return errors::not_found_response("GET", "static"),
@@ -120,7 +136,7 @@ async fn read_response(file_path: &PathBuf, if_none_match: Option<&str>) -> Axum
         return Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .header(header::ETAG, &etag)
-            .header(header::CACHE_CONTROL, CACHE_CONTROL)
+            .header(header::CACHE_CONTROL, cache_control)
             .header(header::VARY, VARY)
             .body(Body::empty())
             .unwrap_or_else(|_| errors::not_found_response("GET", "static"));
@@ -144,7 +160,7 @@ async fn read_response(file_path: &PathBuf, if_none_match: Option<&str>) -> Axum
     let response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime)
-        .header(header::CACHE_CONTROL, CACHE_CONTROL)
+        .header(header::CACHE_CONTROL, cache_control)
         .header(header::ETAG, &etag)
         .header(header::VARY, VARY)
         .header(header::CONTENT_LENGTH, body.len())
