@@ -125,6 +125,11 @@ pub fn panel_router(state: ServerState) -> Router {
         // any 而不是 get：探针要与登录**同动词**（POST）—— 有的中转按方法
         // 区别对待 Set-Cookie，只测 GET 会误报「cookie 通道完好」
         .route("/api/panel/cookie-probe", any(api::panel::cookie_probe))
+        .route("/api/panel/oauth/start", get(api::panel_oauth::get_oauth_start))
+        .route("/api/panel/oauth/start-url", post(api::panel_oauth::post_oauth_start_url))
+        .route("/api/panel/oauth/poll", get(api::panel_oauth::get_oauth_poll))
+        .route("/api/panel/oauth/callback", get(api::panel_oauth::get_oauth_callback))
+        .route("/api/panel/oauth/exchange", post(api::panel_oauth::post_oauth_exchange))
         // CatPaw 网页登录的回调路由已随实现搬到插件：它的登录是**双通道**
         // （插件自己 bind 的 loopback 回调 + 上游 poll-token 兜底），回调落在
         // 插件进程的端口上，不再经过网关的 `/api/session/login/*`。
@@ -269,6 +274,11 @@ pub fn panel_router(state: ServerState) -> Router {
         .route(
             "/api/stats/requests/filters",
             get(api::stats_api::stats_request_filters),
+        )
+        // 单条请求的完整详情（列表页走轻量列，点开详情或悬停标签时按需查完整大字段）。
+        .route(
+            "/api/stats/requests/detail",
+            get(api::stats_api::stats_request_detail),
         )
         // 单条请求的原始正文（预览对话详情弹窗的数据源）。同样要排在通配之前
         .route(
@@ -506,7 +516,7 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/sidebar-layout",
             get(api::sidebar_layout::get_layout).put(api::sidebar_layout::put_layout),
         )
-        // ── 出网代理（Clash Verge 实时读取 + 出口连通性测试 + 代理池）──
+        // ── 出网代理（EasyClash 实时读取 + 出口连通性测试 + 代理池）──
         // /api/proxies 与 /api/proxies/pool* 之外（如 /api/proxies/zzz）不注册
         // → 落到全局 404 兜底，与 Node 版「前缀判定不通过 → 全局兜底」一致。
         // pool 各条都是固定路径（id 走 body / query，不用 {id} 段 ——
@@ -544,8 +554,10 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/checkin-keepalive",
             get(api::billing::get_keepalive).post(api::billing::save_keepalive),
         )
-        // WorkBuddy 国际版日活任务的手动粒度入口（保活 / 领取 / 保活+领取）
+        // WorkBuddy 国际版日活任务的手动粒度入口（保活 / 领取 / 保活+领取）及详情/解锁
         .route("/api/checkin-activity", post(api::billing::run_activity))
+        .route("/api/checkin-activity/status", get(api::billing::activity_status))
+        .route("/api/checkin-activity/reset", post(api::billing::reset_activity))
         // ── 会话与登录 ──
         // 只读动态登录元数据也必须走管理面鉴权；不是任意 admin.action 通道。
         .route("/api/session/login/methods", get(api::session::login_methods))
@@ -678,6 +690,7 @@ pub fn panel_router(state: ServerState) -> Router {
             post(api::custom_providers::fetch_custom_models),
         )
         .route("/api/provider-settings", get(api::plugin_provider_settings::list).patch(api::plugin_provider_settings::configure))
+        .route("/api/provider-settings/upstream-sync", post(api::plugin_provider_settings::sync_upstream))
         .route("/api/model-access/models", get(api::model_access::models))
         .route("/api/model-access/keys", get(api::model_access::list_keys))
         .route("/api/keys", get(api::keys_api::list_keys).post(api::keys_api::create_key))
@@ -704,14 +717,11 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/plugins/desktop-import/chatglm/confirm", post(api::plugin_desktop_import::confirm))
         .route("/api/plugins/desktop-import/chatglm/cancel", post(api::plugin_desktop_import::cancel))
         .route("/api/plugins/desktop-import/chatglm/status", get(api::plugin_desktop_import::status))
-        .route("/api/plugins/enrollment/codearts/prepare", post(api::plugin_codearts_enrollment::prepare))
-        .route("/api/plugins/enrollment/codearts/confirm", post(api::plugin_codearts_enrollment::confirm))
-        .route("/api/plugins/enrollment/codearts/cancel", post(api::plugin_codearts_enrollment::cancel))
-        .route("/api/plugins/enrollment/codearts/status", get(api::plugin_codearts_enrollment::status))
         .route("/api/plugins/permissions", get(api::plugin_permissions::list).patch(api::plugin_permissions::configure))
         .route("/api/plugins/settings", get(api::plugins::settings).patch(api::plugins::save_settings))
         .route("/api/plugins/capacity", get(api::runtime_capacity::get).patch(api::runtime_capacity::save))
         .route("/api/plugins/provider-settings", get(api::plugin_provider_settings::list).patch(api::plugin_provider_settings::configure))
+        .route("/api/plugins/provider-settings/upstream-sync", post(api::plugin_provider_settings::sync_upstream))
         .route("/api/plugins/progress", get(api::plugins::progress))
         .route("/api/plugins/scripts/install", post(api::plugins::install_script))
         .route("/api/plugins/scripts/change", post(api::plugins::change_script))
@@ -853,6 +863,30 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/captcha",
             get(api::captcha::get_captcha).put(api::captcha::put_captcha),
         )
+        .route(
+            "/api/notifications",
+            get(api::notifications::get_notifications).put(api::notifications::put_notifications),
+        )
+        .route(
+            "/api/notifications/test",
+            post(api::notifications::test_notification),
+        )
+        .route(
+            "/api/panel/oauth/settings",
+            get(api::panel_oauth::get_oauth_settings).put(api::panel_oauth::put_oauth_settings),
+        )
+        .route(
+            "/api/panel/oauth/bind-url",
+            post(api::panel_oauth::post_oauth_bind_url),
+        )
+        .route(
+            "/api/model-pricing",
+            get(api::model_pricing::get_model_pricing).put(api::model_pricing::put_model_pricing),
+        )
+        .route(
+            "/api/model-pricing/fx/refresh",
+            post(api::model_pricing::post_refresh_fx),
+        )
         // ── 活动套餐通道的人机验证令牌池 ──
         // 与上面那条**不是一回事**：上面是网关自己的登录门槛（ALTCHA），这条是
         // 上游 ZCode 对活动套餐推理端点要求的阿里云验证码令牌（界面静默铸造、
@@ -988,25 +1022,33 @@ pub fn panel_router(state: ServerState) -> Router {
         //      要与 update 的 pickInstaller 规则相符：带 setup 的 .exe 优先）。
         .layer(middleware::from_fn(require_api_key));
 
-    // 静态托管只在 headless 打开（set_ui_dir）：桌面形态的界面由 Tauri 壳出，
-    // 网关的未知路径保持纯 404。ui_dir 是启动即定值，克隆进闭包。
+    // 静态托管：headless 走磁盘 `ui_dir`，桌面形态发布版走随壳内嵌的 `ui_assets`
+    // （避免安装包里额外带第二份 `ui/`）。两者都未设置时网关未知路径保持纯 404。
     let ui_dir = state.ui_dir().cloned();
+    let ui_assets = state.ui_assets().cloned();
     Router::new()
         .merge(public)
         .merge(protected)
         .fallback(move |request: Request| {
             let ui_dir = ui_dir.clone();
+            let ui_assets = ui_assets.clone();
             async move {
-                let Some(dir) = ui_dir else {
+                if ui_dir.is_none() && ui_assets.is_none() {
                     return not_found(request).await;
-                };
+                }
                 // 未登录打开面板首页 → 先去登录页（见 `panel_boot_redirect`）。
                 // 必须排在出 index.html 之前：主界面一加载就会由 app.js 与各页面岛
                 // 并发打出十几条 `/api/*`，未登录时它们全部 401，等于空跑一轮。
                 if let Some(response) = panel_boot_redirect(&request) {
                     return response;
                 }
-                super::static_files::serve(request, dir).await
+                if let Some(dir) = ui_dir {
+                    super::static_files::serve(request, dir).await
+                } else if let Some(assets) = ui_assets {
+                    super::static_files::serve_embedded(request, assets).await
+                } else {
+                    not_found(request).await
+                }
             }
         })
         // 方法不匹配的兜底：Node 版没有 405 概念，一律落到 404 分支，

@@ -19,30 +19,54 @@ pub const MAX_MODELS: usize = 2000;
 /// 处理方式。图片兼容只有这两种，所以每一块都是一个固定的设置块，不是可以增删的配置列表。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Mode { #[default] Assist, Reroute }
+pub enum Mode {
+    #[default]
+    Assist,
+    Reroute,
+}
 
 impl Mode {
     pub fn as_str(self) -> &'static str {
-        match self { Self::Assist => "assist", Self::Reroute => "reroute" }
+        match self {
+            Self::Assist => "assist",
+            Self::Reroute => "reroute",
+        }
     }
 }
 
 /// 旧版「模型单独配置」用的处理方式（多一档「不做兼容」）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OverrideMode { #[default] Assist, Reroute, Off }
+pub enum OverrideMode {
+    #[default]
+    Assist,
+    Reroute,
+    Off,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ModelSource { #[default] Shared, Custom }
+pub enum ModelSource {
+    #[default]
+    Shared,
+    Custom,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Fallback { #[default] Stop, Designated }
+pub enum Fallback {
+    #[default]
+    Stop,
+    Designated,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UnknownCapability { #[default] TryOriginal, Compat }
+pub enum UnknownCapability {
+    #[default]
+    TryOriginal,
+    Compat,
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -63,7 +87,10 @@ pub struct ModelRef {
 
 impl ModelRef {
     pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
-        Self { provider: provider.into(), model: model.into() }
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+        }
     }
 
     fn matches(&self, provider: &str, model: &str) -> bool {
@@ -103,7 +130,13 @@ pub struct AssistSettings {
 
 impl Default for AssistSettings {
     fn default() -> Self {
-        Self { models: Vec::new(), source: ModelSource::Shared, target: None, shared_target: None, reuse_results: true }
+        Self {
+            models: Vec::new(),
+            source: ModelSource::Shared,
+            target: None,
+            shared_target: None,
+            reuse_results: true,
+        }
     }
 }
 
@@ -120,7 +153,12 @@ pub struct RerouteSettings {
 
 impl Default for RerouteSettings {
     fn default() -> Self {
-        Self { models: Vec::new(), prefer_current_route: true, fallback: Fallback::Stop, targets: Vec::new() }
+        Self {
+            models: Vec::new(),
+            prefer_current_route: true,
+            fallback: Fallback::Stop,
+            targets: Vec::new(),
+        }
     }
 }
 
@@ -166,8 +204,14 @@ impl Default for VisionRule {
     /// （与两块设置的默认值一致），derive 会全给 false，等于悄悄改掉既有行为。
     fn default() -> Self {
         Self {
-            enabled: true, models: Vec::new(), mode: Mode::Assist, source: ModelSource::Shared,
-            target: None, reuse_results: true, prefer_current_route: true, fallback: Fallback::Stop,
+            enabled: true,
+            models: Vec::new(),
+            mode: Mode::Assist,
+            source: ModelSource::Shared,
+            target: None,
+            reuse_results: true,
+            prefer_current_route: true,
+            fallback: Fallback::Stop,
             targets: Vec::new(),
         }
     }
@@ -177,8 +221,12 @@ impl VisionRule {
     /// 从「辅助识图」那一块造一条规则：旧形状换算与保存时的投影共用同一份口径。
     pub fn from_assist(assist: &AssistSettings) -> Self {
         Self {
-            enabled: !assist.models.is_empty(), models: assist.models.clone(), mode: Mode::Assist,
-            source: assist.source, target: assist.target.clone(), reuse_results: assist.reuse_results,
+            enabled: !assist.models.is_empty(),
+            models: assist.models.clone(),
+            mode: Mode::Assist,
+            source: assist.source,
+            target: assist.target.clone(),
+            reuse_results: assist.reuse_results,
             ..Self::default()
         }
     }
@@ -186,9 +234,13 @@ impl VisionRule {
     /// 从「整体接管」那一块造一条规则。
     pub fn from_reroute(reroute: &RerouteSettings) -> Self {
         Self {
-            enabled: !reroute.models.is_empty(), models: reroute.models.clone(), mode: Mode::Reroute,
-            prefer_current_route: reroute.prefer_current_route, fallback: reroute.fallback,
-            targets: reroute.targets.clone(), ..Self::default()
+            enabled: !reroute.models.is_empty(),
+            models: reroute.models.clone(),
+            mode: Mode::Reroute,
+            prefer_current_route: reroute.prefer_current_route,
+            fallback: reroute.fallback,
+            targets: reroute.targets.clone(),
+            ..Self::default()
         }
     }
 }
@@ -227,9 +279,14 @@ pub struct VisionSettings {
 impl Default for VisionSettings {
     fn default() -> Self {
         Self {
-            enabled: true, rules: Vec::new(), assist: AssistSettings::default(), reroute: RerouteSettings::default(),
-            unknown_capability: UnknownCapability::TryOriginal, timeout_seconds: 30,
-            mode: None, overrides: Vec::new(),
+            enabled: true,
+            rules: Vec::new(),
+            assist: AssistSettings::default(),
+            reroute: RerouteSettings::default(),
+            unknown_capability: UnknownCapability::TryOriginal,
+            timeout_seconds: 30,
+            mode: None,
+            overrides: Vec::new(),
         }
     }
 }
@@ -245,9 +302,15 @@ impl VisionSettings {
 
     /// 旧版语义：这个模型走哪种方式（`None` = 不做兼容）。不看 `enabled`，供展开名单时逐项判定。
     pub fn legacy_mode(&self, provider: &str, model: &str) -> Option<Mode> {
-        match self.overrides.iter()
-            .find(|entry| entry.provider.eq_ignore_ascii_case(provider) && entry.model.eq_ignore_ascii_case(model))
-            .map(|entry| entry.mode) {
+        match self
+            .overrides
+            .iter()
+            .find(|entry| {
+                entry.provider.eq_ignore_ascii_case(provider)
+                    && entry.model.eq_ignore_ascii_case(model)
+            })
+            .map(|entry| entry.mode)
+        {
             Some(OverrideMode::Off) => None,
             Some(OverrideMode::Assist) => Some(Mode::Assist),
             Some(OverrideMode::Reroute) => Some(Mode::Reroute),
@@ -263,37 +326,50 @@ impl VisionSettings {
     /// 三种形状都照顾到，请求路径只认这一个入口：规则列表 → 旧版全局方式（+ 模型单独
     /// 配置）→ 还没折成规则的两块名单。
     pub fn rule_for(&self, provider: &str, model: &str) -> Option<VisionRule> {
-        if !self.enabled { return None; }
+        if !self.enabled {
+            return None;
+        }
         if !self.rules.is_empty() {
-            return self.rules.iter()
+            return self
+                .rules
+                .iter()
                 .filter(|rule| rule.enabled && !rule.models.is_empty())
                 .find(|rule| lists_model(&rule.models, provider, model))
                 .cloned();
         }
         if self.is_legacy() {
             let assist = || VisionRule {
-                models: vec![ModelRef::new(provider, model)], mode: Mode::Assist,
-                source: self.assist.source, target: self.assist.target.clone(),
-                reuse_results: self.assist.reuse_results, ..VisionRule::default()
+                models: vec![ModelRef::new(provider, model)],
+                mode: Mode::Assist,
+                source: self.assist.source,
+                target: self.assist.target.clone(),
+                reuse_results: self.assist.reuse_results,
+                ..VisionRule::default()
             };
             let reroute = || VisionRule {
-                models: vec![ModelRef::new(provider, model)], mode: Mode::Reroute,
-                prefer_current_route: self.reroute.prefer_current_route, fallback: self.reroute.fallback,
-                targets: self.reroute.targets.clone(), ..VisionRule::default()
+                models: vec![ModelRef::new(provider, model)],
+                mode: Mode::Reroute,
+                prefer_current_route: self.reroute.prefer_current_route,
+                fallback: self.reroute.fallback,
+                targets: self.reroute.targets.clone(),
+                ..VisionRule::default()
             };
             return self.legacy_mode(provider, model).map(|mode| match mode {
-                Mode::Assist => assist(), Mode::Reroute => reroute(),
+                Mode::Assist => assist(),
+                Mode::Reroute => reroute(),
             });
         }
         // 还没折成规则的两块名单：辅助识图优先（与旧口径一致）。
         if lists_model(&self.assist.models, provider, model) {
             return Some(VisionRule {
-                models: vec![ModelRef::new(provider, model)], ..VisionRule::from_assist(&self.assist)
+                models: vec![ModelRef::new(provider, model)],
+                ..VisionRule::from_assist(&self.assist)
             });
         }
         if lists_model(&self.reroute.models, provider, model) {
             return Some(VisionRule {
-                models: vec![ModelRef::new(provider, model)], ..VisionRule::from_reroute(&self.reroute)
+                models: vec![ModelRef::new(provider, model)],
+                ..VisionRule::from_reroute(&self.reroute)
             });
         }
         None
@@ -307,16 +383,30 @@ impl VisionSettings {
     /// 两块设置折成规则列表（旧配置迁移用）。只在还没有规则时生效；
     /// 名单为空的那一块不折 —— 旧口径里「名单空 = 这种方式不参与」。
     pub fn fold_blocks(&mut self) {
-        if !self.rules.is_empty() { return; }
-        if !self.assist.models.is_empty() { self.rules.push(VisionRule::from_assist(&self.assist)); }
-        if !self.reroute.models.is_empty() { self.rules.push(VisionRule::from_reroute(&self.reroute)); }
+        if !self.rules.is_empty() {
+            return;
+        }
+        if !self.assist.models.is_empty() {
+            self.rules.push(VisionRule::from_assist(&self.assist));
+        }
+        if !self.reroute.models.is_empty() {
+            self.rules.push(VisionRule::from_reroute(&self.reroute));
+        }
     }
 
     /// 规则 → 两块设置（投影）。手机端与旧界面按两块读写，这里让它们看到真实配置：
     /// 名单取**同方式所有规则的并集**，其余字段取该方式第一条规则。
     pub fn project_blocks(&mut self) {
-        let assists: Vec<&VisionRule> = self.rules.iter().filter(|rule| rule.mode == Mode::Assist).collect();
-        let reroutes: Vec<&VisionRule> = self.rules.iter().filter(|rule| rule.mode == Mode::Reroute).collect();
+        let assists: Vec<&VisionRule> = self
+            .rules
+            .iter()
+            .filter(|rule| rule.mode == Mode::Assist)
+            .collect();
+        let reroutes: Vec<&VisionRule> = self
+            .rules
+            .iter()
+            .filter(|rule| rule.mode == Mode::Reroute)
+            .collect();
         let first_assist = assists.first().copied();
         let first_reroute = reroutes.first().copied();
         self.assist = AssistSettings {
@@ -328,9 +418,13 @@ impl VisionSettings {
         };
         self.reroute = RerouteSettings {
             models: union_models(reroutes.iter().flat_map(|rule| rule.models.iter())),
-            prefer_current_route: first_reroute.map(|rule| rule.prefer_current_route).unwrap_or(true),
+            prefer_current_route: first_reroute
+                .map(|rule| rule.prefer_current_route)
+                .unwrap_or(true),
             fallback: first_reroute.map(|rule| rule.fallback).unwrap_or_default(),
-            targets: first_reroute.map(|rule| rule.targets.clone()).unwrap_or_default(),
+            targets: first_reroute
+                .map(|rule| rule.targets.clone())
+                .unwrap_or_default(),
         };
     }
 
@@ -338,11 +432,19 @@ impl VisionSettings {
     pub fn uses(&self, mode: Mode) -> bool {
         if self.is_legacy() {
             return self.mode.unwrap_or_default() == mode
-                || self.overrides.iter().any(|entry| matches!((entry.mode, mode),
-                    (OverrideMode::Assist, Mode::Assist) | (OverrideMode::Reroute, Mode::Reroute)));
+                || self.overrides.iter().any(|entry| {
+                    matches!(
+                        (entry.mode, mode),
+                        (OverrideMode::Assist, Mode::Assist)
+                            | (OverrideMode::Reroute, Mode::Reroute)
+                    )
+                });
         }
         if !self.rules.is_empty() {
-            return self.rules.iter().any(|rule| rule.enabled && !rule.models.is_empty() && rule.mode == mode);
+            return self
+                .rules
+                .iter()
+                .any(|rule| rule.enabled && !rule.models.is_empty() && rule.mode == mode);
         }
         match mode {
             Mode::Assist => !self.assist.models.is_empty(),
@@ -364,11 +466,15 @@ pub struct VisionSnapshot {
 }
 
 impl Default for VisionSnapshot {
-    fn default() -> Self { from_value(None) }
+    fn default() -> Self {
+        from_value(None)
+    }
 }
 
 fn valid_name(value: &str) -> bool {
-    !value.is_empty() && value.trim() == value && value.chars().count() <= 256
+    !value.is_empty()
+        && value.trim() == value
+        && value.chars().count() <= 256
         && !value.chars().any(char::is_control)
 }
 
@@ -376,7 +482,9 @@ pub fn validate_target(target: &VisionTarget) -> Result<(), String> {
     if !valid_name(&target.provider) || !valid_name(&target.model) {
         return Err("请选择完整的提供商与模型，名称不能超过 256 个字符或含控制字符".into());
     }
-    if !target.reasoning.is_empty() && !crate::server::core::model_rules::REASONING_LEVELS.contains(&target.reasoning.as_str()) {
+    if !target.reasoning.is_empty()
+        && !crate::server::core::model_rules::REASONING_LEVELS.contains(&target.reasoning.as_str())
+    {
         return Err("图片兼容的思考等级无效".into());
     }
     Ok(())
@@ -411,19 +519,27 @@ pub fn validate(settings: &VisionSettings) -> Result<(), String> {
             return Err(format!("第 {at} 条规则最多 {MAX_TARGETS} 个备选视觉模型"));
         }
         match rule.mode {
-            Mode::Assist => { if let Some(target) = &rule.target { validate_target(target)?; } }
+            Mode::Assist => {
+                if let Some(target) = &rule.target {
+                    validate_target(target)?;
+                }
+            }
             Mode::Reroute => {
                 let mut targets = HashSet::new();
                 for target in &rule.targets {
                     validate_target(target)?;
-                    if !targets.insert((target.provider.to_lowercase(), target.model.to_lowercase())) {
+                    if !targets
+                        .insert((target.provider.to_lowercase(), target.model.to_lowercase()))
+                    {
                         return Err(format!("第 {at} 条规则的备选视觉模型不能重复"));
                     }
                 }
             }
         }
         // 只有真的会用上的规则才要求配全：停用的、总开关关掉的，允许留着半截。
-        if !settings.enabled || !rule.enabled || rule.models.is_empty() { continue; }
+        if !settings.enabled || !rule.enabled || rule.models.is_empty() {
+            continue;
+        }
         match rule.mode {
             Mode::Assist => {
                 if rule.source == ModelSource::Custom && rule.target.is_none() {
@@ -436,19 +552,29 @@ pub fn validate(settings: &VisionSettings) -> Result<(), String> {
                     return Err(format!("第 {at} 条规则请选择「优先使用当前路由内的视觉模型」，或指定接管回答的视觉模型"));
                 }
                 if rule.fallback == Fallback::Designated && rule.targets.is_empty() {
-                    return Err(format!("第 {at} 条规则选了「指定备选模型」，请至少添加一个视觉模型"));
+                    return Err(format!(
+                        "第 {at} 条规则选了「指定备选模型」，请至少添加一个视觉模型"
+                    ));
                 }
             }
         }
     }
-    if settings.assist.models.len() > MAX_MODELS || settings.reroute.models.len() > MAX_MODELS
-        || settings.reroute.targets.len() > MAX_TARGETS {
-        return Err(format!("图片兼容每种方式最多 {MAX_MODELS} 个模型、{MAX_TARGETS} 个备选视觉模型"));
+    if settings.assist.models.len() > MAX_MODELS
+        || settings.reroute.models.len() > MAX_MODELS
+        || settings.reroute.targets.len() > MAX_TARGETS
+    {
+        return Err(format!(
+            "图片兼容每种方式最多 {MAX_MODELS} 个模型、{MAX_TARGETS} 个备选视觉模型"
+        ));
     }
     validate_model_list("辅助识图", &settings.assist.models)?;
     validate_model_list("切换视觉模型", &settings.reroute.models)?;
-    if let Some(target) = &settings.assist.target { validate_target(target)?; }
-    if let Some(target) = &settings.assist.shared_target { validate_target(target)?; }
+    if let Some(target) = &settings.assist.target {
+        validate_target(target)?;
+    }
+    if let Some(target) = &settings.assist.shared_target {
+        validate_target(target)?;
+    }
     let mut targets = HashSet::new();
     for target in &settings.reroute.targets {
         validate_target(target)?;
@@ -465,16 +591,21 @@ pub fn validate(settings: &VisionSettings) -> Result<(), String> {
             return Err("同一提供商的同一模型不能重复配置".into());
         }
     }
-    if settings.enabled && settings.uses(Mode::Assist)
-        && settings.assist.source == ModelSource::Custom && settings.assist.target.is_none() {
+    if settings.enabled
+        && settings.uses(Mode::Assist)
+        && settings.assist.source == ModelSource::Custom
+        && settings.assist.target.is_none()
+    {
         return Err("启用前请先选择辅助识图的视觉模型".into());
     }
     if settings.enabled && settings.uses(Mode::Reroute) {
-        let designated = settings.reroute.fallback == Fallback::Designated && !settings.reroute.targets.is_empty();
+        let designated = settings.reroute.fallback == Fallback::Designated
+            && !settings.reroute.targets.is_empty();
         if !settings.reroute.prefer_current_route && !designated {
             return Err("启用前请选择当前路由优先，或指定接管回答的视觉模型".into());
         }
-        if settings.reroute.fallback == Fallback::Designated && settings.reroute.targets.is_empty() {
+        if settings.reroute.fallback == Fallback::Designated && settings.reroute.targets.is_empty()
+        {
             return Err("已选择指定备选模型，请至少添加一个视觉模型".into());
         }
     }
@@ -482,7 +613,10 @@ pub fn validate(settings: &VisionSettings) -> Result<(), String> {
 }
 
 fn revision(value: Option<&Value>) -> String {
-    format!("{:x}", Sha256::digest(value.cloned().unwrap_or(Value::Null).to_string().as_bytes()))
+    format!(
+        "{:x}",
+        Sha256::digest(value.cloned().unwrap_or(Value::Null).to_string().as_bytes())
+    )
 }
 
 fn from_value(value: Option<&Value>) -> VisionSnapshot {
@@ -490,9 +624,15 @@ fn from_value(value: Option<&Value>) -> VisionSnapshot {
         None => Ok(VisionSettings::default()),
         Some(value) => serde_json::from_value::<VisionSettings>(value.clone())
             .map_err(|error| format!("图片兼容配置格式不正确：{error}"))
-            .and_then(|settings| { validate(&settings)?; Ok(settings) }),
+            .and_then(|settings| {
+                validate(&settings)?;
+                Ok(settings)
+            }),
     };
-    VisionSnapshot { settings, revision: revision(value) }
+    VisionSnapshot {
+        settings,
+        revision: revision(value),
+    }
 }
 
 pub(crate) fn from_raw(raw: &Map<String, Value>) -> Arc<VisionSnapshot> {
@@ -500,38 +640,60 @@ pub(crate) fn from_raw(raw: &Map<String, Value>) -> Arc<VisionSnapshot> {
 }
 
 pub fn current() -> Arc<VisionSnapshot> {
-    super::CONFIG.read().unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref().map(|config| config.vision_compat.clone()).unwrap_or_default()
+    super::CONFIG
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|config| config.vision_compat.clone())
+        .unwrap_or_default()
 }
 
 pub fn shared_target() -> Option<VisionTarget> {
     let config = crate::server::core::tool_services::load().vision?;
-    Some(VisionTarget { provider: config.provider, model: config.upstream_model, reasoning: config.reasoning })
+    Some(VisionTarget {
+        provider: config.provider,
+        model: config.upstream_model,
+        reasoning: config.reasoning,
+    })
 }
 
 pub fn save(settings: VisionSettings, expected: &str) -> Result<(), GatewayError> {
-    super::try_update_raw_field(KEY_VISION_COMPAT, |raw| {
-        if revision(Some(raw)) != expected {
-            return Err(GatewayError::with_status(409, "图片兼容已在其他位置修改，请重新读取后再改；本次改动未生效"));
-        }
-        let previous = from_value(Some(raw)).settings.unwrap_or_default();
-        let mut next = settings.clone();
-        // 旧界面（手机端）发来的还是两块设置，没有 rules：折回规则列表。
-        //
-        // 同一种方式已经有多条规则时两块表达不了，直接拒掉并指路 —— 让它照样存下去，
-        // 等于用两条规则覆盖掉其余的，那是静默丢配置。
-        if next.rules.is_empty() {
-            let count = |mode: Mode| previous.rules.iter().filter(|rule| rule.mode == mode).count();
-            if count(Mode::Assist) > 1 || count(Mode::Reroute) > 1 {
-                return Err(GatewayError::bad_request(
-                    "图片兼容已改为按规则配置；这一种方式下有多条规则时，请到「路由 → 图片兼容」里修改"));
+    super::try_update_raw_field(
+        KEY_VISION_COMPAT,
+        |raw| {
+            if revision(Some(raw)) != expected {
+                return Err(GatewayError::with_status(
+                    409,
+                    "图片兼容已在其他位置修改，请重新读取后再改；本次改动未生效",
+                ));
             }
-            next.fold_blocks();
-        }
-        validate(&next).map_err(GatewayError::bad_request)?;
-        // 两块设置降级成投影：手机端与旧界面还在按它读。
-        next.project_blocks();
-        *raw = serde_json::to_value(&next).map_err(|error| GatewayError::new(error.to_string()))?;
-        Ok(())
-    }, || GatewayError::new("图片兼容保存失败，未应用本次修改"))
+            let previous = from_value(Some(raw)).settings.unwrap_or_default();
+            let mut next = settings.clone();
+            // 旧界面（手机端）发来的还是两块设置，没有 rules：折回规则列表。
+            //
+            // 同一种方式已经有多条规则时两块表达不了，直接拒掉并指路 —— 让它照样存下去，
+            // 等于用两条规则覆盖掉其余的，那是静默丢配置。
+            if next.rules.is_empty() {
+                let count = |mode: Mode| {
+                    previous
+                        .rules
+                        .iter()
+                        .filter(|rule| rule.mode == mode)
+                        .count()
+                };
+                if count(Mode::Assist) > 1 || count(Mode::Reroute) > 1 {
+                    return Err(GatewayError::bad_request(
+                    "图片兼容已改为按规则配置；这一种方式下有多条规则时，请到「路由 → 图片兼容」里修改"));
+                }
+                next.fold_blocks();
+            }
+            validate(&next).map_err(GatewayError::bad_request)?;
+            // 两块设置降级成投影：手机端与旧界面还在按它读。
+            next.project_blocks();
+            *raw = serde_json::to_value(&next)
+                .map_err(|error| GatewayError::new(error.to_string()))?;
+            Ok(())
+        },
+        || GatewayError::new("图片兼容保存失败，未应用本次修改"),
+    )
 }

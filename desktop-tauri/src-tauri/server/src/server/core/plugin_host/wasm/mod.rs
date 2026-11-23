@@ -12,14 +12,13 @@ pub(in crate::server) use catpaw_turn::output::{
 };
 pub(super) mod checkin_call;
 pub(in crate::server::core) use checkin_call::{OfficialDailyFact, ObservationView};
-pub(crate) mod codearts_enrollment;
-mod codearts_refresh;
 mod codearts_session;
 pub(crate) mod desktop_credentials;
 pub(crate) mod desktop_launch;
 mod inline_images;
 mod doubao_upload;
 mod doubao_turn;
+mod deepseek_pow;
 mod monkeycode_cap;
 pub(crate) mod codearts_login;
 mod client_device;
@@ -36,7 +35,6 @@ mod http;
 pub(super) mod inbound_images;
 pub(super) mod install_source;
 mod limits;
-mod legacy_credentials;
 mod legacy_secret;
 mod login;
 pub(crate) mod managed;
@@ -99,6 +97,7 @@ pub(crate) fn contract() -> serde_json::Value {
     serde_json::json!({ "abi": manifest::ABI, "capabilities": manifest::CAPABILITIES,
         "limits": { "messageBytes": MAX_MESSAGE, "streamChunkBytes": 64 * 1024, "resourceBytes": 96 * 1024 * 1024,
             "stackBytes": compilation::MAX_WASM_STACK_BYTES,
+            "defaultMemoryMib": manifest::DEFAULT_MEMORY_MIB, "maxMemoryMib": manifest::MAX_MEMORY_MIB,
             "accountStateBytes": 2 * 1024 * 1024, "conversationTtlMs": 86_400_000,
             "publicImageBytes": resource_fetch::MAX_IMAGE_BYTES, "publicDownloadBytes": resource_fetch::MAX_TOTAL_BYTES,
             "protocolConverters": protocol::MAX_CONVERTERS, "protocolChunkBytes": protocol::MAX_CHUNK_BYTES,
@@ -111,7 +110,7 @@ pub(crate) fn contract() -> serde_json::Value {
         "state": { "login": "discard_on_reload", "conversation": "preserve_on_reload_reset_on_restart",
             "account": "encrypted_persistent_compare_exchange", "schema": "plugin_owned" },
         "settings": { "schema": "init.settings_schema", "group": "init.settings_group",
-            "types": ["string", "number", "boolean", "select"], "placement": "host_owned",
+            "types": ["string", "number", "boolean", "select", "upstream_version"], "placement": "host_owned",
             "values": "host_saved_overrides", "secrets": "account_store_only", "runtimeOverrides": "settings.overrides" },
         "images": "normalized_result_resources", "catalog": "account_snapshots_provider_union",
         "tasks": { "declarations": "tasks.list", "categories": "tasks.categories", "placement": "host_owned",

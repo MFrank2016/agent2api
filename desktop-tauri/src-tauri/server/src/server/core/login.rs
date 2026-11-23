@@ -40,6 +40,7 @@ use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind};
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 
+pub(crate) mod callback_page;
 pub(crate) mod sms;
 pub(crate) mod sms_contract;
 pub(crate) mod managed;
@@ -334,9 +335,12 @@ impl LoginTasks {
         let Some(handle) = self.get(state) else {
             return false;
         };
-        {
+        let remove_from_table = {
             let mut task = handle.lock();
             if task.done {
+                return false;
+            }
+            if task.managed && task.persistence != persistence::SaveState::NotEntered {
                 return false;
             }
             task.canceled = true;
@@ -348,8 +352,9 @@ impl LoginTasks {
             task.auth_url = None;
             task.error = Some("登录已取消".to_string());
             task.finished_at = Some(logging::now_ms());
-        }
-        {
+            !task.managed
+        };
+        if remove_from_table {
             let mut table = self.lock();
             // 按 state 或按句柄（state 未入表时用 ticket 兜底，两者必居其一）
             let ticket = handle.ticket();

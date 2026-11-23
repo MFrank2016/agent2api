@@ -114,10 +114,9 @@ const INFLIGHT_WAIT_MS: u64 = 45_000;
 
 /// 选路循环的最大轮数（防病态数据下的无限回环）。
 ///
-/// Node 版靠 `pickNextAccount` 返回 null 收尾 —— 每次轮换都会往 triedIds 里
-/// 加一个账号，而账号上限是 20，所以必然收敛。这里额外加一个轮数上限兜底：
-/// 万一账号数据被手工改出「同一个 id 出现两次」之类的怪状，宁可报错也不要空转。
-pub(super) const MAX_ROUTE_ATTEMPTS: usize = 32;
+/// 与 `config::error_policy::MAX_SWITCHES`（100）对齐，让高账号数部署在配置到
+/// 100 时不会在转发层被提前截断。
+pub(super) const MAX_ROUTE_ATTEMPTS: usize = 100;
 
 /// 在途请求的完成信号（去重队列用）。
 ///
@@ -415,6 +414,21 @@ impl UpstreamService {
             Some(model) => self.route.model_rest_clear(account_id, model),
             None => self.route.model_rest_clear_all(account_id),
         }
+    }
+
+    pub fn route_queue_facts_for(
+        &self,
+        accounts: &[Value],
+        keys: &crate::server::core::routing::CooldownKeys<'_>,
+        now: i64,
+    ) -> (
+        HashMap<String, i64>,
+        HashMap<String, i64>,
+        std::collections::HashSet<String>,
+    ) {
+        let mut snapshot = self.route.snapshot("", now, 0);
+        self.route.merge_scoped_sunk(accounts, keys, now, &mut snapshot.sunk);
+        (snapshot.sunk, snapshot.resting, snapshot.open)
     }
 
     pub fn route_sticky_sessions(&self, model: Option<&str>, now: i64) -> Vec<Value> {

@@ -39,10 +39,18 @@ pub struct CapacitySettings {
 impl Default for CapacitySettings {
     fn default() -> Self {
         Self {
-            mode: CapacityMode::Auto, max_conversations: 1024, max_interactive: 64,
-            max_background: 32, background_per_provider: 8, max_images: 16,
-            max_connections: 4096, memory_mib: 0, queue_requests: 2048,
-            queue_memory_mib: 256, queue_wait_seconds: 10, provider_limits: BTreeMap::new(),
+            mode: CapacityMode::Auto,
+            max_conversations: 1024,
+            max_interactive: 64,
+            max_background: 32,
+            background_per_provider: 8,
+            max_images: 16,
+            max_connections: 4096,
+            memory_mib: 0,
+            queue_requests: 2048,
+            queue_memory_mib: 256,
+            queue_wait_seconds: 10,
+            provider_limits: BTreeMap::new(),
         }
     }
 }
@@ -69,10 +77,15 @@ impl CapacitySettings {
         if !(1..=120).contains(&self.queue_wait_seconds) {
             return Err("排队等待必须在 1～120 秒之间".into());
         }
-        if self.provider_limits.len() > 256 || self.provider_limits.iter().any(|(id, limit)| {
-            id.is_empty() || id.len() > 128 || id.chars().any(char::is_control)
-                || *limit == 0 || *limit > MAX_EXECUTIONS
-        }) {
+        if self.provider_limits.len() > 256
+            || self.provider_limits.iter().any(|(id, limit)| {
+                id.is_empty()
+                    || id.len() > 128
+                    || id.chars().any(char::is_control)
+                    || *limit == 0
+                    || *limit > MAX_EXECUTIONS
+            })
+        {
             return Err("提供商并发设置无效".into());
         }
         Ok(())
@@ -87,21 +100,41 @@ pub struct CapacitySnapshot {
 }
 
 impl Default for CapacitySnapshot {
-    fn default() -> Self { from_value(None) }
+    fn default() -> Self {
+        from_value(None)
+    }
 }
 
 fn revision(value: Option<&Value>) -> String {
-    format!("{:x}", Sha256::digest(value.cloned().unwrap_or(Value::Null).to_string().as_bytes()))
+    format!(
+        "{:x}",
+        Sha256::digest(value.cloned().unwrap_or(Value::Null).to_string().as_bytes())
+    )
 }
 
 fn from_value(value: Option<&Value>) -> CapacitySnapshot {
-    let result = value.map_or_else(|| Ok(CapacitySettings::default()), |value| {
-        serde_json::from_value::<CapacitySettings>(value.clone()).map_err(|error| error.to_string())
-            .and_then(|settings| { settings.validate()?; Ok(settings) })
-    });
+    let result = value.map_or_else(
+        || Ok(CapacitySettings::default()),
+        |value| {
+            serde_json::from_value::<CapacitySettings>(value.clone())
+                .map_err(|error| error.to_string())
+                .and_then(|settings| {
+                    settings.validate()?;
+                    Ok(settings)
+                })
+        },
+    );
     match result {
-        Ok(settings) => CapacitySnapshot { settings, revision: revision(value), error: None },
-        Err(error) => CapacitySnapshot { settings: CapacitySettings::default(), revision: revision(value), error: Some(error) },
+        Ok(settings) => CapacitySnapshot {
+            settings,
+            revision: revision(value),
+            error: None,
+        },
+        Err(error) => CapacitySnapshot {
+            settings: CapacitySettings::default(),
+            revision: revision(value),
+            error: Some(error),
+        },
     }
 }
 
@@ -110,20 +143,32 @@ pub(crate) fn from_raw(raw: &Map<String, Value>) -> Arc<CapacitySnapshot> {
 }
 
 pub fn current() -> Arc<CapacitySnapshot> {
-    super::CONFIG.read().unwrap_or_else(|error| error.into_inner()).as_ref()
-        .map(|config| config.runtime_capacity.clone()).unwrap_or_default()
+    super::CONFIG
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .map(|config| config.runtime_capacity.clone())
+        .unwrap_or_default()
 }
 
 pub fn save(settings: CapacitySettings, expected: &str) -> Result<(), GatewayError> {
     settings.validate().map_err(GatewayError::bad_request)?;
-    let value = serde_json::to_value(settings).map_err(|error| GatewayError::new(error.to_string()))?;
-    super::try_update_raw_field(KEY_RUNTIME_CAPACITY, |raw| {
-        if revision(Some(raw)) != expected {
-            return Err(GatewayError::with_status(409, "运行容量已在其他位置修改，请重新读取后再保存"));
-        }
-        *raw = value;
-        Ok(())
-    }, || GatewayError::new("运行容量保存失败，未应用本次修改"))?;
+    let value =
+        serde_json::to_value(settings).map_err(|error| GatewayError::new(error.to_string()))?;
+    super::try_update_raw_field(
+        KEY_RUNTIME_CAPACITY,
+        |raw| {
+            if revision(Some(raw)) != expected {
+                return Err(GatewayError::with_status(
+                    409,
+                    "运行容量已在其他位置修改，请重新读取后再保存",
+                ));
+            }
+            *raw = value;
+            Ok(())
+        },
+        || GatewayError::new("运行容量保存失败，未应用本次修改"),
+    )?;
     crate::server::core::runtime_capacity::changed();
     Ok(())
 }

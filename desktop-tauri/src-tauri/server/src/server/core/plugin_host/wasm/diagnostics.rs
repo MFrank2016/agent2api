@@ -43,7 +43,9 @@ impl Invocation {
         snapshot["outputBytes"] = json!(context.progress.output_bytes());
         snapshot["hostCalls"] = json!(context.calls);
         snapshot["memoryBytes"] = json!(limits.linear_bytes);
-        snapshot["memoryLimitBytes"] = json!(context.shared.options.manifest.memory_mib * 1024 * 1024);
+        snapshot["memoryLimitBytes"] = json!(
+            context.shared.options.effective_memory_mib(self.method == proto::methods::gateway::CONVERSATION) * 1024 * 1024
+        );
         snapshot["tableBytes"] = json!(limits.table_bytes);
         snapshot["stackLimitBytes"] = json!(super::compilation::MAX_WASM_STACK_BYTES);
         state.snapshot = snapshot;
@@ -79,11 +81,10 @@ impl Invocation {
             Some("cancelled") => "Wasm 插件调用已取消",
             Some("unavailable") => "Wasm 插件调用已关闭",
             Some(_) => "Wasm 插件执行未完成",
-            None => "Wasm 插件计算用量",
+            None => "Wasm 插件沙盒资源统计",
         };
         let level = if matches!(reason, Some("cancelled" | "unavailable")) { "info" }
             else if error.is_some() { "warn" }
-            else if self.method == proto::methods::gateway::CONVERSATION { "info" }
             else { "debug" };
         let data = json!({ "provider": self.provider, "action": self.method, "moduleDigest": self.module,
             "account": state.account, "requestId": state.request, "phase": state.phase,

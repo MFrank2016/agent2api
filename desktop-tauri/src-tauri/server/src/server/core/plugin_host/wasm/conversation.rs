@@ -3,10 +3,10 @@
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, Weak};
 
-mod ordinary_http;
+pub(super) mod ordinary_http;
 mod catpaw_material;
 pub(super) use catpaw_material::CatPawMaterial;
-pub(in crate::server::core::plugin_host) use ordinary_http::WorkBuddyExecution;
+pub(in crate::server::core::plugin_host) use ordinary_http::{WorkBuddyExecution, WORKBUDDY_MAX_BODY};
 mod source_ref;
 mod task_call;
 pub(super) use source_ref::{SourceGate, SourceRef};

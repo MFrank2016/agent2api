@@ -88,6 +88,8 @@ impl Host {
             })?;
             let value = unwrap_reply(reply).map_err(|error| error.message)?;
             let settings = super::super::provider_settings::parse(self, &value)?;
+            let error_rules = super::super::error_rules::parse(&value);
+            let usage_policies = super::super::usage_policy::parse(&value);
             super::desktop_launch::validate_metadata(&runtime.shared.options, &value)?;
             let providers: Vec<proto::ProviderInfo> = serde_json::from_value(value).map_err(|_| "Wasm 握手返回无效提供商信息")?;
             if providers.len() != 1 || providers[0].id.as_str() != runtime.shared.options.provider {
@@ -110,10 +112,10 @@ impl Host {
                 return Err("Wasm 对话必须声明受控账号访问能力".into());
             }
             runtime.shared.system_proxy_when_unset.store(provider.capabilities.system_proxy_when_unset, Ordering::Release);
-            Ok((providers, settings, runtime))
+            Ok((providers, settings, error_rules, usage_policies, runtime))
         }.await;
         match result {
-            Ok((providers, settings, runtime)) => {
+            Ok((providers, settings, error_rules, usage_policies, runtime)) => {
                 let _state = self.lifecycle.lock().unwrap_or_else(|error| error.into_inner());
                 if self.closing.load(Ordering::Acquire) || super::super::runtime::admission_closed()
                     || runtime.shared.cancel.is_cancelled() {
@@ -128,6 +130,8 @@ impl Host {
                 // 当前Shared仍保持弱登记，关闭时不依赖可能正被借用的Runtime锁。
                 *self.providers.lock().unwrap_or_else(|error| error.into_inner()) = providers.clone();
                 *self.provider_settings.lock().unwrap_or_else(|error| error.into_inner()) = settings;
+                *self.error_rules.lock().unwrap_or_else(|error| error.into_inner()) = error_rules;
+                *self.usage_policies.lock().unwrap_or_else(|error| error.into_inner()) = usage_policies;
                 self.generation.fetch_add(1, Ordering::AcqRel);
                 self.running.store(true, Ordering::Release);
                 self.ready.store(true, Ordering::Release);
@@ -156,27 +160,6 @@ impl Host {
 
     pub(crate) async fn call_wasm(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, proto::WireError> {
         self.call_wasm_inner(method, params, timeout, None).await
-    }
-
-    pub(in crate::server::core::plugin_host) async fn call_wasm_codearts_refresh(self: &Arc<Self>,
-        params: Value, timeout: Duration,
-    ) -> Result<Value, proto::WireError> {
-        let method = proto::methods::gateway::TOKEN_REFRESH;
-        let account = params["account"].as_str().ok_or_else(|| super::error("CodeArts原换证调用缺少目标账号"))?;
-        if params["provider"].as_str() != Some("codearts") || !self.ready() {
-            return Err(super::error("CodeArts原换证运行来源不可用"));
-        }
-        let (_telemetry, egress) = match super::super::account_egress::capture_request("codearts", account) {
-            Ok((telemetry, egress)) => (Some(telemetry), Some(egress)),
-            Err(super::super::account_egress::EgressError::MissingScope
-                | super::super::account_egress::EgressError::NoRequest) => (None, None),
-            Err(_) => return Err(super::error("CodeArts原请求账号出口未确认，未重新选号或回退直连")),
-        };
-        let runtime = self.embedded.runtime.try_read().map_err(|_| super::error("CodeArts原运行实例正忙"))?
-            .clone().ok_or_else(|| super::error("CodeArts原运行实例不可用"))?;
-        let call = super::codearts_refresh::Call::capture(self, &runtime, method, account,
-            tokio::time::Instant::now() + timeout, egress)?;
-        unwrap_reply(runtime.invoke_codearts_refresh(call, params, timeout).await?)
     }
 
     pub(in crate::server::core::plugin_host) async fn call_wasm_doubao_rewards(self: &Arc<Self>,
@@ -276,10 +259,6 @@ impl Host {
         }
         let _lease = self.activity.acquire().ok_or_else(|| super::error("插件正在切换或已关闭"))?;
         let runtime = self.embedded.runtime.read().await.clone().ok_or_else(|| super::error("Wasm 插件尚未加载"))?;
-        if runtime.shared.options.provider.as_str() == "codearts"
-            && method == proto::methods::gateway::TOKEN_REFRESH {
-            return Err(proto::WireError::with_code("换证必须来自原账号的固定宿主调用", "forbidden"));
-        }
         if runtime.shared.options.provider == "doubaowork" && matches!(method, proto::methods::gateway::CLAIM | proto::methods::gateway::CLAIM_STATUS) {
             return Err(proto::WireError::with_code("豆包任务领奖必须由原账号固定宿主入口执行", "forbidden"));
         }
@@ -331,6 +310,12 @@ impl Host {
             let mut nonce = [0u8; 32];
             getrandom::getrandom(&mut nonce).map_err(|_| super::error("无法生成安全的登录流程标识"))?;
             params["flow"] = json!(format!("login_{}", nonce.iter().map(|byte| format!("{byte:02x}")).collect::<String>()));
+            if runtime.shared.options.provider == "raccoon" && params["payload"]["mode"] == "external"
+                && params["payload"].get("callbackOrigin").is_none() {
+                let port = super::super::bootstrap::loopback_port();
+                if port == 0 { return Err(super::error("网关本机回调端口尚未就绪")); }
+                params["payload"]["callbackOrigin"] = json!(format!("http://127.0.0.1:{port}"));
+            }
             if runtime.shared.options.allows("login.callback.v1") {
                 let port = super::super::bootstrap::loopback_port();
                 if port == 0 { return Err(super::error("网关本机回调端口尚未就绪")); }
@@ -375,17 +360,24 @@ impl Host {
         } else if let Some(owner) = claim_owner { runtime.invoke_claim(method, params, timeout, owner).await? }
         else { runtime.invoke(method, params, timeout, None).await? };
         let result = unwrap_reply(reply)?;
-        let _sms_completed = sms_verify.then(|| LoginCleanup { shared: runtime.shared.clone(),
+        let sms_captcha = sms_action && result["status"] == "captcha";
+        let _sms_completed = (sms_verify && !sms_captcha).then(|| LoginCleanup { shared: runtime.shared.clone(),
             flow: sms.map(|call| call.flow().to_string()).unwrap_or_default() });
-        if sms_action && result["status"] == "captcha" && result["challenge"]["type"] == "geetest"
+        if sms_captcha && result["challenge"]["type"] == "geetest"
             && !runtime.shared.options.allows("login.captcha.geetest.v1")
         {
             return Err(proto::WireError::with_code("插件未声明人机验证能力", "forbidden"));
         }
-        if sms_action && result["status"] == "captcha" && result["challenge"]["type"] == "external" {
+        if sms_captcha && result["challenge"]["type"] == "alicom4"
+            && (runtime.shared.options.provider != "codar"
+                || !runtime.shared.options.allows("login.sms.alicom4.v1"))
+        {
+            return Err(proto::WireError::with_code("插件未声明人机验证能力", "forbidden"));
+        }
+        if sms_captcha && result["challenge"]["type"] == "external" {
             runtime.shared.options.check_url(result["challenge"]["url"].as_str().unwrap_or(""), false)?;
         }
-        if sms_verify {
+        if sms_verify && !sms_captcha {
             validate_identity(&runtime.shared.options, &result)?;
             super::public_view::validate(&result["public"], &result["secret"])?;
         }
@@ -427,7 +419,6 @@ impl Host {
                 if result["account"].is_object() {
                     validate_identity(&runtime.shared.options, &result["account"])?;
                     super::public_view::validate(&result["account"]["public"], &result["account"]["secret"])?;
-                    if runtime.shared.options.provider == "codearts" { super::codearts_login::accept(&runtime.shared, &flow, &result)?; }
                 }
             }
             _ => {}

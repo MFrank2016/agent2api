@@ -30,12 +30,18 @@
 import * as React from "react";
 import { createRoot } from "react-dom/client";
 import {
+  Alert,
+  Badge,
   Button,
   Dialog,
+  DialogBody,
   DialogContent,
   DialogFooter,
   DialogHeader,
   DialogTitle,
+  NavItem,
+  NavList,
+  Sidebar,
 } from "@ui";
 
 import {
@@ -56,7 +62,26 @@ import {
 } from "./add-account-forms";
 import { useAddAccountCatalog } from "./add-account-catalog";
 import { useProviderIcon } from "./provider-icon";
-import { AddAccountProxyProvider } from "./add-account-proxy";
+import {
+  AddAccountProxyProvider,
+  useAddAccountProxy,
+} from "./add-account-proxy";
+import {
+  AddAccountForwardingPane,
+  AddAccountLimiterPane,
+  AddAccountNetworkPane,
+  AddAccountQueryPane,
+  AddAccountSettingsProvider,
+  useAddAccountSettings,
+  type AddPaneId,
+} from "./add-account-settings";
+import { AccountSettingsIcon } from "./accounts-settings-fields";
+import { providerFeatures } from "./accounts-features";
+import { isOpencodeZenProvider } from "./accounts-domain";
+import {
+  customUserAgentEditable,
+  userAgentEditable,
+} from "./add-account-user-agent";
 import {
   managedCaptchaBusy,
   subscribeManagedCaptchaBusy,
@@ -198,6 +223,395 @@ function providerFormState(
   return next;
 }
 
+function AddAccountFormContent({
+  state,
+  version,
+  availability,
+  formFootHost,
+  backToPick,
+}: {
+  state: IslandState;
+  version: number;
+  availability: string;
+  formFootHost: HTMLElement;
+  backToPick: () => void;
+}): React.ReactElement {
+  const proxy = useAddAccountProxy();
+  const settings = useAddAccountSettings();
+  const paneScroll = React.useRef<HTMLDivElement | null>(null);
+  const panePositions = React.useRef<Partial<Record<AddPaneId, number>>>({});
+
+  const isCustom = state.provider === CUSTOM_PROVIDER;
+  const customMode: CustomMode = state.providerHint ? "existing" : "create";
+  const pickedProvider =
+    isCustom && state.providerHint
+      ? customList().find((item) => item.id === state.providerHint)
+      : undefined;
+  const createPreset =
+    isCustom && !state.providerHint && state.presetKey
+      ? shared().wbPresetProviders?.presetOf?.(state.presetKey)
+      : null;
+  const customLabel = state.providerHint
+    ? pickedProvider?.name || ""
+    : createPreset?.name || "";
+  const providerLabel = t(
+    shared().wbProviders?.labelOf?.(state.provider) || state.provider,
+  );
+  const heading = isCustom
+    ? state.providerHint
+      ? t("添加 {name} 账号", { name: customLabel || t("自定义提供商") })
+      : state.presetKey
+        ? t("使用 {name} 模板新建提供商", { name: customLabel })
+        : t("新建自定义提供商")
+    : state.provider === "deepseek-web"
+      ? t("添加 DeepSeek 账号")
+      : t("添加 {name} 账号", { name: providerLabel });
+
+  const balanceScheme = isCustom
+    ? String(
+        pickedProvider?.balanceScheme || createPreset?.balance?.scheme || "",
+      )
+    : "";
+  const supportsUsage = isCustom
+    ? Boolean(balanceScheme)
+    : providerFeatures(state.provider).usage;
+  const uaEditable = isCustom
+    ? customMode === "existing"
+      ? customUserAgentEditable(pickedProvider)
+      : customUserAgentEditable(createPreset)
+    : userAgentEditable(state.provider);
+  const allowRotate = isCustom
+    ? isOpencodeZenProvider(
+        pickedProvider ||
+          (createPreset
+            ? {
+                clientEmulation: createPreset.clientEmulation,
+                baseUrl: createPreset.baseUrl,
+              }
+            : undefined),
+        createPreset?.baseUrl || pickedProvider?.baseUrl,
+      )
+    : false;
+  const concDefault = isCustom
+    ? 0
+    : providerFeatures(state.provider).concurrencyDefault || 0;
+  const effectiveProvider = state.providerHint || state.provider;
+
+  const panes: AddPaneId[] = supportsUsage
+    ? ["basic", "forwarding", "query", "limiter", "network"]
+    : ["basic", "forwarding", "limiter", "network"];
+
+  const paneInfo: Record<
+    AddPaneId,
+    { title: string; description: string; icon: string }
+  > = {
+    basic: {
+      title: isCustom ? t("连接与凭证") : t("登录与凭证"),
+      description: isCustom
+        ? customMode === "create"
+          ? t("按分组填写连接参数与账号凭证，右侧可实时预览完整请求地址。")
+          : t("查看所属站点信息，填写当前账号的 API Key 与备注名。")
+        : t("选择登录方式并填写对应凭证。"),
+      icon: "key",
+    },
+    forwarding: {
+      title: t("转发行为"),
+      description: t(
+        "预设账号启用状态、失败换号策略、并发上限及自定义 User-Agent。",
+      ),
+      icon: "sliders",
+    },
+    query: {
+      title: t("查询设置"),
+      description: t("预设自动余额刷新间隔、失败重试次数及查询凭证。"),
+      icon: "refresh",
+    },
+    limiter: {
+      title: t("限制器"),
+      description: t("创建时即可配置余额或本地用量保护规则。"),
+      icon: "shield",
+    },
+    network: {
+      title: t("网络"),
+      description: t("设置当前账号访问上游时使用的出网代理。"),
+      icon: "proxies",
+    },
+  };
+
+  const activePane: AddPaneId = panes.includes(settings.pane)
+    ? settings.pane
+    : "basic";
+
+  // 每次在第 1 步点卡片重新打开表单时，回到首屏（连接与凭证）
+  React.useEffect(() => {
+    settings.setPane("basic");
+    panePositions.current = {};
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.showToken]);
+
+  React.useLayoutEffect(() => {
+    if (paneScroll.current)
+      paneScroll.current.scrollTop = panePositions.current[activePane] || 0;
+  }, [activePane]);
+
+  function selectPane(next: AddPaneId): void {
+    if (proxy.busy) return;
+    if (paneScroll.current)
+      panePositions.current[activePane] = paneScroll.current.scrollTop;
+    settings.setPane(next);
+  }
+
+  return (
+    <DialogContent
+      keepMounted
+      overlayForceRender
+      className={`${state.provider === "deepseek-web" ? "compact-login-dialog " : ""}acct-settings-dialog acct-add-form-dialog`}
+    >
+      <DialogHeader className="acct-dlg-header">
+        <ProviderMark
+          provider={state.provider}
+          label={customLabel || providerLabel}
+        />
+        <div className="acct-dlg-identity">
+          <div className="acct-dlg-title-row">
+            <DialogTitle>{heading}</DialogTitle>
+            {isCustom ? (
+              <Badge variant="secondary" shape="tag">
+                {t("自定义 API")}
+              </Badge>
+            ) : null}
+          </div>
+          <p>
+            <span>
+              {isCustom ? customLabel || t("自定义提供商") : providerLabel}
+            </span>
+            <span className="acct-dlg-title-dot">·</span>
+            <span>
+              {isCustom && customMode === "create"
+                ? t("新建提供商并添加账号")
+                : t("新建账号配置")}
+            </span>
+          </p>
+        </div>
+      </DialogHeader>
+      <DialogBody className="acct-dlg-body">
+        <div className="acct-dlg">
+          <Sidebar className="acct-dlg-rail" aria-label={t("添加账号分组")}>
+            <NavList className="acct-dlg-nav">
+              <div className="acct-dlg-nav-label">{t("添加设置")}</div>
+              {panes.map((id) => (
+                <NavItem
+                  key={id}
+                  active={activePane === id}
+                  title={paneInfo[id].title}
+                  disabled={proxy.busy && activePane !== id}
+                  className="shadow-none"
+                  icon={<AccountSettingsIcon name={paneInfo[id].icon} />}
+                  trailing={
+                    settings.dirtyPanes[id] ? (
+                      <span
+                        className="acct-dlg-dirty-dot"
+                        aria-label={t("已调整设置")}
+                      />
+                    ) : undefined
+                  }
+                  onClick={() => selectPane(id)}
+                >
+                  {paneInfo[id].title}
+                </NavItem>
+              ))}
+            </NavList>
+            <div className="acct-dlg-rail-context">
+              <strong>
+                <AccountSettingsIcon
+                  name={isCustom ? "agent" : "accounts"}
+                  size={14}
+                />
+                {isCustom ? customLabel || t("自定义 API") : providerLabel}
+              </strong>
+              <p>
+                {isCustom && customMode === "create"
+                  ? t("创建后会继续提示获取模型")
+                  : t("所有设置会在保存时一并生效")}
+              </p>
+            </div>
+          </Sidebar>
+          <div className="acct-dlg-main">
+            <div className="acct-dlg-pane-head">
+              <div>
+                <h3>{paneInfo[activePane].title}</h3>
+                <p>{paneInfo[activePane].description}</p>
+              </div>
+              <span className="acct-dlg-scope">
+                <AccountSettingsIcon name="sliders" size={13} />
+                {activePane === "basic" ? t("必填项与凭证") : t("账号初始设置")}
+              </span>
+            </div>
+            <div
+              ref={paneScroll}
+              className="acct-dlg-scroll"
+              aria-busy={proxy.busy}
+            >
+              <div className="acct-dlg-pane">
+                {/* 首栏常驻 DOM（只用 hidden 切换）：保证登录引擎事件与草稿 ID 不因切栏丢失 */}
+                <div hidden={activePane !== "basic"}>
+                  <AddAccountForms
+                    forms={state.forms}
+                    provider={state.provider}
+                    open={state.step === "form"}
+                    version={version}
+                    availability={availability}
+                    footerHost={formFootHost}
+                  />
+                </div>
+                {activePane === "forwarding" ? (
+                  <AddAccountForwardingPane
+                    concDefault={concDefault}
+                    uaEditable={uaEditable}
+                    busy={proxy.busy}
+                  />
+                ) : null}
+                {activePane === "query" && supportsUsage ? (
+                  <AddAccountQueryPane
+                    supportsUsage={supportsUsage}
+                    balanceScheme={balanceScheme}
+                    busy={proxy.busy}
+                  />
+                ) : null}
+                {activePane === "limiter" ? (
+                  <AddAccountLimiterPane
+                    provider={effectiveProvider}
+                    allowBalance={supportsUsage}
+                    busy={proxy.busy}
+                  />
+                ) : null}
+                {activePane === "network" ? (
+                  <AddAccountNetworkPane
+                    idPrefix="add-account-proxy"
+                    busy={proxy.busy}
+                    allowRotate={allowRotate}
+                  />
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </div>
+      </DialogBody>
+      {/* 表单动作始终挂在固定底栏宿主，在任何分栏下都可直接提交或返回 */}
+      <DialogFooter className="acct-add-foot">
+        <Button variant="ghost" className="acct-add-back" onClick={backToPick}>
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            aria-hidden="true"
+          >
+            <path d="m15 5-7 7 7 7" />
+          </svg>
+          {state.direct ? t("取消") : t("更换提供商")}
+        </Button>
+        {isCustom ? (
+          <div className="acct-add-foot-host">
+            <CustomFootActions
+              mode={customMode}
+              presetKey={state.presetKey}
+              providerId={state.providerHint}
+            />
+          </div>
+        ) : (
+          <div
+            className="acct-add-foot-mount"
+            ref={(node) => {
+              if (node && formFootHost.parentElement !== node)
+                node.append(formFootHost);
+            }}
+          />
+        )}
+      </DialogFooter>
+    </DialogContent>
+  );
+}
+
+type ModalErrorBoundaryProps = {
+  withDialog?: boolean;
+  onDismiss?: () => void;
+  children: React.ReactNode;
+};
+
+class ModalErrorBoundary extends React.Component<
+  ModalErrorBoundaryProps,
+  { error: Error | null; attempt: number }
+> {
+  state: { error: Error | null; attempt: number } = { error: null, attempt: 0 };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: React.ErrorInfo): void {
+    console.error("[add-account-modal] render error", error, info);
+  }
+
+  render(): React.ReactNode {
+    if (!this.state.error) {
+      return (
+        <React.Fragment key={this.state.attempt}>
+          {this.props.children}
+        </React.Fragment>
+      );
+    }
+    const content = (
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>{t("添加账号")}</DialogTitle>
+        </DialogHeader>
+        <DialogBody>
+          <Alert variant="destructive">
+            {t("界面渲染异常，请重试或关闭后重新打开。")}
+          </Alert>
+        </DialogBody>
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() =>
+              this.setState((prev) => ({
+                error: null,
+                attempt: prev.attempt + 1,
+              }))
+            }
+          >
+            {t("重试")}
+          </Button>
+          {this.props.onDismiss ? (
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={this.props.onDismiss}
+            >
+              {t("关闭")}
+            </Button>
+          ) : null}
+        </DialogFooter>
+      </DialogContent>
+    );
+    if (!this.props.withDialog) return content;
+    return (
+      <Dialog
+        open
+        onOpenChange={(open) => {
+          if (!open) this.props.onDismiss?.();
+        }}
+      >
+        {content}
+      </Dialog>
+    );
+  }
+}
+
 function AddAccountModal({
   onClose,
   onReady,
@@ -266,28 +680,6 @@ function AddAccountModal({
       void refreshCustom();
   }, [state.step, state.provider, state.showToken, refreshCustom]);
 
-  const isCustom = state.provider === CUSTOM_PROVIDER;
-  const isDeepseek = state.provider === "deepseek-web";
-  const customMode: CustomMode = state.providerHint ? "existing" : "create";
-  const customLabel = state.providerHint
-    ? customList().find((item) => item.id === state.providerHint)?.name || ""
-    : state.presetKey
-      ? shared().wbPresetProviders?.presetOf?.(state.presetKey)?.name || ""
-      : "";
-  const providerLabel = t(
-    shared().wbProviders?.labelOf?.(state.provider) || state.provider,
-  );
-  // 标题写在表单弹窗的头部：列表弹窗的标题始终是「添加账号」，不跟着步骤变
-  const heading = isCustom
-    ? state.providerHint
-      ? t("添加 {name} 账号", { name: customLabel || t("自定义提供商") })
-      : state.presetKey
-        ? t("使用 {name} 模板新建提供商", { name: customLabel })
-        : t("新建自定义提供商")
-    : isDeepseek
-      ? t("添加 DeepSeek 账号")
-      : t("添加 {name} 账号", { name: providerLabel });
-
   /** 第 1 步点一张卡：三种特殊取值分别落到自定义块的哪种模式（见 pickProvider 的旧注释） */
   const pick = React.useCallback((id: string) => {
     if (id && requireAccountEntry(id))
@@ -317,66 +709,22 @@ function AddAccountModal({
       }}
     >
       <AddAccountProxyProvider>
-        <DialogContent
-          keepMounted
-          overlayForceRender
-          className={
-            isDeepseek
-              ? "compact-login-dialog acct-add-form-dialog w-[min(620px,calc(100vw-48px))]"
-              : "acct-add-form-dialog w-[min(620px,calc(100vw-48px))]"
-          }
+        <AddAccountSettingsProvider
+          contextKey={`${state.provider}:${state.providerHint}:${state.presetKey}`}
         >
-          <DialogHeader>
-            <ProviderMark provider={state.provider} label={providerLabel} />
-            <DialogTitle>{heading}</DialogTitle>
-          </DialogHeader>
-          <AddAccountForms
-            forms={state.forms}
-            provider={state.provider}
-            open={state.step === "form"}
-            version={version}
-            availability={availability}
-            footerHost={formFootHost}
-          />
-          {/* 表单动作始终挂在固定底栏宿主，返回入口不随当前动作显隐。 */}
-          <DialogFooter className="acct-add-foot">
-            <Button
-              variant="ghost"
-              className="acct-add-back"
-              onClick={backToPick}
-            >
-              <svg
-                width="16"
-                height="16"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.8"
-                aria-hidden="true"
-              >
-                <path d="m15 5-7 7 7 7" />
-              </svg>
-              {state.direct ? t("取消") : t("更换提供商")}
-            </Button>
-            {isCustom ? (
-              <div className="acct-add-foot-host">
-                <CustomFootActions
-                  mode={customMode}
-                  presetKey={state.presetKey}
-                  providerId={state.providerHint}
-                />
-              </div>
-            ) : (
-              <div
-                className="acct-add-foot-mount"
-                ref={(node) => {
-                  if (node && formFootHost.parentElement !== node)
-                    node.append(formFootHost);
-                }}
-              />
-            )}
-          </DialogFooter>
-        </DialogContent>
+          <ModalErrorBoundary
+            key={`${state.provider}:${state.providerHint}:${state.presetKey}`}
+            onDismiss={backToPick}
+          >
+            <AddAccountFormContent
+              state={state}
+              version={version}
+              availability={availability}
+              formFootHost={formFootHost}
+              backToPick={backToPick}
+            />
+          </ModalErrorBoundary>
+        </AddAccountSettingsProvider>
       </AddAccountProxyProvider>
     </Dialog>
   ) : null;
@@ -441,17 +789,19 @@ function mountModal(initialProvider?: string): void {
   document.body.append(host);
   root = createRoot(host);
   root.render(
-    <AddAccountModal
-      onClose={closeModal}
-      initialProvider={initialProvider}
-      onReady={(next) => {
-        handle = next;
-        if (!next) return;
-        const action = pendingAction;
-        pendingAction = null;
-        action?.();
-      }}
-    />,
+    <ModalErrorBoundary withDialog onDismiss={closeModal}>
+      <AddAccountModal
+        onClose={closeModal}
+        initialProvider={initialProvider}
+        onReady={(next) => {
+          handle = next;
+          if (!next) return;
+          const action = pendingAction;
+          pendingAction = null;
+          action?.();
+        }}
+      />
+    </ModalErrorBoundary>,
   );
 }
 

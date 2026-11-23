@@ -65,7 +65,9 @@ pub struct RoutingProfiles {
 
 impl RoutingProfiles {
     pub fn group_for_model(&self, model: &str) -> Option<&super::RoutingGroup> {
-        self.groups.values().find(|group| group.model.eq_ignore_ascii_case(model.trim()))
+        self.groups
+            .values()
+            .find(|group| group.model.eq_ignore_ascii_case(model.trim()))
     }
     pub fn model_profile(&self, model: &str) -> Option<&RoutingProfile> {
         self.models.get(&model.trim().to_ascii_lowercase())
@@ -91,7 +93,9 @@ impl RoutingProfiles {
                 settings.sticky = super::StickyMode::from_id(sticky);
             }
         }
-        if let Some(group) = self.group_for_model(model) { return group.settings(settings); }
+        if let Some(group) = self.group_for_model(model) {
+            return group.settings(settings);
+        }
         settings
     }
 
@@ -258,10 +262,19 @@ pub fn save_routing_profile(model: &str, profile: Option<RoutingProfile>) -> Res
     let mut result = Ok(());
     let saved = super::update(|config: &mut RuntimeConfig| {
         let mut next = (*config.routing_profiles).clone();
-        if next.group_for_model(&model).is_some() { result = Err("此模型 ID 已被自定义路由组占用".into()); return; }
+        if next.group_for_model(&model).is_some() {
+            result = Err("此模型 ID 已被自定义路由组占用".into());
+            return;
+        }
         if model.is_empty() {
-            if next.global.as_ref().is_some_and(super::routing_workspace::global_accounts::has_restrictions)
-                || profile.as_ref().is_some_and(super::routing_workspace::global_accounts::has_restrictions) {
+            if next
+                .global
+                .as_ref()
+                .is_some_and(super::routing_workspace::global_accounts::has_restrictions)
+                || profile
+                    .as_ref()
+                    .is_some_and(super::routing_workspace::global_accounts::has_restrictions)
+            {
                 result = Err("全局默认已改为账号启停，请先转换旧版全局参与设置；模型独立路由仍可设置参与名单".into());
                 return;
             }

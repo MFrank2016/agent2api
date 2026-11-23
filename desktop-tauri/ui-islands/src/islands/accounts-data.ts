@@ -370,6 +370,7 @@ export function rowContext(
 export type AccountsViewApi = {
   render(): void
   findAccount: typeof findAccount
+  refreshFailureMessage: typeof errorMessage
   ensureAccountDetails: typeof ensureAccountDetails
   refreshList: typeof refreshList
   refreshCaches(validIds: Set<string>): void
@@ -494,6 +495,7 @@ export function installAccountsApi(): void {
   window.wbAccountsView = {
     render: () => { syncAccountSorting(); bump() },
     findAccount,
+    refreshFailureMessage: errorMessage,
     ensureAccountDetails,
     refreshList,
     refreshCaches,

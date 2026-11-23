@@ -17,6 +17,11 @@ export type Prompt = {
 
 export type CallbackInput = 'url' | 'code'
 
+export type SmsInitialChallenge = {
+  type: 'alicom4'
+  captchaId: string
+}
+
 export type SmsConfig = {
   phoneLabel: string
   phonePlaceholder: string
@@ -27,10 +32,19 @@ export type SmsConfig = {
   codeMaxLength: number
   resendAfterSeconds: number
   expiresAfterSeconds: number
+  challenge?: SmsInitialChallenge
+}
+
+export type CredentialFile = {
+  field: string
+  accept: string
+  maxBytes: number
+  binary: boolean
 }
 
 export type Method = {
   id: string
+  file?: CredentialFile
   type: 'oauth' | 'api' | 'sms' | 'desktop'
   sms?: SmsConfig
   label: string
@@ -144,11 +158,20 @@ function parseSms(value: unknown): SmsConfig {
   }
   const phoneMinLength = integer('phoneMinLength', 1, 32)
   const codeMinLength = integer('codeMinLength', 1, 16)
+  let challenge: SmsInitialChallenge | undefined
+  if (raw.challenge !== undefined && raw.challenge !== null) {
+    const ch = objectOf(raw.challenge)
+    if (!ch || ch.type !== 'alicom4' || ch.captchaId !== 'bb7f810ecc9f6d21dcf72bcae120c8c5') {
+      throw new Error(t('插件返回的短信登录声明无效'))
+    }
+    challenge = { type: 'alicom4', captchaId: ch.captchaId }
+  }
   return {
     phoneLabel: loginText(raw.phoneLabel), phonePlaceholder: loginText(raw.phonePlaceholder), countryCodes,
     phoneMinLength, phoneMaxLength: integer('phoneMaxLength', phoneMinLength, 32),
     codeMinLength, codeMaxLength: integer('codeMaxLength', codeMinLength, 16),
     resendAfterSeconds: integer('resendAfterSeconds', 1, 3600), expiresAfterSeconds: integer('expiresAfterSeconds', 30, 900),
+    ...(challenge ? { challenge } : {}),
   }
 }
 
@@ -209,6 +232,14 @@ export function parseMethods(value: unknown, provider = ''): MethodsState {
       || (raw.type === 'api' && (raw.localOnly === true || manualCallback || embeddedOnly))) {
       throw new Error(t('插件返回了无效的登录方式，请更新插件或联系作者'))
     }
+    const file = objectOf(raw.file)
+    if (raw.file !== undefined && (!file || raw.type !== 'api' || raw.dynamicPrompts === true
+      || typeof file.field !== 'string' || typeof file.accept !== 'string' || file.accept.length > 512
+      || typeof file.binary !== 'boolean' || typeof file.maxBytes !== 'number' || !Number.isSafeInteger(file.maxBytes)
+      || file.maxBytes <= 0 || file.maxBytes > (file.binary ? 32 * 1024 * 1024 : 262144)
+      || !prompts.some(prompt => prompt.key === file.field && prompt.type === 'text' && !prompt.when))) {
+      throw new Error(t('插件凭据文件声明无效'))
+    }
     const callbackContractMissing = provider === 'copilot-subscription' && index === 1
       && (!manualCallback || callbackInput !== 'code')
     let browserMode = raw.browserMode as Method['browserMode']
@@ -216,6 +247,7 @@ export function parseMethods(value: unknown, provider = ''): MethodsState {
       && (!browserMode || browserMode === 'choice')) browserMode = 'plugin'
     return {
       id: `method:${index}`, methodIndex: index, type: raw.type as Method['type'], sms,
+      ...(file ? { file: { field: String(file.field), accept: String(file.accept), maxBytes: Number(file.maxBytes), binary: file.binary === true } } : {}),
       label: loginText(textOf(raw.label) || (raw.type === 'oauth' ? t('OAuth 登录') : raw.type === 'sms' ? t('手机验证码登录') : t('API 凭证'))),
       prompts, dynamicPrompts: raw.dynamicPrompts === true, localOnly: raw.localOnly === true, manualCallback, callbackInput, embeddedOnly,
       desktopOnly: raw.desktopOnly === true, browserMode,

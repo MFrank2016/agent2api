@@ -680,6 +680,11 @@ async fn attempt_queue(
     // 同样顺延（粘性不等于无条件）。
     let conv_key = super::route_state::RouteState::conversation_key(ctx.client_headers, &ctx.body);
     let sticky_generation = service.route.sticky_generation();
+    let sticky = super::error_policy_finish::StickyContext {
+        key: &conv_key,
+        model: &model,
+        generation: sticky_generation,
+    };
     let sticky_source = super::route_state::RouteState::conversation_source(ctx.client_headers, &ctx.body);
     if !conv_key.is_empty() {
         let mut decision = json!({
@@ -871,6 +876,9 @@ async fn attempt_queue(
             match attempt_custom(service, ctx, target, slot, connections, degraded, &mut budget).await {
                 Ok(outcome) => {
                     if let Some(account_id) = custom_account_id.as_deref() {
+                        let clear_model = failed_target.account.as_ref()
+                            .map(|account| cooldown_keys.for_account(account))
+                            .unwrap_or_else(|| cooldown_keys.for_provider(&failed_target.provider));
                         service.route.sticky_bind(
                             &conv_key, &model, &attempt_key, sticky_source, logging::now_ms(),
                             ctx.routing.settings.sticky.ttl_ms().unwrap_or(0), sticky_generation,
@@ -884,7 +892,6 @@ async fn attempt_queue(
                     return Ok(outcome);
                 },
                 Err(error) => {
-                    if ctx.telemetry.replay_guard().blocked() { return Err(error); }
                     if super::vision_compat::handles_error(ctx, &error) { return Err(error); }
                     // 手动终止优先（与无状态路径同一判定与理由）：不把已受理的
                     // 终止当成「这一轮失败」去顺延下一个账号
@@ -953,7 +960,7 @@ async fn attempt_queue(
                     // ── 通用错误策略与顺延（上游新结构）──────────────
                     let mut error = error;
                     if super::error_policy_finish::finish_failure(service, ctx, provider_ids, &cooldown_keys,
-                        &failed_target, &mut error, &mut tried_ids, &mut switches_left, switch_total) {
+                        &failed_target, &mut error, &mut tried_ids, &mut switches_left, switch_total, sticky) {
                         last_error = Some(error); continue 'accounts;
                     }
                     return Err(error);
@@ -1010,6 +1017,9 @@ async fn attempt_queue(
             {
                 Ok(outcome) => {
                     if let Some(account_id) = stateful_account_id.as_deref() {
+                        let clear_model = failed_target.account.as_ref()
+                            .map(|account| cooldown_keys.for_account(account))
+                            .unwrap_or_else(|| cooldown_keys.for_provider(provider_id));
                         service.route.sticky_bind(
                             &conv_key, &model, &attempt_key, sticky_source, logging::now_ms(),
                             ctx.routing.settings.sticky.ttl_ms().unwrap_or(0), sticky_generation,
@@ -1022,13 +1032,6 @@ async fn attempt_queue(
                     return Ok(outcome);
                 },
                 Err(error) => {
-                    if ctx.telemetry.replay_guard().blocked() { return Err(error); }
-                    if super::vision_compat::handles_error(ctx, &error) { return Err(error); }
-                    if matches!(error.code.as_deref(), Some("plugin_busy" | "gateway_busy" | "account_busy" | "plugin_resource_limit"
-                        | "plugin_protocol_error" | "plugin_trap" | "plugin_response_started" | "web_tools_invalid_request")) { return Err(error); }
-                    let account_unavailable = matches!(error.code.as_deref(),
-                        Some("account_model_unavailable" | "account_model_permissions_unknown"));
-                    if ctx.images.is_some() && !account_unavailable { return Err(error); }
                     // 手动终止优先（与无状态 / 自定义两条路径同一判定与理由）：
                     // 会话式这一轮已经结束，但用户要的是终止 —— 不把它当成
                     // 普通失败去顺延下一个账号（那会把终止拖成另一轮转发）
@@ -1039,7 +1042,28 @@ async fn attempt_queue(
                         );
                         return Err(cancellation::cancelled_error());
                     }
-                    if stateful_account_id.is_some() {
+                    if matches!(error.code.as_deref(), Some("plugin_busy" | "gateway_busy" | "account_busy" | "plugin_resource_limit"
+                        | "plugin_protocol_error" | "plugin_trap" | "plugin_response_started" | "web_tools_invalid_request")) {
+                        super::error_policy_finish::forget_sticky(service, ctx, sticky, Some(&attempt_key));
+                        return Err(error);
+                    }
+                    let account_unavailable = matches!(error.code.as_deref(),
+                        Some("account_model_unavailable" | "account_model_permissions_unknown"));
+                    if ctx.images.is_some() && !account_unavailable { return Err(error); }
+                    if super::vision_compat::handles_error(ctx, &error) { return Err(error); }
+                    if matches!(error.conversation_class, Some(UpstreamErrorClass::TokenExpired { .. }))
+                        && !adapter.supports_refresh()
+                    {
+                        if let Some(account_id) = stateful_account_id.as_deref() {
+                            if !crate::server::core::blocking::in_place(|| service.store.needs_relogin(account_id)) {
+                                crate::server::core::blocking::in_place(|| service.store.set_needs_relogin(
+                                    account_id,
+                                    Some("上游拒绝了这个登录态（会话已失效）"),
+                                ));
+                            }
+                        }
+                    }
+                    if stateful_account_id.is_some() && !ctx.telemetry.replay_guard().blocked() {
                         if !tried_ids.contains(&attempt_key) {
                             tried_ids.push(attempt_key.clone());
                         }
@@ -1102,7 +1126,7 @@ async fn attempt_queue(
                     // ── 通用错误策略与顺延（上游新结构）──────────────
                     let mut error = error;
                     if super::error_policy_finish::finish_failure(service, ctx, provider_ids, &cooldown_keys,
-                        &failed_target, &mut error, &mut tried_ids, &mut switches_left, switch_total) {
+                        &failed_target, &mut error, &mut tried_ids, &mut switches_left, switch_total, sticky) {
                         last_error = Some(error); continue 'accounts;
                     }
                     return Err(error);
@@ -1173,12 +1197,16 @@ async fn attempt_queue(
                         session = fresh;
                     }
                 }
-                Err(error) if ctx.telemetry.replay_guard().blocked() => return Err(error),
+                Err(error) if ctx.telemetry.replay_guard().blocked() => {
+                    super::error_policy_finish::forget_sticky(service, ctx, sticky, Some(&attempt_key));
+                    return Err(error);
+                }
                 Err(error) if crate::server::core::providers::subscriptions::contains(provider_id) => {
                     let name = account_label(target.account.as_ref(), &account_id, &session);
                     ctx.telemetry.note_attempt(Some(&account_id), &name, provider_id);
                     ctx.telemetry.note_attempt_started(provider_id, &name);
                     ctx.telemetry.finish_last_attempt(Some(i64::from(error.status_code)), Some(&error.message));
+                    super::error_policy_finish::forget_sticky(service, ctx, sticky, Some(&attempt_key));
                     return Err(error);
                 }
                 Err(error) => logging::verbose(
@@ -1344,6 +1372,7 @@ async fn attempt_queue(
                         Some(i64::from(error.status_code)),
                         Some(&error.message),
                     );
+                    super::error_policy_finish::forget_sticky(service, ctx, sticky, Some(&attempt_key));
                     // ── 构造期的**本地**失败：这一家还没出本机就发不出去 ──────
                     // 判据是状态码而不是文案（556，见 `readiness` 模块头）：适配器
                     // 在**构造请求时**发现本地前置条件不成立（当前唯一用户是 ZCode
@@ -1365,7 +1394,7 @@ async fn attempt_queue(
                         if account_unavailable || error.status_code == 501 {
                             let mut error = error;
                             if super::error_policy_finish::finish_failure(service, ctx, provider_ids, &cooldown_keys,
-                                &target, &mut error, &mut tried_ids, &mut switches_left, switch_total) {
+                                &target, &mut error, &mut tried_ids, &mut switches_left, switch_total, sticky) {
                                 last_error = Some(error); continue 'accounts;
                             }
                             return Err(error);
@@ -1411,6 +1440,7 @@ async fn attempt_queue(
                         Some(reset),
                     );
                     ctx.telemetry.finish_last_attempt(Some(429), Some(&error.message));
+                    super::error_policy_finish::forget_sticky(service, ctx, sticky, Some(&attempt_key));
                     if !tried_ids.contains(&attempt_key) {
                         tried_ids.push(attempt_key.clone());
                     }
@@ -1661,6 +1691,9 @@ async fn attempt_queue(
                 Err(failure) => {
                     if ctx.telemetry.replay_guard().blocked() {
                         ctx.telemetry.finish_last_attempt(Some(i64::from(failure.error.status_code)), Some(&failure.error.message));
+                        if !ctx.telemetry.is_cancelled() {
+                            super::error_policy_finish::forget_sticky(service, ctx, sticky, Some(&attempt_key));
+                        }
                         return Err(failure.error);
                     }
                     // ── 手动终止优先于一切重试动作 ────────────────────────
@@ -1681,23 +1714,27 @@ async fn attempt_queue(
                         return Err(failure.error);
                     }
                     if let Some(account_id) = target.account_id.as_deref() {
-                        if failure.policy.suspend_account {
-                            let _ = crate::server::core::blocking::in_place(|| {
-                                service.store.suspend_upstream_account(account_id, &failure.policy.reason)
-                            });
-                        } else if failure.stop {
-                            if let Some(until) = failure.policy.account_cooldown_until {
-                                let _ = crate::server::core::blocking::in_place(|| {
-                                    service.store.cooldown_upstream_account(account_id, until, &failure.policy.reason)
-                                });
-                            }
-                        }
+                        let cooldown_until = if !failure.policy.suspend_account && failure.stop {
+                            failure.policy.account_cooldown_until
+                        } else {
+                            None
+                        };
+                        super::error_policy_finish::persist_account_action(
+                            &service.store,
+                            account_id,
+                            failure.policy.suspend_account,
+                            cooldown_until,
+                            &failure.policy.reason,
+                        );
                     }
                     if ctx.telemetry.replay_guard().blocked() || failure.stop {
                         ctx.telemetry.finish_last_attempt(
                             Some(i64::from(failure.error.status_code)),
                             Some(&failure.error.message),
                         );
+                        if !ctx.telemetry.is_cancelled() {
+                            super::error_policy_finish::forget_sticky(service, ctx, sticky, Some(&attempt_key));
+                        }
                         return Err(failure.error);
                     }
                     // 用户点名的状态码（默认 402）不做「同一账号再看一眼」：
@@ -1807,7 +1844,10 @@ async fn attempt_queue(
                                 service, provider_id, target.account_id.as_deref(),
                             ).await {
                                 let delay = host_rule.retry_delay(0);
-                                if !budget.take_retry(delay) { return Err(failure.error); }
+                                if !budget.take_retry(delay) {
+                                    super::error_policy_finish::forget_sticky(service, ctx, sticky, Some(&attempt_key));
+                                    return Err(failure.error);
+                                }
                                 ctx.telemetry.note_attempt_retry("登录凭证已刷新，在原账号重试一次", Some(401), delay);
                                 super::error_policy_send::sleep_or_cancel(ctx.telemetry, delay).await;
                                 session = fresh;
@@ -2100,7 +2140,7 @@ async fn attempt_queue(
                     if ctx.telemetry.replay_guard().blocked() { return Err(failure.error); }
                     let mut error = failure.error;
                     if super::error_policy_finish::finish_failure(service, ctx, provider_ids, &cooldown_keys,
-                        &target, &mut error, &mut tried_ids, &mut switches_left, switch_total) {
+                        &target, &mut error, &mut tried_ids, &mut switches_left, switch_total, sticky) {
                         last_error = Some(error); continue 'accounts;
                     }
                     return Err(error);
@@ -2271,7 +2311,7 @@ async fn attempt_queue(
                     let mut error = quota_refusal_error(client_text, refusal_reset_at, is_quota);
                     if ctx.telemetry.replay_guard().blocked() { return Err(error); }
                     if super::error_policy_finish::finish_failure(service, ctx, provider_ids, &cooldown_keys,
-                        &target, &mut error, &mut tried_ids, &mut switches_left, switch_total) {
+                        &target, &mut error, &mut tried_ids, &mut switches_left, switch_total, sticky) {
                         last_error = Some(error); continue 'accounts;
                     }
                     return Err(error);
@@ -2656,7 +2696,7 @@ async fn attempt_custom(
     // **即将发送**。`send_body` 对自定义 id 是零改写（它的模型名改写只认
     // modelRules），处理结果就是「提示词/脱敏后的客户端请求体」—— 自定义
     // 语义的改写（映射 alias → 真名、思考等级）在 forward 里做。
-    let native = if super::native_payload::eligible(ctx, &provider_id)? { ctx.native } else { None };
+    let native = if super::native_payload::eligible(ctx, &provider_id, target.account.as_ref())? { ctx.native } else { None };
     let send = match native {
         Some(native) => super::native_payload::prepare(ctx, native, &provider_id, target.account.as_ref(), degraded),
         None => send_body(ctx, &provider_id, target.account.as_ref(), degraded).await,
@@ -2881,8 +2921,9 @@ fn stateful_masking_gate(provider_label: &str) -> Result<(), GatewayError> {
 /// 选路仍然共用 —— 全局队列选到 CatPaw 的账号时才进入本函数。
 ///
 /// ── 在途槽位（去重队列）─────────────────────────────────────
-/// 无状态路径把槽位交给 `ForwardStream`；有状态路径把同一个凭证包进
-/// [`SlotHoldingStream`]，「槽位占到响应体发完」的语义在两家形态上一致。
+/// 无状态路径把槽位交给 `ForwardStream`；本路径的标准 Chat 流同样交由
+/// `ForwardStream`，原生透传流（`Native`）则由 [`SlotHoldingStream`] 持槽，
+/// 「槽位占到响应体发完」的语义在各形态上一致。
 /// 账号级连接计数（`connections`）与它同一处理：成功转为流式时一同移交给流。
 async fn attempt_stateful(
     service: &UpstreamService,
@@ -3036,22 +3077,27 @@ async fn attempt_stateful(
             // 不带错误 —— 前端把它渲染成「成功」（无状态码）。
             ctx.telemetry.finish_last_attempt(None, None);
             // 会话适配器只收到上游真名；客户端别名由外层可信请求体恢复。
+            // 插件路径返回的 Chat SSE 统一经由 `ForwardStream` 做 reasoning 合并、保活换行剥除
+            // 与 model 回写（包括 DeepSeek 网页等有状态插件，避免逐词分片在客户端碎成多段），
+            // 与无状态路径及非流式聚合同口径；`Native` 透传流仍落到下方的 `attach_slot`。
+            let mut response_policy = frame_policy_of(adapter, &model);
+            if ctx.routing.group.is_some() {
+                response_policy.rewrite = Some(super::sse::ModelRewrite { requested: model.clone() });
+            }
             let outcome = match outcome {
-                ForwardOutcome::Stream { status, stream } if adapter.sse_model_rewrite() || ctx.routing.group.is_some() => {
+                ForwardOutcome::Stream { status, stream } => {
                     return Ok(ForwardOutcome::Stream {
                         status,
                         stream: Box::new(super::ForwardStream::from_translated(
                             Box::pin(stream), slot.take(), connections.handoff(),
                             ctx.telemetry.clone(),
-                            super::sse::FramePolicy::with_rewrite(Some(super::sse::ModelRewrite {
-                                requested: model,
-                            })),
+                            response_policy,
                             // 会话式路径不发 `TransportRequest`（没有出站脱敏会话）
                             None,
                         )),
                     });
                 }
-                ForwardOutcome::Completion { mut body } if adapter.sse_model_rewrite() || ctx.routing.group.is_some() => {
+                ForwardOutcome::Completion { mut body } if response_policy.rewrite.is_some() => {
                     if let Some(current) = body.get_mut("model").filter(|value| value.as_str() != Some(model.as_str())) {
                         *current = Value::String(model);
                     }

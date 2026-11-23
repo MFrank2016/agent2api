@@ -10,6 +10,7 @@ mod account;
 mod credentials;
 mod errors;
 mod http;
+mod images;
 mod login;
 mod models;
 mod request;
@@ -65,6 +66,21 @@ impl ProviderAdapter for CodexSubscription {
     ) -> Result<ChatRequestPlan, GatewayError> {
         request::chat(account, body, client_headers)
     }
+    fn supports_image_generation(&self) -> bool {
+        true
+    }
+    fn supports_image_editing(&self) -> bool {
+        true
+    }
+    fn build_image_request_async<'a>(
+        &'a self,
+        account: &'a Value,
+        body: &'a Value,
+        client_headers: &'a HeaderMap,
+        operation: super::images::ImageOperation,
+    ) -> Async<'a, Result<ChatRequestPlan, GatewayError>> {
+        Box::pin(async move { images::build(account, body, client_headers, operation) })
+    }
 
     fn ensure_access_token<'a>(
         &'a self,
@@ -84,6 +100,15 @@ impl ProviderAdapter for CodexSubscription {
 
     fn credentials_expiring(&self, store: &AccountStore, account_id: &str) -> bool {
         credentials::expiring(store, account_id)
+    }
+
+    fn credentials_expiring_within(
+        &self,
+        store: &AccountStore,
+        account_id: &str,
+        min_lead_ms: i64,
+    ) -> bool {
+        credentials::expiring_within(store, account_id, min_lead_ms)
     }
     fn supports_refresh(&self) -> bool {
         true

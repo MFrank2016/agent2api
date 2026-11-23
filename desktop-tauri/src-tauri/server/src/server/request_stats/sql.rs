@@ -58,7 +58,7 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection};
 use serde_json::Value;
 
-use super::record::{AttemptDetail, RequestEntry, RequestQuery, RunningProgress, SensitiveHit};
+use super::record::{AttemptDetail, RequestEntry, RequestListRow, RequestQuery, RunningProgress, SensitiveHit};
 use super::report::normalize_status_filter;
 pub(super) use super::cache_report::{select_summary_rows, sum_cache_windows};
 
@@ -80,7 +80,32 @@ pub(super) const REQUEST_COLUMNS: &str = "id, ts, model, account_id, account_nam
      first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
      cache_read_tokens, provider, client_model, upstream_model, attempt_details, sensitive_hits, \
      client_reasoning, upstream_reasoning, phase, phase_started_at, is_test, route, client, \
-     api_key_id, api_key_name, api_key_source, credit, client_evidence";
+     api_key_id, api_key_name, api_key_source, credit, client_evidence, \
+     cache_creation_tokens, cache_creation_1h_tokens, cost_usd";
+
+/// 列表页轻量查询列：跳过四个大 JSON 文本列，仅在 SQL 里判定极轻量布尔/字符串提示，
+/// 彻底省掉整页行上的 JSON 解析与超大对象序列化开销。
+pub(super) const REQUEST_LIST_SELECT: &str = "row_id, id, ts, model, account_id, account_name, status, \
+     duration_ms, first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
+     cache_read_tokens, provider, client_model, upstream_model, client_reasoning, upstream_reasoning, \
+     phase, phase_started_at, is_test, client, api_key_id, api_key_name, api_key_source, credit, \
+     CASE WHEN route IS NOT NULL THEN 1 ELSE 0 END AS has_route, \
+     CASE WHEN route IS NOT NULL AND instr(route, 'visionCompatibility') > 0 AND json_valid(route) \
+          THEN COALESCE(json_extract(route, '$.visionCompatibility.mode'), '') ELSE '' END AS vision_mode, \
+     CASE WHEN sensitive_hits <> '' AND sensitive_hits <> '[]' THEN 1 ELSE 0 END AS has_sensitive_hits, \
+     CASE WHEN attempts > 1 OR (attempt_details <> '' AND attempt_details <> '[]' \
+          AND (instr(attempt_details, '\"retries\":[{') > 0 OR instr(attempt_details, '\"notice\":\"') > 0)) \
+          THEN 1 ELSE 0 END AS has_process_facts, \
+     CASE WHEN attempts <= 1 AND attempt_details <> '' AND attempt_details <> '[]' \
+          AND instr(attempt_details, '\"retries\":[{') > 0 AND json_valid(attempt_details) \
+          THEN COALESCE(json_array_length(json_extract(attempt_details, '$[0].retries')), 0) ELSE 0 END AS internal_retries, \
+     CASE WHEN client_evidence <> '' AND client_evidence <> '{}' AND json_valid(client_evidence) \
+          AND COALESCE(json_extract(client_evidence, '$.method'), '') <> '' THEN 1 ELSE 0 END AS has_client_evidence, \
+     CASE WHEN client_evidence <> '' AND client_evidence <> '{}' AND json_valid(client_evidence) \
+          THEN COALESCE(json_extract(client_evidence, '$.clientName'), '') ELSE '' END AS recorded_client_name, \
+     CASE WHEN client_evidence <> '' AND client_evidence <> '{}' AND json_valid(client_evidence) \
+          THEN COALESCE(json_extract(client_evidence, '$.userAgent'), '') ELSE '' END AS client_user_agent, \
+     cache_creation_tokens, cache_creation_1h_tokens, cost_usd";
 
 // `request_daily`（按天聚合）那一支的列常量、编解码与读-改-写语句在
 // `daily.rs` —— 两张表的语句分文件后各自独立演化。
@@ -160,6 +185,53 @@ pub(super) fn decode_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reques
         // 末列是 schema v23 加的（积分消耗）；旧行 / 没上报的行是 NULL ——
         // 读成 None，与「上报了 0」分开（前端前者显示「—」）。
         credit: row.get(29)?,
+        cache_creation_tokens: row.get::<_, Option<i64>>(31)?.unwrap_or(0),
+        cache_creation_1h_tokens: row.get::<_, Option<i64>>(32)?.unwrap_or(0),
+        cost_usd: row.get(33)?,
+    })
+}
+
+pub(super) fn decode_request_list(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestListRow> {
+    Ok(RequestListRow {
+        row_id: row.get(0)?,
+        id: row.get(1)?,
+        ts: row.get(2)?,
+        model: row.get(3)?,
+        account_id: row.get(4)?,
+        account_name: row.get(5)?,
+        status: row.get(6)?,
+        duration_ms: row.get(7)?,
+        first_response_ms: row.get(8)?,
+        attempts: row.get(9)?,
+        error: row.get(10)?,
+        prompt_tokens: row.get(11)?,
+        completion_tokens: row.get(12)?,
+        total_tokens: row.get(13)?,
+        cache_read_tokens: row.get(14)?,
+        provider: row.get(15)?,
+        client_model: row.get(16)?,
+        upstream_model: row.get(17)?,
+        client_reasoning: row.get(18)?,
+        upstream_reasoning: row.get(19)?,
+        phase: row.get(20)?,
+        phase_started_at: row.get(21)?,
+        is_test: row.get::<_, i64>(22)? != 0,
+        client: row.get(23)?,
+        api_key_id: row.get(24)?,
+        api_key_name: row.get(25)?,
+        api_key_source: row.get(26)?,
+        credit: row.get(27)?,
+        has_route: row.get::<_, i64>(28)? != 0,
+        vision_mode: row.get(29)?,
+        has_sensitive_hits: row.get::<_, i64>(30)? != 0,
+        has_process_facts: row.get::<_, i64>(31)? != 0,
+        internal_retries: row.get(32)?,
+        has_client_evidence: row.get::<_, i64>(33)? != 0,
+        recorded_client_name: row.get(34)?,
+        client_user_agent: row.get(35)?,
+        cache_creation_tokens: row.get::<_, Option<i64>>(36)?.unwrap_or(0),
+        cache_creation_1h_tokens: row.get::<_, Option<i64>>(37)?.unwrap_or(0),
+        cost_usd: row.get(38)?,
     })
 }
 
@@ -495,6 +567,54 @@ pub(super) fn select_page_desc(
     Ok(out)
 }
 
+pub(super) fn select_page_list_desc(
+    conn: &Connection,
+    plan: &FilterPlan,
+    offset: usize,
+    limit: usize,
+) -> rusqlite::Result<Vec<RequestListRow>> {
+    let sql = format!(
+        "SELECT {REQUEST_LIST_SELECT} FROM requests{} ORDER BY ts DESC, row_id DESC LIMIT ? OFFSET ?",
+        plan.where_sql
+    );
+    let mut binds = plan.binds.clone();
+    binds.push(SqlValue::Integer(limit as i64));
+    binds.push(SqlValue::Integer(offset as i64));
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params_from_iter(binds.iter()))?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(decode_request_list(row)?);
+    }
+    Ok(out)
+}
+
+pub(super) fn select_detail_by_row_id(
+    conn: &Connection,
+    row_id: i64,
+) -> rusqlite::Result<Option<(i64, RequestEntry)>> {
+    let sql = format!("SELECT {REQUEST_COLUMNS}, row_id FROM requests WHERE row_id = ?1 LIMIT 1");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params![row_id])?;
+    let Some(row) = rows.next()? else { return Ok(None); };
+    Ok(Some((row.get(34)?, decode_request(row)?)))
+}
+
+pub(super) fn select_detail_by_id(
+    conn: &Connection,
+    id: &str,
+    ts: Option<i64>,
+) -> rusqlite::Result<Option<(i64, RequestEntry)>> {
+    let sql = format!(
+        "SELECT {REQUEST_COLUMNS}, row_id FROM requests WHERE id = ?1 AND (?2 IS NULL OR ts = ?2) \
+         ORDER BY (status = 0) DESC, ts DESC, row_id DESC LIMIT 1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params![id, ts])?;
+    let Some(row) = rows.next()? else { return Ok(None); };
+    Ok(Some((row.get(34)?, decode_request(row)?)))
+}
+
 /// 取区间 `[from_ms, to_ms]` 内的**完整明细**，按写入顺序（ts 升序、同 ts 按 row_id）。
 ///
 /// 现在只剩一个用途：`aggregate::rebuild_day` 重算某天聚合时取那一天的明细
@@ -528,6 +648,49 @@ pub(super) fn select_between(
         out.push(decode_request(row)?);
     }
     Ok(out)
+}
+
+/// 供按日重算费用与折叠日报使用的窄列集合：与 [`REQUEST_COLUMNS`] 保持完全一致的 34 列序号
+/// （复用 [`decode_request`]），但跳过 `attempt_details`、`sensitive_hits` 及完整 `route` 大 JSON 文本解析。
+const REQUEST_REPRICE_COLUMNS: &str = "id, ts, model, account_id, account_name, status, duration_ms, \
+     first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
+     cache_read_tokens, provider, client_model, upstream_model, '[]' AS attempt_details, '[]' AS sensitive_hits, \
+     client_reasoning, upstream_reasoning, phase, phase_started_at, is_test, \
+     CASE WHEN route IS NOT NULL AND instr(route, 'visionCompatibility') > 0 AND json_valid(route) \
+          THEN json_object('visionCompatibility', json_object('mode', json_extract(route, '$.visionCompatibility.mode'))) \
+          ELSE NULL END AS route, \
+     client, api_key_id, api_key_name, api_key_source, credit, client_evidence, \
+     cache_creation_tokens, cache_creation_1h_tokens, cost_usd";
+
+pub(super) fn select_between_with_row_id(
+    conn: &Connection,
+    from_ms: i64,
+    to_ms: i64,
+    exclude_tests: bool,
+) -> rusqlite::Result<Vec<(i64, RequestEntry)>> {
+    let filter = if exclude_tests { " AND is_test = 0" } else { "" };
+    let sql = format!(
+        "SELECT {REQUEST_REPRICE_COLUMNS}, row_id FROM requests WHERE ts >= ?1 AND ts <= ?2{filter} \
+         ORDER BY ts ASC, row_id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params![from_ms, to_ms])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let row_id: i64 = row.get(34)?;
+        out.push((row_id, decode_request(row)?));
+    }
+    Ok(out)
+}
+
+pub(super) fn update_request_cost(
+    conn: &Connection,
+    row_id: i64,
+    cost_usd: Option<f64>,
+) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare_cached("UPDATE requests SET cost_usd = ?1 WHERE row_id = ?2")?;
+    stmt.execute(params![cost_usd, row_id])?;
+    Ok(())
 }
 
 /// 插一条**进行中**的明细（status=0，转发开始前调用；见 `RequestStats::record_started`）。
@@ -712,7 +875,8 @@ pub(super) fn update_running_request(
          client_model = ?16, upstream_model = ?17, attempt_details = ?18, sensitive_hits = ?19, \
          client_reasoning = ?20, upstream_reasoning = ?21, phase = '', phase_started_at = NULL, \
          is_test = ?22, route = ?23, client = ?24, \
-         api_key_id = ?25, api_key_name = ?26, api_key_source = ?27, credit = ?28, client_evidence = ?29 \
+         api_key_id = ?25, api_key_name = ?26, api_key_source = ?27, credit = ?28, client_evidence = ?29, \
+         cache_creation_tokens = ?30, cache_creation_1h_tokens = ?31, cost_usd = ?32 \
          WHERE id = ?1 AND status = 0",
         params![
             entry.id,
@@ -748,6 +912,9 @@ pub(super) fn update_running_request(
             entry.source.api_key.source,
             entry.credit,
             entry.source.evidence_json(),
+            entry.cache_creation_tokens,
+            entry.cache_creation_1h_tokens,
+            entry.cost_usd,
         ],
     )
 }
@@ -774,9 +941,10 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
          first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
          cache_read_tokens, provider, client_model, upstream_model, attempt_details, \
          sensitive_hits, client_reasoning, upstream_reasoning, is_test, route, client, \
-         api_key_id, api_key_name, api_key_source, credit, client_evidence) \
+         api_key_id, api_key_name, api_key_source, credit, client_evidence, \
+         cache_creation_tokens, cache_creation_1h_tokens, cost_usd) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-         ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
+         ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)",
         params![
             entry.id,
             entry.ts,
@@ -807,6 +975,9 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
             entry.source.api_key.source,
             entry.credit,
             entry.source.evidence_json(),
+            entry.cache_creation_tokens,
+            entry.cache_creation_1h_tokens,
+            entry.cost_usd,
         ],
     )?;
     Ok(())

@@ -58,7 +58,7 @@ import { UsageWindowsCell, usageWindows } from './accounts-usage-windows'
 import { GroupBalanceBadge, groupBalanceOf } from './accounts-usage-group'
 import { accountReloginText } from './accounts-authorization'
 import { credentialExpiryRowsOf, credentialExpiryText, type CredentialExpiryRow } from '../../../ui-shared/credential-expiry'
-import { balanceWalletOf, creditStatisticsWalletsOf, isSnapshotWallet, snapshotReadingsOf, usageAggregateOf, usageAvailableViewOf, usageEmptyStateOf, usageSupplementReadingsOf, usageUnitLabel, usageWarningsOf, usageWindowLabel, usageWindowView } from '../../../ui-shared/usage-readings'
+import { balanceWalletOf, creditStatisticsWalletsOf, isSnapshotWallet, snapshotReadingsOf, usageAggregateOf, usageAvailableViewOf, usageEmptyStateOf, usageModelQuotasOf, usageSupplementReadingsOf, usageUnitLabel, usageWarningsOf, usageWindowLabel, usageWindowView } from '../../../ui-shared/usage-readings'
 import { LimitDetailButton, limitRowsOf } from './accounts-limit-detail'
 import { upstreamCooldownOf, upstreamSuspendedReasonOf } from '../../../ui-shared/account-upstream-state'
 import { LimiterStatus } from './accounts-limiter-status'
@@ -190,7 +190,7 @@ function GroupMenu({ group, ids, collapsed }: { group: AccountGroup; ids: string
  * 样式刻意保持中性（surface 底 + 一条 hairline）：一家一色会让整页像调色板，
  * 而「哪一段是哪一家」由家名与图标已经说清楚了。
  */
-export function GroupBandRow({ group, collapsed, colSpan, pageCount, virtualIndex, measure, stickyTop }: {
+export function GroupBandRow({ group, collapsed, colSpan, pageCount, virtualIndex, measure, stickyTop, groupLocked, groupLockTitle }: {
   group: AccountGroup
   collapsed: boolean
   colSpan: number
@@ -198,6 +198,8 @@ export function GroupBandRow({ group, collapsed, colSpan, pageCount, virtualInde
   virtualIndex?: number
   measure?: (element: HTMLTableRowElement | null) => void
   stickyTop?: number
+  groupLocked?: boolean
+  groupLockTitle?: string
 }) {
   const now = useDisplayClock()
   const { src: icon, onError: onIconError } = useProviderIcon(group.provider)
@@ -235,8 +237,10 @@ export function GroupBandRow({ group, collapsed, colSpan, pageCount, virtualInde
       <TableCell colSpan={colSpan} onClick={onBandClick}
         style={stickyTop === undefined ? undefined : { position: 'sticky', top: stickyTop, zIndex: 1, background: 'var(--surface)' }}>
         <div className='grp-band-inner'>
-          <span className='queue-grip' role='button' tabIndex={-1} aria-label={t('拖动调整整组顺序')}
-            title={t('按住拖动，调整这一家的组顺位（整组一起动）')}
+          <span className={`queue-grip${groupLocked ? ' locked' : ''}`} role='button' tabIndex={-1}
+            aria-label={t('拖动调整整组顺序')}
+            aria-disabled={groupLocked || undefined}
+            title={groupLocked ? (groupLockTitle || t('当前列表不能拖动整组')) : t('按住拖动，调整这一家的组顺位（整组一起动）')}
             dangerouslySetInnerHTML={{ __html: iconHtml('gripVertical', 14) }} />
           <span className='grp-rank' title={t('组顺位：越小越先用（拖动分组带调整）')}>
             {t('第 {rank} 顺位', { rank: group.rank })}
@@ -574,7 +578,7 @@ export function usageSummary(entry: UsageEntry): { text: string; kind: string; t
   }
   if (Array.isArray(data.windows) && data.windows.length) {
     const windows = data.windows as Array<Record<string, unknown>>
-    const modelRows = Array.isArray(data.modelQuotas) ? data.modelQuotas as Array<Record<string, unknown>> : []
+    const modelRows = usageModelQuotasOf(data)
     const missing = usageWarningsOf(data)
     return {
       text: t('分窗口额度'),
@@ -583,7 +587,7 @@ export function usageSummary(entry: UsageEntry): { text: string; kind: string; t
         ...usageSupplementReadingsOf(data, t, numberText),
         subscriptionText(data.subscription),
         ...windows.filter(row => row && typeof row === 'object').map(row => [usageWindowLabel(row.label, t), usageWindowView(row, t, numberText)].filter(Boolean).join(' ')),
-        ...modelRows.filter(row => row && typeof row === 'object').map(row => [typeof row.name === 'string' ? row.name : String(row.id || ''), usageWindowView(row, t, numberText)].filter(Boolean).join(' ')),
+        ...modelRows.map(item => [item.name || item.id, usageWindowView(item.row, t, numberText)].filter(Boolean).join(' ')),
         ...missing.map(line => t(line)),
       ].filter(Boolean))].join(' · '),
     }
@@ -1411,10 +1415,10 @@ export function ProxyCell({ account }: { account: AccountRecord }) {
     // 补位项：不带动任何写操作（PROXY_CUSTOM_CURRENT 在 applyProxyPick 里被忽略），
     // 只是把当前值原样显示出来。轮询档不加前缀 —— 后端给的 label 本身就是
     // 「轮询全部代理（N 个出口）」这种完整一句话（见 describe_account_proxy）
-    const prefix = source === 'clash' ? t('Clash 出口：') : source === 'custom' ? t('自定义：') : ''
+    const prefix = source === 'clash' ? t('EasyClash 出口：') : source === 'custom' ? t('自定义：') : ''
     items.push({ value: PROXY_CUSTOM_CURRENT, label: `${prefix}${label}${broken ? t('（不可用）') : ''}` })
   } else if (source === 'pool' && !poolItems.some(item => `${POOL_VALUE_PREFIX}${item.id}` === current)) {
-    // 池引用但条目已不在池里（被删 / Clash 侧删了出口）：补位显示当前值
+    // 池引用但条目已不在池里（被删 / EasyClash 侧删了出口）：补位显示当前值
     items.push({ value: current, label: `${label}${broken ? t('（不可用）') : ''}` })
   }
   items.push({ value: PROXY_CUSTOM_EDIT, label: t('自定义代理…') })
@@ -1424,7 +1428,7 @@ export function ProxyCell({ account }: { account: AccountRecord }) {
     : source === 'rotate'
       ? t('当前：{label}（每条请求换一个出口）；「自定义代理…」打开完整设置', { label })
       : source === 'clash'
-        ? t('当前：{label}（Clash Verge 直接引用）；可在「网络代理」页同步端点后改选', { label })
+        ? t('当前：{label}（EasyClash 直接引用）；可在「网络代理」页同步端点后改选', { label })
         : source === 'custom'
           ? t('当前：{label}（未经过代理池 —— 可在「网络代理」页添加相同地址后来这里改选）', { label })
           : t('当前：{label}；选项来自「网络代理」页；「自定义代理…」打开完整设置', {

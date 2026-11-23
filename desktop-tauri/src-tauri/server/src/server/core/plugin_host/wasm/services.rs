@@ -48,8 +48,9 @@ impl Context {
                 return Err(proto::WireError::with_code("本机启动资格检查只能读取账号，不允许刷新或修改", "forbidden"));
             }
         }
-        self.calls += 1;
-        if self.calls > 100_000 { return Err(proto::WireError::with_code("插件调用次数超出上限", "plugin_resource_limit")); }
+        self.calls = self.calls.saturating_add(1);
+        self.spin_calls = self.spin_calls.saturating_add(1);
+        if self.spin_calls > 100_000 { return Err(proto::WireError::with_code("插件调用次数超出上限", "plugin_resource_limit")); }
         if method != "clock.now" && !params.is_object() { return Err(super::error("插件能力参数必须是 JSON 对象")); }
         // started 由 ABI 入口在解码前记录；权限、账号读取及正文准备不能另起计时。
         let opening = matches!(method, "http.open" | "http.open_account");
@@ -91,15 +92,6 @@ impl Context {
         if method == "claim.doubao.tasks" {
             return Err(proto::WireError::with_code("当前调用没有豆包原任务领奖来源", "forbidden"));
         }
-        if let Some(call) = &self.codearts_refresh {
-            if method != "credential.codearts.refresh" || params.as_object().is_none_or(|fields| !fields.is_empty()) {
-                return Err(proto::WireError::with_code("CodeArts换证只接受原调用的固定宿主入口", "forbidden"));
-            }
-            return super::codearts_refresh::exchange(call.clone()).await;
-        }
-        if method == "credential.codearts.refresh" {
-            return Err(proto::WireError::with_code("当前调用没有CodeArts原换证来源", "forbidden"));
-        }
         if let Some(result) = self.verification_guard(method, &params).await? { return Ok(result); }
         if let Some(call) = &self.managed { call.validate(&self.shared.options.provider).map_err(super::managed::wire)?; }
         let provider = self.shared.options.provider.clone();
@@ -119,8 +111,8 @@ impl Context {
                 self.desktop_launch.as_ref().ok_or_else(|| super::error("本机启动来源已失效"))?.validate(self)?;
                 Ok(result)
             }
-            "credentials.legacy.take" => super::legacy_credentials::take(self, &params),
             "credential.kiro.external.refresh" => super::external_refresh::invoke(self, &params).await,
+            "crypto.deepseek.pow.solve" => super::deepseek_pow::solve(self, &params).await,
             "crypto.monkeycode.cap.solve" => super::monkeycode_cap::solve(self, &params).await,
             "resource.cookie-file.take" => {
                 self.permission("resources.cookie-file.v1")?;
@@ -207,7 +199,7 @@ impl Context {
                     .ok_or_else(|| super::error("账号记录缺少标识"))?.to_string();
                 self.account()?;
                 self.identity = record["identity"].as_str().unwrap_or(&self.account).to_string();
-                if self.desktop_launch.is_none() && self.codearts_refresh.is_none()
+                if self.desktop_launch.is_none()
                     && self.doubao_rewards.is_none() {
                     super::legacy_secret::expose(self, &mut record);
                 }
@@ -434,14 +426,20 @@ impl Context {
                         let session = self.codearts_session.as_ref().ok_or_else(|| super::error("对话缺少本次 CodeArts 心跳会话"))?;
                         if params["headers"]["User-Session-Id"].as_str() != Some(session.id.as_str()) { return Err(super::error("CodeArts 对话的会话编号与心跳不符")); }
                         let client = session.client.client().map_err(|_| super::error("CodeArts 原出口已关闭"))?.clone();
+                        let body = super::http::body(self, &params, deadline)?;
+                        deadline.check()?;
                         self.guard_http_submission(&params)?;
-                        let (result,handle) = script::open_pinned(&params,client,deadline.cap_at(self.call_deadline)).await?;
+                        let opened = script::open_pinned_body(&params, body, client, deadline.cap_at(self.call_deadline)).await;
+                        self.finish_http_submission(&opened);
+                        let (result, handle) = opened?;
                         return self.keep_http(result,handle,deadline);
                     }
                     let body = super::http::body(self, &params, deadline)?;
                     deadline.check()?;
                     self.guard_http_submission(&params)?;
-                    let (result, handle) = script::open_body_with_policy(&params, body, self.system_proxy_when_unset, deadline).await?;
+                    let opened = script::open_body_with_policy(&params, body, self.system_proxy_when_unset, deadline).await;
+                    self.finish_http_submission(&opened);
+                    let (result, handle) = opened?;
                     self.keep_http(result, handle, deadline)
                 }
             }
@@ -485,6 +483,9 @@ impl Context {
                 sink.events.send(super::super::StreamEvent::Head(proto::StreamHead {
                     status, headers: headers.into_iter().collect(), upstream: proto::UpstreamKind::Chat,
                 })).map_err(|_| super::error("下游请求已结束"))?;
+                if (200..400).contains(&status) {
+                    self.confirm_stream_started();
+                }
                 self.head_sent = true;
                 Ok(Value::Null)
             }

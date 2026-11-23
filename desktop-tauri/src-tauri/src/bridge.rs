@@ -170,6 +170,7 @@ const BRIDGE_JS: &str = r#"
 
     // ── 会话 ──
     getState: () => call('GET', '/api/session?accounts=index'),
+    openManagedLogin: (flow, interaction) => invoke('open_managed_login', { flow, interaction }),
     startLogin: (edition, mode, provider, socialRestore, options) =>
       invoke('start_login', {
         edition: edition || 'cn',
@@ -459,7 +460,7 @@ const BRIDGE_JS: &str = r#"
     //   · restoreAgentClient  按最近一次备份还原
     //   · importAgentClient   从客户端现有文件里读回一套配置
     //   写操作都返回整份 `{clients}`（就地替换，页面不必再拉一次）。
-    getAgents: () => call('GET', '/api/agents'),
+    getAgents: options => call('GET', '/api/agents' + (options && options.refresh ? '?refresh=1' : '')),
     getAgentModels: gatewayKeyId => call('GET', '/api/agents/models' + (gatewayKeyId == null ? '' : '?gatewayKeyId=' + encodeURIComponent(gatewayKeyId))),
     saveAgentProfiles: payload => call('POST', '/api/agents/profiles', payload || {}),
     applyAgentProfile: payload => call('POST', '/api/agents/apply', payload || {}),
@@ -488,6 +489,7 @@ const BRIDGE_JS: &str = r#"
 
     // 桌面壳的文件夹选择框：参数名与命令签名一致（camelCase ← Rust 的 snake_case）
     pickFolder: defaultDir => invoke('pick_folder', { defaultDir: defaultDir == null ? null : String(defaultDir) }),
+    pickAgentConfigFile: defaultPath => invoke('pick_agent_config_file', { defaultPath: defaultPath == null ? null : String(defaultPath) }),
     pickDesktopClient: defaultPath => invoke('pick_desktop_client', { defaultPath: defaultPath == null ? null : String(defaultPath) }),
 
     // ── 积分 / 签到 ──
@@ -654,8 +656,10 @@ const BRIDGE_JS: &str = r#"
     getTravelSchedule: () => call('GET', '/api/travel-schedule'),
     saveTravelSchedule: patch => call('POST', '/api/travel-schedule', patch),
     runTravelScheduleNow: () => call('POST', '/api/travel-schedule/run', {}),
-    // WorkBuddy 国际版日活任务的手动粒度入口（mode: full | claim | keepalive）
+    // WorkBuddy 国际版日活任务的手动粒度入口（mode: full | claim | keepalive）及详情/重置
     runCheckinActivity: (id, mode) => call('POST', '/api/checkin-activity', { id, mode }),
+    getCheckinActivityStatus: id => call('GET', '/api/checkin-activity/status?id=' + encodeURIComponent(String(id || ''))),
+    resetCheckinActivity: id => call('POST', '/api/checkin-activity/reset', { id }),
     // 签到中心的聚合快照（每日签到分组 / 自动签到设置 / 签到历史 / 一次性项入口），
     // 见 api::checkin_center 的模块头 —— 页面打开只打这一条
     getCheckinCenter: () => call('GET', '/api/checkin-center'),
@@ -914,6 +918,7 @@ const BRIDGE_JS: &str = r#"
     // 筛选条件是可选对象，复用上面 toQuery 的「空值跳过」语义：
     // 清空的输入框不该变成 `?model=` 这种永不命中的条件
     getStatsRequests: query => call('GET', '/api/stats/requests' + toQuery(query)),
+    getStatsRequestDetail: query => call('GET', '/api/stats/requests/detail' + toQuery(query)),
     // 筛选下拉的候选清单（出现过的模型 / 提供商）。不带参数、不随筛选变化 ——
     // 它只在进页面时拉一次（理由见 api::stats_api::stats_request_filters）。
     // 读不到时前端只保留「全部」选项，不弹错（筛选器退化成不可用，列表照常）
@@ -1125,6 +1130,22 @@ const BRIDGE_JS: &str = r#"
     cloudSyncUpload: () => invoke('cloud_sync_upload'),
     cloudSyncDownload: () => invoke('cloud_sync_download'),
     importCloudSyncKey: password => invoke('cloud_sync_import_key', { password }),
+
+    // ── 系统通知（设置页「通知」）──
+    getNotifications: () => call('GET', '/api/notifications'),
+    saveNotifications: payload => call('PUT', '/api/notifications', payload || {}),
+    testNotification: payload => call('POST', '/api/notifications/test', payload || {}),
+
+    // ── 面板 OAuth 第三方登录（设置页「账户」）──
+    getOauthSettings: () => call('GET', '/api/panel/oauth/settings'),
+    saveOauthSettings: payload => call('PUT', '/api/panel/oauth/settings', payload || {}),
+    startOauthBind: payload => call('POST', '/api/panel/oauth/bind-url', payload || {}),
+    pollOauthState: state => call('GET', '/api/panel/oauth/poll' + toQuery({ state })),
+
+    // ── 模型计价 ──
+    getModelPricing: () => call('GET', '/api/model-pricing'),
+    saveModelPricing: payload => call('PUT', '/api/model-pricing', payload || {}),
+    refreshFxRate: () => call('POST', '/api/model-pricing/fx/refresh', {}),
   };
 })();
 "#;

@@ -373,5 +373,18 @@
   "首次购买使用优惠码 AGENT2API25 享 75 折。": "",
   "＋ 新增代理": "",
   "＋ 新增订阅": "",
-  "，": ""
+  "，": "",
+  "✅ 已同步 EasyClash 出口（{n} 项变更）": "",
+  "另有 {n} 条来自 EasyClash 同步，将跳过（请到 EasyClash 里删）。": "",
+  "只读：在 EasyClash 里改": "",
+  "同步 EasyClash": "",
+  "名字与端口在 EasyClash 里改；启用可在本页关闭": "",
+  "已有手动配置和 EasyClash 端点引用不受影响。仍可添加 HTTP / SOCKS5 地址、同步 EasyClash 端点并测试连通性；EasyClash 由你自行安装和运行。": "既有手動設定和 EasyClash 端點參照不受影響。仍可新增 HTTP / SOCKS5 位址、同步 EasyClash 端點並測試連線；EasyClash 由你自行安裝和執行。",
+  "手动代理与 EasyClash 同步仍然保留": "手動代理與 EasyClash 同步仍然保留",
+  "添加手动 HTTP / SOCKS5 地址，或同步 EasyClash 的端点，供账号与服务线路使用。": "新增手動 HTTP / SOCKS5 位址，或同步 EasyClash 的端點，供帳號與服務線路使用。",
+  "禁用后本端不再用它（引用它的账号回退直连）；端口在 EasyClash 侧，不受影响": "",
+  "请填写已有代理服务的 HTTP / SOCKS5 地址，或自行运行 EasyClash 后同步端点，并重新为相关账号和服务线路选择代理。": "請填寫既有代理服務的 HTTP / SOCKS5 位址，或自行執行 EasyClash 後同步端點，並重新為相關帳號和服務線路選擇代理。",
+  "跳过 {n} 个（EasyClash 同步）": "",
+  "这条在 EasyClash 里是停用的，本页启用不生效 —— 到 EasyClash 里打开它": "",
+  "选中的 {n} 条都来自 EasyClash 同步，不能删除（请到 EasyClash 里删）": ""
 }

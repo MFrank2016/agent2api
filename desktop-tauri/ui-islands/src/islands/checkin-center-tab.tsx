@@ -169,7 +169,9 @@ export function CheckinStats({ center }: { center: CheckinCenter }): React.React
       />
       <MetricCell
         label={t('累计签到记录')}
-        value={store.recordsLoaded ? store.recordsTotal : <span className='ck-pending'>—</span>}
+        value={typeof center.recordsTotal === 'number'
+          ? center.recordsTotal
+          : store.recordsLoaded ? store.recordsTotal : <span className='ck-pending'>—</span>}
         foot={t('每账号一条明细')}
         onClick={() => goTab('records')}
       />
@@ -518,7 +520,7 @@ export function CenterTab({ center }: { center: CheckinCenter }): React.ReactEle
   const taskCategory = section === 'daily' ? 'checkin' : section === 'growth' ? 'growth' : section === 'plans' ? 'rewards' : ''
   for (const row of center.pluginTasks ?? []) {
     if (row.category !== taskCategory || railOptions.some(option => option.id === row.provider)) continue
-    railOptions.push({ id: row.provider, label: row.providerLabel || providerLabel(row.provider), done: null, total: 0 })
+    railOptions.push({ id: row.provider, label: row.providerLabel || providerLabel(row.provider), done: null, total: 0, isTask: true })
   }
 
   const railTotal = railOptions.reduce<{ done: number; all: number }>((sum, option) => ({
@@ -584,7 +586,9 @@ export function CenterTab({ center }: { center: CheckinCenter }): React.ReactEle
   }[section]
 
   const emptyText = section === 'daily'
-    ? filter === 'done' ? t('今天还没有账号签到，切到「全部」看看哪些还没签。') : t('今天的账号都签完了。')
+    ? sectionMeta.total === 0
+      ? t('没有可签到的账号')
+      : filter === 'done' ? t('今天还没有账号签到，切到「全部」看看哪些还没签。') : t('今天的账号都签完了。')
     : section === 'onboarding'
       ? extras.onboarding.length === 0
         ? t('没有支持新手福利的账号。')

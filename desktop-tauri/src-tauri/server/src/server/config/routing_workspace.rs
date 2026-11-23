@@ -46,14 +46,22 @@ pub fn save_workspace(
     profile: Option<RoutingProfile>,
     expected: &str,
 ) -> Result<(), String> {
-    let _update = CONFIG_UPDATE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _update = CONFIG_UPDATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // 模型目录可能回读账号状态，必须在获取账号锁前解析。
-    let available = (!model.is_empty()).then(|| crate::server::core::providers::catalog::forwarding_providers(model));
+    let available = (!model.is_empty())
+        .then(|| crate::server::core::providers::catalog::forwarding_providers(model));
     let guard = store.guard();
     let state = store.load(&guard);
-    let visible: Vec<Value> = state.accounts.iter()
-        .filter(|record| crate::server::core::account_store::store_view::account_visible(&record.provider()))
-        .map(|record| store.public_account(record)).collect();
+    let visible: Vec<Value> = state
+        .accounts
+        .iter()
+        .filter(|record| {
+            crate::server::core::account_store::store_view::account_visible(&record.provider())
+        })
+        .map(|record| store.public_account(record))
+        .collect();
     let available = available.unwrap_or_else(|| routing_scope::available_providers(&visible));
     let mut next = super::current();
     if next.routing_profiles.group_for_model(model).is_some() {
@@ -75,9 +83,18 @@ pub fn save_workspace(
         return Err("路由配置已在其他位置修改，请刷新当前配置后重试；草稿未丢失".to_string());
     }
     let mut profiles: RoutingProfiles = (*next.routing_profiles).clone();
-    if model.is_empty() && (profiles.global.as_ref().is_some_and(global_accounts::has_restrictions)
-        || profile.as_ref().is_some_and(global_accounts::has_restrictions)) {
-        return Err("全局默认已改为账号启停，请先转换旧版全局参与设置；模型独立路由仍可设置参与名单".into());
+    if model.is_empty()
+        && (profiles
+            .global
+            .as_ref()
+            .is_some_and(global_accounts::has_restrictions)
+            || profile
+                .as_ref()
+                .is_some_and(global_accounts::has_restrictions))
+    {
+        return Err(
+            "全局默认已改为账号启停，请先转换旧版全局参与设置；模型独立路由仍可设置参与名单".into(),
+        );
     }
     if !model.is_empty()
         && profile.is_some()
@@ -165,10 +182,8 @@ pub fn save_workspace(
                 // 展示 id（order/rotate/provider）是 workspace 面的有损投影，
                 // 保留现有权威默认值；只有本地 7 档 id 才走规范写入口。
                 let canonical = next.routing_strategy.clone();
-                let default = canonical_default_after_profile_strategy(
-                    canonical.default,
-                    Some(&strategy),
-                );
+                let default =
+                    canonical_default_after_profile_strategy(canonical.default, Some(&strategy));
                 if default != canonical.default {
                     let mut updated = canonical;
                     updated.default = default;
@@ -235,7 +250,10 @@ mod tests {
             canonical_default_after_profile_strategy(canonical, Some("least-recently-used")),
             RoutingStrategy::LeastRecentlyUsed
         );
-        assert_eq!(canonical_default_after_profile_strategy(canonical, None), canonical);
+        assert_eq!(
+            canonical_default_after_profile_strategy(canonical, None),
+            canonical
+        );
         assert_eq!(
             canonical_default_after_profile_strategy(canonical, Some("nonsense")),
             canonical

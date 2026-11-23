@@ -421,6 +421,7 @@ pub async fn create_key(State(state): State<ServerState>, body: Bytes) -> Respon
         Ok(entry) => {
             // 配置变了：配额缓存的「启用中的窗口种类集合」可能变，清掉重算
             crate::server::core::key_quota::invalidate();
+            logging::log_with_level("[Config]", &format!("✅ 新增 API Key「{}」，客户端需带 Authorization: Bearer <key>", entry.name), "info");
             let mut payload = list_json(&state);
             if let Some(map) = payload.as_object_mut() {
                 map.insert("created".to_string(), entry.public_json());
@@ -484,9 +485,10 @@ pub async fn update_key(State(state): State<ServerState>, Path(id): Path<String>
         Ok(entry) => {
             // 配额上限 / 窗口可能变了：清缓存，下一个请求按新配置判定
             crate::server::core::key_quota::invalidate();
-            logging::log(
+            logging::log_with_level(
                 "[Config]",
                 &format!("API Key「{}」已更新（{}）", entry.name, if entry.enabled { "启用" } else { "停用" }),
+                "info",
             );
             ok_json(list_json(&state))
         }

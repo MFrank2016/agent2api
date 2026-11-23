@@ -8,8 +8,8 @@ use crate::server::core::task_state::{self, Claim, TaskState};
 use crate::server::logging;
 
 use super::{
-    api_base, pick_android_apk, pick_asset_by_name, pick_installer, server_bundle_name,
-    version, UpdateError, UpdateManager, CURRENT_VERSION,
+    api_base, pick_android_apk, pick_asset_by_name, pick_installer, pick_ios_ipa,
+    server_bundle_name, version, UpdateError, UpdateManager, CURRENT_VERSION,
 };
 
 /// 官网版本查询请求的超时，安装包下载另有逐块读取超时。
@@ -91,8 +91,14 @@ impl UpdateManager {
     /// **不触发任何网络请求**：本进程还没查过时返回 `checked:false`，
     /// 界面据此显示「未检查」—— 与改造前「前端自己打一次 GitHub」的差别正在这里。
     pub fn last_check(&self) -> Value {
-        match self.check_state(CURRENT_VERSION) {
-            Ok(state) => self.checked_result(CURRENT_VERSION, &state),
+        self.last_check_for(CURRENT_VERSION)
+    }
+
+    pub fn last_check_for(&self, current_version: &str) -> Value {
+        let current = current_version.trim();
+        let current = if current.is_empty() { CURRENT_VERSION } else { current };
+        match self.check_state(current) {
+            Ok(state) => self.checked_result(current, &state),
             Err(error) => json!({ "checked": false, "lastError": error }),
         }
     }
@@ -115,15 +121,136 @@ impl UpdateManager {
         self.check_with_mode(current_version, false).await
     }
 
-    async fn check_with_mode(&self, current_version: &str, manual: bool) -> Result<Value, UpdateError> {
+    pub(crate) fn claim_check(&self, current_version: &str, manual: bool) -> Result<Claim, String> {
+        let key = self.check_key_for(current_version);
+        let interval = config::scheduled_settings().update_check.interval * 60_000;
+        task_state::claim(&key, interval, manual, task_state::ManualBackoff::Bypass, 0)
+    }
+
+    pub(crate) async fn run_claimed_check(
+        &self,
+        current_version: &str,
+        guard: task_state::RunGuard,
+        recorder: Option<crate::server::core::maintenance::storage::Recorder>,
+    ) -> Result<Value, UpdateError> {
         self.resolve_repository().await;
         let required = self.force_update(current_version);
         let key = self.check_key_for(current_version);
+        let channels = config::update_channels();
+        let channel_label = match (channels.stable, channels.beta) {
+            (true, true) => "正式版 + beta 版",
+            (false, true) => "仅 beta 版",
+            _ => "仅正式版",
+        };
+        let started = std::time::Instant::now();
+        let outcome = self.fetch_release(channels, required.as_ref()).await;
         let interval = config::scheduled_settings().update_check.interval * 60_000;
+        let duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+        match outcome {
+            Ok(release) => {
+                self.lock().latest = release.clone();
+                let result = self.build_check_result(current_version);
+                let has_update = result.get("hasUpdate").and_then(Value::as_bool) == Some(true);
+                let latest_version = result
+                    .get("latestVersion")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let summary = if has_update {
+                    format!("发现新版本 {}", latest_version.as_deref().unwrap_or(""))
+                } else {
+                    "已完成版本检查".to_string()
+                };
+                let state = guard
+                    .finish(
+                        true,
+                        summary,
+                        Some(json!({ "release": release, "channels": channels, "required": required.is_some() })),
+                        0,
+                        interval,
+                    )
+                    .map_err(|error| UpdateError::new(error))?;
+                if channels != config::update_channels() {
+                    task_state::schedule_now(&key).map_err(|error| UpdateError::new(error))?;
+                }
+                if let Some(recorder) = recorder {
+                    let message = if has_update {
+                        format!(
+                            "发现新版本 v{}（当前 v{current_version}）",
+                            latest_version.as_deref().unwrap_or("")
+                        )
+                    } else {
+                        format!("已是最新版本（当前 v{current_version}）")
+                    };
+                    let change_label = if has_update {
+                        format!("发现 v{}", latest_version.as_deref().unwrap_or(""))
+                    } else {
+                        "已是最新".to_string()
+                    };
+                    let raw = json!({
+                        "provider": "agent2api",
+                        "providerLabel": "Agent2API 软件",
+                        "accountName": channel_label,
+                        "status": "refreshed",
+                        "message": message,
+                        "currentVersion": current_version,
+                        "latestVersion": latest_version,
+                        "changeLabel": change_label,
+                        "durationMs": duration_ms,
+                    });
+                    let item = crate::server::core::maintenance::types::item(
+                        &raw,
+                        0,
+                        &std::collections::HashMap::new(),
+                    );
+                    let _ = recorder.finish(vec![item], None);
+                }
+                Ok(self.checked_result(current_version, &state))
+            }
+            Err(error) => {
+                let value = self
+                    .check_state(current_version)
+                    .ok()
+                    .and_then(|state| state.value)
+                    .filter(Value::is_object)
+                    .unwrap_or_else(|| json!({}));
+                let state = guard
+                    .finish(
+                        false,
+                        format!("检查失败：{}", error.message),
+                        Some(value),
+                        0,
+                        interval,
+                    )
+                    .map_err(|error| UpdateError::new(error))?;
+                if let Some(recorder) = recorder {
+                    let raw = json!({
+                        "provider": "agent2api",
+                        "providerLabel": "Agent2API 软件",
+                        "accountName": channel_label,
+                        "status": "failed",
+                        "message": error.message,
+                        "currentVersion": current_version,
+                        "changeLabel": "检查失败",
+                        "retryAt": state.retry_at,
+                        "durationMs": duration_ms,
+                    });
+                    let item = crate::server::core::maintenance::types::item(
+                        &raw,
+                        0,
+                        &std::collections::HashMap::new(),
+                    );
+                    let _ = recorder.finish(vec![item], None);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn check_with_mode(&self, current_version: &str, manual: bool) -> Result<Value, UpdateError> {
+        self.resolve_repository().await;
+        let key = self.check_key_for(current_version);
         let started = logging::now_ms();
-        let guard = match task_state::claim(&key, interval, manual, task_state::ManualBackoff::Bypass, 0)
-            .map_err(|error| UpdateError::new(error))?
-        {
+        let guard = match self.claim_check(current_version, manual).map_err(UpdateError::new)? {
             Claim::Acquired(guard) => guard,
             Claim::Deferred(mut state) => {
                 // 已有一次在跑（另一个进程，或同一进程的手动/定时撞车）：等它的
@@ -145,33 +272,13 @@ impl UpdateManager {
                 return Err(UpdateError::new(waiting_message(&state)));
             }
         };
-        let channels = config::update_channels();
-        let outcome = self.fetch_release(channels, required.as_ref()).await;
-        let interval = config::scheduled_settings().update_check.interval * 60_000;
-        match outcome {
-            Ok(release) => {
-                self.lock().latest = release.clone();
-                let result = self.build_check_result(current_version);
-                let summary = if result.get("hasUpdate").and_then(Value::as_bool) == Some(true) {
-                    format!("发现新版本 {}", result["latestVersion"].as_str().unwrap_or(""))
-                } else {
-                    "已完成版本检查".to_string()
-                };
-                let state = guard.finish(true, summary, Some(json!({ "release": release, "channels": channels, "required": required.is_some() })), 0, interval)
-                    .map_err(|error| UpdateError::new(error))?;
-                if channels != config::update_channels() {
-                    task_state::schedule_now(&key).map_err(|error| UpdateError::new(error))?;
-                }
-                Ok(self.checked_result(current_version, &state))
-            }
-            Err(error) => {
-                let value = self.check_state(current_version).ok().and_then(|state| state.value)
-                    .filter(Value::is_object).unwrap_or_else(|| json!({}));
-                guard.finish(false, format!("检查失败：{}", error.message), Some(value), 0, interval)
-                    .map_err(|error| UpdateError::new(error))?;
-                Err(error)
-            }
-        }
+        let recorder = crate::server::core::maintenance::storage::Recorder::start(
+            crate::server::core::maintenance::UPDATE_CHECK,
+            if manual { "manual" } else { "automatic" },
+            None,
+        )
+        .ok();
+        self.run_claimed_check(current_version, guard, recorder).await
     }
 
     /// 优先从官网静态 CDN 拉取发布清单挑选版本，必要时回退实时 API；没有候选版本时视为无更新。
@@ -334,9 +441,10 @@ fn release_json(payload: &Value, repository: &str) -> Value {
         // 「asset 为空」时界面据此说明原因，见 [`asset_probe`] 的注释与
         // `build_check_result` 里补 expected* 的那一段
         "assetProbe": asset_probe,
-        // 手机端（APK）的安装包。与 `asset` 并列而不是二选一：网关可能同时被
+        // 手机端（APK / IPA）的安装包。与 `asset` 并列而不是二选一：网关可能同时被
         // 电脑和手机访问，两边各自挑自己那份，谁都不该把对方的那条藏起来。
         "androidAsset": pick_android_apk(assets),
+        "iosAsset": pick_ios_ipa(assets),
         "serverBundle": bundle_asset.unwrap_or(Value::Null),
         "serverChecksums": bundle_checksums.unwrap_or(Value::Null),
     })

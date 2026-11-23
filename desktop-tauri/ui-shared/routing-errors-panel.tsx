@@ -1,10 +1,10 @@
 import * as React from 'react'
-import { Alert, Button, Card, CardContent, CardHeader, CardTitle, Popover, PopoverContent, PopoverTrigger, SegmentedControl, Spinner, confirmDialog } from '@ui'
+import { Alert, Button, Popover, PopoverContent, PopoverTrigger, SegmentedControl, Spinner, confirmDialog } from '@ui'
 import { ErrorIcon, ErrorNumber } from './routing-errors-controls'
 import { ErrorRules } from './routing-errors-rules'
 import { ErrorBoundaries, ErrorProtection } from './routing-errors-protection'
 import { ErrorPreviewPanel } from './routing-errors-preview'
-import { ERROR_POLICY_CHANGED, errorPolicyValidation, type ErrorKind, type ErrorPolicyApi, type ErrorPolicyView, type ErrorSettings, type ErrorTranslate } from './routing-errors-types'
+import { ERROR_POLICY_CHANGED, errorPolicyValidation, mergeProviderRules, type ErrorKind, type ErrorPolicyApi, type ErrorPolicyView, type ErrorSettings, type ErrorTranslate } from './routing-errors-types'
 import type { ErrorPreviewInput } from './routing-errors-simulation'
 import './routing-errors.css'
 
@@ -18,7 +18,8 @@ export function RoutingErrorsPanel({ api, t, active = true, identity = '', reloa
   const [error, setError] = React.useState('')
   const [message, setMessage] = React.useState('')
   const [tab, setTab] = React.useState(initialTab)
-  const [input, setInput] = React.useState<ErrorPreviewInput>({ scenario: 'rate', provider: '', model: '', started: false, uncertain: false, pinned: false, switchesUsed: 0, resendsUsed: 0, strikes: 1 })
+  const [ruleScope, setRuleScope] = React.useState<'global' | 'provider'>('global')
+  const [input, setInput] = React.useState<ErrorPreviewInput>({ scenario: 'rate', provider: '', model: '', started: false, uncertain: false, pinned: false, switchesUsed: 0, resendsUsed: 0, strikes: 1, customStatus: '', customCode: '' })
   const generation = React.useRef(0)
   const pending = React.useRef(false)
   const dirtyRef = React.useRef(false)
@@ -76,6 +77,10 @@ export function RoutingErrorsPanel({ api, t, active = true, identity = '', reloa
     const map: Record<ErrorKind, string> = { rate_limit: 'rate', quota: 'quota', auth: 'auth', balance: 'balance', transient: 'transient', unsupported: 'unsupported', bad_request: 'input', content: 'content', unknown: 'unknown' }
     setInput(current => ({ ...current, scenario: map[kind], started: false, uncertain: false }))
   }
+  const providerRuleCount = React.useMemo(
+    () => (draft && view ? mergeProviderRules(draft, view.providerRules ?? []).length : 0),
+    [draft, view],
+  )
   if (!view || !draft) return <div className='re-panel'><div className='re-loading'>{busy ? <Spinner /> : <Button variant='outline' onClick={() => void load(true)}>{t('重新读取')}</Button>}</div>{error ? <Alert variant='destructive'>{error}</Alert> : null}</div>
   return <section className='re-panel' aria-label={t('错误处理')} hidden={!active}>
     <div className='re-toolbar'><SegmentedControl aria-label={t('错误处理分类')} value={tab} onValueChange={setTab} options={[
@@ -85,7 +90,7 @@ export function RoutingErrorsPanel({ api, t, active = true, identity = '', reloa
     }}>{t('恢复建议值')}</Button><Button size='sm' disabled={!dirty || busy} onClick={() => void save()}><ErrorIcon name='check' size={14} />{busy ? t('保存中…') : t('保存修改')}</Button></div></div>
     <div className='re-limit-strip' role='group' aria-label={t('每条请求的重试上限')}><div className='re-compact-fields'>
       <ErrorNumber compact label={t('原账号重发')} unit={t('次')} value={draft.resends} max={10} disabled={busy} onChange={resends => patch({ resends })} />
-      <ErrorNumber compact label={t('最多再换账号')} unit={t('个')} value={draft.switches} max={10} disabled={busy} onChange={switches => patch({ switches })} />
+      <ErrorNumber compact label={t('最多再换账号')} unit={t('个')} value={draft.switches} max={100} disabled={busy} onChange={switches => patch({ switches })} />
       <ErrorNumber compact label={t('重发间隔')} unit={t('秒')} value={draft.intervalSeconds} max={300} disabled={busy} onChange={intervalSeconds => patch({ intervalSeconds })} />
       <ErrorNumber compact label={t('累计等待上限')} unit={t('秒')} value={draft.waitBudgetSeconds} max={300} disabled={busy} onChange={waitBudgetSeconds => patch({ waitBudgetSeconds })} />
     </div><Popover><PopoverTrigger render={<Button variant='ghost' size='icon-sm' aria-label={t('重试计数说明')} />}><ErrorIcon name='info' size={14} /></PopoverTrigger><PopoverContent className='re-limit-help' align='end'>
@@ -93,12 +98,21 @@ export function RoutingErrorsPanel({ api, t, active = true, identity = '', reloa
     </PopoverContent></Popover></div>
     {view.legacy ? <p className='re-legacy'>{t('已保留原重试与失败休息参数，错误处理已统一；429 也计入换号上限，已有冷却记录不清除。')}</p> : null}
     {error ? <Alert variant='destructive'>{error}</Alert> : null}{message ? <p className='re-saved' role='status'>{message}</p> : null}
-    <div className='re-content-grid'><div className='re-primary'>
-      {tab === 'rules' ? <><ErrorRules settings={draft} providers={view.providers} t={t} onChange={setDraft} onPreview={inspect} />
-        <Card><CardHeader><CardTitle>{t('恢复时间保护')}</CardTitle></CardHeader><CardContent className='re-time-protection'>
-          <ErrorNumber label={t('最短限流冷却')} unit={t('秒')} value={draft.cooldownFloorSeconds} min={1} max={60} onChange={cooldownFloorSeconds => patch({ cooldownFloorSeconds })} />
-          <p>{t('上游明确时间不会被最长冷却截短。自行估算的冷却可被后续可信上游时间替换。')}</p>
-        </CardContent></Card></> : tab === 'protection' ? <ErrorProtection settings={draft} t={t} onChange={setDraft} /> : <ErrorBoundaries t={t} />}
-    </div><ErrorPreviewPanel settings={draft} providers={view.providers} t={t} input={input} onChange={setInput} /></div>
+    <div className='re-content-grid'><div className={`re-primary${tab === 'rules' ? ' is-rules' : ''}`}>
+      {tab === 'rules' ? <>
+        <div className='re-rules-switch'>
+          <SegmentedControl
+            aria-label={t('处理规则范围')}
+            value={ruleScope}
+            onValueChange={setRuleScope}
+            options={[
+              { value: 'global', label: t('全局处理规则') },
+              { value: 'provider', label: t('提供商处理规则'), count: providerRuleCount },
+            ]}
+          />
+        </div>
+        <ErrorRules settings={draft} providers={view.providers} providerRules={view.providerRules ?? []} scope={ruleScope} t={t} onChange={setDraft} onPreview={inspect} />
+      </> : tab === 'protection' ? <ErrorProtection settings={draft} t={t} onChange={setDraft} /> : <ErrorBoundaries t={t} />}
+    </div><ErrorPreviewPanel settings={draft} providers={view.providers} providerRules={view.providerRules ?? []} t={t} input={input} onChange={setInput} /></div>
   </section>
 }

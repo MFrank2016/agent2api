@@ -520,8 +520,10 @@ pub const KEY_LOGS_AUTO_REFRESH: &str = "logsAutoRefresh";
 pub const KEY_REQUESTS_AUTO_REFRESH: &str = "requestsAutoRefresh";
 /// 报表页自动刷新在 `scheduledTasks` 下的子键（同上）
 pub const KEY_REPORT_AUTO_REFRESH: &str = "reportAutoRefresh";
-/// 软件版本检查在 `scheduledTasks` 下的子键（后端定时向 GitHub 查最新发布版本）
+/// 软件版本检查在 `scheduledTasks` 下的子键（后端定时向官网查最新发布版本）
 pub const KEY_UPDATE_CHECK: &str = "updateCheck";
+/// Magpie 插件清单与更新检查在 `scheduledTasks` 下的子键
+pub const KEY_MAGPIE_PLUGIN_CHECK: &str = "magpiePluginCheck";
 
 /// 凭证维护默认间隔（分钟）：与改造前的硬编码 600 秒一致
 pub const DEFAULT_CREDENTIAL_MAINTENANCE_MINUTES: i64 = 10;
@@ -531,14 +533,10 @@ pub const DEFAULT_CREDENTIAL_MAINTENANCE_MINUTES: i64 = 10;
 /// 上游（见 `providers::workbuddy` 的 `refresh_models`），间隔太密等于给上游
 /// 添无谓的负载。一小时的粒度对「模型清单变了没」这个问题足够。
 pub const DEFAULT_MODEL_REFRESH_MINUTES: i64 = 60;
-/// 两个前端自动刷新的默认间隔（秒）：每秒一次。
-///
-/// 比改造前的硬编码 10 秒密得多，这是有意的：两条任务都只在**对应页面可见时**
-/// 才请求（`document.hidden` 与当前页都判过），离开页面就完全静默，所以
-/// 「密」的代价只落在用户正盯着那一页的时候 —— 而那正是他想要实时的时刻。
-/// 两条接口都是本地读写（一条读日志库、一条查统计库），不出网。
-pub const DEFAULT_LOGS_AUTO_REFRESH_SECONDS: i64 = 1;
-pub const DEFAULT_REQUESTS_AUTO_REFRESH_SECONDS: i64 = 1;
+/// 两个前端自动刷新的默认间隔（秒）：放缓为 5 秒作为兜底/节流节拍；
+/// 日志与请求日志页优先由增量事件驱动按需刷新，空闲期不再每秒轮询数据库。
+pub const DEFAULT_LOGS_AUTO_REFRESH_SECONDS: i64 = 5;
+pub const DEFAULT_REQUESTS_AUTO_REFRESH_SECONDS: i64 = 5;
 pub const DEFAULT_REPORT_AUTO_REFRESH_SECONDS: i64 = 1;
 /// 软件版本检查默认间隔（分钟）：每 20 分钟查一次 GitHub 最新发布。
 ///
@@ -549,6 +547,8 @@ pub const DEFAULT_REPORT_AUTO_REFRESH_SECONDS: i64 = 1;
 /// `scheduledTasks.updateCheck.interval` 的配置按原值跑（`interval_field`
 /// 只在键缺失或越界时才回落到默认），所以调整它不会改写老用户的设置。
 pub const DEFAULT_UPDATE_CHECK_MINUTES: i64 = 240;
+/// Magpie 插件清单与更新检查默认间隔（分钟）：6 小时。
+pub const DEFAULT_MAGPIE_PLUGIN_CHECK_MINUTES: i64 = 360;
 
 /// 间隔型任务的取值范围。上下限分两套（分钟 / 秒），因为两类任务的合理区间
 /// 差着量级：后端维护任务按分钟（1 分钟～1 天），前端刷新按秒（1 秒～10 分钟）。
@@ -584,6 +584,7 @@ pub struct ScheduledSettings {
     pub requests_auto_refresh: IntervalTask,
     pub report_auto_refresh: IntervalTask,
     pub update_check: IntervalTask,
+    pub magpie_plugin_check: IntervalTask,
 }
 
 impl Default for ScheduledSettings {
@@ -612,6 +613,10 @@ impl Default for ScheduledSettings {
             update_check: IntervalTask {
                 enabled: true,
                 interval: DEFAULT_UPDATE_CHECK_MINUTES,
+            },
+            magpie_plugin_check: IntervalTask {
+                enabled: true,
+                interval: DEFAULT_MAGPIE_PLUGIN_CHECK_MINUTES,
             },
         }
     }
@@ -669,11 +674,11 @@ pub const KEY_RETRY_INTERVAL_SECONDS: &str = "retryIntervalSeconds";
 
 /// 同一账号的原地重发次数默认值：失败后再试 3 次（连同首发共 4 次发送）
 pub const DEFAULT_RETRY_COUNT: i64 = 3;
-/// 换账号的次数默认值：失败后最多换 5 个账号。
+/// 换账号的次数默认值：失败后最多换 32 个账号（账号多的部署最高可调到 100）。
 ///
 /// 比原地重发那档更宽是刻意的：换号的成本主要在「等到下一个可用账号」，
 /// 而一个账号失败往往说明它这份额度确实不通，多换几个比快速失败更符合预期。
-pub const DEFAULT_RETRY_SWITCH_COUNT: i64 = 5;
+pub const DEFAULT_RETRY_SWITCH_COUNT: i64 = 32;
 /// 重试间隔默认值：5 秒
 pub const DEFAULT_RETRY_INTERVAL_SECONDS: i64 = 5;
 
@@ -702,6 +707,8 @@ pub const RETRY_MAX_NO_RETRY_CODES: usize = 50;
 /// 该档（不重发 / 不换号），间隔 0 = 立即重发。
 pub const RETRY_MIN_COUNT: i64 = 0;
 pub const RETRY_MAX_COUNT: i64 = 10;
+/// 「换账号次数」的上界：与转发层 `MAX_ROUTE_ATTEMPTS`（100）对齐。
+pub const RETRY_MAX_SWITCH_COUNT: i64 = 100;
 pub const RETRY_MIN_INTERVAL_SECONDS: i64 = 0;
 pub const RETRY_MAX_INTERVAL_SECONDS: i64 = 300;
 

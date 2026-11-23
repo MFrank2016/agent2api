@@ -30,7 +30,12 @@ pub struct CompactRoutes {
 }
 
 impl Default for CompactRoutes {
-    fn default() -> Self { Self { enabled: true, rules: Vec::new() } }
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rules: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -40,10 +45,14 @@ pub struct CompactRoutesSnapshot {
 }
 
 impl Default for CompactRoutesSnapshot {
-    fn default() -> Self { from_value(None) }
+    fn default() -> Self {
+        from_value(None)
+    }
 }
 
-pub fn model_key(model: &str) -> String { model.trim().to_lowercase() }
+pub fn model_key(model: &str) -> String {
+    model.trim().to_lowercase()
+}
 
 pub fn validate(settings: &CompactRoutes) -> Result<(), String> {
     if settings.rules.len() > MAX_COMPACT_ROUTES {
@@ -55,10 +64,15 @@ pub fn validate(settings: &CompactRoutes) -> Result<(), String> {
             return Err("压缩路由目前只支持 ZCode 客户端".into());
         }
         for model in [&rule.source, &rule.target] {
-            if model.trim().is_empty() || model.trim() != model || model.chars().count() > 256
+            if model.trim().is_empty()
+                || model.trim() != model
+                || model.chars().count() > 256
                 || model.chars().any(char::is_control)
             {
-                return Err("来源模型和压缩模型必须完整填写，模型 ID 不能超过 256 个字符或含控制字符".into());
+                return Err(
+                    "来源模型和压缩模型必须完整填写，模型 ID 不能超过 256 个字符或含控制字符"
+                        .into(),
+                );
             }
         }
         let source = model_key(&rule.source);
@@ -82,9 +96,15 @@ fn from_value(value: Option<&Value>) -> CompactRoutesSnapshot {
         None => Ok(CompactRoutes::default()),
         Some(value) => serde_json::from_value::<CompactRoutes>(value.clone())
             .map_err(|error| format!("压缩路由配置格式不正确：{error}"))
-            .and_then(|settings| { validate(&settings)?; Ok(settings) }),
+            .and_then(|settings| {
+                validate(&settings)?;
+                Ok(settings)
+            }),
     };
-    CompactRoutesSnapshot { settings, revision: revision(value) }
+    CompactRoutesSnapshot {
+        settings,
+        revision: revision(value),
+    }
 }
 
 pub(crate) fn from_raw(raw: &Map<String, Value>) -> Arc<CompactRoutesSnapshot> {
@@ -92,19 +112,31 @@ pub(crate) fn from_raw(raw: &Map<String, Value>) -> Arc<CompactRoutesSnapshot> {
 }
 
 pub fn current() -> Arc<CompactRoutesSnapshot> {
-    super::CONFIG.read().unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref().map(|config| config.compact_routes.clone()).unwrap_or_default()
+    super::CONFIG
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|config| config.compact_routes.clone())
+        .unwrap_or_default()
 }
 
 pub fn save(settings: CompactRoutes, expected: &str) -> Result<(), GatewayError> {
     validate(&settings).map_err(GatewayError::bad_request)?;
-    let value = serde_json::to_value(settings).map_err(|error| GatewayError::new(error.to_string()))?;
-    super::try_update_raw_field(KEY_COMPACT_ROUTES, |raw| {
-        // 缺键时更新入口给 Null；它与读取端的初始修订号一致。
-        if revision(Some(raw)) != expected {
-            return Err(GatewayError::with_status(409, "压缩路由已在其他位置修改，请重新读取后再保存；当前草稿未丢失"));
-        }
-        *raw = value;
-        Ok(())
-    }, || GatewayError::new("压缩路由保存失败，未应用本次修改"))
+    let value =
+        serde_json::to_value(settings).map_err(|error| GatewayError::new(error.to_string()))?;
+    super::try_update_raw_field(
+        KEY_COMPACT_ROUTES,
+        |raw| {
+            // 缺键时更新入口给 Null；它与读取端的初始修订号一致。
+            if revision(Some(raw)) != expected {
+                return Err(GatewayError::with_status(
+                    409,
+                    "压缩路由已在其他位置修改，请重新读取后再保存；当前草稿未丢失",
+                ));
+            }
+            *raw = value;
+            Ok(())
+        },
+        || GatewayError::new("压缩路由保存失败，未应用本次修改"),
+    )
 }

@@ -3,7 +3,10 @@ import { mountOnPage } from "../island-lazy";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import {
+  Avatar,
+  AvatarFallback,
   Badge,
+  BadgeDot,
   Button,
   Collapsible,
   CollapsibleContent,
@@ -11,12 +14,21 @@ import {
   Dialog,
   DialogBody,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
+  Field,
+  FieldLabel,
   Input,
   InputGroup,
   InputGroupInput,
+  Item,
+  ItemActions,
+  ItemContent,
+  ItemDescription,
+  ItemMedia,
+  ItemTitle,
   Label,
   NavList,
   NavItem,
@@ -30,7 +42,10 @@ import {
   CardHeader,
   Card,
   CardContent,
+  CardTitle,
+  cn,
 } from "@ui";
+import { ChevronDownIcon, KeyIcon } from "./settings-account-ui";
 import {
   CATEGORIES,
   CAPTCHA_POOL_FIELDS,
@@ -52,9 +67,15 @@ import {
   readThemeMode,
   readZoomPercent,
   shared,
+  toast,
   type NumberField,
   type ThemeMode,
 } from "./settings-model";
+import {
+  refreshExchangeRate,
+  switchDisplayCurrency,
+  usePricingDisplay,
+} from "./model-pricing";
 import {
   applyUnits,
   closePasswordDialog,
@@ -128,8 +149,13 @@ import { promptRulesApi } from "./settings-prompt-api";
 // 与设置页的快照 store 没有交集，见该文件的模块头
 import { CloudSyncPanel } from "./settings-cloud-sync";
 import { CaptchaSettingsPanel } from "./settings-captcha";
+import { NotificationSettingsPanel } from "./settings-notifications";
+import { OauthSettingsPanel } from "./settings-oauth";
 import { BrandingSettingsPanel } from "./settings-branding";
-import { NetworkAccessDialog, NetworkAccessPanel } from "./settings-network-access";
+import {
+  NetworkAccessDialog,
+  NetworkAccessPanel,
+} from "./settings-network-access";
 import { GraphicsSettingsPanel } from "./settings-graphics";
 import { DbRestoreDialog } from "./settings-db-restore";
 import {
@@ -399,7 +425,7 @@ function GeneralPane({ snap }: { snap: SettingsSnapshot }) {
   return (
     <>
       <Card render={<section />} className="panel">
-      <BrandingSettingsPanel disabled={snap.busy !== null} />
+        <BrandingSettingsPanel disabled={snap.busy !== null} />
 
         <PanelHead
           title={t("启动与托盘")}
@@ -446,23 +472,100 @@ function GeneralPane({ snap }: { snap: SettingsSnapshot }) {
         </CardContent>
       </Card>
 
-      <Card render={<section />} className='panel'>
-        <PanelHead title={t('计量单位')} tip={TIPS.units} />
-        <CardContent className='panel-body'>
-          <div className='settings-switches'>
-            <SwitchRow
-              id="settings-chinese-units"
-              label={t("使用中文单位（亿 / 万）")}
-              checked={snap.unitsChinese}
-              onCheckedChange={applyUnits}
-            />
-          </div>
-          <div className="settings-state">
-            {snap.unitsChinese ? STATES.unitsOn : STATES.unitsOff}
-          </div>
-        </CardContent>
-      </Card>
+      <UnitsPanel snap={snap} />
     </>
+  );
+}
+
+const CURRENCY_OPTIONS = [
+  { value: "usd", label: t("美元 ($)") },
+  { value: "cny", label: t("人民币 (¥)") },
+] as const;
+
+function UnitsPanel({ snap }: { snap: SettingsSnapshot }) {
+  const pricing = usePricingDisplay();
+  const [currencyBusy, setCurrencyBusy] = React.useState(false);
+  const [fxBusy, setFxBusy] = React.useState(false);
+
+  return (
+    <Card render={<section />} className="panel">
+      <PanelHead title={t("计量单位")} tip={TIPS.units} />
+      <CardContent className="panel-body">
+        <div className="settings-switches">
+          <SwitchRow
+            id="settings-chinese-units"
+            label={t("使用中文单位（亿 / 万）")}
+            checked={snap.unitsChinese}
+            onCheckedChange={applyUnits}
+          />
+        </div>
+        <div className="settings-state">
+          {snap.unitsChinese ? STATES.unitsOn : STATES.unitsOff}
+        </div>
+        <div className="retention-list">
+          <div className="retention-row">
+            <Label>{t("计价货币")}</Label>
+            <div className="flex flex-wrap items-center gap-2.5">
+              <SegmentedControl<"usd" | "cny">
+                aria-label={t("计价货币")}
+                value={pricing.currency}
+                options={CURRENCY_OPTIONS}
+                onValueChange={(next) => {
+                  if (next === pricing.currency || currencyBusy) return;
+                  setCurrencyBusy(true);
+                  void switchDisplayCurrency(next)
+                    .then(() => {
+                      toast(
+                        next === "cny"
+                          ? t("✅ 已切换为人民币 (¥)")
+                          : t("✅ 已切换为美元 ($)"),
+                      );
+                    })
+                    .finally(() => setCurrencyBusy(false));
+                }}
+              />
+              <span className="text-[12px] text-subtle tabular-nums">
+                {t("1 USD ≈ ¥{rate}", {
+                  rate: pricing.exchangeRate.toFixed(4),
+                })}
+                {pricing.fx?.fallback ? t("（离线默认）") : ""}
+              </span>
+              <Button
+                id="settings-refresh-fx"
+                variant="outline"
+                size="sm"
+                disabled={fxBusy}
+                onClick={() => {
+                  setFxBusy(true);
+                  void refreshExchangeRate()
+                    .then((fx) => {
+                      if (fx)
+                        toast(
+                          t("✅ 汇率已刷新：1 USD ≈ ¥{rate}", {
+                            rate: fx.rate.toFixed(4),
+                          }),
+                        );
+                      else toast(t("当前环境不支持刷新汇率"), "err");
+                    })
+                    .catch((err) => {
+                      toast(
+                        t("刷新汇率失败：{message}", {
+                          message:
+                            err instanceof Error ? err.message : String(err),
+                        }),
+                        "err",
+                      );
+                    })
+                    .finally(() => setFxBusy(false));
+                }}
+              >
+                {fxBusy ? t("刷新中…") : t("刷新汇率")}
+              </Button>
+            </div>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -725,7 +828,13 @@ function LanguageRow() {
 /* ─── 网关分类 ─────────────────────────────── */
 
 function PromptPanel({ snap }: { snap: SettingsSnapshot }) {
-  return <PromptSettingsPanel api={promptRulesApi} t={t} active={snap.category === 'gateway'} />
+  return (
+    <PromptSettingsPanel
+      api={promptRulesApi}
+      t={t}
+      active={snap.category === "gateway"}
+    />
+  );
 }
 
 /** 调试模式的状态行：条数只在后端给了两个整数时才提 */
@@ -1613,71 +1722,127 @@ function storageBadge(state: StorageState): React.ReactNode {
  * 所以这里只显示状态，要关就按下面的重置说明走，语义清楚、后果可见。
  */
 function AccountPane({ snap }: { snap: SettingsSnapshot }) {
-  const account = snap.account
+  const account = snap.account;
+  const [resetOpen, setResetOpen] = React.useState(false);
+  const initial = (account.username?.trim().slice(0, 1) || "A").toUpperCase();
 
   return (
     <>
       <Card render={<section />} className="panel">
-        <PanelHead
-          title={t("管理员账号")}
-          badge={
-            account.status === "loading" ? (
+        <CardHeader>
+          <div className="flex flex-wrap items-center gap-2">
+            <CardTitle>{t("管理员账号")}</CardTitle>
+            {account.status === "loading" ? (
               <StatusBadge tone="idle">{t("检测中…")}</StatusBadge>
             ) : account.status === "unavailable" ? (
               <StatusBadge tone="bad">{t("不可用")}</StatusBadge>
             ) : account.registered ? (
-              <StatusBadge tone="ok">{t("已启用登录")}</StatusBadge>
+              <Badge variant="success">
+                <BadgeDot />
+                {t("已启用登录")}
+              </Badge>
             ) : (
               <StatusBadge tone="idle">{t("未注册")}</StatusBadge>
-            )
-          }
-          actions={
-            account.registered ? (
-              <Button
-                id="btn-account-change-password"
-                variant="outline"
-                onClick={() => openPasswordDialog()}
-              >
-                {t("修改密码")}
-              </Button>
-            ) : null
-          }
-        />
-        <CardContent className="panel-body">
-          <div className="settings-state" id="account-username">
-            {account.status === "unavailable"
-              ? t("未能读取账户信息，请稍后重试")
-              : account.registered
-                ? t('当前管理员：{name}', { name: account.username || '—' })
-                : t('尚未注册管理员。开启「网关 → 网络访问 → 允许其他设备访问网关」时会引导注册，也可以从登录页注册。')}
+            )}
           </div>
-          {account.registered ? (
-            <div className="hint">
-              {t(
-                "修改密码需要输入当前密码；修改成功后，其他设备 / 浏览器上的登录会立即失效，当前这条会话保留。",
-              )}
+        </CardHeader>
+
+        <CardContent className="flex flex-col gap-3">
+          {account.status === "loading" ? (
+            <div className="settings-state" id="account-username">
+              —
             </div>
-          ) : null}
+          ) : account.status === "unavailable" ? (
+            <Alert variant="destructive" id="account-username">
+              {t("未能读取账户信息，请稍后重试")}
+            </Alert>
+          ) : account.registered ? (
+            <Item
+              variant="outline"
+              size="sm"
+              className="flex-wrap bg-surface-2/60 px-3.5 py-2.5 sm:flex-nowrap"
+            >
+              <ItemMedia>
+                <Avatar className="size-8">
+                  <AvatarFallback className="border border-primary-bd bg-primary-soft text-[12.5px] font-semibold text-primary-fg">
+                    {initial}
+                  </AvatarFallback>
+                </Avatar>
+              </ItemMedia>
+              <ItemContent>
+                <ItemTitle
+                  className="text-[13.5px] font-semibold"
+                  id="account-username"
+                >
+                  {account.username || "—"}
+                </ItemTitle>
+                <ItemDescription>
+                  {t("修改密码后其他设备会话将失效，当前会话保留")}
+                </ItemDescription>
+              </ItemContent>
+              <ItemActions>
+                <Button
+                  id="btn-account-change-password"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => openPasswordDialog()}
+                >
+                  <KeyIcon />
+                  {t("修改密码")}
+                </Button>
+              </ItemActions>
+            </Item>
+          ) : (
+            <Alert id="account-username">
+              {t(
+                "尚未注册管理员。开启「网关 → 网络访问 → 允许其他设备访问网关」时会引导注册，也可以从登录页注册。",
+              )}
+            </Alert>
+          )}
+
+          <Collapsible
+            open={resetOpen}
+            onOpenChange={setResetOpen}
+            className="border-t border-hairline pt-2"
+          >
+            <CollapsibleTrigger
+              render={<button type="button" />}
+              className="flex w-full cursor-pointer items-center justify-between gap-3 rounded-md border-0 bg-transparent px-2 py-1 text-left transition-colors hover:bg-surface-2 focus-visible:shadow-focus focus-visible:outline-none"
+            >
+              <span className="text-[12.5px] font-medium text-subtle">
+                {t("忘记密码？查看重置管理员说明")}
+              </span>
+              <ChevronDownIcon
+                size={14}
+                className={cn(
+                  "shrink-0 text-muted-foreground transition-transform duration-150",
+                  resetOpen && "rotate-180",
+                )}
+              />
+            </CollapsibleTrigger>
+
+            <CollapsibleContent
+              keepMounted
+              className="mt-2 flex flex-col gap-2.5 px-2"
+            >
+              <div className="hint">
+                {t(
+                  "忘记密码时无法在界面里找回：需要停掉程序后，从数据库删除管理员记录（kv 表的 panelAdmin 键），重启后按首次使用重新注册。具体命令与各形态的库文件路径见 docs 目录下的「重置管理员」文档。",
+                )}
+              </div>
+              <Alert variant="destructive" className="danger-zone">
+                <strong>
+                  {t("重置会清空管理员账号与密码，面板将回到「未注册」状态。")}
+                </strong>
+              </Alert>
+            </CollapsibleContent>
+          </Collapsible>
         </CardContent>
       </Card>
 
       <CaptchaSettingsPanel disabled={snap.busy !== null} />
 
-      <Card render={<section />} className="panel">
-        <PanelHead title={t("重置管理员")} />
-        <CardContent className="panel-body">
-          <div className="hint">
-            {t(
-              "忘记密码时无法在界面里找回：需要停掉程序后，从数据库删除管理员记录（kv 表的 panelAdmin 键），重启后按首次使用重新注册。具体命令与各形态的库文件路径见 docs 目录下的「重置管理员」文档。",
-            )}
-          </div>
-          <Alert variant="destructive" className="danger-zone">
-            <strong>
-              {t("重置会清空管理员账号与密码，面板将回到「未注册」状态。")}
-            </strong>
-          </Alert>
-        </CardContent>
-      </Card>
+      <OauthSettingsPanel />
     </>
   );
 }
@@ -2019,70 +2184,84 @@ function PasswordDialog({
       }}
     >
       <DialogContent
-        className="w-[min(440px,calc(100vw-48px))]"
+        className="w-[min(430px,calc(100vw-48px))]"
         initialFocus={cancelRef}
       >
         <DialogHeader>
-          <DialogTitle>{t("修改密码")}</DialogTitle>
+          <div className="min-w-0 flex-1">
+            <DialogTitle>{t("修改密码")}</DialogTitle>
+            <DialogDescription className="mt-0.5 text-[12px] text-subtle">
+              {t("修改密码后其他设备会话将失效，当前会话保留")}
+            </DialogDescription>
+          </div>
         </DialogHeader>
-        <DialogBody>
+        <DialogBody className="gap-3.5">
           {/* form 让浏览器的密码管理器能识别「旧密码 → 新密码」这一组 */}
           <form
+            className="flex flex-col gap-3.5"
             onSubmit={(event) => {
               event.preventDefault();
               submit();
             }}
             autoComplete="on"
           >
-            <Label
-              htmlFor="account-old-password"
-              className="mb-[5px] block text-[12.5px]"
-            >
-              {t("当前密码")}
-            </Label>
-            <Input
-              id="account-old-password"
-              type="password"
-              autoComplete="current-password"
-              placeholder={t("输入当前登录用的密码")}
-              value={oldValue}
-              disabled={busy}
-              onChange={(event) => setOldValue(event.target.value)}
-            />
-            <Label
-              htmlFor="account-new-password"
-              className="mt-3.5 mb-[5px] block text-[12.5px]"
-            >
-              {t("新密码")}
-            </Label>
-            <Input
-              id="account-new-password"
-              type="password"
-              autoComplete="new-password"
-              placeholder={t("至少 8 位")}
-              value={newValue}
-              disabled={busy}
-              onChange={(event) => setNewValue(event.target.value)}
-            />
-            <Label
-              htmlFor="account-repeat-password"
-              className="mt-3.5 mb-[5px] block text-[12.5px]"
-            >
-              {t("确认新密码")}
-            </Label>
-            <Input
-              id="account-repeat-password"
-              type="password"
-              autoComplete="new-password"
-              placeholder={t("再输入一次新密码")}
-              value={repeat}
-              disabled={busy}
-              onChange={(event) => setRepeat(event.target.value)}
-            />
+            <Field>
+              <FieldLabel
+                htmlFor="account-old-password"
+                className="text-[12.5px] font-medium text-foreground"
+              >
+                {t("当前密码")}
+              </FieldLabel>
+              <Input
+                id="account-old-password"
+                type="password"
+                autoComplete="current-password"
+                placeholder={t("输入当前登录用的密码")}
+                value={oldValue}
+                disabled={busy}
+                onChange={(event) => setOldValue(event.target.value)}
+              />
+            </Field>
+            <Field>
+              <FieldLabel
+                htmlFor="account-new-password"
+                className="text-[12.5px] font-medium text-foreground"
+              >
+                {t("新密码")}
+              </FieldLabel>
+              <Input
+                id="account-new-password"
+                type="password"
+                autoComplete="new-password"
+                placeholder={t("至少 8 位")}
+                value={newValue}
+                disabled={busy}
+                onChange={(event) => setNewValue(event.target.value)}
+              />
+            </Field>
+            <Field>
+              <FieldLabel
+                htmlFor="account-repeat-password"
+                className="text-[12.5px] font-medium text-foreground"
+              >
+                {t("确认新密码")}
+              </FieldLabel>
+              <Input
+                id="account-repeat-password"
+                type="password"
+                autoComplete="new-password"
+                placeholder={t("再输入一次新密码")}
+                value={repeat}
+                disabled={busy}
+                onChange={(event) => setRepeat(event.target.value)}
+              />
+            </Field>
           </form>
-          <div className="mt-3 min-h-5 text-[13px] whitespace-pre-wrap text-destructive">
-            {mismatch ? t("两次输入的新密码不一致") : password?.error || ""}
-          </div>
+          {mismatch || password?.error ? (
+            <div className="text-[12.5px] whitespace-pre-wrap text-destructive">
+              {mismatch ? t("两次输入的新密码不一致") : password?.error || ""}
+            </div>
+          ) : null}
         </DialogBody>
         <DialogFooter>
           <div className="mr-auto" />
@@ -2248,15 +2427,22 @@ function SettingsPage() {
         <div className={paneClass("display")} data-cat="display">
           <DisplayPane />
         </div>
-        <div className={paneClass('gateway')} data-cat='gateway'>
+        <div className={paneClass("gateway")} data-cat="gateway">
           <NetworkAccessPanel snap={snap} />
           {/* 图片兼容已搬到「路由 → 特殊请求路由 → 图片兼容」：它与账号路由是同一层
               （都在模型解析时改写请求），留在设置页会让「改哪只模型」散落在两处。 */}
-          <ClientIdentificationPanel api={clientIdentificationApi} t={t} active={snap.category === 'gateway'} />
+          <ClientIdentificationPanel
+            api={clientIdentificationApi}
+            t={t}
+            active={snap.category === "gateway"}
+          />
           <GatewayPane snap={snap} panels={adminPanels} />
         </div>
-        <div className={paneClass('providers')} data-cat='providers'>
-          <ProviderSettingsPane active={snap.category === 'providers'} onOpenDetail={() => setMobileDetail(true)} />
+        <div className={paneClass("providers")} data-cat="providers">
+          <ProviderSettingsPane
+            active={snap.category === "providers"}
+            onOpenDetail={() => setMobileDetail(true)}
+          />
         </div>
         <div className={paneClass("timeout")} data-cat="timeout">
           <TimeoutPane snap={snap} />
@@ -2266,6 +2452,9 @@ function SettingsPage() {
         </div>
         <div className={paneClass("account")} data-cat="account">
           <AccountPane snap={snap} />
+        </div>
+        <div className={paneClass("notifications")} data-cat="notifications">
+          <NotificationSettingsPanel />
         </div>
         <div className={paneClass("data")} data-cat="data">
           <DataPane snap={snap} />
@@ -2297,7 +2486,10 @@ function SettingsPage() {
       {/* 恢复进度弹窗：**不可关闭**，直到恢复收口（见该文件的说明） */}
       <DbRestoreDialog />
       <PasswordDialog password={snap.account.password} />
-      <NetworkAccessDialog confirm={snap.lanConfirm} register={snap.lanRegister} />
+      <NetworkAccessDialog
+        confirm={snap.lanConfirm}
+        register={snap.lanRegister}
+      />
     </div>
   );
 }

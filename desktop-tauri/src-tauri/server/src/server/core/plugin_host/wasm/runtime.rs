@@ -72,7 +72,6 @@ enum InvocationContext {
     DoubaoImage(super::conversation::ConversationCall),
     DesktopImport(super::native::chatglm::DesktopCall),
     DesktopLaunch(super::desktop_launch::binding::Call),
-    CodeArtsRefresh(Arc<super::codearts_refresh::Call>),
     DoubaoRewards(Arc<super::doubao_rewards::Call>),
 }
 
@@ -113,9 +112,12 @@ impl Runtime {
                 let method = input["method"].as_str().ok_or_else(|| wasmtime::Error::msg("Wasm 调用缺少方法"))?;
                 let result = caller.data_mut().context.invoke_at(method, input["params"].clone(), received).await;
                 let upstream_bytes = caller.data_mut().context.progress.take();
-                let remaining = caller.get_fuel()?;
-                let grant = if result.is_ok() { caller.data_mut().budget.replenish(remaining, upstream_bytes) } else { 0 };
-                if grant > 0 { caller.set_fuel(remaining.saturating_add(grant))?; }
+                if result.is_ok() && upstream_bytes > 0 && caller.data().budget.is_adaptive() {
+                    caller.data_mut().context.spin_calls = 0;
+                    let remaining = caller.get_fuel()?;
+                    let grant = caller.data_mut().budget.replenish(remaining, upstream_bytes);
+                    if grant > 0 { caller.set_fuel(remaining.saturating_add(grant))?; }
+                }
                 caller.data().capture(caller.get_fuel().ok(), None);
                 drop(input);
                 drop(bytes);
@@ -190,13 +192,6 @@ impl Runtime {
         params: Value, timeout: Duration, kiro: Option<Arc<super::managed::kiro_execution::KiroExecution>>,
     ) -> Result<Value, proto::WireError> {
         self.invoke_inner(call.method(), params, timeout, None, InvocationContext::Managed { call, kiro }).await
-    }
-
-    pub(super) async fn invoke_codearts_refresh(&self, call: Arc<super::codearts_refresh::Call>,
-        params: Value, timeout: Duration,
-    ) -> Result<Value, proto::WireError> {
-        self.invoke_inner(proto::methods::gateway::TOKEN_REFRESH, params, timeout, None,
-            InvocationContext::CodeArtsRefresh(call)).await
     }
 
     pub(super) async fn invoke_doubao_rewards(&self, call: Arc<super::doubao_rewards::Call>,
@@ -337,10 +332,6 @@ impl Runtime {
                             call.enter(self, method, &context.account)?;
                             context.doubao_rewards = Some(call);
                         }
-                        InvocationContext::CodeArtsRefresh(call) => {
-                            call.enter_once(self, method, &context.account)?;
-                            context.codearts_refresh = Some(call);
-                        }
                         InvocationContext::DesktopLaunch(call) => {
                             if !matches!(method, super::desktop_launch::declaration::CHECK | super::desktop_launch::declaration::PREPARE) {
                                 return Err(proto::WireError::with_code("本机启动上下文不能用于其他操作", "forbidden"));
@@ -378,25 +369,18 @@ impl Runtime {
                     && crate::server::core::usage_query::is_account_query(&self.shared.options.provider, &context.account);
             context.desktop_selected = super::desktop_credentials::selected_import(&self.shared.options.provider)
                 && (method == "login.start" || method == proto::methods::gateway::ACCOUNT_NORMALIZE);
-            if method == proto::methods::gateway::ACCOUNT_NORMALIZE && super::desktop_credentials::supplied_import() {
-                if super::legacy_credentials::selected(&self.shared.options.provider, &params)? {
-                    context.permission("credentials.legacy-import.v1")?;
-                    let credentials = super::legacy_credentials::prepare(&self.shared.options.provider)?;
-                    if matches!(self.shared.options.provider.as_str(), "autoclaw" | "autoclaw-intl") {
-                        context.supplied_credentials = Some(super::desktop_credentials::supplied_tokens(
-                            &json!({ "source": { "kind": "manual", "payload": credentials } }))?);
-                    }
-                    context.supplied_legacy_credentials = Some(credentials);
-                } else if matches!(self.shared.options.provider.as_str(), "autoclaw" | "autoclaw-intl") {
-                    context.supplied_credentials = Some(super::desktop_credentials::supplied_tokens(&params)?);
-                }
+            if method == proto::methods::gateway::ACCOUNT_NORMALIZE
+                && super::desktop_credentials::supplied_import()
+                && matches!(self.shared.options.provider.as_str(), "autoclaw" | "autoclaw-intl")
+            {
+                context.supplied_credentials = Some(super::desktop_credentials::supplied_tokens(&params)?);
             }
             if method == proto::methods::gateway::ACCOUNT_NORMALIZE && super::desktop_credentials::supplied_import()
                 && self.shared.options.provider == "kuku" && params["source"]["kind"] == "file_base64" {
                 context.permission("resources.cookie-file.v1")?;
                 context.supplied_cookie_file = Some(super::desktop_credentials::cookie_file::prepare(&params)?);
             }
-            if !context.account.is_empty() && context.codearts_refresh.is_none() && context.doubao_rewards.is_none() {
+            if !context.account.is_empty() && context.doubao_rewards.is_none() {
                 context.invoke("account.get", json!({})).await?;
             }
             if let Some(call) = &context.conversation { call.validate_context(&self.shared, &context.account)?; }
@@ -506,7 +490,8 @@ impl Runtime {
                         "authorization" | "x-api-key" | "api-key" | "cookie" | "proxy-authorization"));
                 }
             }
-            let limits = StoreLimitsBuilder::new().memory_size(self.shared.options.manifest.memory_mib * 1024 * 1024)
+            let memory_limit_mib = self.shared.options.effective_memory_mib(method == proto::methods::gateway::CONVERSATION);
+            let limits = StoreLimitsBuilder::new().memory_size(memory_limit_mib * 1024 * 1024)
                 .instances(1).memories(1).tables(2).table_elements(100_000).trap_on_grow_failure(true).build();
             let memory = capacity::MemoryBudget::new();
             memory.resize(2 * capacity::MIB)?;
@@ -556,7 +541,7 @@ impl Runtime {
                 }
                 Err(_) if store.data().limits.exhausted => {
                     let reason = store.data().limits.reason;
-                    let limit_mib = self.shared.options.manifest.memory_mib;
+                    let limit_mib = memory_limit_mib;
                     let input = store.data().input_bytes;
                     let (message, code) = match reason {
                         Some("table") => ("Wasm 插件表容量超限".to_string(), "plugin_resource_limit"),

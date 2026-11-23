@@ -35,7 +35,10 @@ import {
   SERVER_PAGE_SIZES,
   readPageSize,
 } from "./table-shell";
-import type { CheckinResultRow } from "../../../ui-shared/checkin";
+import type {
+  ActivityRunStatus,
+  CheckinResultRow,
+} from "../../../ui-shared/checkin";
 import { growthTaskRunnable } from "../../../ui-shared/checkin";
 import {
   rowCompleted,
@@ -109,6 +112,12 @@ type CheckinBridge = {
     id: string,
     mode: string,
   ) => Promise<CheckinRunResult | null | undefined>;
+  getCheckinActivityStatus?: (
+    id: string,
+  ) => Promise<ActivityRunStatus | undefined>;
+  resetCheckinActivity?: (
+    id: string,
+  ) => Promise<{ cleared?: string[]; message?: string } | null | undefined>;
   getCheckinRecords?: (
     params: Record<string, unknown>,
   ) => Promise<RecordsPage | null | undefined>;
@@ -281,6 +290,7 @@ export type Store = {
   records: RecordRow[];
   recordsTotal: number;
   recordsLoaded: boolean;
+  recordsStale: boolean;
   recordsError: string;
   recordsLoading: boolean;
   recordsQuery: {
@@ -323,6 +333,7 @@ export const store: Store = {
   records: [],
   recordsTotal: 0,
   recordsLoaded: false,
+  recordsStale: false,
   recordsError: "",
   recordsLoading: false,
   recordsQuery: {
@@ -359,29 +370,90 @@ export function patch(next: Partial<Store>): void {
 
 /* ─── 读 ───────────────────────────────────── */
 
+const CENTER_SKIP_MS = 4_000;
+const CENTER_FRESH_MS = 15_000;
+let centerLoadedAt = 0;
+let centerMutationEpoch = 0;
+
+export function invalidateCenter(): void {
+  centerLoadedAt = 0;
+}
+
+function touchCenterMutation(): void {
+  centerMutationEpoch += 1;
+  centerLoadedAt = Date.now();
+}
+
+function sameStringList(
+  left: string[] | null | undefined,
+  right: string[] | null | undefined,
+): boolean {
+  return (
+    Boolean(left && right) &&
+    left!.length === right!.length &&
+    left!.every((item, index) => item === right![index])
+  );
+}
+
+function sameTravelDraft(
+  draft: string | null,
+  times: string[] | undefined,
+): boolean {
+  return (
+    draft !== null && draft.replace(/\s+/g, "") === (times ?? []).join(",")
+  );
+}
+
 const refreshCenter = createRefreshRequest(async (isCurrent) => {
+  const fetchEpoch = centerMutationEpoch;
   try {
     const data = await bridge().getCheckinCenter?.();
-    if (!isCurrent()) return;
+    if (!isCurrent() || store.saving || fetchEpoch !== centerMutationEpoch)
+      return;
     if (!data) {
       patch({ loaded: true, loadError: "后端未返回签到中心数据" });
       return;
     }
+    centerLoadedAt = Date.now();
     patch({
       center: data,
       onboarding: onboardingFromCenter(data, store.onboarding),
       loaded: true,
       loadError: "",
-      keepaliveDraft: null,
-      travelTimesDraft: null,
+      // 保留尚未保存的本地编辑草稿，避免后台轮询或回读把输入框/列表清空
+      keepaliveDraft: sameStringList(
+        store.keepaliveDraft,
+        data.keepalive?.models,
+      )
+        ? null
+        : store.keepaliveDraft,
+      travelTimesDraft: sameTravelDraft(
+        store.travelTimesDraft,
+        data.travel?.times,
+      )
+        ? null
+        : store.travelTimesDraft,
     });
   } catch (error) {
-    if (isCurrent()) patch({ loaded: true, loadError: errorMessage(error) });
+    if (isCurrent() && !store.saving && fetchEpoch === centerMutationEpoch) {
+      patch({ loaded: true, loadError: errorMessage(error) });
+    }
   }
 });
 
 export function loadCenter(afterChange = false): Promise<void> {
   return refreshCenter(afterChange);
+}
+
+export async function loadCenterIfStale(): Promise<void> {
+  const age = Date.now() - centerLoadedAt;
+  if (!store.loaded || centerLoadedAt === 0 || age >= CENTER_FRESH_MS) {
+    await loadCenter(centerLoadedAt === 0 && store.loaded);
+    return;
+  }
+  if (age >= CENTER_SKIP_MS) {
+    void loadCenter();
+  }
 }
 
 let recordsRequest = 0;
@@ -412,11 +484,21 @@ export async function loadRecords(): Promise<void> {
       await loadRecords();
       return;
     }
+    const unfiltered =
+      !query.outcome &&
+      !query.kind &&
+      !query.provider &&
+      !query.keyword &&
+      query.start == null;
     patch({
       records: Array.isArray(data?.records) ? data.records : [],
       recordsTotal: total,
       recordsLoaded: true,
+      recordsStale: false,
       recordsError: "",
+      ...(unfiltered && store.center
+        ? { center: { ...store.center, recordsTotal: total } }
+        : {}),
     });
   } catch (error) {
     if (request === recordsRequest)
@@ -442,7 +524,10 @@ async function run<T>(
   patch({ saving: true });
   try {
     const result = await action();
-    if (options.reload !== false) await loadCenter(true);
+    if (options.reload !== false) {
+      patch({ recordsStale: true });
+      await loadCenter(true);
+    }
     if (options.success) toast(options.success);
     return result;
   } catch (error) {
@@ -490,7 +575,7 @@ export async function runAllCheckin(accountId?: string): Promise<void> {
   } catch (error) {
     toast(`签到失败：${errorMessage(error)}`, "err");
   } finally {
-    patch({ runningAll: false });
+    patch({ runningAll: false, recordsStale: true });
     await loadCenter(true);
   }
   // 签到成功后自动跟进新手福利（失败不触发；见 `checkin-onboarding` 的说明）
@@ -526,7 +611,7 @@ export async function signSingle(
   } finally {
     const after = new Set(store.signing);
     after.delete(key);
-    patch({ signing: after });
+    patch({ signing: after, recordsStale: true });
     await loadCenter(true);
   }
   // 签到成功后自动跟进这个账号的新手福利（失败不触发；整组签到由调用方统一收尾）
@@ -661,7 +746,10 @@ export async function toggleMaster(enabled: boolean): Promise<void> {
   await run(
     async () => {
       const data = await bridge().saveAutoCheckin?.({ enabled });
-      if (data) patch({ center: withAuto(store.center, data) });
+      if (data) {
+        touchCenterMutation();
+        patch({ center: withAuto(store.center, data) });
+      }
     },
     {
       success: enabled ? "✅ 定时签到已开启" : "定时签到已关闭",
@@ -681,6 +769,7 @@ export async function saveScheduleEntry(
     async () => {
       const data = await bridge().saveCheckinSchedule?.(payload);
       if (!data) throw new Error(t("后端未返回定时签到数据"));
+      touchCenterMutation();
       patch({
         center: withAuto(store.center, data),
         ...(options.closeEditor === false ? {} : { editingId: null }),
@@ -717,7 +806,7 @@ export async function runScheduleEntry(id: string): Promise<void> {
   } catch (error) {
     toast(`执行失败：${errorMessage(error)}`, "err");
   } finally {
-    patch({ runningScheduleId: null });
+    patch({ runningScheduleId: null, recordsStale: true });
     await loadCenter(true);
   }
 }
@@ -730,7 +819,9 @@ export async function saveKeepaliveModels(
   await run(
     async () => {
       const data = await bridge().saveCheckinKeepalive?.(models, apiKeyId);
-      if (data && store.center) {
+      if (!data) throw new Error("后端未返回保活配置");
+      touchCenterMutation();
+      if (store.center) {
         patch({
           center: { ...store.center, keepalive: data },
           keepaliveDraft: null,
@@ -746,7 +837,9 @@ export async function saveTravel(body: Record<string, unknown>): Promise<void> {
   await run(
     async () => {
       const data = await bridge().saveTravelSchedule?.(body);
-      if (data && store.center) {
+      if (!data) throw new Error("后端未返回猫猫旅行排程");
+      touchCenterMutation();
+      if (store.center) {
         patch({
           center: { ...store.center, travel: data },
           ...(body.times ? { travelTimesDraft: null } : {}),
@@ -825,6 +918,7 @@ export async function clearRecords(all: boolean): Promise<void> {
     { success: "签到记录已清空", reload: false, failure: "清空失败" },
   );
   await loadRecords();
+  if (!all) void loadCenter(true);
 }
 
 /* ─── 成长任务（WorkBuddy 国内版）───────────── */

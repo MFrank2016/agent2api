@@ -173,6 +173,7 @@ pub struct RpcAdapter {
     stop_on_error: bool,
     image_editing: bool,
     image_models: Vec<Value>,
+    web_search: Option<crate::server::core::providers::adapter::WebSearchCapability>,
     /// `finish_reason` 拒答集合（握手时取回）。
     ///
     /// ── 为什么存的是 `&'static [&'static str]` 而不是 `Box<[...]>` ──
@@ -209,6 +210,7 @@ impl RpcAdapter {
             image_editing: false,
             image_models: info.default_models.into_iter()
                 .filter(crate::server::core::providers::images::model_is_image).collect(),
+            web_search: None,
             refusal_finishes: leak_slice(info.refusal_finishes),
             refusal_markers: leak_slice(info.refusal_markers),
         }
@@ -267,6 +269,20 @@ impl RpcAdapter {
         if !self.image_generation {
             self.image_models.clear();
         }
+        if self.host.options.wasm.is_some() || self.host.options.script {
+            let mut params = self.with_account("");
+            if let Some(object) = params.as_object_mut() {
+                object.insert("action".into(), Value::String("web-search.capabilities".into()));
+                object.insert("payload".into(), Value::Object(serde_json::Map::new()));
+            }
+            let search = self
+                .control(proto::methods::gateway::ADMIN_ACTION, params)
+                .await
+                .ok()
+                .as_ref()
+                .and_then(crate::server::core::providers::adapter::WebSearchCapability::from_metadata);
+            self.web_search = search;
+        }
     }
 
     /// 调一次控制面 RPC。
@@ -291,7 +307,7 @@ impl RpcAdapter {
                 .ok_or_else(|| GatewayError::with_status(503, "原账号存储尚未就绪"))?;
             let account = params["account"].as_str().unwrap_or("");
             if !account.is_empty() {
-                self.prepare_read_credentials(&store, account).await?;
+                self.ensure_access_token(&store, account).await?;
             }
         }
         super::account_egress::apply(&mut params)?;
@@ -611,6 +627,12 @@ impl ProviderAdapter for RpcAdapter {
         self.metadata().image_editing
     }
 
+    fn web_search_capability(
+        &self,
+    ) -> Option<crate::server::core::providers::adapter::WebSearchCapability> {
+        self.metadata().web_search.clone()
+    }
+
     fn forwards_images(&self) -> bool { self.metadata().host.options.wasm.is_some() }
 
     fn forward_images<'a>(
@@ -797,20 +819,43 @@ impl ProviderAdapter for RpcAdapter {
         account_id: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
-            if super::operations::active_for_provider(self.id) { return false; }
-            if self.id == "codearts" && self.metadata().host.options.wasm.is_some()
-                && super::rpc_refresh::readiness(store, self.id, account_id).await.is_err() {
-                return false;
+            self.check_credentials_expiring(store, account_id).await.unwrap_or(false)
+        })
+    }
+
+    fn check_credentials_expiring<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, GatewayError>> + Send + 'a>> {
+        self.check_credentials_expiring_within(store, account_id, 0)
+    }
+
+    fn check_credentials_expiring_within<'a>(
+        &'a self,
+        _store: &'a AccountStore,
+        account_id: &'a str,
+        min_lead_ms: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, GatewayError>> + Send + 'a>> {
+        Box::pin(async move {
+            if super::operations::active_for_provider(self.id) {
+                return Err(GatewayError::with_status(503, "插件正在安装或更新，暂时无法检查凭证有效期。")
+                    .with_code("credential_refresh_check_unavailable"));
             }
-            self.control(
+            let execution = self.execution().await?;
+            let mut params = execution.with_account(account_id);
+            if min_lead_ms > 0 {
+                if let Some(object) = params.as_object_mut() {
+                    object.insert("minLeadMs".into(), Value::from(min_lead_ms));
+                }
+            }
+            let value = execution.control(
                 proto::methods::gateway::TOKEN_EXPIRING,
-                self.with_account(account_id),
-            )
-            .await
-            .ok()
-            .and_then(|value| value.as_bool())
-            // 判不出来就 false：宁可漏刷，也不要凭猜测打上游。
-            .unwrap_or(false)
+                params,
+            ).await?;
+            value.as_bool().ok_or_else(|| GatewayError::with_status(
+                502, "无法检查凭证有效期，插件返回的结果无效。",
+            ).with_code("credential_refresh_check_failed"))
         })
     }
 
@@ -1129,20 +1174,12 @@ impl ProviderAdapter for RpcAdapter {
 
     fn ensure_access_token<'a>(
         &'a self,
-        store: &'a AccountStore,
+        _store: &'a AccountStore,
         account_id: &'a str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            if self.id == "codearts" && self.metadata().host.options.wasm.is_some()
-                && self.supports_refresh() && self.credentials_expiring_async(store, account_id).await {
-                // CodeArts 旧/手工材料没有登记时，尚未到期的访问仍可只读使用；不据临期补建续期资格。
-                // 已登记后的真实换证失败继续报错，不能沿用旧值冒充本次换证成功。
-                if super::rpc_refresh::readiness(store, self.id, account_id).await.is_ok() {
-                    return self.refresh_access_token(store, account_id).await;
-                }
-            }
             let value = self
                 .network(proto::methods::gateway::TOKEN_ENSURE, self.with_account(account_id))
                 .await?;
@@ -1161,15 +1198,9 @@ impl ProviderAdapter for RpcAdapter {
         Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let value = if self.id == "codearts" && self.metadata().host.options.wasm.is_some() {
-                let execution = self.execution().await?;
-                super::rpc_refresh::readiness(_store, self.id, account_id).await?;
-                let params = self.with_account(account_id);
-                let result = execution.host.call_wasm_codearts_refresh(params, NETWORK_TIMEOUT).await;
-                result.map_err(|error| rpc_error(self.id, error, proto::methods::gateway::TOKEN_REFRESH))?
-            } else {
-                self.network(proto::methods::gateway::TOKEN_REFRESH, self.with_account(account_id)).await?
-            };
+            let value = self
+                .network(proto::methods::gateway::TOKEN_REFRESH, self.with_account(account_id))
+                .await?;
             value
                 .as_str()
                 .map(str::to_string)
@@ -2103,17 +2134,6 @@ impl RpcAdapter {
                 "账号库尚未就绪，无法保存登录结果",
             ));
         };
-        if let Some(completed) = super::wasm::codearts_login::take(self.id, account) {
-            let origin = store.prepare_codearts_enrollment_origin().map_err(|_| GatewayError::with_status(503,"CodeArts 新登录的账号存储不可用"))?;
-            return match origin.commit_new_login(completed, proxy) {
-                crate::server::core::account_store::credential_version::EnrollmentCommitOutcome::Committed {receipt,..} => Ok(receipt.account().to_string()),
-                _ => Err(GatewayError::with_status(503,"CodeArts 登录已完成，但保存未确认；不会再次交换授权码")),
-            };
-        }
-        if self.id == "codearts" && self.metadata().host.options.wasm.is_some()
-            && account.secret["refresh_token"].as_str().is_some_and(|token| !token.is_empty()) {
-            return Err(GatewayError::with_status(503, "CodeArts 新授权保存来源未确认，未改用普通导入或再次交换授权码"));
-        }
         let id = account.identity.clone();
         let name = account
             .public
@@ -2215,7 +2235,16 @@ impl RpcAdapter {
             if strict::applies(self.id) {
                 return Err(strict::conversation(self.id, status, class, &error, response_headers.as_ref()));
             }
-            return Err(conversation_error(status, class, &error));
+            let mut failure = conversation_error(status, class, &error);
+            if failure.code.is_none() {
+                if let Some(code) = error.get("code").or_else(|| error.get("providerCode"))
+                    .or_else(|| error.pointer("/error/code")).and_then(Value::as_str)
+                    .filter(|text| !text.is_empty() && text.len() <= 256)
+                {
+                    failure.code = Some(code.to_string());
+                }
+            }
+            return Err(failure);
         }
 
         if self.id == "catpaw" && self.host.options.wasm.is_some()

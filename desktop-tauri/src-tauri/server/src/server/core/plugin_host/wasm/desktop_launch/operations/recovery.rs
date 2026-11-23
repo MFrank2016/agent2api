@@ -29,7 +29,7 @@ async fn enter(operation: &Arc<Operation>, phase: &'static str) -> Result<OwnedM
     Ok(lock)
 }
 
-pub async fn retry_start(manager: Source, intent: &str) -> Result<Value, String> {
+pub async fn retry_start(manager: Source, intent: &str, restart_confirmed: bool) -> Result<Value, String> {
     let operation = find(&manager, intent)?;
     {
         let state = operation.state.lock().map_err(|_| "本机启动状态不可用")?;
@@ -47,22 +47,44 @@ pub async fn retry_start(manager: Source, intent: &str) -> Result<Value, String>
             paths::identity(&runner.binding.client, &runner.executable)?;
             let expected = runner.expected.lock().map_err(|_| "本机启动账号状态不可用")?;
             runner.binding.origin()?.check(expected.as_ref().ok_or("缺少本次启动账号快照")?)?;
+            runner.check_proxy()?;
             let id = runner.state.lock().map_err(|_| "本机启动状态不可用")?.backup.clone().ok_or("缺少本次切换备份")?;
             let mut journal = Journal::read(&id)?;
             for edit in &journal.edits {
                 let current = super::super::Secret(edit.target.snapshot()?);
                 if current.0 != edit.after { return Err("客户端凭证已改变，未用旧账号启动".into()); }
             }
+            let running = windows::running(&runner.executable)?;
+            if running {
+                if !restart_confirmed { return Err("客户端正在运行，请先保存未完成的内容并确认重启".into()); }
+                runner.state.lock().map_err(|_| "本机启动状态不可用")?.phase = "closing";
+                windows::close(&runner.executable)?;
+                runner.state.lock().map_err(|_| "本机启动状态不可用")?.client_running = false;
+                for edit in &journal.edits {
+                    let current = super::super::Secret(edit.target.snapshot()?);
+                    if current.0 != edit.after { edit.target.write(&current.0, &edit.after)?; }
+                }
+            }
             if !runner.manager.is_current() || runner.binding.current().is_err() { return Err("本机启动来源已变化，未启动客户端".into()); }
+            runner.check_proxy()?;
             runner.state.lock().map_err(|_| "本机启动状态不可用")?.phase = "starting";
-            windows::start(&runner.executable)?;
-            runner.state.lock().map_err(|_| "本机启动状态不可用")?.started = true;
+            windows::start(&runner.executable, runner.proxy.resolved.as_ref())?;
+            {
+                let mut state = runner.state.lock().map_err(|_| "本机启动状态不可用")?;
+                state.started = true; state.client_running = true;
+            }
             journal.phase = "started".into(); journal.save()?;
             Ok::<_, String>(())
         }).await;
         match result {
-            Ok(Ok(())) => operation.finish("started", "客户端已启动", false),
+            Ok(Ok(())) => {
+                let message = if operation.proxy.resolved.is_some() { "客户端已使用账号代理启动" } else { "客户端已启动" };
+                operation.finish("started", message, false);
+            }
             Ok(Err(error)) => {
+                if let Ok(running) = windows::running(&operation.executable) {
+                    if let Ok(mut state) = operation.state.lock() { state.client_running = running; }
+                }
                 let phase = if operation.state.lock().is_ok_and(|state| state.started) { "started" } else { "committed" };
                 operation.finish(phase, error, true);
             }
@@ -105,6 +127,7 @@ pub async fn restore(manager: Source, intent: &str, confirmed: bool) -> Result<V
             }
             runner.state.lock().map_err(|_| "本机启动状态不可用")?.phase = "closing";
             if windows::running(&runner.executable)? { windows::close(&runner.executable)?; }
+            runner.state.lock().map_err(|_| "本机启动状态不可用")?.client_running = false;
             if !runner.manager.is_current() || runner.binding.current().is_err() { return Err("本机恢复来源已变化，未写入凭证".into()); }
             journal.phase = "restoring".into(); journal.save()?;
             runner.state.lock().map_err(|_| "本机启动状态不可用")?.phase = "writing";

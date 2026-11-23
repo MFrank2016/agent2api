@@ -31,7 +31,7 @@
  */
 
 import * as React from "react";
-import { accountImportNotice } from '../../../ui-shared/account-import-result';
+import { accountImportNotice } from "../../../ui-shared/account-import-result";
 import {
   CATEGORIES,
   CAPTCHA_POOL_FIELDS,
@@ -72,6 +72,7 @@ import {
   type SanitizeState,
 } from "./settings-sanitize-model";
 import { t } from "../i18n";
+import { loadPricingSettings } from "./model-pricing";
 import {
   retentionSavedMessage,
   retentionShrinkHead,
@@ -208,7 +209,7 @@ export type ProviderOptionsState = {
 };
 
 /** 第三方模型回答完自动折叠过程开关 */
-export type ReasoningCollapseState = { status: LoadStatus; on: boolean }
+export type ReasoningCollapseState = { status: LoadStatus; on: boolean };
 
 /**
  * 会话图片压缩：一个开关 + 三项参数。`values` 为 null（loading / unavailable）
@@ -1074,11 +1075,15 @@ export async function importAccounts(): Promise<void> {
       note: providerNote,
     });
 
-    const notice = accountImportNotice(result)
-    const message = failed || notice?.warning
-      ? t('导入完成：{summary}', { summary })
-      : t('✅ 导入完成：{summary}', { summary })
-    toast(notice ? `${message}\n${t(notice.text)}` : message, failed ? 'err' : notice?.warning ? 'warn' : 'ok')
+    const notice = accountImportNotice(result);
+    const message =
+      failed || notice?.warning
+        ? t("导入完成：{summary}", { summary })
+        : t("✅ 导入完成：{summary}", { summary });
+    toast(
+      notice ? `${message}\n${t(notice.text)}` : message,
+      failed ? "err" : notice?.warning ? "warn" : "ok",
+    );
     if (failed) {
       // 失败明细只列前 3 条，与账号页批量操作的展示密度保持一致；
       // 定义警告（customProvider 标记）没有账号语义，展示时注明归属
@@ -2088,12 +2093,14 @@ export async function saveTimeoutField(
 
 /* ─── 调试模式 / 指纹脱敏 ── */
 
-let debugRevision = 0
+let debugRevision = 0;
 
 export function renderDebug(data?: unknown): void {
   if (data === undefined) return;
-  const record = data && typeof data === "object" && !Array.isArray(data)
-    ? (data as Record<string, unknown>) : null;
+  const record =
+    data && typeof data === "object" && !Array.isArray(data)
+      ? (data as Record<string, unknown>)
+      : null;
   if (!record || typeof record.debugMode !== "boolean") {
     publish({ debug: { ...snapshot.debug, status: "unavailable" } });
     return;
@@ -2111,41 +2118,44 @@ export function renderDebug(data?: unknown): void {
 }
 
 async function readDebug(): Promise<void> {
-  const revision = ++debugRevision
+  const revision = ++debugRevision;
   try {
-    const data = await shared().workbuddyDesktop?.getDebug()
-    if (revision === debugRevision) renderDebug(data ?? null)
+    const data = await shared().workbuddyDesktop?.getDebug();
+    if (revision === debugRevision) renderDebug(data ?? null);
   } catch (error) {
-    if (revision !== debugRevision) return
+    if (revision !== debugRevision) return;
     console.warn("读取调试模式设置失败:", errorMessage(error));
     renderDebug(null);
   }
 }
 
 export async function loadDebug(): Promise<void> {
-  if (busyScope !== 'debug') await readDebug()
+  if (busyScope !== "debug") await readDebug();
 }
 
 export async function saveDebug(next: boolean): Promise<void> {
-  if (busyScope || snapshot.debug.status !== "ready") { repaint(); return }
+  if (busyScope || snapshot.debug.status !== "ready") {
+    repaint();
+    return;
+  }
   // 保存开始后，先前的读取结果不能覆盖新状态。
-  const previous = snapshot.debug
-  debugRevision += 1
+  const previous = snapshot.debug;
+  debugRevision += 1;
   beginBusy("debug");
   publish({ debug: { ...previous, on: next } });
   try {
-    const bridge = shared().workbuddyDesktop
-    if (!bridge?.saveDebug) throw new Error(t("主进程桥不可用"))
-    const saved = await bridge.saveDebug(next)
-    renderDebug(saved ?? null)
+    const bridge = shared().workbuddyDesktop;
+    if (!bridge?.saveDebug) throw new Error(t("主进程桥不可用"));
+    const saved = await bridge.saveDebug(next);
+    renderDebug(saved ?? null);
     if (snapshot.debug.status !== "ready" || snapshot.debug.on !== next) {
-      throw new Error(t("未能读取调试模式设置，请稍后重试"))
+      throw new Error(t("未能读取调试模式设置，请稍后重试"));
     }
     toast(next ? t("✅ 调试模式已开启") : t("✅ 调试模式已关闭"));
   } catch (error) {
     toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
-    publish({ debug: previous })
-    await readDebug()
+    publish({ debug: previous });
+    await readDebug();
   } finally {
     endBusy();
   }
@@ -2504,37 +2514,54 @@ export async function saveDeveloperRoleCompat(next: boolean): Promise<void> {
 /* ─── 第三方模型回答完自动折叠过程（给 Responses 助手消息补阶段标记）── */
 
 export function renderReasoningCollapse(data?: unknown): void {
-  if (data === undefined) return
-  if (!data || typeof data !== 'object') {
-    publish({ reasoningCollapse: { status: 'unavailable', on: false } })
-    return
+  if (data === undefined) return;
+  if (!data || typeof data !== "object") {
+    publish({ reasoningCollapse: { status: "unavailable", on: false } });
+    return;
   }
-  const record = data as Record<string, unknown>
-  publish({ reasoningCollapse: { status: 'ready', on: record.thirdPartyReasoningCollapse === true } })
+  const record = data as Record<string, unknown>;
+  publish({
+    reasoningCollapse: {
+      status: "ready",
+      on: record.thirdPartyReasoningCollapse === true,
+    },
+  });
 }
 
 async function loadReasoningCollapse(): Promise<void> {
   try {
-    renderReasoningCollapse(await shared().workbuddyDesktop?.getReasoningCollapse())
+    renderReasoningCollapse(
+      await shared().workbuddyDesktop?.getReasoningCollapse(),
+    );
   } catch (error) {
-    console.warn('读取第三方模型回答完自动折叠过程设置失败:', errorMessage(error))
-    renderReasoningCollapse(null)
+    console.warn(
+      "读取第三方模型回答完自动折叠过程设置失败:",
+      errorMessage(error),
+    );
+    renderReasoningCollapse(null);
   }
 }
 
 export async function saveReasoningCollapse(next: boolean): Promise<void> {
-  if (busyScope) { repaint(); return }
-  beginBusy('reasoningCollapse')
-  publish({ reasoningCollapse: { status: 'ready', on: next } })
+  if (busyScope) {
+    repaint();
+    return;
+  }
+  beginBusy("reasoningCollapse");
+  publish({ reasoningCollapse: { status: "ready", on: next } });
   try {
-    const saved = await shared().workbuddyDesktop?.saveReasoningCollapse(next)
-    renderReasoningCollapse(saved)
-    toast(next ? t('✅ 第三方模型回答完自动折叠过程已开启') : t('已关闭第三方模型回答完自动折叠过程'))
+    const saved = await shared().workbuddyDesktop?.saveReasoningCollapse(next);
+    renderReasoningCollapse(saved);
+    toast(
+      next
+        ? t("✅ 第三方模型回答完自动折叠过程已开启")
+        : t("已关闭第三方模型回答完自动折叠过程"),
+    );
   } catch (error) {
-    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadReasoningCollapse() // 回滚到后端的真实值
+    toast(t("保存失败：{message}", { message: errorMessage(error) }), "err");
+    await loadReasoningCollapse(); // 回滚到后端的真实值
   } finally {
-    endBusy()
+    endBusy();
   }
 }
 
@@ -3458,12 +3485,14 @@ export async function panelLogout(): Promise<boolean> {
  * 设置页数据入口（app.js 切入该页时调用，upgrade-panel 迁移完成后也调）。
  * 九个取数并行，各自失败各自降级 —— 一个接口挂了不该把整页拖成空白。
  */
-export async function load({ checkUpdate = false }: { checkUpdate?: boolean } = {}): Promise<void> {
-  if (checkUpdate) showCategory("about")
-  else restoreCategory()
-  renderUnits()
-  publish({ panelLogin: readPanelLogin() })
-  window.dispatchEvent(new Event("wb:settings-load"))
+export async function load({
+  checkUpdate = false,
+}: { checkUpdate?: boolean } = {}): Promise<void> {
+  if (checkUpdate) showCategory("about");
+  else restoreCategory();
+  renderUnits();
+  publish({ panelLogin: readPanelLogin() });
+  window.dispatchEvent(new Event("wb:settings-load"));
   await Promise.all([
     loadSettings(),
     loadLanExtras(),
@@ -3484,9 +3513,12 @@ export async function load({ checkUpdate = false }: { checkUpdate?: boolean } = 
     loadStorage(),
     loadAccount(),
     loadModelsDev(),
+    loadPricingSettings().catch(() => null),
     reconnectDbRestore(),
     // 托盘只检查版本，不能恢复下载任务后顺带启动已完成的安装包。
-    checkUpdate ? shared().wbUpdatePanel?.check?.() : shared().wbUpdatePanel?.load?.(),
+    checkUpdate
+      ? shared().wbUpdatePanel?.check?.()
+      : shared().wbUpdatePanel?.load?.(),
     // 「版本信息」也是独立岛（system-info-pane.tsx）：同样在切进设置页时重拉 ——
     // 版本 / 运行时长 / 在途请求这些读数会随时间变，缓存一份旧的没有意义
     shared().wbSystemInfoPane?.load?.(),
@@ -3561,8 +3593,8 @@ export async function refreshDeveloperRoleCompat(): Promise<void> {
 }
 
 export async function refreshReasoningCollapse(): Promise<void> {
-  await loadReasoningCollapse()
-  toast(t('第三方模型回答完自动折叠过程设置已刷新'))
+  await loadReasoningCollapse();
+  toast(t("第三方模型回答完自动折叠过程设置已刷新"));
 }
 
 export async function refreshCors(): Promise<void> {

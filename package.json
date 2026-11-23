@@ -6,6 +6,8 @@
   "private": true,
   "scripts": {
     "prepare": "git config core.hooksPath .githooks || exit 0",
+    "release:prepare": "node scripts/prepare-release.mjs",
+    "release:plugins": "node scripts/release-plugins.mjs",
     "test:rust": "node scripts/cargo-test.mjs",
     "test:rust:plugins": "node scripts/cargo-test.mjs --plugins",
     "test:rust:coverage": "node scripts/cargo-test.mjs --coverage",

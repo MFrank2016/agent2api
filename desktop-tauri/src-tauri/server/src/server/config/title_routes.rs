@@ -55,7 +55,10 @@ impl Fallback {
     /// 用于日志与诊断；序列化本身走 serde 的 snake_case。
     #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
-        match self { Self::Original => "original", Self::Error => "error" }
+        match self {
+            Self::Original => "original",
+            Self::Error => "error",
+        }
     }
 }
 
@@ -86,7 +89,12 @@ pub struct TitleRoutes {
 }
 
 impl Default for TitleRoutes {
-    fn default() -> Self { Self { enabled: true, rules: Vec::new() } }
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rules: Vec::new(),
+        }
+    }
 }
 
 /// 读时形状：同时认新形状（`rules`）与旧形状（`clients` + `model` + `fallback`）。
@@ -113,7 +121,10 @@ impl<'de> Deserialize<'de> for TitleRoutes {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = RawTitleRoutes::deserialize(deserializer)?;
         Ok(match raw.rules {
-            Some(rules) => Self { enabled: raw.enabled, rules },
+            Some(rules) => Self {
+                enabled: raw.enabled,
+                rules,
+            },
             // 旧形状：折叠成一条规则
             None if raw.clients.is_some() || raw.model.is_some() => Self {
                 enabled: raw.enabled,
@@ -124,7 +135,10 @@ impl<'de> Deserialize<'de> for TitleRoutes {
                     fallback: raw.fallback.unwrap_or_default(),
                 }],
             },
-            None => Self { enabled: raw.enabled, rules: Vec::new() },
+            None => Self {
+                enabled: raw.enabled,
+                rules: Vec::new(),
+            },
         })
     }
 }
@@ -136,13 +150,20 @@ pub struct TitleRoutesSnapshot {
 }
 
 impl Default for TitleRoutesSnapshot {
-    fn default() -> Self { from_value(None) }
+    fn default() -> Self {
+        from_value(None)
+    }
 }
 
-pub fn model_key(model: &str) -> String { model.trim().to_lowercase() }
+pub fn model_key(model: &str) -> String {
+    model.trim().to_lowercase()
+}
 
 pub fn client_label(id: &str) -> Option<&'static str> {
-    CLIENTS.iter().find(|(key, _)| *key == id).map(|(_, label)| *label)
+    CLIENTS
+        .iter()
+        .find(|(key, _)| *key == id)
+        .map(|(_, label)| *label)
 }
 
 pub fn validate(settings: &TitleRoutes) -> Result<(), String> {
@@ -152,7 +173,9 @@ pub fn validate(settings: &TitleRoutes) -> Result<(), String> {
     for (index, rule) in settings.rules.iter().enumerate() {
         let at = index + 1;
         if rule.clients.len() > MAX_CLIENTS {
-            return Err(format!("标题生成路由第 {at} 条规则最多支持 {MAX_CLIENTS} 个客户端"));
+            return Err(format!(
+                "标题生成路由第 {at} 条规则最多支持 {MAX_CLIENTS} 个客户端"
+            ));
         }
         let mut seen = HashSet::new();
         for client in &rule.clients {
@@ -160,7 +183,10 @@ pub fn validate(settings: &TitleRoutes) -> Result<(), String> {
                 return Err(format!("标题生成路由不支持客户端「{client}」"));
             }
             if !seen.insert(client.as_str()) {
-                return Err(format!("第 {at} 条规则里「{}」重复出现", client_label(client).unwrap_or(client)));
+                return Err(format!(
+                    "第 {at} 条规则里「{}」重复出现",
+                    client_label(client).unwrap_or(client)
+                ));
             }
         }
         // 只有真的启用时才要求配全：关掉以后保留半截配置不该变成非法文件。
@@ -170,11 +196,18 @@ pub fn validate(settings: &TitleRoutes) -> Result<(), String> {
         }
         let model = &rule.model;
         if model.trim().is_empty() {
-            if live { return Err(format!("启用标题生成路由第 {at} 条规则前请先选择标题模型")); }
+            if live {
+                return Err(format!("启用标题生成路由第 {at} 条规则前请先选择标题模型"));
+            }
             continue;
         }
-        if model.trim() != model || model.chars().count() > 256 || model.chars().any(char::is_control) {
-            return Err(format!("第 {at} 条规则的标题模型 ID 不能超过 256 个字符、不能含控制字符或首尾空格"));
+        if model.trim() != model
+            || model.chars().count() > 256
+            || model.chars().any(char::is_control)
+        {
+            return Err(format!(
+                "第 {at} 条规则的标题模型 ID 不能超过 256 个字符、不能含控制字符或首尾空格"
+            ));
         }
     }
     Ok(())
@@ -195,9 +228,15 @@ fn from_value(value: Option<&Value>) -> TitleRoutesSnapshot {
         None => Ok(TitleRoutes::default()),
         Some(value) => serde_json::from_value::<TitleRoutes>(value.clone())
             .map_err(|error| format!("标题生成路由配置格式不正确：{error}"))
-            .and_then(|settings| { validate(&settings)?; Ok(settings) }),
+            .and_then(|settings| {
+                validate(&settings)?;
+                Ok(settings)
+            }),
     };
-    TitleRoutesSnapshot { settings, revision: revision(value) }
+    TitleRoutesSnapshot {
+        settings,
+        revision: revision(value),
+    }
 }
 
 pub(crate) fn from_raw(raw: &Map<String, Value>) -> Arc<TitleRoutesSnapshot> {
@@ -205,21 +244,29 @@ pub(crate) fn from_raw(raw: &Map<String, Value>) -> Arc<TitleRoutesSnapshot> {
 }
 
 pub fn current() -> Arc<TitleRoutesSnapshot> {
-    super::CONFIG.read().unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref().map(|config| config.title_routes.clone()).unwrap_or_default()
+    super::CONFIG
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|config| config.title_routes.clone())
+        .unwrap_or_default()
 }
 
 /// 当前生效的配置：总开关打开、且至少有一条真会命中的规则。
 pub fn active() -> Option<TitleRoutes> {
     let snapshot = current();
     let settings = snapshot.settings.as_ref().ok()?;
-    if !settings.enabled || !settings.rules.iter().any(effective) { return None; }
+    if !settings.enabled || !settings.rules.iter().any(effective) {
+        return None;
+    }
     Some(settings.clone())
 }
 
 /// 这次请求该走哪条规则：按列表顺序取第一条命中的 —— 顺序即优先级。
 pub fn match_rule(settings: &TitleRoutes, client: &str) -> Option<TitleRule> {
-    settings.rules.iter()
+    settings
+        .rules
+        .iter()
         .filter(|rule| effective(rule))
         .find(|rule| rule.clients.iter().any(|id| id == client))
         .cloned()
@@ -227,12 +274,20 @@ pub fn match_rule(settings: &TitleRoutes, client: &str) -> Option<TitleRule> {
 
 pub fn save(settings: TitleRoutes, expected: &str) -> Result<(), GatewayError> {
     validate(&settings).map_err(GatewayError::bad_request)?;
-    let value = serde_json::to_value(settings).map_err(|error| GatewayError::new(error.to_string()))?;
-    super::try_update_raw_field(KEY_TITLE_ROUTES, |raw| {
-        if revision(Some(raw)) != expected {
-            return Err(GatewayError::with_status(409, "标题生成路由已在其他位置修改，请重新读取后再保存；当前草稿未丢失"));
-        }
-        *raw = value;
-        Ok(())
-    }, || GatewayError::new("标题生成路由保存失败，未应用本次修改"))
+    let value =
+        serde_json::to_value(settings).map_err(|error| GatewayError::new(error.to_string()))?;
+    super::try_update_raw_field(
+        KEY_TITLE_ROUTES,
+        |raw| {
+            if revision(Some(raw)) != expected {
+                return Err(GatewayError::with_status(
+                    409,
+                    "标题生成路由已在其他位置修改，请重新读取后再保存；当前草稿未丢失",
+                ));
+            }
+            *raw = value;
+            Ok(())
+        },
+        || GatewayError::new("标题生成路由保存失败，未应用本次修改"),
+    )
 }

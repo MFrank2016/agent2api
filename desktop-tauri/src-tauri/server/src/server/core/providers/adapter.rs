@@ -221,6 +221,23 @@ impl ChatRequestPlan {
             policy: super::policy::ChatPolicy::default(),
         }
     }
+
+    /// 图片生成与编辑端点的请求计划（响应格式由 [`super::images::ImageResponseKind`] 决定）。
+    pub fn images(
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Value,
+        response: super::images::ImageResponseKind,
+    ) -> Self {
+        Self {
+            url,
+            headers,
+            body,
+            response: UpstreamResponse::Images(response),
+            reasoning: None,
+            policy: super::policy::ChatPolicy::default(),
+        }
+    }
 }
 
 /// 上游响应的协议（**请求体与响应必须同源**：这套标记由适配器在构造请求时
@@ -367,6 +384,64 @@ impl UpstreamErrorClass {
             ),
             _ => None,
         }
+    }
+}
+
+/// 账号型网页搜索插件声明的能力边界（由 `web-search.capabilities` 返回）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebSearchCapability {
+    pub max_query_chars: usize,
+    pub supports_max_results: bool,
+    pub default_max_results: Option<usize>,
+    pub max_results_limit: Option<usize>,
+}
+
+impl WebSearchCapability {
+    /// 解析插件返回的 `web-search.capabilities` 元数据；旧版未申报条数参数时保持兼容关闭。
+    pub fn from_metadata(metadata: &Value) -> Option<Self> {
+        if metadata.get("version").and_then(Value::as_u64) != Some(1)
+            || metadata.get("search").and_then(Value::as_bool) != Some(true)
+        {
+            return None;
+        }
+        let max_query_chars = metadata
+            .get("max_query_chars")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| (1..=16000).contains(value))?;
+        let supports_max_results = metadata
+            .get("supports_max_results")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let max_results_limit = if supports_max_results {
+            metadata
+                .get("max_results_limit")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| (1..=1000).contains(value))
+                .or(Some(10))
+        } else {
+            None
+        };
+        let default_max_results = if supports_max_results {
+            let limit = max_results_limit.unwrap_or(10);
+            Some(
+                metadata
+                    .get("default_max_results")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .map(|value| value.clamp(1, limit))
+                    .unwrap_or_else(|| limit.min(10)),
+            )
+        } else {
+            None
+        };
+        Some(Self {
+            max_query_chars,
+            supports_max_results,
+            default_max_results,
+            max_results_limit,
+        })
     }
 }
 
@@ -556,6 +631,10 @@ pub trait ProviderAdapter: Send + Sync {
 
     fn supports_image_editing(&self) -> bool {
         false
+    }
+
+    fn web_search_capability(&self) -> Option<WebSearchCapability> {
+        None
     }
 
     fn forwards_images(&self) -> bool { false }
@@ -1024,6 +1103,17 @@ pub trait ProviderAdapter: Send + Sync {
         false
     }
 
+    /// 带最小提前量（毫秒）的临期判定；供凭证维护把窗口放大到覆盖维护间隔，
+    /// 不改变转发按需续期使用的 [`Self::credentials_expiring`]。
+    fn credentials_expiring_within(
+        &self,
+        store: &AccountStore,
+        account_id: &str,
+        _min_lead_ms: i64,
+    ) -> bool {
+        self.credentials_expiring(store, account_id)
+    }
+
     /// [`Self::credentials_expiring`] 的异步形态（插件架构新增，理由同
     /// [`Self::build_chat_request_async`]）。
     ///
@@ -1039,6 +1129,30 @@ pub trait ProviderAdapter: Send + Sync {
         account_id: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(async move { self.credentials_expiring(store, account_id) })
+    }
+
+    /// 维护任务保留检查失败的原因；失败不表示未到期，也不允许据此发送续期请求。
+    fn check_credentials_expiring<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, GatewayError>> + Send + 'a>> {
+        Box::pin(async move { Ok(self.credentials_expiring_async(store, account_id).await) })
+    }
+
+    /// 带最小提前量（毫秒）的异步临期检查；供凭证维护把窗口放大到覆盖维护间隔。
+    fn check_credentials_expiring_within<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+        min_lead_ms: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, GatewayError>> + Send + 'a>> {
+        Box::pin(async move {
+            if min_lead_ms <= 0 {
+                return self.check_credentials_expiring(store, account_id).await;
+            }
+            Ok(self.credentials_expiring_within(store, account_id, min_lead_ms))
+        })
     }
 
     /// 本 provider 是否允许「一个账号都没有时用默认登录态转发」
@@ -1984,6 +2098,10 @@ impl ProviderAdapter for BuiltinAdapter {
         adapter_for(self.0).supports_image_editing()
     }
 
+    fn web_search_capability(&self) -> Option<WebSearchCapability> {
+        adapter_for(self.0).web_search_capability()
+    }
+
     fn build_image_request_async<'a>(
         &'a self,
         account: &'a Value,
@@ -2049,12 +2167,38 @@ impl ProviderAdapter for BuiltinAdapter {
         adapter_for(self.0).credentials_expiring(store, account_id)
     }
 
+    fn credentials_expiring_within(
+        &self,
+        store: &AccountStore,
+        account_id: &str,
+        min_lead_ms: i64,
+    ) -> bool {
+        adapter_for(self.0).credentials_expiring_within(store, account_id, min_lead_ms)
+    }
+
     fn credentials_expiring_async<'a>(
         &'a self,
         store: &'a AccountStore,
         account_id: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         adapter_for(self.0).credentials_expiring_async(store, account_id)
+    }
+
+    fn check_credentials_expiring<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, GatewayError>> + Send + 'a>> {
+        adapter_for(self.0).check_credentials_expiring(store, account_id)
+    }
+
+    fn check_credentials_expiring_within<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+        min_lead_ms: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, GatewayError>> + Send + 'a>> {
+        adapter_for(self.0).check_credentials_expiring_within(store, account_id, min_lead_ms)
     }
 
     fn allows_anonymous_default_session(&self) -> bool {
